@@ -27,9 +27,9 @@ teamwork-review-agents start
 
 所有命令默认读取当前工作目录的 `config.yaml`。需要使用其他配置时，仍可通过 `-c /path/to/other.yaml` 覆盖。
 
-全部配置项、默认值和字段用途见 [`config_example.yaml`](config_example.yaml)。其中的业务示例保持注释状态，复制后不会在首次 UI 中创建示例仓库、Agent 或规则。
+全部配置项、默认值和字段用途见 [`config_example.yaml`](config_example.yaml)。复制后会得到三个内置 Agent 和两条内置规则模板；所有内置规则都设置为 `enabled: false`，不会自动启动 Agent。
 
-首次启动时，管理 UI 中的 GitHub / GitLab 连接、仓库、环境变量、Skill、Agent 和触发规则都是空的。运行时配置显示默认继承状态，但不会预先写入某个模型。访问 [http://127.0.0.1:8080](http://127.0.0.1:8080) 后按实际需要添加配置并保存即可。
+首次启动时，管理 UI 中的 GitHub / GitLab 连接、仓库、环境变量和 Skill 都是空的；Agent 页面会显示内置 Agent，触发规则页面会显示已关闭的内置模板。运行时配置显示默认继承状态，但不会预先写入某个模型。访问 [http://127.0.0.1:8080](http://127.0.0.1:8080) 后先配置平台连接和仓库，检查 Agent 权限与 Prompt，再按需启用规则。
 
 ## 运行模式
 
@@ -183,7 +183,13 @@ Agent 的 Prompt 支持两种来源：
 
 从电脑导入时，后台会将 UTF-8 编码的 `.md` 或 `.txt` 文件复制到配置目录旁的 `./prompts/`，然后自动填写相对路径。浏览器原始路径不会被写入配置；同名但内容不同的文件会自动增加数字后缀。
 
-仓库根目录的 `/prompts/` 默认由 Git 忽略，用于保存每个部署环境自己的 Prompt，不会因为 UI 导入而进入版本控制。项目目前不包含内置 Prompt；以后新增内置 Prompt 时，应只为明确指定的内置文件增加 `.gitignore` 例外，不要解除整个目录的忽略规则。
+仓库根目录的 `/prompts/` 默认由 Git 忽略，用于保存每个部署环境自己的 Prompt，不会因为 UI 导入而进入版本控制。项目只精确提交以下内置 Prompt：
+
+- `prompts/general-review.md`
+- `prompts/增量文档更新入口.md`
+- `prompts/增量文档更新.md`
+
+其他 Prompt 仍保持忽略。内置 Agent 会随示例配置显示，但内置规则默认关闭；只有管理员主动启用规则后，扫描事件才会启动对应 Agent。
 
 ## Skill 配置与装载
 

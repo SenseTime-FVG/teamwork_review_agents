@@ -243,3 +243,9 @@ Timeline 负责能够明确还原的离散动作：关闭、重新打开、合�
 服务不再强制使用 `--ignore-user-config`，因此未被 Teamwork 或 Agent 覆盖的 Codex 配置仍按 CLI 原生层级生效。Teamwork 的应用托管 MCP 网关、当前运行 Skill 选择、工作目录和 Sandbox 继续由命令行显式指定，不能被运行时高级配置覆盖。
 
 后端提供只读的 Codex 运行能力接口：优先调用当前配置的 `codex_binary debug models --bundled` 获取本机 CLI 已知模型、各模型支持的推理强度、默认推理强度和快速模式能力；命令不可用时 UI 仍允许手工填写。Agent 模型留空时，UI 按可验证来源显示继承结果：先显示 `runtime.codex.model`，否则尝试读取 `$CODEX_HOME/config.toml` 或 `~/.codex/config.toml` 的顶层 `model`；两者都没有时显示“由 CLI 与账号决定”，不猜测内置默认模型。仓库级 `.codex/config.toml` 可能因实际运行仓库不同而改变结果，UI 会明确提示这一点。
+
+## 23. 内置 Agent、规则模板与 Prompt
+
+项目在 `config_example.yaml` 中直接提供通用审核和增量文档更新所需的 Agent 定义，使用户复制示例配置后可以在管理 UI 中查看、调整并复用这些 Agent。示例中的所有内置规则都保留完整的事件、Agent、去重与工作区继承关系，但统一设置为 `enabled: false`；未由管理员主动启用前，扫描产生的事件不会因为内置模板而启动 Agent。
+
+内置 Prompt 保存在仓库根目录的 `prompts/` 中，并通过 `.gitignore` 的精确例外纳入版本控制。除明确列出的内置文件外，UI 导入或部署环境自行创建的其他 Prompt 仍保持忽略，避免把本地 Prompt 或潜在敏感内容误提交。示例配置只包含 Agent 与禁用规则，不包含 Provider、仓库、真实 Token 或其他部署私有值。

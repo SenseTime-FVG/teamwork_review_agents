@@ -102,8 +102,25 @@ def test_example_config_is_valid() -> None:
     assert validate_runtime_files(config) == []
     assert config.providers == {}
     assert config.repositories == []
-    assert config.agents == {}
-    assert config.rules == []
+    assert set(config.agents) == {
+        "general-reviewer",
+        "incremental-doc-update-runner",
+        "incremental-doc-updater",
+    }
+    assert all(
+        agent.prompt_file is not None and agent.prompt_file.is_file()
+        for agent in config.agents.values()
+    )
+    assert config.agents[
+        "incremental-doc-update-runner"
+    ].allowed_sub_agents == ["incremental-doc-updater"]
+    assert [rule.name for rule in config.rules] == [
+        "general-review",
+        "增量文档更新",
+    ]
+    assert all(not rule.enabled for rule in config.rules)
+    assert config.rules[0].deduplicate_per_scan is True
+    assert config.rules[1].inherit_workspace is True
     assert config.database.path.is_absolute()
     assert config.scanner.interval_seconds == 300
     assert config.scanner.max_items_per_repository == 100

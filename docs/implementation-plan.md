@@ -184,3 +184,13 @@
 - 更新完整配置示例、README、后端测试和前端构建产物。
 
 验收：运行时默认参数进入每次 Codex 命令；Agent 显式值覆盖全局运行时；sub-agent 不继承父 Agent 覆盖；高级配置不能覆盖应用安全边界；模型目录不可用时仍可编辑和运行；UI 能区分 Teamwork 默认、用户配置和 CLI/账号决定三种模型来源。
+
+## 阶段二十：固化内置 Agent、规则模板与 Prompt
+
+- 将当前通用审核、增量文档入口和增量文档更新三个 Agent 写入 `config_example.yaml`，保留 sub-agent 白名单、环境变量与写作用域。
+- 将通用审核与增量文档更新两条规则写为可直接编辑的内置模板，并统一设置 `enabled: false`。
+- 通过 `.gitignore` 精确放行三个内置 Prompt，其余 `prompts/` 内容继续忽略。
+- 更新 README 与示例说明，明确内置 Agent 不等于自动运行，启用规则才会触发。
+- 增加示例配置测试，校验内置 Agent、规则禁用状态、Prompt 文件存在和 sub-agent 引用关系。
+
+验收：复制示例配置后可以在 UI 中看到三个内置 Agent 和两条禁用规则；未主动启用规则时不会触发 Agent；示例配置不包含 Provider、仓库或真实 Token；三个内置 Prompt 可被 Git 跟踪，其他本地 Prompt 仍被忽略。

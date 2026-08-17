@@ -4,7 +4,11 @@
 __pycache__/
 *.py[cod]
 config.yaml
-/prompts/
+# 本地 Prompt 默认忽略，只提交项目明确维护的内置 Prompt。
+/prompts/*
+!/prompts/general-review.md
+!/prompts/增量文档更新.md
+!/prompts/增量文档更新入口.md
 /skills/
 /workspaces/
 ui/node_modules/

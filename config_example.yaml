@@ -1,7 +1,8 @@
 # Teamwork Review Agents 完整配置参考
 #
-# 这个文件可以直接复制为 config.yaml。只有 database 和 web 保持启用，
-# Provider、仓库、Skill、Agent 与规则均为注释示例，因此首次打开管理 UI 仍是空白状态。
+# 这个文件可以直接复制为 config.yaml。Provider、仓库、环境变量和 Skill 均为注释示例；
+# 项目内置 Agent 会显示在管理 UI 中，内置规则全部关闭，不会自动触发 Agent。
+# 示例只保存 Token 的环境变量名或占位说明，绝不包含真实 Token。
 # 所有相对路径都以 config.yaml 所在目录为基准。
 
 # 必填：SQLite 用于保存 MR/PR 快照、事件、运行记录、日志和资源锁。
@@ -155,103 +156,89 @@ web:
 #     # 也可以引用运行服务的机器上已经存在的绝对目录。
 #     path: /opt/teamwork-skills/security-review
 
-# 可选：Codex CLI Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
-# agents:
-#   code-reviewer:
-#     # prompt_file 和 prompt 必须且只能配置一个。
-#     # 文件路径相对于 config.yaml；UI 也支持将 .md/.txt 导入 ./prompts/。
-#     # 仓库根目录的 prompts/ 默认被 Git 忽略，本地 Prompt 不会自动提交。
-#     prompt_file: ./prompts/code-reviewer.md
-#     # 也可以使用内联 Prompt；模板中的缺失变量会渲染为空字符串。
-#     # prompt: |
-#     #   请审查 ${{REPOSITORY_PROJECT}} 的 MR #${{MR_NUMBER}}。
-#     #   输出风格：${{REVIEW_STYLE}}
-#     # 可选：覆盖 runtime.codex.model；省略时继承 Teamwork 运行时或 Codex 默认模型。
-#     model: gpt-5.6-sol
-#     # 下列字段均为当前 Agent 的可选覆盖；sub-agent 使用目标 Agent 自己的设置。
-#     model_reasoning_effort: high
-#     # inherit：继承 runtime.codex；standard：关闭；fast：开启快速模式。
-#     fast_mode: inherit
-#     # 可选：low、medium、high。
-#     model_verbosity: medium
-#     # 可选：none、friendly、pragmatic。
-#     personality: pragmatic
-#     # 可选：disabled、cached、live。
-#     web_search: cached
-#     # read-only：本地只读；workspace-write：工作区可写；danger-full-access：完全访问。
-#     sandbox: read-only
-#     # 单次 Codex CLI 运行最长秒数。
-#     timeout_seconds: 1200
-#     # 写操作声明用于申请串行锁，不等同于平台账号授权。
-#     # change_request：评论、标签、审批、合并等 MR/PR 写操作。
-#     # workspace：修改代码、提交、推送等操作；同一 MR/PR 源分支会串行。
-#     write_scopes: []
-#     # 只授予 invoke_agent 调用权限，不会自动启动这些 Agent。
-#     allowed_sub_agents:
-#       - security-reviewer
-#     # 可选：只装载这里选择的应用 Skill。选择表示 Codex 可以按 description
-#     # 隐式匹配或通过 $skill-name 显式使用，不代表每次运行都强制执行。
-#     # sub-agent 使用自己的 skills，不继承父 Agent 的选择。
-#     skills:
-#       - incremental-doc-update
-#     # 可选：要求 Codex 最终输出符合指定 JSON Schema。
-#     output_schema: ./schemas/review-result.json
-#     # true 时允许工作目录不是 Git 仓库，通常保持 false。
-#     skip_git_repo_check: false
-#     # 可选：追加到 codex exec 的高级命令行参数。
-#     extra_codex_args: []
-#     # 可选：只覆盖当前 Agent 的环境变量。
-#     environment:
-#       REVIEW_STYLE: concise
-#
-#   security-reviewer:
-#     prompt_file: ./prompts/security-reviewer.md
-#     sandbox: read-only
-#     timeout_seconds: 1200
-#     write_scopes: []
-#     allowed_sub_agents: []
-#     skills:
-#       - security-review
+# 内置 Codex CLI Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
+# 这里的定义会显示在首次启动的 UI 中，但只有启用规则后才会被自动触发。
+agents:
+  general-reviewer:
+    # prompt_file 和 prompt 必须且只能配置一个；相对路径以 config.yaml 为基准。
+    # 这三个明确列出的文件是项目内置 Prompt，其他 prompts/ 文件仍被 Git 忽略。
+    prompt_file: ./prompts/general-review.md
+    # 可选：model、model_reasoning_effort、fast_mode、model_verbosity、personality
+    # 和 web_search 可以覆盖 runtime.codex；省略时继承运行时或 Codex 默认设置。
+    # read-only：本地只读；workspace-write：工作区可写；
+    # danger-full-access：完全访问。
+    sandbox: workspace-write
+    # 单次 Codex CLI 运行最长秒数。
+    timeout_seconds: 1200
+    # 写操作声明用于申请串行锁，不等同于平台账号授权。
+    # workspace：修改代码、提交或推送；change_request：评论、标签或合并 MR/PR。
+    write_scopes:
+      - workspace
+      - change_request
+    # 只授予 invoke_agent 调用权限；空数组表示不能委托其他 Agent。
+    allowed_sub_agents: []
+    # 可选：当前 Agent 独立装载的 Skill ID，不继承给 sub-agent。
+    # skills: []
+    # 可选：output_schema、skip_git_repo_check 和 extra_codex_args 仍可按需配置。
+    environment: {}
 
-# 可选：MR/PR 状态变化到 Agent 的映射规则。
-# rules:
-#   - # 规则唯一名称，会记录到 Agent 运行审计中。
-#     name: review-new-commit
-#     # 支持 discovered、opened、reopened、closed、merged、commits_changed、
-#     # draft_changed、labels_changed、approvals_changed、pipeline_changed、
-#     # merge_status_changed 和 updated，完整名称以 change_request. 开头。
-#     events:
-#       - change_request.commits_changed
-#     # 要启动的根 Agent；按配置顺序调度。
-#     agents:
-#       - code-reviewer
-#     # 可选：只匹配指定仓库；省略或留空表示全部仓库。
-#     repositories:
-#       - example-github
-#     # 可选：匹配事件的新旧快照字段。
-#     conditions:
-#       # 无前缀时读取新快照，也可以使用 old.state 或 new.state。
-#       state: opened
-#       draft: false
-#       # 操作符写在双下划线后：ne、contains、not_contains、in、not_in、
-#       # gte、lte、gt、lt、changed。
-#       labels__contains: security
-#       pipeline_status__in:
-#         - success
-#         - skipped
-#       approvals__gte: 2
-#       head_sha__changed: true
-#     # 可选：同一轮扫描中，同一个 MR/PR 的多个匹配事件是否合并运行。
-#     # false（默认）表示每个匹配事件分别触发；true 表示每个目标 Agent 只触发一次，
-#     # 并把本轮匹配动作合并到根 Agent 输入的 mr.action 数组。
-#     deduplicate_per_scan: false
-#     # 可选：sub-agent 是否复用父 Agent 本次运行的临时 worktree，默认 false。
-#     # true 时整条调用链能看到父 Agent 的当前分支、暂存区和未提交文件，
-#     # 但不会自动继承 MR 输入或父 Agent 对话；共享工作区委托会串行执行。
-#     # false 时 sub-agent 为自己的运行创建基于 MR/PR Head 的独立 worktree。
-#     inherit_workspace: false
-#     # false 时保留规则但不参与匹配。
-#     enabled: true
+  incremental-doc-update-runner:
+    prompt_file: ./prompts/增量文档更新入口.md
+    sandbox: workspace-write
+    timeout_seconds: 1200
+    write_scopes:
+      - workspace
+      - change_request
+    # 入口 Agent 只能委托这个内置文档更新 Agent。
+    allowed_sub_agents:
+      - incremental-doc-updater
+    environment:
+      # Prompt 通过该变量读取实际要调用的 sub-agent 名称。
+      INCREMENTAL_DOC_UPDATE_AGENT_NAME:
+        value: incremental-doc-updater
+        secret: false
+        expose_to_prompt: true
+        expose_to_process: true
+
+  incremental-doc-updater:
+    prompt_file: ./prompts/增量文档更新.md
+    sandbox: workspace-write
+    timeout_seconds: 1200
+    write_scopes:
+      - workspace
+      - change_request
+    allowed_sub_agents: []
+    environment: {}
+
+# 内置 MR/PR 触发规则模板。全部默认关闭，管理员检查后再从 UI 主动启用。
+# 支持 discovered、opened、reopened、closed、merged、commits_changed、
+# draft_changed、labels_changed、approvals_changed、pipeline_changed、
+# merge_status_changed 和 updated，完整名称以 change_request. 开头。
+rules:
+  - name: general-review
+    events:
+      - change_request.opened
+      - change_request.reopened
+    agents:
+      - general-reviewer
+    # 留空表示不限制仓库，也不附加快照字段条件。
+    conditions: {}
+    # 同轮多个匹配事件对每个目标 Agent 合并为一次运行。
+    deduplicate_per_scan: true
+    # 内置规则绝不自动启用。
+    enabled: false
+
+  - name: 增量文档更新
+    events:
+      - change_request.merged
+    agents:
+      - incremental-doc-update-runner
+    conditions: {}
+    deduplicate_per_scan: true
+    # sub-agent 复用入口 Agent 的 worktree、分支、暂存区和未提交文件。
+    inherit_workspace: true
+    # 内置规则绝不自动启用。
+    enabled: false
 
 # Prompt 可直接使用的系统运行变量：
 # REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、MR_NUMBER、MR_TITLE、
