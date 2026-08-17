@@ -20,7 +20,7 @@
 python -m pip install -e '.[dev]'
 cp config_example.yaml config.yaml
 teamwork-review-agents validate
-teamwork-review-agents serve
+teamwork-review-agents start
 ```
 
 所有命令默认读取当前工作目录的 `config.yaml`。需要使用其他配置时，仍可通过 `-c /path/to/other.yaml` 覆盖。
@@ -31,15 +31,57 @@ teamwork-review-agents serve
 
 ## 运行模式
 
-### `serve`：持续后台运行
+### `start`：在后台启动
 
 ```bash
-teamwork-review-agents serve
+teamwork-review-agents start
 ```
 
-启动 FastAPI 管理服务和后台调度器。服务启动后立即执行一次扫描，之后按照 `scanner.interval_seconds` 周期持续扫描。管理界面可以编辑 GitHub / GitLab 连接、仓库、全局与分层环境变量、Agent、sub-agent 白名单和 MR/PR 触发规则，也可以立即扫描、暂停调度并查看 Agent 日志和父子运行记录。
+校验配置后启动脱离当前终端的 FastAPI 管理服务和后台调度器。命令会输出 PID、管理界面地址和后台日志路径；关闭当前终端不会停止服务。服务启动后立即执行一次扫描，之后按照 `scanner.interval_seconds` 周期持续扫描。
 
-`serve` 本身是前台常驻进程。生产环境请交给 systemd、launchd 或容器平台保活，不要使用应用内 fork。可直接参考：
+默认运行文件位于 `config.yaml` 同目录的 `data/`：
+
+- `teamwork-review-agents.pid`：当前进程身份。
+- `teamwork-review-agents.lock`：防止同一配置重复启动。
+- `teamwork-review-agents.log`：后台进程的标准输出与错误日志。
+
+Agent 运行日志仍保存在 SQLite 中，并可以在管理 UI 查看。
+
+### `run`：在前台运行
+
+```bash
+teamwork-review-agents run
+```
+
+功能与 `start` 相同，但进程保留在当前终端，按 `Ctrl+C` 结束。`serve` 作为旧版本兼容命令保留，行为等同于 `run`。
+
+### `stop` / `end`：结束服务
+
+```bash
+teamwork-review-agents stop
+# 或
+teamwork-review-agents end
+```
+
+两个命令完全等价。默认发送 `SIGTERM` 等待当前服务收尾；30 秒后仍未退出时会强制结束。服务没有运行时命令也会正常返回。
+
+### `restart`：重启后台服务
+
+```bash
+teamwork-review-agents restart
+```
+
+先校验新配置，再停止当前服务并重新在后台启动。如果服务原本没有运行，则直接启动。
+
+以上命令都默认使用当前目录的 `config.yaml`。自定义配置时必须在启动、停止和重启时传入同一路径：
+
+```bash
+teamwork-review-agents start -c /path/to/config.yaml
+teamwork-review-agents restart -c /path/to/config.yaml
+teamwork-review-agents stop -c /path/to/config.yaml
+```
+
+生产环境需要故障自动拉起和开机启动时，仍建议让进程管理器运行前台命令 `run`：
 
 - [systemd 服务模板](deploy/teamwork-review-agents.service)
 - [macOS launchd 模板](deploy/com.teamwork.review-agents.plist)
@@ -58,7 +100,7 @@ teamwork-review-agents scan-once
 teamwork-review-agents scan-once --dry-run
 ```
 
-该模式仍会请求 Provider、保存最新快照并生成事件，但不会处理事件或启动 Agent。生成的事件会保留为待处理状态，之后执行普通 `scan-once` 或启动 `serve` 时仍可能被处理。
+该模式仍会请求 Provider、保存最新快照并生成事件，但不会处理事件或启动 Agent。生成的事件会保留为待处理状态，之后执行普通 `scan-once` 或启动 `run` / `start` 时仍可能被处理。
 
 首次看到一个 MR/PR 时，系统默认只建立快照基线，不产生触发事件。将 `scanner.emit_initial_events` 改为 `true` 后，首次发现会生成 `change_request.discovered` 事件，并按照规则决定是否启动 Agent。
 
@@ -85,6 +127,8 @@ Agent 的 Prompt 支持两种来源：
 - 文件：手工填写相对于 `config.yaml` 的路径，选择 `./prompts/` 中已有文件，或点击“从电脑选择并导入”。
 
 从电脑导入时，后台会将 UTF-8 编码的 `.md` 或 `.txt` 文件复制到配置目录旁的 `./prompts/`，然后自动填写相对路径。浏览器原始路径不会被写入配置；同名但内容不同的文件会自动增加数字后缀。
+
+仓库根目录的 `/prompts/` 默认由 Git 忽略，用于保存每个部署环境自己的 Prompt，不会因为 UI 导入而进入版本控制。项目目前不包含内置 Prompt；以后新增内置 Prompt 时，应只为明确指定的内置文件增加 `.gitignore` 例外，不要解除整个目录的忽略规则。
 
 ## 环境变量与 Prompt 模板
 
@@ -135,7 +179,7 @@ web:
 
 ```bash
 export TEAMWORK_ADMIN_TOKEN='使用高强度随机值'
-teamwork-review-agents serve
+teamwork-review-agents run
 ```
 
 在 UI 顶部输入同一个 Token。Token 只保存在当前浏览器的 `localStorage`，不会写入 YAML。

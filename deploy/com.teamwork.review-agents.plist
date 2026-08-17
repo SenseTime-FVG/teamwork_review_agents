@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/绝对路径/teamwork_review_agents/.venv/bin/teamwork-review-agents</string>
-    <string>serve</string>
+    <string>run</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/绝对路径/teamwork_review_agents</string>

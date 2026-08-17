@@ -121,7 +121,11 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 
 ## 11. 后台管理服务
 
-应用升级为 FastAPI 后台服务，HTTP API、配置管理、定时扫描和 Agent 队列在同一服务进程中运行。生产环境由 systemd、launchd 或容器平台负责保活，不在应用内部自行 fork daemon。
+应用升级为 FastAPI 后台服务，HTTP API、配置管理、定时扫描和 Agent 队列在同一服务进程中运行。CLI 提供 `run` 前台运行，以及 `start`、`stop`、`end`、`restart` 本地后台进程管理；同一配置文件通过 PID 文件和进程锁保证只有一个服务实例。
+
+`start` 使用脱离终端的子进程运行服务，并将标准输出与错误写入配置目录旁的 `data/teamwork-review-agents.log`。`stop` 先发送 `SIGTERM` 等待优雅收尾，超时后强制结束。PID 记录同时保存进程启动时间，防止 PID 被系统复用时误结束其他进程。
+
+生产环境需要故障自动恢复和开机启动时，仍由 systemd、launchd 或容器平台运行 `run` 并负责保活。
 
 后台支持立即扫描、暂停、恢复、配置热加载、服务心跳和运行状态汇总。默认只监听 `127.0.0.1`；监听非本机地址时必须配置管理员 Token。
 

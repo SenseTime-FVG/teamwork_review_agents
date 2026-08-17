@@ -4,9 +4,15 @@ import sys
 from pathlib import Path
 
 from teamwork_review_agents.codex_runner import CodexRunner
-from teamwork_review_agents.cli import build_parser
+from teamwork_review_agents.cli import _server_settings, build_parser
 from teamwork_review_agents.config import load_config, validate_runtime_files
 from teamwork_review_agents.models import InvocationContext
+from teamwork_review_agents.process_manager import (
+    ServiceLease,
+    management_url,
+    running_process,
+    runtime_paths,
+)
 
 
 def test_cli_uses_root_config_by_default() -> None:
@@ -17,6 +23,67 @@ def test_cli_uses_root_config_by_default() -> None:
 def test_cli_allows_config_override() -> None:
     args = build_parser().parse_args(["serve", "-c", "custom.yaml"])
     assert args.config == Path("custom.yaml")
+
+
+def test_cli_exposes_foreground_and_background_commands() -> None:
+    """前后台服务命令都应支持预期参数。"""
+
+    for command in ("run", "start", "restart", "serve"):
+        args = build_parser().parse_args(
+            [command, "-c", "custom.yaml", "--host", "localhost", "--port", "9000"]
+        )
+        assert args.config == Path("custom.yaml")
+        assert args.host == "localhost"
+        assert args.port == 9000
+    for command in ("stop", "end"):
+        args = build_parser().parse_args([command, "-c", "custom.yaml"])
+        assert args.config == Path("custom.yaml")
+
+
+def test_service_lease_prevents_duplicate_processes(tmp_path) -> None:
+    """同一个配置文件同一时刻只能登记一个服务进程。"""
+
+    config_path = tmp_path / "config.yaml"
+    paths = runtime_paths(config_path)
+    assert paths.pid_file.name == "teamwork-review-agents.pid"
+    assert paths.log_file.name == "teamwork-review-agents.log"
+
+    lease = ServiceLease.acquire(
+        config_path,
+        host="127.0.0.1",
+        port=8080,
+        detached=False,
+    )
+    assert lease is not None
+    try:
+        record = running_process(config_path)
+        assert record is not None
+        assert record.pid == lease.record.pid
+        assert ServiceLease.acquire(
+            config_path,
+            host="127.0.0.1",
+            port=8081,
+            detached=False,
+        ) is None
+    finally:
+        lease.release()
+    assert running_process(config_path) is None
+
+
+def test_management_url_uses_local_openable_address() -> None:
+    """通配监听地址应展示为浏览器可以访问的本机地址。"""
+
+    assert management_url("0.0.0.0", 8080) == "http://127.0.0.1:8080"
+    assert management_url("::1", 8080) == "http://[::1]:8080"
+
+
+def test_server_settings_reject_invalid_port(tmp_path, capsys) -> None:
+    """命令行覆盖端口也必须遵守有效端口范围。"""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("database:\n  path: ./state.db\n", encoding="utf-8")
+    assert _server_settings(config_path, None, 0) is None
+    assert "监听端口必须在 1 到 65535 之间" in capsys.readouterr().out
 
 
 def test_example_config_is_valid() -> None:

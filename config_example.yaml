@@ -117,6 +117,7 @@ web:
 #   code-reviewer:
 #     # prompt_file 和 prompt 必须且只能配置一个。
 #     # 文件路径相对于 config.yaml；UI 也支持将 .md/.txt 导入 ./prompts/。
+#     # 仓库根目录的 prompts/ 默认被 Git 忽略，本地 Prompt 不会自动提交。
 #     prompt_file: ./prompts/code-reviewer.md
 #     # 也可以使用内联 Prompt；模板中的缺失变量会渲染为空字符串。
 #     # prompt: |

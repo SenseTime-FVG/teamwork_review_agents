@@ -4,8 +4,12 @@
 __pycache__/
 *.py[cod]
 config.yaml
+/prompts/
 ui/node_modules/
 ui/*.tsbuildinfo
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.pid
+data/*.lock
+data/*.log
