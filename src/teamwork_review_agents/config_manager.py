@@ -11,7 +11,12 @@ from typing import Any
 
 import yaml
 
-from .config import AppConfig, load_config, parse_config_data
+from .config import (
+    AppConfig,
+    load_config,
+    parse_config_data,
+    protect_provider_credentials,
+)
 from .environment import MASK
 from .state import StateStore
 
@@ -97,29 +102,34 @@ class ConfigManager:
         """返回 UI 使用的原始配置结构。"""
 
         with self._lock:
-            raw = self._read_raw()
+            raw = protect_provider_credentials(self._read_raw())
         return self._mask_secrets(raw) if mask_secrets else raw
 
     def _record_version(self, config: AppConfig, source: str) -> None:
         """只保存脱敏后的配置历史。"""
 
-        masked = self._mask_secrets(self._read_raw())
+        protected = protect_provider_credentials(self._read_raw())
+        masked = self._mask_secrets(protected)
         content = yaml.safe_dump(masked, allow_unicode=True, sort_keys=False)
         self.store.save_config_version(config.revision, content, source)
 
     def validate(self, document: dict[str, Any]) -> AppConfig:
         """合并 Secret 占位并执行完整配置校验。"""
 
-        current = self._read_raw()
-        merged = self._merge_masked(document, current)
+        current = protect_provider_credentials(self._read_raw())
+        incoming = protect_provider_credentials(document)
+        merged = protect_provider_credentials(self._merge_masked(incoming, current))
         return parse_config_data(merged, self.path)
 
     def save(self, document: dict[str, Any], *, source: str = "ui") -> AppConfig:
         """校验后在同目录原子替换 YAML，并更新有效配置。"""
 
         with self._lock:
-            current_raw = self._read_raw()
-            merged = self._merge_masked(document, current_raw)
+            current_raw = protect_provider_credentials(self._read_raw())
+            incoming = protect_provider_credentials(document)
+            merged = protect_provider_credentials(
+                self._merge_masked(incoming, current_raw)
+            )
             config = parse_config_data(merged, self.path)
             if config.database.path != self._config.database.path:
                 raise ValueError("后台运行期间不允许通过 UI 修改 database.path")

@@ -5,7 +5,12 @@ from pathlib import Path
 
 from teamwork_review_agents.codex_runner import CodexRunner
 from teamwork_review_agents.cli import _server_settings, build_parser
-from teamwork_review_agents.config import load_config, validate_runtime_files
+from teamwork_review_agents.config import (
+    RepositoryConfig,
+    ScannerConfig,
+    load_config,
+    validate_runtime_files,
+)
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.process_manager import (
     ServiceLease,
@@ -95,6 +100,39 @@ def test_example_config_is_valid() -> None:
     assert config.agents == {}
     assert config.rules == []
     assert config.database.path.is_absolute()
+    assert config.scanner.interval_seconds == 300
+    assert config.scanner.max_items_per_repository == 100
+    assert config.scanner.api_page_size == 50
+
+
+def test_scanner_migrates_legacy_pagination_settings() -> None:
+    """旧版页数配置应无损迁移为每轮数量上限。"""
+
+    scanner = ScannerConfig.model_validate({"max_pages": 3, "page_size": 20})
+    assert scanner.max_items_per_repository == 60
+    assert scanner.api_page_size == 20
+
+
+def test_repository_accepts_project_path_ssh_and_https() -> None:
+    """远端仓库输入应统一转换为平台 API 使用的项目路径。"""
+
+    inputs = {
+        "SenseTime-FVG/test": "SenseTime-FVG/test",
+        "git@github.com:SenseTime-FVG/test.git": "SenseTime-FVG/test",
+        "https://github.com/SenseTime-FVG/test.git": "SenseTime-FVG/test",
+        "ssh://git@gitlab.example.com/group/subgroup/test.git": "group/subgroup/test",
+    }
+    for value, expected in inputs.items():
+        repository = RepositoryConfig(
+            id="test",
+            provider="provider-main",
+            project=value,
+            workspace=Path("/tmp/test-workspace"),
+        )
+        assert repository.project == expected
+        assert repository.clone_url == (
+            value if value.startswith(("git@", "http", "ssh://")) else None
+        )
 
 
 def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> None:
@@ -102,10 +140,16 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     monkeypatch.setenv("GITHUB_TOKEN", "不应进入 Codex")
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
     monkeypatch.setenv("CODEX_API_KEY", "Codex 自身凭据")
-    environment = CodexRunner(config).child_environment()
+    environment = CodexRunner(config).child_environment(
+        {
+            "GITHUB_TOKEN": "Agent 环境也不能重新注入",
+            "VISIBLE_AGENT_VALUE": "允许进入 Codex",
+        }
+    )
     assert "GITHUB_TOKEN" not in environment
     assert "GITLAB_TOKEN" not in environment
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
+    assert environment["VISIBLE_AGENT_VALUE"] == "允许进入 Codex"
 
 
 def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_factory) -> None:

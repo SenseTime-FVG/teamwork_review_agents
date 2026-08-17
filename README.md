@@ -37,7 +37,7 @@ teamwork-review-agents start
 teamwork-review-agents start
 ```
 
-校验配置后启动脱离当前终端的 FastAPI 管理服务和后台调度器。命令会输出 PID、管理界面地址和后台日志路径；关闭当前终端不会停止服务。服务启动后立即执行一次扫描，之后按照 `scanner.interval_seconds` 周期持续扫描。
+校验配置后启动脱离当前终端的 FastAPI 管理服务和后台调度器。命令会输出 PID、管理界面地址和后台日志路径；关闭当前终端不会停止服务。服务启动后立即执行一次扫描，之后默认每 5 分钟持续扫描；底层配置仍以 `scanner.interval_seconds: 300` 保存秒数。
 
 默认运行文件位于 `config.yaml` 同目录的 `data/`：
 
@@ -106,14 +106,25 @@ teamwork-review-agents scan-once --dry-run
 
 ## GitHub / GitLab 连接与仓库
 
-“GitHub / GitLab 连接”是后台扫描远端 MR / PR 时使用的平台 API 配置，不是 Git clone 或 SSH 地址。连接中只保存 Token 的宿主机环境变量名，例如 `GITHUB_TOKEN`；真实 Token 由启动服务的系统环境提供，不会写入 `config.yaml`。
+“GitHub / GitLab 连接”是后台扫描远端 MR / PR 时使用的平台 API 配置，不是 Git clone 或 SSH 地址。连接中的 `token_env` 保存 Provider Token 的变量名，例如 `GITHUB_TOKEN`。系统按以下顺序取值：
+
+1. “全局环境”中的同名变量，可以配置固定值，也可以通过 `from_system` 引用另一个宿主机变量。
+2. 如果全局环境没有该变量，直接读取启动服务时的同名宿主机环境变量，以兼容原有配置。
+
+推荐在“全局环境”中选择“宿主机环境”来源，例如让 `GITHUB_TOKEN` 读取宿主机的 `GITHUB_TOKEN`，这样真实 Token 不会写入 `config.yaml`。如果选择“固定值”，Token 会以明文保存在本机且已被 Git 忽略的 `config.yaml` 中，但管理 API、UI 和配置历史只会显示 `********`。
+
+与 Provider `token_env` 同名的环境变量会自动标记为 Provider 凭据：系统强制将其视为 Secret，并禁止进入 Prompt 和 Codex 子进程。它只供后台扫描器访问平台 API。
 
 仓库配置同时关联两类位置：
 
-- 远端项目路径，例如 GitHub 的 `owner/repository` 或 GitLab 的 `group/project`，用于平台 API 扫描。
-- 本地 Git 工作目录，用于 Codex CLI 读取或修改代码；服务不会根据平台连接自动克隆仓库，需要提前准备该目录。
+- 远端仓库地址或项目路径，用于平台 API 扫描。支持 GitHub 的 `owner/repository`、GitLab 的 `group/project`、`git@host:group/project.git` SSH 地址和 HTTPS Git 地址；后台会自动提取规范项目路径。
+- 本地 Git 工作目录，用于 Codex CLI 读取或修改代码。目录不存在时，服务会根据 SSH/HTTPS 地址自动克隆；目录已经存在时只校验并更新远端引用，不会覆盖文件。
 
 推荐在管理 UI 中按“添加平台连接 → 添加仓库 → 启用仓库 → 保存配置”的顺序操作。
+
+每次 Agent 启动前，服务会执行 `git fetch`，并把当前 MR/PR head 保存到 `refs/teamwork/change-requests/<编号>/head`。Prompt 运行上下文会同时提供这个引用和目标分支引用，Agent 可以直接执行 `git diff`。系统不会自动切换本地当前分支，避免破坏用户已有修改；需要写代码的 Agent 仍应按自己的任务边界创建或切换工作分支。
+
+扫描器会按更新时间倒序自动翻页，读取到上次成功扫描时间之前的数据后提前停止。`scanner.max_items_per_repository` 是单个仓库每轮的安全上限，默认 100 条；它限制需要继续读取详情、Review、流水线与合并状态的 MR/PR 数量，避免大型仓库单轮请求失控。`scanner.api_page_size` 只是高级分页参数，通常无需修改。
 
 ## Agent 与 sub-agent
 
@@ -138,6 +149,11 @@ Agent 的 Prompt 支持两种来源：
 environment:
   global:
     ORGANIZATION_NAME: Example Team
+    GITHUB_TOKEN:
+      from_system: GITHUB_TOKEN
+      secret: true
+      expose_to_prompt: false
+      expose_to_process: false
     INTERNAL_API_TOKEN:
       from_system: TEAMWORK_INTERNAL_API_TOKEN
       secret: true
@@ -162,7 +178,7 @@ agents:
       REVIEW_STYLE: concise
 ```
 
-模板中的未定义变量会渲染为空字符串。Secret 默认不进入 Prompt；配置 API、配置历史、渲染后的 Prompt、Codex JSONL 和 stderr 落库前都会脱敏。UI 中的 `********` 是保留原 Secret 的占位符。
+模板中的未定义变量会渲染为空字符串。Secret 默认不进入 Prompt；配置 API、配置历史、渲染后的 Prompt、Codex JSONL 和 stderr 落库前都会脱敏。UI 中的 `********` 是保留原 Secret 的占位符。Provider 凭据比普通 Secret 更严格：即使手工把 `expose_to_prompt` 或 `expose_to_process` 设为 `true`，运行时也会强制关闭。
 
 系统还会注入仓库、MR/PR、事件与运行信息，包括 `REPOSITORY_ID`、`MR_NUMBER`、`MR_HEAD_SHA`、`MR_URL`、`EVENT_TYPE` 和 `RUN_ID`。
 
@@ -198,10 +214,10 @@ npm run build
 
 ## 运行前提
 
-- 运行目录应当是对应仓库的本地 Git 工作目录。
+- 系统中需要安装 `git`，并准备好克隆地址对应的 SSH Key 或 HTTPS 凭据；工作目录不存在时会自动克隆。
 - Codex CLI 已完成认证，或者运行环境提供仅对 `codex exec` 生效的认证方式。
-- GitHub 使用 `GITHUB_TOKEN`，GitLab 使用配置中指定的 Token 环境变量。
+- GitHub 默认使用 `GITHUB_TOKEN`，GitLab 使用连接中 `token_env` 指定的变量；该变量既可在“全局环境”配置，也可直接来自宿主机环境。
 - 需要进行 GitHub/GitLab 写操作的 Agent，可以使用本机已认证的 `gh`/`glab`，并应在提示词中明确操作边界。
-- Provider Token 不会自动传进 Codex 子进程；写平台操作应使用单独的最小权限身份。
+- Provider Token 永远不会传进 Codex 子进程；写平台操作应使用单独的最小权限身份。
 
 详细架构见 [系统设计](docs/design.md)，分阶段实施与验收项见 [实施方案](docs/implementation-plan.md)。

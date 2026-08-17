@@ -14,6 +14,7 @@ from .environment import SecretRedactor, render_prompt, resolve_environment
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .state import StateStore
+from .workspace import prepare_change_request_workspace
 
 
 class AgentExecutionError(RuntimeError):
@@ -37,6 +38,7 @@ class AgentExecutor:
         self.store = store
         self.runner = CodexRunner(config)
         self.repositories = config.repository_map()
+        self.workspace_prepare_locks: dict[str, asyncio.Lock] = {}
 
     def build_prompt(
         self,
@@ -48,6 +50,7 @@ class AgentExecutor:
         task: str | None,
         extra_context: dict[str, Any] | None,
         prompt_values: dict[str, str],
+        change_ref: str,
     ) -> str:
         """组合 Agent 固定角色、触发上下文和临时委托任务。"""
 
@@ -63,6 +66,8 @@ class AgentExecutor:
                 "project": repository.project,
                 "workspace": str(repository.workspace),
                 "provider": repository.provider,
+                "change_ref": change_ref,
+                "target_ref": f"refs/remotes/origin/{event.new.target_branch}",
             },
             "rule": rule_name,
             "event": event_payload(event),
@@ -132,8 +137,24 @@ class AgentExecutor:
             )
 
         repository = self.repositories[event.repository_id]
-        if not repository.workspace.is_dir():
-            raise AgentExecutionError(f"工作目录不存在：{repository.workspace}")
+        provider = self.config.providers[repository.provider]
+        workspace_key = str(repository.workspace.resolve())
+        prepare_lock = self.workspace_prepare_locks.setdefault(
+            workspace_key,
+            asyncio.Lock(),
+        )
+        async with prepare_lock:
+            try:
+                change_ref = await asyncio.to_thread(
+                    prepare_change_request_workspace,
+                    provider,
+                    repository,
+                    event.new,
+                )
+            except Exception as exc:
+                raise AgentExecutionError(
+                    f"准备仓库 {repository.id} 失败：{exc}"
+                ) from exc
         proposed_run_id = str(uuid.uuid4())
         agent = self.config.agents[agent_name]
         resolved_environment = resolve_environment(
@@ -152,6 +173,7 @@ class AgentExecutor:
             task=task,
             extra_context=extra_context,
             prompt_values=resolved_environment.prompt_values,
+            change_ref=change_ref,
         )
         reservation = await asyncio.to_thread(
             self.store.begin_agent_run,
@@ -196,6 +218,7 @@ class AgentExecutor:
                 task=task,
                 extra_context=extra_context,
                 prompt_values=resolved_environment.prompt_values,
+                change_ref=change_ref,
             )
             await asyncio.to_thread(
                 self.store.update_agent_run_inputs,

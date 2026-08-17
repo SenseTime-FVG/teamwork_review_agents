@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import AppConfig
+from .environment import resolve_provider_token
 from .events import detect_events
 from .executor import AgentExecutor
 from .models import ChangeEvent, stable_hash
@@ -43,6 +45,35 @@ class Orchestrator:
         self.executor = AgentExecutor(config, self.store)
         self.agent_semaphore = asyncio.Semaphore(config.runtime.max_concurrent_agents)
 
+    @staticmethod
+    def _scan_state_key(repository_id: str) -> str:
+        """返回仓库扫描时间水位的持久化键。"""
+
+        return f"repository_scan:{repository_id}"
+
+    def _updated_since(self, repository_id: str) -> datetime | None:
+        """读取上次成功扫描时间，并保留两个扫描周期的重叠窗口。"""
+
+        state = self.store.get_service_state(self._scan_state_key(repository_id))
+        if not state or not state.get("completed_at"):
+            return None
+        try:
+            completed_at = datetime.fromisoformat(str(state["completed_at"]))
+        except ValueError:
+            return None
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=UTC)
+        overlap_seconds = max(60, self.config.scanner.interval_seconds * 2)
+        return completed_at - timedelta(seconds=overlap_seconds)
+
+    def _mark_scan_completed(self, repository_id: str) -> None:
+        """只在仓库完整扫描成功后推进时间水位。"""
+
+        self.store.set_service_state(
+            self._scan_state_key(repository_id),
+            {"completed_at": datetime.now(UTC).isoformat()},
+        )
+
     async def scan(self, summary: CycleSummary) -> None:
         """按 Provider 分组扫描所有启用仓库。"""
 
@@ -58,11 +89,19 @@ class Orchestrator:
                     provider_name,
                     provider_config,
                     self.config.scanner,
+                    token=resolve_provider_token(self.config, provider_config),
                 ) as provider:
                     for repository in repositories:
                         summary.repositories += 1
                         try:
-                            snapshots = await provider.list_change_requests(repository)
+                            updated_since = await asyncio.to_thread(
+                                self._updated_since,
+                                repository.id,
+                            )
+                            snapshots = await provider.list_change_requests(
+                                repository,
+                                updated_since=updated_since,
+                            )
                             for snapshot in snapshots:
                                 old = await asyncio.to_thread(
                                     self.store.load_snapshot,
@@ -80,6 +119,10 @@ class Orchestrator:
                                 )
                                 summary.snapshots += 1
                                 summary.new_events += inserted
+                            await asyncio.to_thread(
+                                self._mark_scan_completed,
+                                repository.id,
+                            )
                         except Exception as exc:
                             summary.errors.append(f"扫描仓库 {repository.id} 失败：{exc}")
             except ProviderError as exc:

@@ -13,6 +13,7 @@ export type Repository = {
   provider: string;
   project: string;
   workspace: string;
+  clone_url?: string;
   enabled?: boolean;
   environment?: EnvironmentMap;
 };

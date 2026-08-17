@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -24,12 +25,18 @@ class GitLabProvider(BaseProvider):
     async def list_change_requests(
         self,
         repository: RepositoryConfig,
+        *,
+        updated_since: datetime | None = None,
     ) -> list[ChangeRequestSnapshot]:
-        """分页读取最近更新的 MR，并补充详情与审批信息。"""
+        """自动分页读取最近更新的 MR，并在时间水位处提前停止。"""
 
         project = quote(repository.project, safe="")
         merge_requests: list[dict[str, Any]] = []
-        for page in range(1, self.scanner.max_pages + 1):
+        page = 1
+        reached_watermark = False
+        while len(merge_requests) < self.scanner.max_items_per_repository:
+            remaining = self.scanner.max_items_per_repository - len(merge_requests)
+            page_size = min(self.scanner.api_page_size, remaining)
             payload = await self.get_json(
                 f"projects/{project}/merge_requests",
                 params={
@@ -37,15 +44,24 @@ class GitLabProvider(BaseProvider):
                     "state": "all",
                     "order_by": "updated_at",
                     "sort": "desc",
-                    "per_page": self.scanner.page_size,
+                    "per_page": page_size,
                     "page": page,
                 },
             )
             if not isinstance(payload, list):
                 raise ProviderError("GitLab Merge Request 列表返回格式异常")
-            merge_requests.extend(item for item in payload if isinstance(item, dict))
-            if len(payload) < self.scanner.page_size:
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                if updated_since and parse_datetime(item.get("updated_at")) < updated_since:
+                    reached_watermark = True
+                    break
+                merge_requests.append(item)
+                if len(merge_requests) >= self.scanner.max_items_per_repository:
+                    break
+            if reached_watermark or len(payload) < page_size:
                 break
+            page += 1
 
         semaphore = asyncio.Semaphore(8)
 

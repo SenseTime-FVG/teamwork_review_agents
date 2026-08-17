@@ -24,16 +24,19 @@ class BaseProvider(ABC):
         name: str,
         config: ProviderConfig,
         scanner: ScannerConfig,
+        *,
+        token: str | None = None,
     ) -> None:
         self.name = name
         self.config = config
         self.scanner = scanner
-        token = os.getenv(config.token_env)
-        if not token:
+        resolved_token = os.getenv(config.token_env) if token is None else token
+        if not resolved_token:
             raise ProviderError(
-                f"Provider {name} 缺少 Token 环境变量：{config.token_env}"
+                f"Provider {name} 缺少 Token：请在全局环境或宿主机环境配置 "
+                f"{config.token_env}"
             )
-        self.token = token
+        self.token = resolved_token
         self.client = httpx.AsyncClient(
             base_url=config.base_url.rstrip("/") + "/",
             timeout=config.request_timeout_seconds,
@@ -94,8 +97,10 @@ class BaseProvider(ABC):
     async def list_change_requests(
         self,
         repository: RepositoryConfig,
+        *,
+        updated_since: datetime | None = None,
     ) -> list[ChangeRequestSnapshot]:
-        """列出配置范围内最近更新的变更请求。"""
+        """列出数量上限内、指定时间之后更新的变更请求。"""
 
 
 def parse_datetime(value: str | None) -> datetime:
@@ -114,15 +119,17 @@ def create_provider(
     name: str,
     config: ProviderConfig,
     scanner: ScannerConfig,
+    *,
+    token: str | None = None,
 ) -> BaseProvider:
     """根据配置创建平台适配器。"""
 
     if config.kind == "github":
         from .github import GitHubProvider
 
-        return GitHubProvider(name, config, scanner)
+        return GitHubProvider(name, config, scanner, token=token)
     if config.kind == "gitlab":
         from .gitlab import GitLabProvider
 
-        return GitLabProvider(name, config, scanner)
+        return GitLabProvider(name, config, scanner, token=token)
     raise ProviderError(f"不支持的 Provider 类型：{config.kind}")

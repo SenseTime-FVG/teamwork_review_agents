@@ -31,14 +31,22 @@ const EMPTY_STATUS: RuntimeStatus = {
 };
 
 function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
+  const scannerInput = { ...(value.scanner ?? {}) };
+  const legacyPageSize = Number(scannerInput.page_size ?? 50);
+  const legacyMaxPages = Number(scannerInput.max_pages ?? 2);
+  const maxItems = Number(
+    scannerInput.max_items_per_repository
+      ?? legacyPageSize * legacyMaxPages,
+  );
+  delete scannerInput.max_pages;
+  delete scannerInput.page_size;
   return {
     database: value.database ?? { path: "../data/teamwork-review-agents.db" },
     scanner: {
-      interval_seconds: 60,
-      max_pages: 2,
-      page_size: 50,
+      interval_seconds: 300,
+      max_items_per_repository: maxItems,
       emit_initial_events: false,
-      ...(value.scanner ?? {}),
+      ...scannerInput,
     },
     runtime: {
       max_concurrent_agents: 4,
@@ -309,18 +317,44 @@ function normalizeVariable(value: EnvironmentMap[string]): EnvironmentVariable {
   };
 }
 
+function providerCredentialNames(document: ConfigDocument): Set<string> {
+  return new Set(
+    Object.values(document.providers)
+      .map((provider) => String(provider.token_env ?? "").trim())
+      .filter(Boolean),
+  );
+}
+
+function protectProviderVariable(
+  name: string,
+  variable: EnvironmentVariable,
+  protectedNames: ReadonlySet<string>,
+): EnvironmentVariable {
+  if (!protectedNames.has(name)) return variable;
+  return {
+    ...variable,
+    secret: true,
+    expose_to_prompt: false,
+    expose_to_process: false,
+  };
+}
+
 function EnvironmentEditor(props: {
   title: string;
   value: EnvironmentMap;
   onChange: (value: EnvironmentMap) => void;
   compact?: boolean;
+  protectedNames?: ReadonlySet<string>;
 }) {
   const entries = Object.entries(props.value);
+  const protectedNames = props.protectedNames ?? new Set<string>();
 
   function update(name: string, nextName: string, variable: EnvironmentVariable) {
     const next = { ...props.value };
     delete next[name];
-    if (nextName) next[nextName] = variable;
+    if (nextName) {
+      next[nextName] = protectProviderVariable(nextName, variable, protectedNames);
+    }
     props.onChange(next);
   }
 
@@ -342,21 +376,29 @@ function EnvironmentEditor(props: {
       {entries.length === 0 && <div className="empty">还没有配置环境变量</div>}
       <div className="env-list">
         {entries.map(([name, raw]) => {
-          const variable = normalizeVariable(raw);
+          const isProviderCredential = protectedNames.has(name);
+          const variable = protectProviderVariable(
+            name,
+            normalizeVariable(raw),
+            protectedNames,
+          );
           const source = variable.from_system !== undefined ? "system" : "value";
           return (
-            <div className="env-row" key={name}>
-              <CommitField
-                label=""
-                value={name}
-                className="env-name-field"
-                onCommit={(nextName) => {
-                  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(nextName)) return false;
-                  if (nextName !== name && Object.hasOwn(props.value, nextName)) return false;
-                  update(name, nextName, variable);
-                  return true;
-                }}
-              />
+            <div className={`env-row ${isProviderCredential ? "provider-credential" : ""}`} key={name}>
+              <div className="env-name-cell">
+                <CommitField
+                  label=""
+                  value={name}
+                  className="env-name-field"
+                  onCommit={(nextName) => {
+                    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(nextName)) return false;
+                    if (nextName !== name && Object.hasOwn(props.value, nextName)) return false;
+                    update(name, nextName, variable);
+                    return true;
+                  }}
+                />
+                {isProviderCredential && <span className="credential-badge">Provider 凭据</span>}
+              </div>
               <select
                 value={source}
                 aria-label="变量来源"
@@ -389,6 +431,7 @@ function EnvironmentEditor(props: {
                 <input
                   type="checkbox"
                   checked={variable.secret ?? false}
+                  disabled={isProviderCredential}
                   onChange={(event) =>
                     update(name, name, {
                       ...variable,
@@ -403,6 +446,7 @@ function EnvironmentEditor(props: {
                 <input
                   type="checkbox"
                   checked={variable.expose_to_prompt ?? false}
+                  disabled={isProviderCredential}
                   onChange={(event) => update(name, name, { ...variable, expose_to_prompt: event.target.checked })}
                 />
                 Prompt
@@ -411,6 +455,7 @@ function EnvironmentEditor(props: {
                 <input
                   type="checkbox"
                   checked={variable.expose_to_process ?? true}
+                  disabled={isProviderCredential}
                   onChange={(event) => update(name, name, { ...variable, expose_to_process: event.target.checked })}
                 />
                 进程
@@ -432,6 +477,9 @@ function EnvironmentEditor(props: {
         })}
       </div>
       <p className="section-note">Secret 默认不会进入 Prompt，日志与配置历史中会显示为 ********。</p>
+      {entries.some(([name]) => protectedNames.has(name)) && (
+        <p className="section-note credential-note">Provider 凭据只供后台扫描器访问平台 API，始终不会进入 Prompt 或 Codex 进程。</p>
+      )}
     </section>
   );
 }
@@ -498,6 +546,7 @@ function GlobalEnvironment(props: {
   document: ConfigDocument;
   onChange: (document: ConfigDocument) => void;
 }) {
+  const protectedNames = providerCredentialNames(props.document);
   function patchSection(section: "scanner" | "runtime" | "web", key: string, value: unknown) {
     props.onChange({
       ...props.document,
@@ -509,14 +558,14 @@ function GlobalEnvironment(props: {
       <EnvironmentEditor
         title="全局环境变量"
         value={props.document.environment.global}
+        protectedNames={protectedNames}
         onChange={(global) => props.onChange({ ...props.document, environment: { global } })}
       />
       <section className="section-card">
         <div className="section-title-row"><div><h2>后台与扫描设置</h2><p>这些值保存后由常驻进程热加载。</p></div></div>
         <div className="form-grid three">
-          <Field label="扫描间隔（秒）" type="number" value={Number(props.document.scanner.interval_seconds)} onChange={(value) => patchSection("scanner", "interval_seconds", Number(value))} />
-          <Field label="最大页数" type="number" value={Number(props.document.scanner.max_pages)} onChange={(value) => patchSection("scanner", "max_pages", Number(value))} />
-          <Field label="每页数量" type="number" value={Number(props.document.scanner.page_size)} onChange={(value) => patchSection("scanner", "page_size", Number(value))} />
+          <Field label="扫描间隔（分钟）" type="number" value={Number(props.document.scanner.interval_seconds) / 60} onChange={(value) => patchSection("scanner", "interval_seconds", Math.round(Number(value) * 60))} help="默认每 5 分钟扫描一次；服务启动后会先立即扫描" />
+          <Field label="每个仓库每轮最多扫描 MR / PR" type="number" value={Number(props.document.scanner.max_items_per_repository ?? 100)} onChange={(value) => patchSection("scanner", "max_items_per_repository", Number(value))} help="默认 100 条；后台自动分页，并在到达上次成功扫描时间后提前停止" />
           <Field label="配置检测（秒）" type="number" value={Number(props.document.web.config_poll_seconds)} onChange={(value) => patchSection("web", "config_poll_seconds", Number(value))} />
           <Field label="日志保留（天）" type="number" value={Number(props.document.web.log_retention_days)} onChange={(value) => patchSection("web", "log_retention_days", Number(value))} />
           <Field label="最大并行 Agent" type="number" value={Number(props.document.runtime.max_concurrent_agents)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} />
@@ -579,6 +628,7 @@ function RepositoriesEditor(props: {
   onChange: (document: ConfigDocument) => void;
 }) {
   const providerNames = Object.keys(props.document.providers);
+  const protectedNames = providerCredentialNames(props.document);
   const repositoryCount = props.document.repositories.length;
 
   function providerDefaults(kind: "github" | "gitlab") {
@@ -616,6 +666,25 @@ function RepositoriesEditor(props: {
     });
   }
 
+  function addRepository() {
+    let index = props.document.repositories.length + 1;
+    let id = `repository-${index}`;
+    while (props.document.repositories.some((repository) => repository.id === id)) {
+      id = `repository-${++index}`;
+    }
+    props.onChange({
+      ...props.document,
+      repositories: [...props.document.repositories, {
+        id,
+        provider: providerNames[0],
+        project: "owner/repository",
+        workspace: `./workspaces/${id}`,
+        enabled: false,
+        environment: {},
+      }],
+    });
+  }
+
   function renameProvider(name: string, nextName: string): boolean {
     if (!nextName || (nextName !== name && props.document.providers[nextName])) return false;
     const providers = Object.fromEntries(
@@ -636,7 +705,14 @@ function RepositoriesEditor(props: {
     if (!id || props.document.repositories.some((item, itemIndex) => itemIndex !== index && item.id === id)) return false;
     const oldId = props.document.repositories[index].id;
     const repositories = [...props.document.repositories];
-    repositories[index] = { ...repositories[index], id };
+    const oldDefaultWorkspace = `./workspaces/${oldId}`;
+    repositories[index] = {
+      ...repositories[index],
+      id,
+      workspace: repositories[index].workspace === oldDefaultWorkspace
+        ? `./workspaces/${id}`
+        : repositories[index].workspace,
+    };
     const rules = props.document.rules.map((rule) => ({
       ...rule,
       repositories: rule.repositories?.map((repositoryId) => repositoryId === oldId ? id : repositoryId),
@@ -665,7 +741,7 @@ function RepositoriesEditor(props: {
         <div className="section-title-row">
           <div>
             <h2>GitHub / GitLab 连接</h2>
-            <p>后台使用这里的平台 API 和 Token 扫描远端 MR / PR；它不是 Git clone 或 SSH 连接，也不会在此处克隆代码。</p>
+            <p>后台使用这里的平台 API 和 Token 扫描远端 MR / PR；平台连接本身不会立即克隆代码，Agent 首次运行时才按仓库配置自动准备本地工作目录。</p>
           </div>
           <button className="button secondary" onClick={addProvider}>+ 添加平台连接</button>
         </div>
@@ -678,6 +754,14 @@ function RepositoriesEditor(props: {
           )}
           {providerNames.map((name) => {
             const provider = props.document.providers[name];
+            const tokenEnvironment = String(provider.token_env ?? "").trim();
+            const hasGlobalToken = Boolean(tokenEnvironment)
+              && Object.hasOwn(props.document.environment.global, tokenEnvironment);
+            const tokenHelp = !tokenEnvironment
+              ? "填写 Provider Token 的变量名"
+              : hasGlobalToken
+                ? "已由“全局环境”配置；只供后台扫描器使用，不会进入 Prompt 或 Codex 进程"
+                : `全局环境未配置；将从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
               <div className="sub-card provider-row" key={name}>
@@ -687,7 +771,7 @@ function RepositoriesEditor(props: {
                   updateProvider(name, { kind, ...providerDefaults(kind) });
                 }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
                 <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateProvider(name, { base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
-                <Field label="Token 所在环境变量" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} help="这里只填变量名，例如 GITHUB_TOKEN，不填写真实 Token" />
+                <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} help={tokenHelp} />
                 <button
                   className="icon-button danger align-end"
                   disabled={referencedRepositories > 0}
@@ -710,17 +794,7 @@ function RepositoriesEditor(props: {
             className="button primary"
             disabled={providerNames.length === 0}
             title={providerNames.length === 0 ? "请先添加 GitHub / GitLab 连接" : "添加仓库"}
-            onClick={() => props.onChange({
-              ...props.document,
-              repositories: [...props.document.repositories, {
-                id: `repository-${props.document.repositories.length + 1}`,
-                provider: providerNames[0],
-                project: "owner/repository",
-                workspace: "./workspaces/repository",
-                enabled: false,
-                environment: {},
-              }],
-            })}
+            onClick={addRepository}
           >+ 添加仓库</button>
         </div>
         <div className="card-list">
@@ -739,10 +813,10 @@ function RepositoriesEditor(props: {
               <div className="form-grid two">
                 <CommitField label="仓库 ID" value={repository.id} onCommit={(id) => renameRepository(index, id)} />
                 <label className="field"><span>所属 GitHub / GitLab 连接</span><select value={repository.provider} onChange={(event) => updateRepository(index, { provider: event.target.value })}>{providerNames.map((provider) => <option key={provider}>{provider}</option>)}</select><small>决定使用哪个平台 API 和 Token 扫描此仓库</small></label>
-                <Field label="远端项目路径" value={repository.project} onChange={(project) => updateRepository(index, { project })} placeholder="group/project" help="GitHub 填 owner/repository，GitLab 填 group/project" />
-                <Field label="本地 Git 工作目录" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="需提前准备好代码，Agent 会在此目录运行 Codex CLI" />
+                <Field label="远端仓库地址 / 项目路径" value={repository.clone_url ?? repository.project} onChange={(project) => updateRepository(index, { project, clone_url: undefined })} placeholder="git@github.com:owner/repository.git" help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后后台会自动解析为平台项目路径" />
+                <Field label="本地 Git 工作目录（自动管理）" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="默认使用 ./workspaces/<仓库ID>；目录不存在时自动克隆，已有目录只校验和 fetch，不会覆盖文件或自动切换分支" />
               </div>
-              <EnvironmentEditor compact title="仓库环境变量" value={repository.environment ?? {}} onChange={(environment) => updateRepository(index, { environment })} />
+              <EnvironmentEditor compact title="仓库环境变量" value={repository.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => updateRepository(index, { environment })} />
             </article>
           ))}
         </div>
@@ -756,6 +830,7 @@ function AgentsEditor(props: {
   onChange: (document: ConfigDocument) => void;
 }) {
   const names = Object.keys(props.document.agents);
+  const protectedNames = providerCredentialNames(props.document);
   function update(name: string, patch: Partial<Agent>) {
     props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { ...props.document.agents[name], ...patch } } });
   }
@@ -880,7 +955,7 @@ function AgentsEditor(props: {
               <div className="toggle-grid">
                 <Toggle label="跳过 Git 仓库检查" checked={agent.skip_git_repo_check ?? false} onChange={(skip_git_repo_check) => update(name, { skip_git_repo_check })} />
               </div>
-              <EnvironmentEditor compact title="Agent 环境变量" value={agent.environment ?? {}} onChange={(environment) => update(name, { environment })} />
+              <EnvironmentEditor compact title="Agent 环境变量" value={agent.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => update(name, { environment })} />
             </article>
           );
         })}

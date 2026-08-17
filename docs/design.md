@@ -104,19 +104,21 @@ sub-agent 不是模型内部的逻辑角色，而是由编排器启动的另一�
 
 ## 9. 凭据与权限
 
-Provider Token 只用于扫描器调用 API，启动 Codex CLI 前会从子进程环境中移除。第一版不把高权限 Provider Token 直接交给模型。
+Provider Token 优先从全局环境配置中的同名变量解析，没有配置时回退到宿主机环境。它只用于扫描器调用 API，并被强制标记为 Secret；启动 Codex CLI 前会从 Prompt 和子进程环境中移除，不把高权限 Provider Token 直接交给模型。
 
 需要平台写操作时，推荐使用权限受控的 `gh`/`glab` 登录身份。生产版本可进一步增加窄权限的平台 MCP 工具，将评论、审批和合并变成可审计的确定性接口。
 
 Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工作目录的 Agent 才使用 `workspace-write`，不默认开放 `danger-full-access`。
 
+本地工作目录不存在时，执行器根据仓库 SSH/HTTPS 地址原子克隆；已存在时只校验 Git 仓库并 fetch。当前 MR/PR head 写入 `refs/teamwork/change-requests/<编号>/head`，不会自动 checkout 或覆盖用户工作区。
+
 ## 10. 已知边界
 
 - 第一版使用轮询，不包含 Webhook。
-- 扫描分页由 `max_pages` 限制，超大型仓库需要增量游标优化。
+- 扫描器按更新时间自动分页，并在上次成功扫描时间水位处提前停止；`max_items_per_repository` 作为单仓库单轮安全上限，`api_page_size` 只控制内部 API 分页大小。
 - GitHub 审批数按每位用户最新有效 Review 粗略计算；复杂分支保护规则仍由合并前的远端检查兜底。
 - 单机 SQLite 适合初期部署，多实例生产部署应迁移到 PostgreSQL。
-- 第一版不自动创建分支或工作树，工作目录生命周期由部署方管理。
+- 系统不会自动创建工作分支或 Git worktree；首次运行可自动克隆仓库，后续仅校验并拉取远端引用，Agent 的分支策略仍由 Prompt 与权限边界决定。
 - 第一版尚未提供窄权限的平台写入 MCP，评论、审批和合并依赖部署方预先认证的 `gh`/`glab`。
 
 ## 11. 后台管理服务

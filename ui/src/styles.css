@@ -146,6 +146,12 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .env-list { display: flex; flex-direction: column; gap: 7px; }
 .env-row { display: grid; grid-template-columns: minmax(130px, 1.1fr) 102px minmax(170px, 1.6fr) auto auto auto 31px; align-items: center; gap: 7px; }
 .env-row input, .env-row select { padding: 8px 9px; font-size: 11px; }
+.env-name-cell { min-width: 0; }
+.credential-badge { display: inline-flex; margin-top: 4px; padding: 2px 6px; border: 1px solid #315f45; border-radius: 8px; background: #10271b; color: #77dca4; font-size: 8px; line-height: 1.2; }
+.provider-credential { align-items: start; padding: 6px; border: 1px solid #253d30; border-radius: 8px; background: rgba(16, 39, 27, .24); }
+.provider-credential .mini-check { padding-top: 8px; }
+.provider-credential .mini-check input:disabled { opacity: .7; }
+.credential-note { color: #56866b; }
 .mini-check { display: flex; flex-direction: column; gap: 3px; align-items: center; color: #748297; font-size: 9px; }
 .mini-check input { width: 14px; height: 14px; accent-color: var(--accent); }
 .provider-row { display: grid; grid-template-columns: 1fr .75fr 1.8fr 1.2fr 32px; gap: 10px; align-items: end; }

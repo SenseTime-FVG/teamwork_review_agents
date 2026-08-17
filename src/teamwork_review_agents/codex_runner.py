@@ -134,9 +134,10 @@ class CodexRunner:
             for name, value in os.environ.items()
             if name in BASE_ENVIRONMENT_NAMES
         }
+        environment.update(agent_environment or {})
+        # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
         for provider in self.config.providers.values():
             environment.pop(provider.token_env, None)
-        environment.update(agent_environment or {})
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
 

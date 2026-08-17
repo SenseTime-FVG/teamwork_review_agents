@@ -10,12 +10,12 @@ database:
 
 # 可选：MR/PR 轮询参数。整段省略时使用下列默认值。
 # scanner:
-#   # 两次自动扫描之间的秒数；serve 启动后会先立即扫描一次。
-#   interval_seconds: 60
-#   # 每个 Provider API 最多拉取的分页数，防止单次扫描无限扩大。
-#   max_pages: 2
-#   # 每页请求数量，允许 1～100。
-#   page_size: 50
+#   # 两次自动扫描之间的秒数；300 秒即 5 分钟，服务启动后会先立即扫描一次。
+#   interval_seconds: 300
+#   # 单个仓库每轮最多补充详情的 MR/PR 数量；后台会自动处理 API 分页。
+#   max_items_per_repository: 100
+#   # 高级参数：单次平台列表 API 的分页大小，允许 1～100；通常无需修改。
+#   api_page_size: 50
 #   # false：首次发现只建立快照基线；true：同时产生 discovered 事件。
 #   emit_initial_events: false
 
@@ -76,6 +76,13 @@ web:
 #       expose_to_prompt: false
 #       # 是否把变量传给 Codex CLI 子进程。
 #       expose_to_process: true
+#     # Provider 的 token_env 可以引用这里的同名变量。推荐使用 from_system，避免 Token 明文落盘。
+#     GITHUB_TOKEN:
+#       from_system: GITHUB_TOKEN
+#       # Provider 凭据会被系统强制设为 Secret，且永远不会进入 Prompt 或 Codex 进程。
+#       secret: true
+#       expose_to_prompt: false
+#       expose_to_process: false
 
 # 可选：GitHub / GitLab API 连接。后台用它扫描远端 MR / PR；它不是 Git clone 或 SSH 连接。
 # 键名是 Provider ID，由仓库的 provider 字段引用。
@@ -85,7 +92,8 @@ web:
 #     kind: github
 #     # GitHub Enterprise 可替换成企业 API 地址。
 #     base_url: https://api.github.com
-#     # 保存访问 Token 的宿主机环境变量名，不要在 YAML 中写真实 Token。
+#     # Provider Token 变量名。系统优先读取 environment.global 中的同名变量，
+#     # 未配置时再从启动服务的宿主机环境读取。
 #     token_env: GITHUB_TOKEN
 #     # 单次 Provider API 请求超时秒数。
 #     request_timeout_seconds: 30
@@ -102,9 +110,10 @@ web:
 #     id: example-github
 #     # 引用 providers 中的键名，决定扫描时使用哪个平台 API 和 Token。
 #     provider: github-main
-#     # GitHub 使用 owner/repository，GitLab 使用 group/project。
-#     project: owner/repository
-#     # Codex CLI 执行时使用的本地 Git 工作目录。
+#     # 支持 owner/repository、group/project、SSH 或 HTTPS Git 地址。
+#     project: git@github.com:owner/repository.git
+#     # Codex CLI 执行时使用的本地 Git 工作目录；不存在时会自动克隆。
+#     # 已存在的目录必须是 Git 仓库，服务只会 fetch，不会覆盖文件或切换当前分支。
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true

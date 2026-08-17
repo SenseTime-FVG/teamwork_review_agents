@@ -8,7 +8,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .config import AgentConfig, AppConfig, EnvironmentVariable, RepositoryConfig
+from .config import (
+    AgentConfig,
+    AppConfig,
+    EnvironmentVariable,
+    ProviderConfig,
+    RepositoryConfig,
+)
 from .models import ChangeEvent
 
 
@@ -33,6 +39,15 @@ def _resolve_variable(variable: EnvironmentVariable) -> str:
     if variable.from_system is not None:
         return os.getenv(variable.from_system, "")
     return variable.value or ""
+
+
+def resolve_provider_token(config: AppConfig, provider: ProviderConfig) -> str:
+    """优先从全局环境配置解析 Provider Token，再回退到宿主机环境。"""
+
+    definition = config.environment.global_variables.get(provider.token_env)
+    if definition is not None:
+        return _resolve_variable(definition)
+    return os.getenv(provider.token_env, "")
 
 
 def runtime_variables(
@@ -72,6 +87,9 @@ def resolve_environment(
     definitions.update(config.environment.global_variables)
     definitions.update(repository.environment)
     definitions.update(agent.environment)
+    provider_token_names = {
+        provider.token_env for provider in config.providers.values()
+    }
 
     all_values: dict[str, str] = {}
     prompt_values: dict[str, str] = {}
@@ -80,12 +98,18 @@ def resolve_environment(
     secrets: list[str] = []
     for name, definition in definitions.items():
         value = _resolve_variable(definition)
+        is_provider_credential = name in provider_token_names
+        is_secret = bool(definition.secret) or is_provider_credential
         all_values[name] = value
-        prompt_values[name] = value if definition.expose_to_prompt else ""
-        if definition.expose_to_process:
+        prompt_values[name] = (
+            value
+            if definition.expose_to_prompt and not is_provider_credential
+            else ""
+        )
+        if definition.expose_to_process and not is_provider_credential:
             process_values[name] = value
-        audit_values[name] = MASK if definition.secret and value else value
-        if definition.secret and value:
+        audit_values[name] = MASK if is_secret and value else value
+        if is_secret and value:
             secrets.append(value)
 
     builtins = runtime_variables(repository, event, run_id)

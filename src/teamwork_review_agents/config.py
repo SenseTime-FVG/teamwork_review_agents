@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import hashlib
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field, PositiveInt, model_validator
@@ -21,10 +23,30 @@ class DatabaseConfig(BaseModel):
 class ScannerConfig(BaseModel):
     """轮询扫描配置。"""
 
-    interval_seconds: PositiveInt = 60
-    max_pages: PositiveInt = 2
-    page_size: int = Field(default=50, ge=1, le=100)
+    interval_seconds: PositiveInt = 300
+    max_items_per_repository: PositiveInt = 100
+    api_page_size: int = Field(default=50, ge=1, le=100)
     emit_initial_events: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_pagination(cls, value: Any) -> Any:
+        """兼容旧版 max_pages 与 page_size，并迁移为数量上限。"""
+
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        legacy_page_size = data.pop("page_size", None)
+        legacy_max_pages = data.pop("max_pages", None)
+        if "api_page_size" not in data and legacy_page_size is not None:
+            data["api_page_size"] = legacy_page_size
+        if (
+            "max_items_per_repository" not in data
+            and legacy_max_pages is not None
+        ):
+            page_size = legacy_page_size or data.get("api_page_size", 50)
+            data["max_items_per_repository"] = int(legacy_max_pages) * int(page_size)
+        return data
 
 
 class RuntimeConfig(BaseModel):
@@ -110,8 +132,39 @@ class RepositoryConfig(BaseModel):
     provider: str
     project: str
     workspace: Path
+    clone_url: str | None = None
     enabled: bool = True
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_remote(cls, value: Any) -> Any:
+        """保留可克隆地址，并把远端输入统一为平台项目路径。"""
+
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        project = str(data.get("project") or "").strip()
+        is_remote_url = "://" in project or bool(
+            re.match(r"^[^/@\s]+@[^:\s]+:", project)
+        )
+        if is_remote_url and not data.get("clone_url"):
+            data["clone_url"] = project
+        if "://" in project:
+            project = urlparse(project).path
+        elif re.match(r"^[^/@\s]+@[^:\s]+:", project):
+            project = project.split(":", 1)[1]
+        project = project.split("?", 1)[0].split("#", 1)[0].strip("/")
+        if project.endswith(".git"):
+            project = project[:-4]
+        if not project or "/" not in project or any(
+            segment in {"", ".", ".."} for segment in project.split("/")
+        ):
+            raise ValueError(
+                "远端项目必须是 owner/repository、group/project、SSH 或 HTTPS 地址"
+            )
+        data["project"] = project
+        return data
 
 
 class AgentConfig(BaseModel):
@@ -173,12 +226,28 @@ class AppConfig(BaseModel):
             raise ValueError("repositories 中存在重复 id")
 
         reserved_token_names = {"CODEX_API_KEY", "OPENAI_API_KEY"}
+        provider_token_names = {
+            provider.token_env for provider in self.providers.values()
+        }
         for provider_name, provider in self.providers.items():
             if provider.token_env in reserved_token_names:
                 raise ValueError(
                     f"Provider {provider_name} 的 token_env 不能复用 Codex 凭据变量："
                     f"{provider.token_env}"
                 )
+
+        # Provider 凭据属于扫描器，不允许被 Prompt 或 Codex 子进程继承。
+        environment_maps = [self.environment.global_variables]
+        environment_maps.extend(
+            repository.environment for repository in self.repositories
+        )
+        environment_maps.extend(agent.environment for agent in self.agents.values())
+        for environment_map in environment_maps:
+            for name in provider_token_names & environment_map.keys():
+                definition = environment_map[name]
+                definition.secret = True
+                definition.expose_to_prompt = False
+                definition.expose_to_process = False
 
         environment_names = set(self.environment.global_variables)
         for repository in self.repositories:
@@ -252,6 +321,61 @@ def _resolve_path(base_dir: Path, value: str | Path) -> Path:
     return expanded.resolve()
 
 
+def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
+    """复制配置并强制隔离所有与 Provider Token 同名的变量。"""
+
+    data = copy.deepcopy(raw)
+    providers = data.get("providers", {})
+    if not isinstance(providers, dict):
+        return data
+    token_names = {
+        str(provider.get("token_env"))
+        for provider in providers.values()
+        if isinstance(provider, dict) and provider.get("token_env")
+    }
+    if not token_names:
+        return data
+
+    environment_maps: list[Any] = []
+    environment = data.get("environment", {})
+    if isinstance(environment, dict):
+        environment_maps.append(environment.get("global", {}))
+    repositories = data.get("repositories", [])
+    if isinstance(repositories, list):
+        environment_maps.extend(
+            repository.get("environment", {})
+            for repository in repositories
+            if isinstance(repository, dict)
+        )
+    agents = data.get("agents", {})
+    if isinstance(agents, dict):
+        environment_maps.extend(
+            agent.get("environment", {})
+            for agent in agents.values()
+            if isinstance(agent, dict)
+        )
+
+    for environment_map in environment_maps:
+        if not isinstance(environment_map, dict):
+            continue
+        for name in token_names & environment_map.keys():
+            raw_definition = environment_map[name]
+            if isinstance(raw_definition, dict):
+                definition = dict(raw_definition)
+            elif isinstance(raw_definition, (str, int, float, bool)) or raw_definition is None:
+                definition = {
+                    "value": "" if raw_definition is None else str(raw_definition)
+                }
+            else:
+                # 非法结构留给 Pydantic 给出原始校验错误。
+                continue
+            definition["secret"] = True
+            definition["expose_to_prompt"] = False
+            definition["expose_to_process"] = False
+            environment_map[name] = definition
+    return data
+
+
 def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     """原地复制并规范化所有文件系统路径。"""
 
@@ -286,8 +410,9 @@ def parse_config_data(raw: dict[str, Any], config_path: str | Path) -> AppConfig
     resolved_path = Path(config_path).expanduser().resolve()
     if not isinstance(raw, dict):
         raise ValueError("配置文件顶层必须是对象")
-    resolved = _resolve_config_paths(raw, resolved_path.parent)
-    serialized = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+    protected = protect_provider_credentials(raw)
+    resolved = _resolve_config_paths(protected, resolved_path.parent)
+    serialized = yaml.safe_dump(protected, allow_unicode=True, sort_keys=False)
     resolved["config_path"] = resolved_path
     resolved["revision"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return AppConfig.model_validate(resolved)
@@ -312,8 +437,17 @@ def validate_runtime_files(config: AppConfig) -> list[str]:
         if agent.output_schema and not agent.output_schema.is_file():
             errors.append(f"Agent {name} 的输出 Schema 不存在：{agent.output_schema}")
     for repository in config.repositories:
-        if repository.enabled and not repository.workspace.is_dir():
-            errors.append(f"仓库 {repository.id} 的工作目录不存在：{repository.workspace}")
+        if repository.enabled and repository.workspace.exists():
+            if not repository.workspace.is_dir():
+                errors.append(
+                    f"仓库 {repository.id} 的本地工作目录不是文件夹："
+                    f"{repository.workspace}"
+                )
+            elif not (repository.workspace / ".git").exists():
+                errors.append(
+                    f"仓库 {repository.id} 的本地工作目录已存在但不是 Git 仓库："
+                    f"{repository.workspace}"
+                )
     if config.web.admin_token_env and not os.getenv(config.web.admin_token_env):
         errors.append(
             f"后台管理员 Token 环境变量不存在：{config.web.admin_token_env}"
