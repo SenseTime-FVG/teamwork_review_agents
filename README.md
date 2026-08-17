@@ -12,6 +12,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 - 每次 Agent 使用独立 Git worktree，避免并发任务互相污染。
 - 合并后按净差异和文档索引，只更新受影响文档。
 - 快照、事件、规则、运行和日志统一写入 SQLite，并在管理界面展示。
+- GitHub PR 可在 Review Agent 前执行仓库自定义的确定性 Preflight CI。
 
 主链路：`扫描 PR/MR → 语义事件 → 规则匹配 → Codex Agent → 审计与日志`
 
@@ -139,6 +140,33 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 这两个超时可以在管理界面左侧“运行时配置”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
 
 仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库执行 fetch，再为每次运行创建独立 worktree；这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
+
+## GitHub 本地 CI 门禁
+
+通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。启用后，只有 Preflight 成功才启动匹配的 Review Agent。
+
+```yaml
+scanner:
+  emit_initial_events: true
+
+repositories:
+  - id: example-github
+    provider: github-main
+    project: owner/repository
+    workspace: ./workspaces/example-github
+    preflight:
+      enabled: true
+      status_context: teamwork/local-ci
+      timeout_seconds: 1800
+      max_output_bytes: 1000000
+      steps:
+        - name: repository-ci
+          command: [bash, ci/preflight.sh]
+```
+
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。命令以参数数组执行且不经过 shell；同一仓库、PR、Head SHA 和配置版本只运行一次。代码失败或超时会阻断 Agent；Git、进程或平台 API 等基础设施错误沿用事件重试。
+
+Provider Token 需要读取 PR 和写 Commit Status 的权限，但不会传给 CI 子进程或 Codex。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。当前 Preflight 通过 YAML 配置，具体步骤、工具安装和目标仓库脚本均由接入仓库维护。
 
 ## 常用命令
 
