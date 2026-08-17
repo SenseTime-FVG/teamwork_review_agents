@@ -85,7 +85,7 @@ def _append_bounded_output(current: str, addition: bytes, limit: int) -> str:
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-    """终止超时步骤及其子进程组。"""
+    """请求终止超时步骤及其子进程组，不在此处无界等待退出。"""
 
     try:
         if os.name == "posix":
@@ -95,8 +95,6 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
             process.kill()
     except ProcessLookupError:
         pass
-    if process.returncode is None:
-        await process.wait()
 
 
 async def _read_bounded_stream(
@@ -167,14 +165,23 @@ async def execute_preflight_steps(
         )
         if pending:
             await _terminate_process(process)
-            if not process_waiter.done():
-                await process_waiter
-            try:
-                step_output = await asyncio.wait_for(output_reader, timeout=1)
-            except TimeoutError:
-                output_reader.cancel()
-                await asyncio.gather(output_reader, return_exceptions=True)
-                step_output = ""
+            cleanup_done, cleanup_pending = await asyncio.wait(
+                {process_waiter, output_reader},
+                timeout=1,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            step_output = (
+                output_reader.result() if output_reader in cleanup_done else ""
+            )
+            if cleanup_pending:
+                stdout_transport = getattr(process.stdout, "_transport", None)
+                if stdout_transport is not None:
+                    stdout_transport.close()
+            for task in cleanup_pending:
+                task.cancel()
+            if cleanup_pending:
+                await asyncio.gather(*cleanup_pending, return_exceptions=True)
+                await asyncio.sleep(0)
             output = _append_bounded_output(
                 output,
                 step_output.encode("utf-8"),

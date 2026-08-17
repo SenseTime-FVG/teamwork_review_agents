@@ -138,6 +138,44 @@ async def test_preflight_timeout_kills_background_process_holding_stdout(
     assert time.monotonic() - started_at < 3
 
 
+async def test_preflight_timeout_is_bounded_when_background_process_escapes_group(
+    tmp_path,
+) -> None:
+    """后台进程主动 setsid 后，清理等待也不能突破硬截止时间。"""
+
+    child_code = "import time; time.sleep(5)"
+    parent_code = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+        "start_new_session=True); "
+        "print('escaped child', flush=True)"
+    )
+    config = PreflightConfig.model_validate(
+        {
+            "enabled": True,
+            "timeout_seconds": 3,
+            "steps": [
+                {
+                    "name": "escaped-background",
+                    "timeout_seconds": 1,
+                    "command": [sys.executable, "-c", parent_code],
+                }
+            ],
+        }
+    )
+
+    started_at = time.monotonic()
+    outcome = await execute_preflight_steps(
+        config,
+        cwd=tmp_path,
+        environment=build_preflight_environment(),
+    )
+
+    assert outcome.status == "timed_out"
+    assert outcome.failed_step == "escaped-background"
+    assert time.monotonic() - started_at < 3
+
+
 def test_preflight_environment_excludes_host_credentials(monkeypatch, tmp_path) -> None:
     """被测 PR 代码不得继承 Provider、Codex 或 OpenAI 凭据。"""
 
