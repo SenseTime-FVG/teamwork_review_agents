@@ -114,13 +114,16 @@ function shortRevision(revision?: string): string {
 
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
-    running: "运行中",
+    queued: "排队中",
+    running: "执行中",
     completed: "已完成",
     failed: "失败",
     timed_out: "超时",
     cancelled: "已取消",
     pending: "待处理",
     processing: "处理中",
+    unmatched: "未触发",
+    triggered: "已触发",
     opened: "打开",
     closed: "已关闭",
     merged: "已合并",
@@ -603,6 +606,7 @@ function Overview(props: {
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
+  const pendingEvents = (props.status.stats.events.pending ?? 0) + (props.status.stats.events.processing ?? 0);
   return (
     <div className="page-stack">
       <section className="hero-card">
@@ -626,8 +630,8 @@ function Overview(props: {
       )}
       <div className="metric-grid">
         <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{props.status.stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
-        <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{props.status.stats.events.pending ?? 0} 个待处理</small></div>
-        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个正在执行</small></div>
+        <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
+        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个执行中 · {props.status.stats.runs.queued ?? 0} 个排队中</small></div>
         <div className="metric-card"><span>最近周期</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
       </div>
       <section className="section-card">
@@ -674,14 +678,15 @@ function Overview(props: {
         <div className="section-title-row"><div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div></div>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>状态</th><th>时间</th></tr></thead>
+            <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th></tr></thead>
             <tbody>
               {props.events.map((event) => (
                 <tr key={event.event_id}>
                   <td className="mono">{event.event_type}</td>
                   <td>{event.repository_id}</td>
                   <td>#{event.number}</td>
-                  <td><StatusPill value={event.status} /></td>
+                  <td><EventStatusPill event={event} /></td>
+                  <td><EventAgentProgress event={event} /></td>
                   <td>{timeText(event.created_at)}</td>
                 </tr>
               ))}
@@ -1659,6 +1664,59 @@ function RulesEditor(props: {
 
 function StatusPill({ value }: { value: string }) {
   return <span className={`status-pill status-${value}`}>{statusLabel(value)}</span>;
+}
+
+function EventStatusPill({ event }: { event: EventRecord }) {
+  const labels: Record<string, string> = {
+    pending: "待处理",
+    processing: "规则匹配中",
+    unmatched: "未触发",
+    triggered: "已触发",
+    completed: event.trigger_count > 0 ? "已处理" : "历史已处理",
+    failed: "处理失败",
+  };
+  return (
+    <span className={`status-pill status-${event.status}`}>
+      {labels[event.status] ?? event.status}
+    </span>
+  );
+}
+
+function EventAgentProgress({ event }: { event: EventRecord }) {
+  const total = event.trigger_count;
+  if (total === 0) {
+    return <span className="event-agent-none">—</span>;
+  }
+  const settled = event.agent_completed_count
+    + event.agent_failed_count
+    + event.agent_timed_out_count;
+  if (event.agent_running_count > 0) {
+    return (
+      <span className="event-agent-progress running">
+        执行中 {event.agent_running_count} · 已结束 {settled}/{total}
+      </span>
+    );
+  }
+  if (event.agent_queued_count > 0) {
+    return (
+      <span className="event-agent-progress queued">
+        排队中 {event.agent_queued_count} · 已结束 {settled}/{total}
+      </span>
+    );
+  }
+  const failed = event.agent_failed_count + event.agent_timed_out_count;
+  if (failed > 0) {
+    return (
+      <span className="event-agent-progress failed">
+        异常 {failed} · 已结束 {settled}/{total}
+      </span>
+    );
+  }
+  return (
+    <span className="event-agent-progress completed">
+      已完成 {event.agent_completed_count}/{total}
+    </span>
+  );
 }
 
 function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {

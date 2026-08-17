@@ -13,7 +13,7 @@ from .config import AppConfig, RepositoryConfig, RuleConfig
 from .environment import resolve_provider_token
 from .events import detect_activity_events, detect_events
 from .executor import AgentExecutor
-from .models import ChangeEvent, stable_hash
+from .models import AgentResult, ChangeEvent, stable_hash
 from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
 from .state import StateStore
@@ -47,6 +47,17 @@ class RuleInvocation:
         """按事件产生顺序返回去重后的动作列表。"""
 
         return tuple(dict.fromkeys(event.type for event in self.events))
+
+    @property
+    def idempotency_key(self) -> str:
+        """返回当前规则、Agent 与匹配事件组合的稳定调度键。"""
+
+        event_ids = tuple(event.id for event in self.events)
+        return stable_hash(
+            event_ids[0] if len(event_ids) == 1 else event_ids,
+            self.rule.name,
+            self.agent_name,
+        )
 
 
 def plan_rule_invocations(
@@ -236,25 +247,19 @@ class Orchestrator:
     async def _run_agent(
         self,
         invocation: RuleInvocation,
-    ) -> bool:
+    ) -> AgentResult | None:
         """在全局并发额度内执行一条规则产生的 Agent 任务。"""
 
         event = invocation.events[0]
-        event_ids = tuple(item.id for item in invocation.events)
         async with self.agent_semaphore:
-            result = await self.executor.execute(
+            return await self.executor.execute(
                 agent_name=invocation.agent_name,
                 event=event,
                 actions=invocation.actions,
                 rule_name=invocation.rule.name,
                 inherit_workspace=invocation.rule.inherit_workspace,
-                idempotency_key=stable_hash(
-                    event_ids[0] if len(event_ids) == 1 else event_ids,
-                    invocation.rule.name,
-                    invocation.agent_name,
-                ),
+                idempotency_key=invocation.idempotency_key,
             )
-        return result is not None
 
     async def process_events(self, summary: CycleSummary) -> None:
         """领取事件、匹配规则并等待所有目标 Agent 完成。"""
@@ -286,30 +291,60 @@ class Orchestrator:
             repository = self.config.repository_map().get(claimed_events[0].repository_id)
             if repository is None or not repository.enabled:
                 for event in claimed_events:
-                    await asyncio.to_thread(self.store.finish_event, event.id)
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="unmatched",
+                    )
                     summary.processed_events += 1
                 continue
 
             errors_by_event: dict[str, list[str]] = {
                 event.id: [] for event in claimed_events
             }
+            matched_event_ids: set[str] = set()
             try:
                 invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                dispatches = [
+                    (
+                        event.id,
+                        invocation.idempotency_key,
+                        invocation.rule.name,
+                        invocation.agent_name,
+                    )
+                    for invocation in invocations
+                    for event in invocation.events
+                ]
+                matched_event_ids = {item[0] for item in dispatches}
+                await asyncio.to_thread(
+                    self.store.record_event_dispatches,
+                    tuple(event.id for event in claimed_events),
+                    dispatches,
+                )
                 tasks = [asyncio.create_task(self._run_agent(item)) for item in invocations]
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    summary.agent_runs += sum(result is True for result in results)
+                    summary.agent_runs += sum(
+                        isinstance(result, AgentResult) for result in results
+                    )
                     for invocation, result in zip(invocations, results, strict=True):
-                        if not isinstance(result, BaseException):
+                        if isinstance(result, BaseException):
+                            error = str(result)
+                        elif isinstance(result, AgentResult) and result.status != "completed":
+                            error = result.error or f"Agent 运行状态为 {result.status}"
+                        else:
                             continue
                         for event in invocation.events:
-                            errors_by_event[event.id].append(str(result))
+                            errors_by_event[event.id].append(error)
             except Exception as exc:
                 for event in claimed_events:
                     errors_by_event[event.id].append(str(exc))
 
             for event in claimed_events:
                 error = "; ".join(errors_by_event[event.id]) or None
+                if event.id not in matched_event_ids and error is None:
+                    summary.processed_events += 1
+                    continue
                 if error:
                     summary.errors.append(f"处理事件 {event.id} 失败：{error}")
                 await asyncio.to_thread(self.store.finish_event, event.id, error=error)

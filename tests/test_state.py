@@ -1,6 +1,7 @@
 """SQLite 幂等与资源租约测试。"""
 
 from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.models import AgentResult
 from teamwork_review_agents.state import StateStore
 
 
@@ -75,6 +76,101 @@ def test_recovery_requeues_processing_event(tmp_path, snapshot_factory) -> None:
     assert store.claim_event(event.id, 2)
     store.recover_interrupted_work()
     assert [item.id for item in store.pending_events()] == [event.id]
+
+
+def test_recovery_requeues_triggered_event_and_fails_queued_agent(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """异常退出后，已触发事件和排队 Agent 应恢复为可重试状态。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    event = detect_events(None, snapshot_factory(), emit_initial=True)[0]
+    store.save_snapshot_and_events(event.new, [event])
+    assert store.claim_event(event.id, 2)
+    store.record_event_dispatches(
+        [event.id],
+        [(event.id, "recovery-key", "review", "reviewer")],
+    )
+    reservation = store.begin_agent_run(
+        proposed_run_id="queued-before-recovery",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="recovery-key",
+        event_id=event.id,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key=event.resource_key,
+        prompt="",
+        max_attempts=2,
+    )
+    assert reservation is not None
+
+    store.recover_interrupted_work()
+
+    assert [item.id for item in store.pending_events()] == [event.id]
+    assert store.agent_run_status("recovery-key") == "failed"
+
+
+def test_event_dispatch_and_agent_progress_are_tracked_separately(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """未匹配事件应立即标记未触发，匹配事件独立聚合 Agent 进度。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    old = snapshot_factory()
+    new = snapshot_factory(state="closed", updated_at="2026-08-17T08:05:00Z")
+    events = detect_events(old, new)
+    closed = next(item for item in events if item.type == "change_request.closed")
+    updated = next(item for item in events if item.type == "change_request.updated")
+    store.save_snapshot_and_events(new, events)
+    assert store.claim_event(closed.id, 2)
+    assert store.claim_event(updated.id, 2)
+
+    store.record_event_dispatches(
+        [closed.id, updated.id],
+        [(closed.id, "dispatch-key", "close-review", "reviewer")],
+    )
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.updated"]["status"] == "unmatched"
+    assert records["change_request.updated"]["trigger_count"] == 0
+    assert records["change_request.closed"]["status"] == "triggered"
+    assert records["change_request.closed"]["trigger_count"] == 1
+    assert records["change_request.closed"]["agent_queued_count"] == 1
+
+    reservation = store.begin_agent_run(
+        proposed_run_id="run-close-review",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="dispatch-key",
+        event_id=closed.id,
+        rule_name="close-review",
+        agent_name="reviewer",
+        resource_key=closed.resource_key,
+        prompt="",
+        max_attempts=1,
+    )
+    assert reservation is not None
+    assert store.agent_run_status("dispatch-key") == "queued"
+    store.mark_agent_run_running(reservation.run_id)
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.closed"]["agent_running_count"] == 1
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=reservation.run_id,
+            root_run_id=reservation.root_run_id,
+            agent_name="reviewer",
+            status="completed",
+        )
+    )
+    store.finish_event(closed.id)
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.closed"]["status"] == "completed"
+    assert records["change_request.closed"]["agent_completed_count"] == 1
 
 
 def test_agent_run_exposes_workspace_cleanup_status(tmp_path) -> None:

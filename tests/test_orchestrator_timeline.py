@@ -1,6 +1,8 @@
 """Timeline 活动与扫描编排集成测试。"""
 
+from teamwork_review_agents.config import RuleConfig
 from teamwork_review_agents.models import (
+    AgentResult,
     ChangeRequestActivity,
     ChangeRequestActivityBatch,
 )
@@ -145,3 +147,133 @@ async def test_scan_initializes_existing_snapshot_before_candidate_filtering(
         repository.id,
         snapshot.number,
     ) == {"page": 4, "item_id": "baseline-last"}
+
+
+async def test_process_events_marks_events_without_matching_rules_as_unmatched(
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """未选择 updated 等事件时，消费后应显示未触发而不是处理中。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    assert summary.processed_events == 2
+    assert summary.agent_runs == 0
+    records = orchestrator.store.list_events()
+    assert {item["status"] for item in records} == {"unmatched"}
+    assert {item["trigger_count"] for item in records} == {0}
+
+
+async def test_deduplicated_run_is_linked_to_every_matching_event(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """单轮去重产生的一次运行应同时计入所有被合并事件。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="close-review",
+            events=["change_request.closed", "change_request.updated"],
+            agents=["code-reviewer"],
+            deduplicate_per_scan=True,
+        )
+    ]
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+
+    async def fake_execute(**kwargs):
+        """跳过真实 Codex，仅验证编排产生的调度关联。"""
+
+        return AgentResult(
+            run_id="deduplicated-run",
+            root_run_id="deduplicated-run",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    assert summary.agent_runs == 1
+    records = orchestrator.store.list_events()
+    assert {item["status"] for item in records} == {"completed"}
+    assert {item["trigger_count"] for item in records} == {1}
+
+
+async def test_failed_agent_marks_matching_event_as_failed(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """Agent 返回失败结果时，匹配事件也应进入处理失败状态。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="close-review",
+            events=["change_request.closed"],
+            agents=["code-reviewer"],
+        )
+    ]
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+
+    async def fake_execute(**kwargs):
+        """返回失败结果以验证事件终态。"""
+
+        return AgentResult(
+            run_id="failed-run",
+            root_run_id="failed-run",
+            agent_name=kwargs["agent_name"],
+            status="failed",
+            error="审核失败",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert records["change_request.closed"]["status"] == "failed"
+    assert records["change_request.closed"]["error"] == "审核失败"
+    assert records["change_request.updated"]["status"] == "unmatched"

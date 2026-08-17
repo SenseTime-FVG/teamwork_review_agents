@@ -294,6 +294,10 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
             "discovered_event_emitted"
         ] is True
         assert len(store.pending_events()) == 1
+        event_record = client.get("/api/events").json()[0]
+        assert event_record["status"] == "pending"
+        assert event_record["trigger_count"] == 0
+        assert event_record["agent_running_count"] == 0
         assert client.post(
             "/api/change-requests/first/999/emit-discovered"
         ).status_code == 404

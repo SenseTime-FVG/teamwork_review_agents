@@ -183,6 +183,12 @@ export type EventRecord = {
   status: string;
   attempts: number;
   error?: string | null;
+  trigger_count: number;
+  agent_queued_count: number;
+  agent_running_count: number;
+  agent_completed_count: number;
+  agent_failed_count: number;
+  agent_timed_out_count: number;
   created_at: number;
   updated_at: number;
 };

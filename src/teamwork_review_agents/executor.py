@@ -231,7 +231,7 @@ class AgentExecutor:
                 self.store.agent_run_status,
                 idempotency_key,
             )
-            if status in {"completed", "running"}:
+            if status in {"completed", "queued", "running"}:
                 return None
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
@@ -379,6 +379,10 @@ class AgentExecutor:
                         "path": str(active_workspace),
                         "reason": workspace_reason,
                     },
+                )
+                await asyncio.to_thread(
+                    self.store.mark_agent_run_running,
+                    reservation.run_id,
                 )
                 await persist_log(
                     "system",

@@ -67,6 +67,19 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_event_inbox_status
                 ON event_inbox(status, updated_at);
 
+                CREATE TABLE IF NOT EXISTS event_agent_dispatches (
+                    event_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    rule_name TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(event_id, idempotency_key),
+                    FOREIGN KEY(event_id) REFERENCES event_inbox(event_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_agent_dispatches_key
+                ON event_agent_dispatches(idempotency_key);
+
                 CREATE TABLE IF NOT EXISTS provider_activity_cursors (
                     provider TEXT NOT NULL,
                     repository_id TEXT NOT NULL,
@@ -174,7 +187,7 @@ class StateStore:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def recover_interrupted_work(self) -> None:
-        """单实例服务启动时恢复上次异常退出遗留的处理中状态。"""
+        """单实例服务启动时恢复上次异常退出遗留的未完成状态。"""
 
         now = time.time()
         with self.connect() as connection:
@@ -183,7 +196,7 @@ class StateStore:
                 """
                 UPDATE event_inbox
                 SET status = 'pending', error = '服务异常退出，事件已重新入队', updated_at = ?
-                WHERE status = 'processing'
+                WHERE status IN ('processing', 'triggered')
                 """,
                 (now,),
             )
@@ -201,7 +214,7 @@ class StateStore:
                         ELSE workspace_reason
                     END,
                     finished_at = ?
-                WHERE status = 'running'
+                WHERE status IN ('queued', 'running')
                 """,
                 (now,),
             )
@@ -489,8 +502,52 @@ class StateStore:
             connection.commit()
         return True
 
-    def finish_event(self, event_id: str, *, error: str | None = None) -> None:
-        """将事件标记为完成或失败。"""
+    def record_event_dispatches(
+        self,
+        event_ids: Iterable[str],
+        dispatches: Iterable[tuple[str, str, str, str]],
+    ) -> None:
+        """记录事件到 Agent 调度的关系，并区分未触发与已触发事件。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        items = tuple(dispatches)
+        matched_ids = {event_id for event_id, *_ in items}
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO event_agent_dispatches (
+                    event_id, idempotency_key, rule_name, agent_name, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [(*item, now) for item in items],
+            )
+            for event_id in ids:
+                connection.execute(
+                    """
+                    UPDATE event_inbox
+                    SET status = ?, error = NULL, updated_at = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        "triggered" if event_id in matched_ids else "unmatched",
+                        now,
+                        event_id,
+                    ),
+                )
+            connection.commit()
+
+    def finish_event(
+        self,
+        event_id: str,
+        *,
+        error: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        """将事件标记为指定的终态，默认根据错误选择完成或失败。"""
+
+        final_status = "failed" if error else status or "completed"
 
         with self.connect() as connection:
             connection.execute(
@@ -499,7 +556,7 @@ class StateStore:
                 SET status = ?, error = ?, updated_at = ?
                 WHERE event_id = ?
                 """,
-                ("failed" if error else "completed", error, time.time(), event_id),
+                (final_status, error, time.time(), event_id),
             )
 
     def begin_agent_run(
@@ -538,7 +595,7 @@ class StateStore:
                         run_id, root_run_id, parent_run_id, idempotency_key,
                         event_id, rule_name, agent_name, resource_key,
                         status, attempts, prompt, environment, config_revision, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)
                     """,
                     (
                         proposed_run_id,
@@ -565,7 +622,7 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'running', attempts = ?, prompt = ?, environment = ?,
+                SET status = 'queued', attempts = ?, prompt = ?, environment = ?,
                     config_revision = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
@@ -599,6 +656,19 @@ class StateStore:
                 (idempotency_key,),
             ).fetchone()
         return None if row is None else str(row["status"])
+
+    def mark_agent_run_running(self, run_id: str) -> None:
+        """在 Codex CLI 即将启动时把 Agent 从排队切换为执行中。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET status = 'running'
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (run_id,),
+            )
 
     def update_agent_run_inputs(
         self,
@@ -923,15 +993,53 @@ class StateStore:
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
 
-        where = "WHERE status = ?" if status else ""
+        where = "WHERE event_inbox.status = ?" if status else ""
         parameters: list[Any] = [status] if status else []
         parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT event_id, event_type, repository_id, number, status,
-                       attempts, error, created_at, updated_at
-                FROM event_inbox {where} ORDER BY created_at DESC LIMIT ?
+                SELECT event_inbox.event_id, event_inbox.event_type,
+                       event_inbox.repository_id, event_inbox.number,
+                       event_inbox.status, event_inbox.attempts,
+                       event_inbox.error, event_inbox.created_at,
+                       event_inbox.updated_at,
+                       COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
+                       COALESCE(dispatch_stats.agent_queued_count, 0)
+                           AS agent_queued_count,
+                       COALESCE(dispatch_stats.agent_running_count, 0)
+                           AS agent_running_count,
+                       COALESCE(dispatch_stats.agent_completed_count, 0)
+                           AS agent_completed_count,
+                       COALESCE(dispatch_stats.agent_failed_count, 0)
+                           AS agent_failed_count,
+                       COALESCE(dispatch_stats.agent_timed_out_count, 0)
+                           AS agent_timed_out_count
+                FROM event_inbox
+                LEFT JOIN (
+                    SELECT dispatch.event_id,
+                           COUNT(*) AS trigger_count,
+                           SUM(
+                               CASE
+                                   WHEN run.run_id IS NULL OR run.status = 'queued'
+                                   THEN 1 ELSE 0
+                               END
+                           ) AS agent_queued_count,
+                           SUM(CASE WHEN run.status = 'running' THEN 1 ELSE 0 END)
+                               AS agent_running_count,
+                           SUM(CASE WHEN run.status = 'completed' THEN 1 ELSE 0 END)
+                               AS agent_completed_count,
+                           SUM(CASE WHEN run.status = 'failed' THEN 1 ELSE 0 END)
+                               AS agent_failed_count,
+                           SUM(CASE WHEN run.status = 'timed_out' THEN 1 ELSE 0 END)
+                               AS agent_timed_out_count
+                    FROM event_agent_dispatches AS dispatch
+                    LEFT JOIN agent_runs AS run
+                        ON run.idempotency_key = dispatch.idempotency_key
+                    GROUP BY dispatch.event_id
+                ) AS dispatch_stats
+                    ON dispatch_stats.event_id = event_inbox.event_id
+                {where} ORDER BY event_inbox.created_at DESC LIMIT ?
                 """,
                 parameters,
             ).fetchall()
