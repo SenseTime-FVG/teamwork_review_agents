@@ -1,144 +1,188 @@
+# Teamwork Review Agents 完整配置参考
+#
+# 这个文件可以直接复制为 config.yaml。只有 database 和 web 保持启用，
+# Provider、仓库、Agent 与规则均为注释示例，因此首次打开管理 UI 仍是空白状态。
+# 所有相对路径都以 config.yaml 所在目录为基准。
+
+# 必填：SQLite 用于保存 MR/PR 快照、事件、运行记录、日志和资源锁。
 database:
   path: ./data/teamwork-review-agents.db
 
-scanner:
-  interval_seconds: 60
-  max_pages: 2
-  page_size: 50
-  emit_initial_events: false
+# 可选：MR/PR 轮询参数。整段省略时使用下列默认值。
+# scanner:
+#   # 两次自动扫描之间的秒数；serve 启动后会先立即扫描一次。
+#   interval_seconds: 60
+#   # 每个 Provider API 最多拉取的分页数，防止单次扫描无限扩大。
+#   max_pages: 2
+#   # 每页请求数量，允许 1～100。
+#   page_size: 50
+#   # false：首次发现只建立快照基线；true：同时产生 discovered 事件。
+#   emit_initial_events: false
 
-runtime:
-  max_concurrent_agents: 4
-  lock_timeout_seconds: 300
-  lock_ttl_seconds: 120
-  max_sub_agent_depth: 2
-  max_agent_runs_per_root: 8
-  event_retry_count: 2
+# 可选：Codex Agent、sub-agent、重试和写资源锁参数。
+# runtime:
+#   # 同一进程最多并行运行多少个 Codex CLI Agent。
+#   max_concurrent_agents: 4
+#   # 等待 MR/PR 或工作目录写锁的最长秒数。
+#   lock_timeout_seconds: 300
+#   # 写锁租约有效秒数；运行期间会自动续租。
+#   lock_ttl_seconds: 120
+#   # sub-agent 最大递归层数；0 表示禁止 sub-agent 再委托。
+#   max_sub_agent_depth: 2
+#   # 一个根任务最多启动的 Agent 总数，包含全部 sub-agent。
+#   max_agent_runs_per_root: 8
+#   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。
+#   event_retry_count: 2
+#   # Codex CLI 命令名，也可以配置为绝对路径。
+#   codex_binary: codex
+#   # 等待 sub-agent MCP Server 启动的最长秒数。
+#   mcp_startup_timeout_seconds: 15
+#   # 单次 invoke_agent MCP 调用的最长秒数。
+#   mcp_tool_timeout_seconds: 1800
+#   # 单次运行最多保留的 Codex JSONL 事件数。
+#   max_jsonl_events: 2000
 
+# 管理 API 与 UI 的默认启动配置。
 web:
+  # 默认只允许本机访问。监听 0.0.0.0 或其他非本机地址时必须配置 Token。
   host: 127.0.0.1
+  # 管理 UI 与 API 监听端口。
   port: 8080
+  # 检测 config.yaml 手工变化的周期秒数。
   config_poll_seconds: 2
+  # 运行日志在 SQLite 中保留的天数。
   log_retention_days: 30
-  # 非本机监听时必须启用，并在宿主机设置同名变量。
+  # 可选：填写“保存管理员 Token 的宿主机环境变量名”，不是 Token 本身。
   # admin_token_env: TEAMWORK_ADMIN_TOKEN
 
-environment:
-  global:
-    ORGANIZATION_NAME: Example Team
-    DOCS_LANGUAGE: zh-CN
-    INTERNAL_API_TOKEN:
-      from_system: TEAMWORK_INTERNAL_API_TOKEN
-      secret: true
-      expose_to_prompt: false
-      expose_to_process: true
+# 可选：全部仓库和 Agent 都会继承的环境变量。
+# 合并优先级为：全局 → 仓库 → Agent → 系统运行变量，后者覆盖前者。
+# environment:
+#   global:
+#     # 简写等价于 value: Example Team；默认进入 Prompt 和 Codex 进程。
+#     ORGANIZATION_NAME: Example Team
+#     # 完整写法：value 与 from_system 只能选择一个。
+#     DOCS_LANGUAGE:
+#       value: zh-CN
+#       secret: false
+#       expose_to_prompt: true
+#       expose_to_process: true
+#     # 从启动服务的宿主机环境读取真实值，YAML 中不保存 Secret。
+#     INTERNAL_API_TOKEN:
+#       from_system: TEAMWORK_INTERNAL_API_TOKEN
+#       # Secret 会在日志、Prompt 快照和配置历史中显示为 ********。
+#       secret: true
+#       # Secret 默认不进入 Prompt；只有明确需要时才改为 true。
+#       expose_to_prompt: false
+#       # 是否把变量传给 Codex CLI 子进程。
+#       expose_to_process: true
 
-providers:
-  github-main:
-    kind: github
-    base_url: https://api.github.com
-    token_env: GITHUB_TOKEN
+# 可选：GitHub / GitLab API 连接。后台用它扫描远端 MR / PR；它不是 Git clone 或 SSH 连接。
+# 键名是 Provider ID，由仓库的 provider 字段引用。
+# providers:
+#   github-main:
+#     # 只允许 github 或 gitlab。
+#     kind: github
+#     # GitHub Enterprise 可替换成企业 API 地址。
+#     base_url: https://api.github.com
+#     # 保存访问 Token 的宿主机环境变量名，不要在 YAML 中写真实 Token。
+#     token_env: GITHUB_TOKEN
+#     # 单次 Provider API 请求超时秒数。
+#     request_timeout_seconds: 30
+#
+#   gitlab-main:
+#     kind: gitlab
+#     base_url: https://gitlab.example.com/api/v4
+#     token_env: GITLAB_TOKEN
+#     request_timeout_seconds: 30
 
-  gitlab-main:
-    kind: gitlab
-    base_url: https://gitlab.example.com/api/v4
-    token_env: GITLAB_TOKEN
+# 可选：需要扫描的仓库列表。
+# repositories:
+#   - # UI 和规则使用的仓库唯一 ID。
+#     id: example-github
+#     # 引用 providers 中的键名，决定扫描时使用哪个平台 API 和 Token。
+#     provider: github-main
+#     # GitHub 使用 owner/repository，GitLab 使用 group/project。
+#     project: owner/repository
+#     # Codex CLI 执行时使用的本地 Git 工作目录。
+#     workspace: ./workspaces/example-github
+#     # false 时不扫描，也不会处理该仓库的待处理事件。
+#     enabled: true
+#     # 可选：只覆盖当前仓库的环境变量。
+#     environment:
+#       REPOSITORY_TIER: production
 
-repositories:
-  - id: example-github
-    provider: github-main
-    project: owner/repository
-    workspace: ./workspaces/example-github
-    enabled: false
-    environment:
-      REPOSITORY_TIER: production
+# 可选：Codex CLI Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
+# agents:
+#   code-reviewer:
+#     # prompt_file 和 prompt 必须且只能配置一个。
+#     # 文件路径相对于 config.yaml；UI 也支持将 .md/.txt 导入 ./prompts/。
+#     prompt_file: ./prompts/code-reviewer.md
+#     # 也可以使用内联 Prompt；模板中的缺失变量会渲染为空字符串。
+#     # prompt: |
+#     #   请审查 ${{REPOSITORY_PROJECT}} 的 MR #${{MR_NUMBER}}。
+#     #   输出风格：${{REVIEW_STYLE}}
+#     # 可选：留空时继承 Codex CLI 默认模型。
+#     model: gpt-5.4
+#     # read-only：本地只读；workspace-write：工作区可写；danger-full-access：完全访问。
+#     sandbox: read-only
+#     # 单次 Codex CLI 运行最长秒数。
+#     timeout_seconds: 1200
+#     # 写操作声明用于申请串行锁，不等同于平台账号授权。
+#     # change_request：评论、标签、审批、合并等 MR/PR 写操作。
+#     # workspace：修改代码、提交、推送等本地工作目录写操作。
+#     write_scopes: []
+#     # 只授予 invoke_agent 调用权限，不会自动启动这些 Agent。
+#     allowed_sub_agents:
+#       - security-reviewer
+#     # 可选：要求 Codex 最终输出符合指定 JSON Schema。
+#     output_schema: ./schemas/review-result.json
+#     # true 时允许工作目录不是 Git 仓库，通常保持 false。
+#     skip_git_repo_check: false
+#     # 可选：追加到 codex exec 的高级命令行参数。
+#     extra_codex_args: []
+#     # 可选：只覆盖当前 Agent 的环境变量。
+#     environment:
+#       REVIEW_STYLE: concise
+#
+#   security-reviewer:
+#     prompt_file: ./prompts/security-reviewer.md
+#     sandbox: read-only
+#     timeout_seconds: 1200
+#     write_scopes: []
+#     allowed_sub_agents: []
 
-  - id: example-gitlab
-    provider: gitlab-main
-    project: group/project
-    workspace: ./workspaces/example-gitlab
-    enabled: false
-    environment: {}
+# 可选：MR/PR 状态变化到 Agent 的映射规则。
+# rules:
+#   - # 规则唯一名称，会记录到 Agent 运行审计中。
+#     name: review-new-commit
+#     # 支持 discovered、opened、reopened、closed、merged、commits_changed、
+#     # draft_changed、labels_changed、approvals_changed、pipeline_changed、
+#     # merge_status_changed 和 updated，完整名称以 change_request. 开头。
+#     events:
+#       - change_request.commits_changed
+#     # 要启动的根 Agent；按配置顺序调度。
+#     agents:
+#       - code-reviewer
+#     # 可选：只匹配指定仓库；省略或留空表示全部仓库。
+#     repositories:
+#       - example-github
+#     # 可选：匹配事件的新旧快照字段。
+#     conditions:
+#       # 无前缀时读取新快照，也可以使用 old.state 或 new.state。
+#       state: opened
+#       draft: false
+#       # 操作符写在双下划线后：ne、contains、not_contains、in、not_in、
+#       # gte、lte、gt、lt、changed。
+#       labels__contains: security
+#       pipeline_status__in:
+#         - success
+#         - skipped
+#       approvals__gte: 2
+#       head_sha__changed: true
+#     # false 时保留规则但不参与匹配。
+#     enabled: true
 
-agents:
-  code-reviewer:
-    prompt_file: ./prompts/code-reviewer.md
-    sandbox: read-only
-    timeout_seconds: 1200
-    write_scopes: []
-    allowed_sub_agents:
-      - security-reviewer
-    environment:
-      REVIEW_STYLE: concise
-
-  security-reviewer:
-    prompt_file: ./prompts/security-reviewer.md
-    sandbox: read-only
-    timeout_seconds: 1200
-    write_scopes: []
-    allowed_sub_agents: []
-    environment: {}
-
-  docs-updater:
-    prompt_file: ./prompts/docs-updater.md
-    sandbox: workspace-write
-    timeout_seconds: 1800
-    write_scopes:
-      - workspace
-      - change_request
-    allowed_sub_agents: []
-    environment:
-      DOCS_LANGUAGE: zh-CN
-
-  merge-manager:
-    prompt_file: ./prompts/merge-manager.md
-    sandbox: read-only
-    timeout_seconds: 600
-    write_scopes:
-      - change_request
-    allowed_sub_agents:
-      - code-reviewer
-    environment: {}
-
-rules:
-  - name: review-new-commit
-    events:
-      - change_request.commits_changed
-    conditions:
-      state: opened
-      draft: false
-    agents:
-      - code-reviewer
-
-  - name: review-security-change
-    events:
-      - change_request.labels_changed
-    conditions:
-      state: opened
-      labels__contains: security
-    agents:
-      - security-reviewer
-
-  - name: update-docs-after-merge
-    events:
-      - change_request.merged
-    agents:
-      - docs-updater
-
-  - name: check-merge-readiness
-    events:
-      - change_request.pipeline_changed
-      - change_request.approvals_changed
-      - change_request.merge_status_changed
-    conditions:
-      state: opened
-      draft: false
-      pipeline_status__in:
-        - success
-        - skipped
-      merge_status__in:
-        - mergeable
-        - can_be_merged
-      approvals__gte: 2
-    agents:
-      - merge-manager
+# Prompt 可直接使用的系统运行变量：
+# REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、MR_NUMBER、MR_TITLE、
+# MR_STATE、MR_HEAD_SHA、MR_SOURCE_BRANCH、MR_TARGET_BRANCH、MR_URL、EVENT_TYPE、RUN_ID。

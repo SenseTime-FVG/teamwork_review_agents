@@ -23,13 +23,15 @@ def test_example_config_is_valid() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config_example.yaml")
     assert validate_runtime_files(config) == []
-    assert config.agents["docs-updater"].sandbox == "workspace-write"
+    assert config.providers == {}
+    assert config.repositories == []
+    assert config.agents == {}
+    assert config.rules == []
     assert config.database.path.is_absolute()
 
 
-def test_runner_scrubs_provider_tokens(monkeypatch, snapshot_factory) -> None:
-    root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "config_example.yaml")
+def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> None:
+    config = configured_app_factory()
     monkeypatch.setenv("GITHUB_TOKEN", "不应进入 Codex")
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
     monkeypatch.setenv("CODEX_API_KEY", "Codex 自身凭据")
@@ -39,9 +41,8 @@ def test_runner_scrubs_provider_tokens(monkeypatch, snapshot_factory) -> None:
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
 
 
-def test_runner_enables_only_agent_gateway(snapshot_factory) -> None:
-    root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "config_example.yaml")
+def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_factory) -> None:
+    config = configured_app_factory()
     repository = config.repositories[0]
     event_snapshot = snapshot_factory(repository_id=repository.id, provider=repository.provider)
     from teamwork_review_agents.events import detect_events
@@ -65,9 +66,12 @@ def test_runner_enables_only_agent_gateway(snapshot_factory) -> None:
     assert command[-1] == "-"
 
 
-async def test_runner_parses_jsonl_from_process(tmp_path, snapshot_factory) -> None:
-    root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "config_example.yaml")
+async def test_runner_parses_jsonl_from_process(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    config = configured_app_factory()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     fake_codex = tmp_path / "fake-codex"

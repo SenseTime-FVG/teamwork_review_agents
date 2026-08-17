@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, getToken, setToken as persistToken, streamRunLogs } from "./api";
+import {
+  api,
+  getToken,
+  setToken as persistToken,
+  streamRunLogs,
+  uploadPromptFile,
+} from "./api";
+import type { ManagedPromptFile } from "./api";
 import type {
   Agent,
   ConfigDocument,
@@ -165,6 +172,122 @@ function MultiSelect(props: {
       </select>
       <small>按住 Command / Ctrl 可多选</small>
     </label>
+  );
+}
+
+function ChoiceCards(props: {
+  title: string;
+  description: string;
+  values: string[];
+  options: Array<{ value: string; label: string; description: string }>;
+  emptyText?: string;
+  onChange: (values: string[]) => void;
+}) {
+  return (
+    <div className="choice-section">
+      <div className="choice-title"><strong>{props.title}</strong><p>{props.description}</p></div>
+      {props.options.length === 0 ? (
+        <div className="choice-empty">{props.emptyText ?? "暂无可选项"}</div>
+      ) : (
+        <div className="choice-list">
+          {props.options.map((option) => {
+            const checked = props.values.includes(option.value);
+            return (
+              <label className={`choice-card ${checked ? "selected" : ""}`} key={option.value}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => props.onChange(
+                    checked
+                      ? props.values.filter((value) => value !== option.value)
+                      : [...props.values, option.value],
+                  )}
+                />
+                <span><strong>{option.label}</strong><small>{option.description}</small></span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PromptFilePicker(props: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [files, setFiles] = useState<ManagedPromptFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  const loadFiles = useCallback(async () => {
+    try {
+      setFiles(await api<ManagedPromptFile[]>("/api/prompt-files"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取 Prompt 文件失败");
+    }
+  }, []);
+
+  useEffect(() => { void loadFiles(); }, [loadFiles]);
+
+  async function importFile(file?: File) {
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    setMessage("");
+    try {
+      const imported = await uploadPromptFile(file);
+      props.onChange(imported.path);
+      setMessage(`已导入 ${imported.name}`);
+      await loadFiles();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "导入 Prompt 文件失败");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <div className="prompt-file-picker">
+      <Field
+        label="Prompt 文件路径"
+        value={props.value}
+        onChange={props.onChange}
+        placeholder="./prompts/reviewer.md"
+        help="相对路径以 config.yaml 所在目录为基准"
+      />
+      <div className="prompt-file-actions">
+        <select
+          value=""
+          onChange={(event) => {
+            if (event.target.value) props.onChange(event.target.value);
+          }}
+        >
+          <option value="">选择已有 Prompt…</option>
+          {files.map((file) => (
+            <option key={file.path} value={file.path}>{file.name}</option>
+          ))}
+        </select>
+        <label className={`button secondary file-button ${uploading ? "disabled" : ""}`}>
+          {uploading ? "正在导入…" : "从电脑选择并导入"}
+          <input
+            type="file"
+            accept=".md,.txt,text/markdown,text/plain"
+            disabled={uploading}
+            onChange={(event) => {
+              void importFile(event.target.files?.[0]);
+              event.target.value = "";
+            }}
+          />
+        </label>
+        <button className="button secondary" type="button" onClick={() => { void loadFiles(); }}>刷新列表</button>
+      </div>
+      <p className="field-help">选择的文件会复制到配置目录的 `./prompts/`，支持 UTF-8 编码的 `.md` 和 `.txt`，最大 1 MiB。</p>
+      {message && <p className="inline-message success-text">{message}</p>}
+      {error && <p className="inline-message error-text">{error}</p>}
+    </div>
   );
 }
 
@@ -405,7 +528,6 @@ function GlobalEnvironment(props: {
           <Toggle label="首次发现 MR / PR 时触发事件" checked={Boolean(props.document.scanner.emit_initial_events)} onChange={(value) => patchSection("scanner", "emit_initial_events", value)} />
         </div>
       </section>
-      <ConfigHistory />
     </div>
   );
 }
@@ -457,6 +579,26 @@ function RepositoriesEditor(props: {
   onChange: (document: ConfigDocument) => void;
 }) {
   const providerNames = Object.keys(props.document.providers);
+  const repositoryCount = props.document.repositories.length;
+
+  function providerDefaults(kind: "github" | "gitlab") {
+    return kind === "gitlab"
+      ? { base_url: "https://gitlab.com/api/v4", token_env: "GITLAB_TOKEN" }
+      : { base_url: "https://api.github.com", token_env: "GITHUB_TOKEN" };
+  }
+
+  function addProvider() {
+    let index = providerNames.length + 1;
+    let name = `provider-${index}`;
+    while (props.document.providers[name]) name = `provider-${++index}`;
+    props.onChange({
+      ...props.document,
+      providers: {
+        ...props.document.providers,
+        [name]: { kind: "github", ...providerDefaults("github") },
+      },
+    });
+  }
 
   function updateRepository(index: number, patch: Partial<Repository>) {
     const repositories = [...props.document.repositories];
@@ -505,34 +647,57 @@ function RepositoriesEditor(props: {
 
   return (
     <div className="page-stack">
+      <section className="setup-flow" aria-label="仓库配置步骤">
+        <div className={`setup-step ${providerNames.length > 0 ? "complete" : "current"}`}>
+          <span>1</span>
+          <div><strong>连接 GitHub / GitLab</strong><small>配置平台 API 和 Token 环境变量名</small></div>
+        </div>
+        <div className={`setup-step ${repositoryCount > 0 ? "complete" : providerNames.length > 0 ? "current" : ""}`}>
+          <span>2</span>
+          <div><strong>添加仓库</strong><small>关联远端项目与本地工作目录</small></div>
+        </div>
+        <div className={`setup-step ${props.document.repositories.some((repository) => repository.enabled) ? "complete" : repositoryCount > 0 ? "current" : ""}`}>
+          <span>3</span>
+          <div><strong>启用扫描</strong><small>保存配置后后台开始定时扫描</small></div>
+        </div>
+      </section>
       <section className="section-card">
         <div className="section-title-row">
-          <div><h2>代码托管连接</h2><p>Token 只配置宿主机环境变量名，不在这里填写真实 Token。</p></div>
-          <button className="button secondary" onClick={() => {
-            const name = `provider-${providerNames.length + 1}`;
-            props.onChange({
-              ...props.document,
-              providers: {
-                ...props.document.providers,
-                [name]: { kind: "github", base_url: "https://api.github.com", token_env: "GITHUB_TOKEN" },
-              },
-            });
-          }}>+ 添加连接</button>
+          <div>
+            <h2>GitHub / GitLab 连接</h2>
+            <p>后台使用这里的平台 API 和 Token 扫描远端 MR / PR；它不是 Git clone 或 SSH 连接，也不会在此处克隆代码。</p>
+          </div>
+          <button className="button secondary" onClick={addProvider}>+ 添加平台连接</button>
         </div>
         <div className="card-list compact">
+          {providerNames.length === 0 && (
+            <div className="empty-config-state">
+              <strong>还没有 GitHub / GitLab 连接</strong>
+              <p>先点击“添加平台连接”，再配置平台 API 地址，以及宿主机中保存访问 Token 的环境变量名。</p>
+            </div>
+          )}
           {providerNames.map((name) => {
             const provider = props.document.providers[name];
+            const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
               <div className="sub-card provider-row" key={name}>
                 <CommitField label="连接名称" value={name} onCommit={(nextName) => renameProvider(name, nextName)} />
-                <label className="field"><span>平台</span><select value={String(provider.kind)} onChange={(event) => updateProvider(name, { kind: event.target.value })}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
-                <Field label="API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateProvider(name, { base_url: value })} />
-                <Field label="Token 环境变量" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} />
-                <button className="icon-button danger align-end" onClick={() => {
-                  const providers = { ...props.document.providers };
-                  delete providers[name];
-                  props.onChange({ ...props.document, providers });
-                }}>×</button>
+                <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
+                  const kind = event.target.value as "github" | "gitlab";
+                  updateProvider(name, { kind, ...providerDefaults(kind) });
+                }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
+                <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateProvider(name, { base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
+                <Field label="Token 所在环境变量" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} help="这里只填变量名，例如 GITHUB_TOKEN，不填写真实 Token" />
+                <button
+                  className="icon-button danger align-end"
+                  disabled={referencedRepositories > 0}
+                  title={referencedRepositories > 0 ? `有 ${referencedRepositories} 个仓库正在使用此连接` : "删除连接"}
+                  onClick={() => {
+                    const providers = { ...props.document.providers };
+                    delete providers[name];
+                    props.onChange({ ...props.document, providers });
+                  }}
+                >×</button>
               </div>
             );
           })}
@@ -540,20 +705,31 @@ function RepositoriesEditor(props: {
       </section>
       <section className="section-card">
         <div className="section-title-row">
-          <div><h2>仓库</h2><p>一个仓库对应一个本地工作目录，可以覆盖全局环境变量。</p></div>
-          <button className="button primary" onClick={() => props.onChange({
-            ...props.document,
-            repositories: [...props.document.repositories, {
-              id: `repository-${props.document.repositories.length + 1}`,
-              provider: providerNames[0] ?? "",
-              project: "owner/repository",
-              workspace: "./workspaces/repository",
-              enabled: false,
-              environment: {},
-            }],
-          })}>+ 添加仓库</button>
+          <div><h2>仓库</h2><p>选择上方的平台连接来扫描远端 MR / PR；本地工作目录则供 Codex CLI 读取或修改代码。</p></div>
+          <button
+            className="button primary"
+            disabled={providerNames.length === 0}
+            title={providerNames.length === 0 ? "请先添加 GitHub / GitLab 连接" : "添加仓库"}
+            onClick={() => props.onChange({
+              ...props.document,
+              repositories: [...props.document.repositories, {
+                id: `repository-${props.document.repositories.length + 1}`,
+                provider: providerNames[0],
+                project: "owner/repository",
+                workspace: "./workspaces/repository",
+                enabled: false,
+                environment: {},
+              }],
+            })}
+          >+ 添加仓库</button>
         </div>
         <div className="card-list">
+          {props.document.repositories.length === 0 && (
+            <div className="empty-config-state">
+              <strong>{providerNames.length === 0 ? "请先连接 GitHub 或 GitLab" : "还没有配置仓库"}</strong>
+              <p>{providerNames.length === 0 ? "添加平台连接后，才可以创建仓库配置。" : "点击“添加仓库”，关联远端项目和已经准备好的本地 Git 工作目录。"}</p>
+            </div>
+          )}
           {props.document.repositories.map((repository, index) => (
             <article className="sub-card" key={index}>
               <div className="sub-card-head">
@@ -562,9 +738,9 @@ function RepositoriesEditor(props: {
               </div>
               <div className="form-grid two">
                 <CommitField label="仓库 ID" value={repository.id} onCommit={(id) => renameRepository(index, id)} />
-                <label className="field"><span>托管连接</span><select value={repository.provider} onChange={(event) => updateRepository(index, { provider: event.target.value })}>{providerNames.map((provider) => <option key={provider}>{provider}</option>)}</select></label>
-                <Field label="项目路径" value={repository.project} onChange={(project) => updateRepository(index, { project })} placeholder="group/project" />
-                <Field label="本地工作目录" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} />
+                <label className="field"><span>所属 GitHub / GitLab 连接</span><select value={repository.provider} onChange={(event) => updateRepository(index, { provider: event.target.value })}>{providerNames.map((provider) => <option key={provider}>{provider}</option>)}</select><small>决定使用哪个平台 API 和 Token 扫描此仓库</small></label>
+                <Field label="远端项目路径" value={repository.project} onChange={(project) => updateRepository(index, { project })} placeholder="group/project" help="GitHub 填 owner/repository，GitLab 填 group/project" />
+                <Field label="本地 Git 工作目录" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="需提前准备好代码，Agent 会在此目录运行 Codex CLI" />
               </div>
               <EnvironmentEditor compact title="仓库环境变量" value={repository.environment ?? {}} onChange={(environment) => updateRepository(index, { environment })} />
             </article>
@@ -616,6 +792,17 @@ function AgentsEditor(props: {
         {names.map((name) => {
           const agent = props.document.agents[name];
           const promptSource = agent.prompt_file ? "file" : "inline";
+          const writeScopes = agent.write_scopes ?? [];
+          const subAgentOptions = names
+            .filter((item) => item !== name)
+            .map((item) => {
+              const candidate = props.document.agents[item];
+              return {
+                value: item,
+                label: item,
+                description: `${candidate.sandbox ?? "read-only"} · ${candidate.prompt_file ? "文件 Prompt" : "内联 Prompt"}`,
+              };
+            });
           return (
             <article className="sub-card" key={name}>
               <div className="sub-card-head">
@@ -623,16 +810,61 @@ function AgentsEditor(props: {
                 <button className="icon-button danger" onClick={() => {
                   const agents = { ...props.document.agents };
                   delete agents[name];
-                  props.onChange({ ...props.document, agents });
+                  const cleanedAgents = Object.fromEntries(
+                    Object.entries(agents).map(([agentName, value]) => [
+                      agentName,
+                      {
+                        ...value,
+                        allowed_sub_agents: value.allowed_sub_agents?.filter((item) => item !== name),
+                      },
+                    ]),
+                  );
+                  const rules = props.document.rules.map((rule) => ({
+                    ...rule,
+                    agents: rule.agents.filter((item) => item !== name),
+                  }));
+                  props.onChange({ ...props.document, agents: cleanedAgents, rules });
                 }}>×</button>
               </div>
               <div className="form-grid three">
-                <Field label="模型（可选）" value={agent.model ?? ""} onChange={(model) => update(name, { model: model || undefined })} placeholder="继承 Codex 默认模型" />
-                <label className="field"><span>Sandbox</span><select value={agent.sandbox ?? "read-only"} onChange={(event) => update(name, { sandbox: event.target.value as Agent["sandbox"] })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="danger-full-access">danger-full-access</option></select></label>
+                <Field label="模型（可选）" value={agent.model ?? ""} onChange={(model) => update(name, { model: model || undefined })} placeholder="继承 Codex 默认模型" help="留空时使用 Codex CLI 当前默认模型" />
+                <label className="field"><span>本地文件权限（Sandbox）</span><select value={agent.sandbox ?? "read-only"} onChange={(event) => {
+                  const sandbox = event.target.value as Agent["sandbox"];
+                  const nextScopes = sandbox === "read-only"
+                    ? writeScopes.filter((scope) => scope !== "workspace")
+                    : Array.from(new Set([...writeScopes, "workspace"]));
+                  update(name, { sandbox, write_scopes: nextScopes as Agent["write_scopes"] });
+                }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件</option><option value="danger-full-access">完全访问：高风险</option></select><small>切换为可写模式时会自动启用“本地仓库写操作”</small></label>
                 <Field label="超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
-                <MultiSelect label="写作用域" values={agent.write_scopes ?? []} options={["change_request", "workspace"]} onChange={(write_scopes) => update(name, { write_scopes: write_scopes as Agent["write_scopes"] })} />
-                <MultiSelect label="允许的 sub-agent" values={agent.allowed_sub_agents ?? []} options={names.filter((item) => item !== name)} onChange={(allowed_sub_agents) => update(name, { allowed_sub_agents })} />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
+              </div>
+              <div className="permissions-grid">
+                <ChoiceCards
+                  title="写操作声明"
+                  description="用于申请串行资源锁和记录权限边界，不等同于平台账号授权。"
+                  values={writeScopes}
+                  options={[
+                    { value: "change_request", label: "MR / PR 写操作", description: "评论、标签、审批或合并时锁定当前变更请求" },
+                    { value: "workspace", label: "本地仓库写操作", description: "修改代码、提交或推送时锁定当前工作目录" },
+                  ]}
+                  onChange={(values) => {
+                    const hasWorkspace = values.includes("workspace");
+                    update(name, {
+                      write_scopes: values as Agent["write_scopes"],
+                      sandbox: hasWorkspace
+                        ? agent.sandbox === "danger-full-access" ? "danger-full-access" : "workspace-write"
+                        : "read-only",
+                    });
+                  }}
+                />
+                <ChoiceCards
+                  title="允许调用的 sub-agent"
+                  description="只是授予 invoke_agent 委托权限，不会自动运行；MR 规则仍只触发当前 Agent。"
+                  values={agent.allowed_sub_agents ?? []}
+                  options={subAgentOptions}
+                  emptyText="暂无其他 Agent。请先创建另一个 Agent，再回来授予调用权限。"
+                  onChange={(allowed_sub_agents) => update(name, { allowed_sub_agents })}
+                />
               </div>
               <div className="prompt-editor">
                 <div className="prompt-toolbar">
@@ -640,7 +872,7 @@ function AgentsEditor(props: {
                   <code>{"支持 ${{ENV_NAME}}，缺失变量会渲染为空"}</code>
                 </div>
                 {promptSource === "file" ? (
-                  <Field label="Prompt 文件" value={agent.prompt_file ?? ""} onChange={(prompt_file) => update(name, { prompt_file })} />
+                  <PromptFilePicker value={agent.prompt_file ?? ""} onChange={(prompt_file) => update(name, { prompt_file })} />
                 ) : (
                   <textarea value={agent.prompt ?? ""} onChange={(event) => update(name, { prompt: event.target.value })} rows={8} />
                 )}
@@ -800,11 +1032,13 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [document, setDocument] = useState<ConfigDocument | null>(null);
+  const [savedDocument, setSavedDocument] = useState<ConfigDocument | null>(null);
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [eventOptions, setEventOptions] = useState<string[]>([]);
   const [revision, setRevision] = useState("");
+  const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -832,10 +1066,13 @@ export default function App() {
         api<{ events: string[] }>("/api/options"),
         refreshOperationalData(),
       ]);
-      setDocument(normalizeDocument(config.document));
+      const normalized = normalizeDocument(config.document);
+      setDocument(normalized);
+      setSavedDocument(structuredClone(normalized));
       setRevision(config.revision);
       setEventOptions(options.events);
       setDirty(false);
+      setEditing(false);
       if (config.error) setError(config.error);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
@@ -851,9 +1088,27 @@ export default function App() {
   }, [refreshOperationalData]);
 
   function changeDocument(next: ConfigDocument) {
+    if (!editing) return;
     setDocument(next);
     setDirty(true);
     setNotice("");
+  }
+
+  function beginEditing() {
+    if (!document) return;
+    setSavedDocument(structuredClone(document));
+    setEditing(true);
+    setDirty(false);
+    setNotice("已进入编辑模式，修改后请选择保存或取消");
+  }
+
+  function cancelEditing() {
+    if (savedDocument) setDocument(structuredClone(savedDocument));
+    setEditing(false);
+    setDirty(false);
+    setError("");
+    setNotice("已取消编辑，未保存的修改已撤销");
+    window.setTimeout(() => setNotice(""), 3000);
   }
 
   async function save() {
@@ -865,9 +1120,12 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify({ document }),
       });
-      setDocument(normalizeDocument(result.document));
+      const normalized = normalizeDocument(result.document);
+      setDocument(normalized);
+      setSavedDocument(structuredClone(normalized));
       setRevision(result.revision);
       setDirty(false);
+      setEditing(false);
       setNotice("配置已校验、保存并通知后台热加载");
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
@@ -895,6 +1153,7 @@ export default function App() {
     { id: "rules", label: "触发规则", mark: "05" },
     { id: "runs", label: "运行与日志", mark: "06" },
   ], []);
+  const configurableTab = tab === "repositories" || tab === "environment" || tab === "agents" || tab === "rules";
 
   return (
     <div className="app-shell">
@@ -907,8 +1166,17 @@ export default function App() {
         <header className="topbar">
           <div><span className="eyebrow">MR / PR AUTOMATION</span><h1>{tabs.find((item) => item.id === tab)?.label}</h1></div>
           <div className="top-actions">
-            <label className="token-field"><span>管理 Token</span><input type="password" value={token} placeholder="本机模式可留空" onChange={(event) => setToken(event.target.value)} onBlur={() => { persistToken(token); void load(); }} /></label>
-            {tab !== "overview" && tab !== "runs" && <button className="button primary" disabled={!dirty || saving} onClick={save}>{saving ? "保存中…" : dirty ? "保存配置" : "已保存"}</button>}
+            <label className="token-field"><span>管理 Token</span><input type="password" value={token} placeholder="本机模式可留空" onChange={(event) => setToken(event.target.value)} onBlur={() => { persistToken(token); if (!editing) void load(); }} /></label>
+            {(configurableTab || editing) && (
+              editing ? (
+                <div className="button-group edit-actions">
+                  <button className="button secondary" disabled={saving} onClick={cancelEditing}>取消</button>
+                  <button className="button primary" disabled={!dirty || saving} onClick={save}>{saving ? "保存中…" : "保存配置"}</button>
+                </div>
+              ) : (
+                <button className="button primary" onClick={beginEditing}>编辑配置</button>
+              )
+            )}
           </div>
         </header>
         <div className="content">
@@ -918,10 +1186,21 @@ export default function App() {
           {!loading && document && (
             <>
               {tab === "overview" && <Overview status={status} events={events} onAction={control} />}
-              {tab === "repositories" && <RepositoriesEditor document={document} onChange={changeDocument} />}
-              {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
-              {tab === "agents" && <AgentsEditor document={document} onChange={changeDocument} />}
-              {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
+              {configurableTab && (
+                <>
+                  <div className={`edit-mode-banner ${editing ? "editing" : ""}`}>
+                    <span>{editing ? "编辑模式" : "只读模式"}</span>
+                    <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
+                  </div>
+                  <fieldset className="config-editor-surface" disabled={!editing}>
+                    {tab === "repositories" && <RepositoriesEditor document={document} onChange={changeDocument} />}
+                    {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
+                    {tab === "agents" && <AgentsEditor document={document} onChange={changeDocument} />}
+                    {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
+                  </fieldset>
+                  {tab === "environment" && <ConfigHistory />}
+                </>
+              )}
               {tab === "runs" && <RunsView runs={runs} onRefresh={() => { void refreshOperationalData(); }} />}
             </>
           )}

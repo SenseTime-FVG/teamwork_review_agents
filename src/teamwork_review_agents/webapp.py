@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from .config_manager import ConfigManager
 from .environment import render_prompt
 from .events import FIELD_EVENTS
+from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
 from .runtime import BackgroundRuntime
 
 
@@ -174,6 +175,34 @@ def create_app(
         """按运行时相同规则预览模板，未定义变量渲染为空字符串。"""
 
         return {"rendered": render_prompt(body.template, body.variables)}
+
+    @app.get("/api/prompt-files")
+    async def prompt_files() -> list[dict[str, Any]]:
+        """列出配置目录下已经导入的 Prompt 文件。"""
+
+        return await asyncio.to_thread(list_prompt_files, manager.path)
+
+    @app.post("/api/prompt-files/import")
+    async def upload_prompt_file(file: UploadFile = File(...)) -> dict[str, Any]:
+        """将浏览器选择的文本文件复制到配置旁的 prompts 目录。"""
+
+        filename = file.filename or ""
+        try:
+            content = await file.read(MAX_PROMPT_FILE_BYTES + 1)
+            if len(content) > MAX_PROMPT_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="Prompt 文件不能超过 1 MiB")
+            return await asyncio.to_thread(
+                import_prompt_file,
+                manager.path,
+                filename,
+                content,
+            )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            await file.close()
 
     @app.get("/api/runs")
     async def runs(

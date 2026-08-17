@@ -157,10 +157,10 @@ class AppConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
-    providers: dict[str, ProviderConfig]
-    repositories: list[RepositoryConfig]
-    agents: dict[str, AgentConfig]
-    rules: list[RuleConfig]
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    repositories: list[RepositoryConfig] = Field(default_factory=list)
+    agents: dict[str, AgentConfig] = Field(default_factory=dict)
+    rules: list[RuleConfig] = Field(default_factory=list)
     config_path: Path = Field(exclude=True)
     revision: str = Field(exclude=True)
 

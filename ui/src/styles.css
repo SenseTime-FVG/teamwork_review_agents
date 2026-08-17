@@ -51,11 +51,41 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .topbar h1 { margin: 3px 0 0; color: var(--bright); font-size: 23px; line-height: 1.1; letter-spacing: -.025em; }
 .eyebrow { color: #657489; font: 500 10px "SFMono-Regular", Consolas, monospace; letter-spacing: .16em; text-transform: uppercase; }
 .top-actions { display: flex; align-items: center; gap: 12px; }
+.edit-actions { flex-wrap: nowrap; }
 .token-field { display: flex; align-items: center; gap: 8px; padding: 5px 5px 5px 11px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); font-size: 11px; }
 .token-field input { width: 145px; border: 0; border-left: 1px solid var(--line); border-radius: 0 6px 6px 0; padding: 7px 9px; background: #0b111b; color: var(--text); outline: none; }
 .content { padding: 28px 32px 48px; max-width: 1680px; margin: 0 auto; }
+.config-editor-surface { min-width: 0; margin: 0; padding: 0; border: 0; }
+.config-editor-surface + .section-card { margin-top: 18px; }
+.config-editor-surface[disabled] input,
+.config-editor-surface[disabled] select,
+.config-editor-surface[disabled] textarea { color: #8997aa; background: #0b111a; cursor: default; opacity: .82; }
+.config-editor-surface[disabled] button,
+.config-editor-surface[disabled] .choice-card,
+.config-editor-surface[disabled] .file-button { pointer-events: none; cursor: default; opacity: .58; }
+.config-editor-surface[disabled] .toggle.active span { background: #709080; }
+.edit-mode-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; padding: 9px 12px; border: 1px solid #253244; border-radius: 8px; background: #0c131d; }
+.edit-mode-banner span { padding: 3px 7px; border-radius: 9px; background: #1a2431; color: #9dabbc; font-size: 9px; font-weight: 700; }
+.edit-mode-banner small { color: #69788d; font-size: 10px; }
+.edit-mode-banner.editing { border-color: #315c43; background: #0e1b15; }
+.edit-mode-banner.editing span { background: #173c29; color: var(--accent); }
+.edit-mode-banner.editing small { color: #7d9c89; }
 .page-stack, .card-list { display: flex; flex-direction: column; gap: 18px; }
 .card-list.compact { gap: 10px; }
+.setup-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 14px; border: 1px solid var(--line-soft); border-radius: 11px; background: rgba(10, 16, 25, .72); }
+.setup-step { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid #1d2836; border-radius: 8px; background: #0a1019; opacity: .58; }
+.setup-step > span { width: 24px; height: 24px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #354154; border-radius: 50%; color: #758399; font: 600 10px "SFMono-Regular", Consolas, monospace; }
+.setup-step strong, .setup-step small { display: block; }
+.setup-step strong { color: #aab7c7; font-size: 11px; }
+.setup-step small { margin-top: 3px; color: #617086; font-size: 9px; line-height: 1.4; }
+.setup-step.current { border-color: #375441; background: #0f1b15; opacity: 1; }
+.setup-step.current > span { border-color: #41805b; color: var(--accent); background: #143423; }
+.setup-step.current strong { color: #dce9e2; }
+.setup-step.complete { opacity: .82; }
+.setup-step.complete > span { border-color: #315e45; color: #77dca4; background: #112a1d; }
+.empty-config-state { padding: 24px 18px; border: 1px dashed #293546; border-radius: 9px; background: #0a1019; text-align: center; }
+.empty-config-state strong { color: #aebaca; font-size: 12px; }
+.empty-config-state p { max-width: 660px; margin: 7px auto 0; color: #657489; font-size: 10px; line-height: 1.6; }
 
 .hero-card { padding: 28px 30px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border: 1px solid #264332; border-radius: 14px; background: linear-gradient(115deg, rgba(27, 61, 43, .62), rgba(13, 24, 28, .68) 55%, rgba(13, 20, 31, .75)); box-shadow: inset 0 1px rgba(255, 255, 255, .02); }
 .hero-card h1 { margin: 8px 0 6px; color: #edf9f2; font-size: 27px; letter-spacing: -.035em; }
@@ -70,6 +100,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .button.secondary:hover:not(:disabled) { border-color: #435166; color: var(--bright); }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 7px; background: #111925; cursor: pointer; color: var(--muted); font-size: 18px; }
 .icon-button.danger:hover { color: var(--red); border-color: #623439; background: #211419; }
+.icon-button:disabled { opacity: .38; cursor: not-allowed; }
 .align-end { align-self: end; margin-bottom: 1px; }
 
 .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -123,6 +154,28 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .prompt-toolbar select { margin-left: 6px; padding: 5px 7px; border: 1px solid #293546; border-radius: 5px; background: #101823; color: var(--text); }
 .prompt-toolbar code { color: #547460; font-size: 9px; }
 .prompt-editor textarea { resize: vertical; font: 400 11px/1.7 "SFMono-Regular", Consolas, monospace; }
+.permissions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+.choice-section { padding: 15px; border: 1px solid var(--line-soft); border-radius: 9px; background: #0a111a; }
+.choice-title strong { color: var(--bright); font-size: 12px; }
+.choice-title p { margin: 5px 0 13px; color: #6e7d91; font-size: 10px; line-height: 1.55; }
+.choice-list { display: flex; flex-direction: column; gap: 7px; }
+.choice-card { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid #263243; border-radius: 8px; background: #090f18; cursor: pointer; transition: .15s ease; }
+.choice-card:hover { border-color: #3b4a5e; }
+.choice-card.selected { border-color: #3d7757; background: #102118; }
+.choice-card input { width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--accent); }
+.choice-card span, .choice-card strong, .choice-card small { display: block; }
+.choice-card strong { color: #cbd6e3; font-size: 11px; }
+.choice-card small { margin-top: 4px; color: #6f7e92; font-size: 9px; line-height: 1.45; }
+.choice-empty { padding: 18px 12px; border: 1px dashed #2a3646; border-radius: 8px; color: #68768a; text-align: center; font-size: 10px; line-height: 1.55; }
+.prompt-file-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: end; }
+.prompt-file-actions { display: flex; align-items: center; gap: 7px; }
+.prompt-file-actions select { min-width: 180px; padding: 9px 10px; border: 1px solid #263243; border-radius: 7px; background: #101823; color: var(--text); }
+.file-button { display: inline-flex; align-items: center; justify-content: center; }
+.file-button input { display: none; }
+.file-button.disabled { opacity: .45; pointer-events: none; }
+.field-help, .inline-message { grid-column: 1 / -1; margin: 0; font-size: 9px; line-height: 1.5; }
+.field-help { color: #607086; }
+.success-text { color: var(--accent); }
 .json-field { margin-top: 16px; }
 .json-field textarea { font-size: 10px; line-height: 1.55; resize: vertical; }
 .error-text { color: var(--red) !important; }
@@ -213,13 +266,17 @@ tbody tr:last-child td { border-bottom: 0; }
   .topbar { height: auto; min-height: 77px; padding: 14px 16px; }
   .topbar h1 { font-size: 19px; }
   .token-field { display: none; }
+  .edit-actions .button { padding-inline: 11px; }
   .content { padding: 18px 14px 88px; }
   .hero-card { align-items: flex-start; flex-direction: column; padding: 22px; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .metric-card { min-height: 108px; padding: 15px; }
   .section-card { padding: 16px; }
   .section-title-row { flex-direction: column; }
-  .form-grid.two, .form-grid.three, .provider-row { grid-template-columns: 1fr; }
+  .form-grid.two, .form-grid.three, .provider-row, .setup-flow { grid-template-columns: 1fr; }
+  .permissions-grid, .prompt-file-picker { grid-template-columns: 1fr; }
+  .prompt-file-actions { align-items: stretch; flex-direction: column; }
+  .prompt-file-actions select, .prompt-file-actions .button { width: 100%; }
   .history-layout { grid-template-columns: 1fr; }
   .env-row { grid-template-columns: 1fr 90px 1.3fr 31px; }
   .env-row .mini-check { display: none; }

@@ -162,6 +162,33 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path) -> None:
         )
         assert preview.json()["rendered"] == "A=1, B="
 
+        assert client.get("/api/prompt-files").json() == []
+        imported = client.post(
+            "/api/prompt-files/import",
+            files={"file": ("review prompt.md", "请审查当前变更。", "text/markdown")},
+        )
+        assert imported.status_code == 200
+        assert imported.json()["path"] == "./prompts/review-prompt.md"
+        assert client.get("/api/prompt-files").json()[0]["name"] == "review-prompt.md"
+
+        duplicate = client.post(
+            "/api/prompt-files/import",
+            files={"file": ("review prompt.md", "请审查当前变更。", "text/markdown")},
+        )
+        assert duplicate.json()["path"] == "./prompts/review-prompt.md"
+
+        renamed = client.post(
+            "/api/prompt-files/import",
+            files={"file": ("review prompt.md", "不同的内容", "text/markdown")},
+        )
+        assert renamed.json()["path"] == "./prompts/review-prompt-2.md"
+
+        unsupported = client.post(
+            "/api/prompt-files/import",
+            files={"file": ("prompt.json", "{}", "application/json")},
+        )
+        assert unsupported.status_code == 422
+
         invalid = document | {
             "agents": {
                 **document["agents"],

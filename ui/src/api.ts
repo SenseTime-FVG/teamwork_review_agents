@@ -14,14 +14,37 @@ export function setToken(token: string): void {
   }
 }
 
-function headers(extra?: HeadersInit): Headers {
+function headers(extra?: HeadersInit, contentType = true): Headers {
   const result = new Headers(extra);
-  result.set("Content-Type", "application/json");
+  if (contentType) {
+    result.set("Content-Type", "application/json");
+  }
   const token = getToken();
   if (token) {
     result.set("Authorization", `Bearer ${token}`);
   }
   return result;
+}
+
+export type ManagedPromptFile = {
+  name: string;
+  path: string;
+  size: number;
+};
+
+export async function uploadPromptFile(file: File): Promise<ManagedPromptFile> {
+  const body = new FormData();
+  body.set("file", file);
+  const response = await fetch("/api/prompt-files/import", {
+    method: "POST",
+    headers: headers(undefined, false),
+    body,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.detail ?? `导入失败：${response.status}`);
+  }
+  return result as ManagedPromptFile;
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
