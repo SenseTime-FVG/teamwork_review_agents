@@ -165,7 +165,7 @@ repositories:
           command: [bash, ci/preflight.sh]
 ```
 
-Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次；代码失败或超时会阻断 Agent，基础设施错误沿用事件重试。终态已生成但 Commit Status 回写失败时，只补发状态，不重跑仓库命令。
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次；代码失败或超时会阻断 Agent。Git、进程启动或首次状态发布等基础设施错误沿用事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
 
 Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 

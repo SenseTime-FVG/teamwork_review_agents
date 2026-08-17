@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from contextlib import contextmanager
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
@@ -97,6 +98,44 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
     assert outcome.failed_step == "slow"
     assert "测" in outcome.output
     assert len(outcome.output.encode("utf-8")) <= 62
+
+
+async def test_preflight_timeout_kills_background_process_holding_stdout(
+    tmp_path,
+) -> None:
+    """主进程提前退出时，继承 stdout 的后台进程也必须受同一超时约束。"""
+
+    child_code = "import time; time.sleep(5)"
+    parent_code = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "print('parent exited', flush=True)"
+    )
+    config = PreflightConfig.model_validate(
+        {
+            "enabled": True,
+            "timeout_seconds": 3,
+            "steps": [
+                {
+                    "name": "background",
+                    "timeout_seconds": 1,
+                    "command": [sys.executable, "-c", parent_code],
+                }
+            ],
+        }
+    )
+
+    started_at = time.monotonic()
+    outcome = await execute_preflight_steps(
+        config,
+        cwd=tmp_path,
+        environment=build_preflight_environment(),
+    )
+
+    assert outcome.status == "timed_out"
+    assert outcome.failed_step == "background"
+    assert "parent exited" in outcome.output
+    assert time.monotonic() - started_at < 3
 
 
 def test_preflight_environment_excludes_host_credentials(monkeypatch, tmp_path) -> None:

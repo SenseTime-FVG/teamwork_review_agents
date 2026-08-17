@@ -87,16 +87,16 @@ def _append_bounded_output(current: str, addition: bytes, limit: int) -> str:
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     """终止超时步骤及其子进程组。"""
 
-    if process.returncode is not None:
-        return
     try:
         if os.name == "posix":
+            # leader 可能已经退出，但继承 stdout 的后台子进程仍在同一进程组中。
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        elif process.returncode is None:
             process.kill()
     except ProcessLookupError:
         pass
-    await process.wait()
+    if process.returncode is None:
+        await process.wait()
 
 
 async def _read_bounded_stream(
@@ -159,14 +159,22 @@ async def execute_preflight_steps(
         output_reader = asyncio.create_task(
             _read_bounded_stream(process.stdout, config.max_output_bytes)
         )
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=step_timeout,
-            )
-        except TimeoutError:
+        process_waiter = asyncio.create_task(process.wait())
+        completed, pending = await asyncio.wait(
+            {process_waiter, output_reader},
+            timeout=step_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        if pending:
             await _terminate_process(process)
-            step_output = await output_reader
+            if not process_waiter.done():
+                await process_waiter
+            try:
+                step_output = await asyncio.wait_for(output_reader, timeout=1)
+            except TimeoutError:
+                output_reader.cancel()
+                await asyncio.gather(output_reader, return_exceptions=True)
+                step_output = ""
             output = _append_bounded_output(
                 output,
                 step_output.encode("utf-8"),
@@ -179,7 +187,9 @@ async def execute_preflight_steps(
                 error=f"步骤 {step.name} 超过 {step_timeout:.0f} 秒",
             )
 
-        step_output = await output_reader
+        assert process_waiter in completed
+        assert output_reader in completed
+        step_output = output_reader.result()
         output = _append_bounded_output(
             output,
             step_output.encode("utf-8"),
