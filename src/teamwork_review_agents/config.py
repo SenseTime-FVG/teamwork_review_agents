@@ -450,6 +450,13 @@ class AppConfig(BaseModel):
                 raise ValueError(
                     f"仓库 {repository.id} 引用了不存在的 Provider：{repository.provider}"
                 )
+            if (
+                repository.preflight.enabled
+                and self.providers[repository.provider].kind != "github"
+            ):
+                raise ValueError(
+                    f"仓库 {repository.id} 启用了 Preflight，第一版仅支持 GitHub"
+                )
 
         agent_names = set(self.agents)
         skill_names = set(self.skills)
