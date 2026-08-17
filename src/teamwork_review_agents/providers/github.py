@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from ..config import RepositoryConfig
 from ..models import (
@@ -41,6 +41,26 @@ class GitHubProvider(BaseProvider):
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "teamwork-review-agents",
         }
+
+    async def set_commit_status(
+        self,
+        repository: RepositoryConfig,
+        sha: str,
+        *,
+        state: Literal["pending", "success", "failure", "error"],
+        context: str,
+        description: str,
+    ) -> None:
+        """为 PR Head 写入可用于 GitHub Ruleset 的 Commit Status。"""
+
+        await self.post_json(
+            f"repos/{repository.project}/statuses/{sha}",
+            {
+                "state": state,
+                "context": context,
+                "description": description[:140],
+            },
+        )
 
     async def list_change_requests(
         self,

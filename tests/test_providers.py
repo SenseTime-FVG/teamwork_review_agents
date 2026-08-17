@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+
+import httpx
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig, ScannerConfig
 from teamwork_review_agents.providers.github import GitHubProvider
@@ -394,3 +397,53 @@ async def test_github_timeline_first_window_reads_back_across_pages() -> None:
     assert fetched_pages == [3, 2]
     assert [item.id for item in result.activities] == ["4", "5", "6"]
     assert result.cursor == {"page": 3, "item_id": "6"}
+
+
+async def test_github_provider_publishes_bounded_commit_status() -> None:
+    """本地 CI 状态必须写到准确的 Head SHA，且描述不能超过平台上限。"""
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"id": 1})
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="https://api.github.com/",
+        transport=httpx.MockTransport(handler),
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    try:
+        await provider.set_commit_status(
+            repository,
+            "a" * 40,
+            state="failure",
+            context="teamwork/local-ci",
+            description="失败" * 100,
+        )
+    finally:
+        await provider.close()
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == f"/repos/owner/demo/statuses/{'a' * 40}"
+    payload = json.loads(requests[0].content)
+    assert payload["state"] == "failure"
+    assert payload["context"] == "teamwork/local-ci"
+    assert len(payload["description"]) == 140

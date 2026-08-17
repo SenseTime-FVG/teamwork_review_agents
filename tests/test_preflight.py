@@ -167,6 +167,24 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     def fake_worktree(*_args, **_kwargs):
         yield tmp_path
 
+    statuses: list[str] = []
+
+    class FakeProvider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def set_commit_status(self, _repository, _sha, *, state, **_kwargs):
+            statuses.append(state)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+
     monkeypatch.setattr(
         "teamwork_review_agents.preflight.temporary_change_request_worktree",
         fake_worktree,
@@ -182,3 +200,4 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     assert second.status == "success"
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
+    assert statuses == ["pending", "success"]

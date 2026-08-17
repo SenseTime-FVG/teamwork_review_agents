@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from typing import Literal
 
 import httpx
 
@@ -102,6 +103,33 @@ class BaseProvider(ABC):
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
+    async def post_json(self, path: str, payload: dict[str, object]) -> object:
+        """执行 POST，并将平台错误转换为不泄露凭据的异常。"""
+
+        try:
+            response = await self.client.post(path, json=payload)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(
+                f"Provider {self.name} 请求失败：{exc.response.status_code} {path}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
+    async def set_commit_status(
+        self,
+        repository: RepositoryConfig,
+        sha: str,
+        *,
+        state: Literal["pending", "success", "failure", "error"],
+        context: str,
+        description: str,
+    ) -> None:
+        """写入提交状态；具体平台必须显式实现。"""
+
+        raise ProviderError(f"Provider {self.name} 不支持提交状态回写")
 
     @abstractmethod
     async def list_change_requests(

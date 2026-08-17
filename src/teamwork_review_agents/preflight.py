@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Literal
 
 from .config import AppConfig, PreflightConfig
+from .environment import resolve_provider_token
 from .models import ChangeEvent, PreflightResult, stable_hash
+from .providers import create_provider
 from .state import StateStore
 from .workspace import temporary_change_request_worktree
 
@@ -188,6 +190,19 @@ def preflight_idempotency_key(config: AppConfig, event: ChangeEvent) -> str:
     )
 
 
+def _status_description(result: PreflightResult) -> str:
+    """返回适合远端 Commit Status 的简短说明。"""
+
+    if result.status == "success":
+        return "本地 CI 全部通过"
+    if result.status == "failure":
+        suffix = "" if result.exit_code is None else f"，退出码 {result.exit_code}"
+        return f"步骤 {result.failed_step or 'unknown'} 失败{suffix}"
+    if result.status == "timed_out":
+        return f"步骤 {result.failed_step or 'unknown'} 超时"
+    return "本地 CI 基础设施错误"
+
+
 class PreflightExecutor:
     """准备隔离 worktree、执行 CI，并持久化可复用结果。"""
 
@@ -200,7 +215,7 @@ class PreflightExecutor:
         """返回当前 Head 的已有终态，或执行一次新的 Preflight。"""
 
         repository = self.repositories[event.repository_id]
-        provider = self.config.providers[repository.provider]
+        provider_config = self.config.providers[repository.provider]
         key = preflight_idempotency_key(self.config, event)
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
@@ -231,26 +246,81 @@ class PreflightExecutor:
                 error="无法创建或读取 Preflight 运行记录",
             )
 
-        manager = temporary_change_request_worktree(provider, repository, event.new)
-        checkout: Path | None = None
+        result: PreflightResult
         try:
-            checkout = await asyncio.to_thread(manager.__enter__)
-            outcome = await execute_preflight_steps(
-                repository.preflight,
-                cwd=checkout,
-                environment=build_preflight_environment(),
-            )
-            result = PreflightResult(
-                run_id=reservation.run_id,
-                repository_id=repository.id,
-                number=event.number,
-                head_sha=event.new.head_sha,
-                status=outcome.status,
-                failed_step=outcome.failed_step,
-                exit_code=outcome.exit_code,
-                output=outcome.output,
-                error=outcome.error,
-            )
+            async with create_provider(
+                repository.provider,
+                provider_config,
+                self.config.scanner,
+                token=resolve_provider_token(self.config, provider_config),
+            ) as remote:
+                try:
+                    await remote.set_commit_status(
+                        repository,
+                        event.new.head_sha,
+                        state="pending",
+                        context=repository.preflight.status_context,
+                        description="本地 CI 正在运行",
+                    )
+                    manager = temporary_change_request_worktree(
+                        provider_config,
+                        repository,
+                        event.new,
+                    )
+                    checkout: Path | None = None
+                    try:
+                        checkout = await asyncio.to_thread(manager.__enter__)
+                        outcome = await execute_preflight_steps(
+                            repository.preflight,
+                            cwd=checkout,
+                            environment=build_preflight_environment(),
+                        )
+                    finally:
+                        if checkout is not None:
+                            await asyncio.to_thread(manager.__exit__, None, None, None)
+                    result = PreflightResult(
+                        run_id=reservation.run_id,
+                        repository_id=repository.id,
+                        number=event.number,
+                        head_sha=event.new.head_sha,
+                        status=outcome.status,
+                        failed_step=outcome.failed_step,
+                        exit_code=outcome.exit_code,
+                        output=outcome.output,
+                        error=outcome.error,
+                    )
+                    remote_state = {
+                        "success": "success",
+                        "failure": "failure",
+                        "timed_out": "failure",
+                        "error": "error",
+                    }[result.status]
+                    await remote.set_commit_status(
+                        repository,
+                        event.new.head_sha,
+                        state=remote_state,
+                        context=repository.preflight.status_context,
+                        description=_status_description(result),
+                    )
+                except Exception as exc:
+                    result = PreflightResult(
+                        run_id=reservation.run_id,
+                        repository_id=repository.id,
+                        number=event.number,
+                        head_sha=event.new.head_sha,
+                        status="error",
+                        error=str(exc),
+                    )
+                    try:
+                        await remote.set_commit_status(
+                            repository,
+                            event.new.head_sha,
+                            state="error",
+                            context=repository.preflight.status_context,
+                            description=_status_description(result),
+                        )
+                    except Exception:
+                        pass
         except Exception as exc:
             result = PreflightResult(
                 run_id=reservation.run_id,
@@ -260,19 +330,6 @@ class PreflightExecutor:
                 status="error",
                 error=str(exc),
             )
-        finally:
-            if checkout is not None:
-                try:
-                    await asyncio.to_thread(manager.__exit__, None, None, None)
-                except Exception as exc:
-                    result = PreflightResult(
-                        run_id=reservation.run_id,
-                        repository_id=repository.id,
-                        number=event.number,
-                        head_sha=event.new.head_sha,
-                        status="error",
-                        error=f"清理 Preflight worktree 失败：{exc}",
-                    )
 
         await asyncio.to_thread(self.store.finish_preflight_run, result)
         return result
