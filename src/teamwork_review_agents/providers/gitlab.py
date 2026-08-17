@@ -1,0 +1,115 @@
+"""GitLab Merge Request API 适配器。"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+from urllib.parse import quote
+
+from ..config import RepositoryConfig
+from ..models import ChangeRequestSnapshot
+from .base import BaseProvider, ProviderError, parse_datetime
+
+
+class GitLabProvider(BaseProvider):
+    """将 GitLab Merge Request 规范化为统一快照。"""
+
+    def headers(self) -> dict[str, str]:
+        return {
+            "PRIVATE-TOKEN": self.token,
+            "Accept": "application/json",
+            "User-Agent": "teamwork-review-agents",
+        }
+
+    async def list_change_requests(
+        self,
+        repository: RepositoryConfig,
+    ) -> list[ChangeRequestSnapshot]:
+        """分页读取最近更新的 MR，并补充详情与审批信息。"""
+
+        project = quote(repository.project, safe="")
+        merge_requests: list[dict[str, Any]] = []
+        for page in range(1, self.scanner.max_pages + 1):
+            payload = await self.get_json(
+                f"projects/{project}/merge_requests",
+                params={
+                    "scope": "all",
+                    "state": "all",
+                    "order_by": "updated_at",
+                    "sort": "desc",
+                    "per_page": self.scanner.page_size,
+                    "page": page,
+                },
+            )
+            if not isinstance(payload, list):
+                raise ProviderError("GitLab Merge Request 列表返回格式异常")
+            merge_requests.extend(item for item in payload if isinstance(item, dict))
+            if len(payload) < self.scanner.page_size:
+                break
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def guarded(item: dict[str, Any]) -> ChangeRequestSnapshot:
+            async with semaphore:
+                return await self._build_snapshot(repository, project, item)
+
+        return await asyncio.gather(*(guarded(item) for item in merge_requests))
+
+    async def _build_snapshot(
+        self,
+        repository: RepositoryConfig,
+        project: str,
+        item: dict[str, Any],
+    ) -> ChangeRequestSnapshot:
+        """并行读取单个 MR 的详情与审批。"""
+
+        iid = int(item["iid"])
+        detail_result, approvals_result = await asyncio.gather(
+            self.get_json(f"projects/{project}/merge_requests/{iid}"),
+            self.get_optional_json(
+                f"projects/{project}/merge_requests/{iid}/approvals",
+                {},
+            ),
+        )
+        if not isinstance(detail_result, dict):
+            raise ProviderError(f"GitLab MR !{iid} 详情返回格式异常")
+        detail = detail_result
+        approvals = approvals_result if isinstance(approvals_result, dict) else {}
+
+        state = str(detail.get("state") or "opened")
+        if state == "merged":
+            normalized_state = "merged"
+        elif state == "closed":
+            normalized_state = "closed"
+        else:
+            normalized_state = "opened"
+
+        pipeline = detail.get("head_pipeline") or {}
+        if not isinstance(pipeline, dict):
+            pipeline = {}
+        approved_by = approvals.get("approved_by") or []
+        diff_refs = detail.get("diff_refs") or {}
+        if not isinstance(diff_refs, dict):
+            diff_refs = {}
+        return ChangeRequestSnapshot(
+            provider=self.name,
+            repository_id=repository.id,
+            number=iid,
+            title=str(detail.get("title") or ""),
+            state=normalized_state,
+            draft=bool(detail.get("draft", detail.get("work_in_progress", False))),
+            source_branch=str(detail.get("source_branch") or ""),
+            target_branch=str(detail.get("target_branch") or ""),
+            head_sha=str(detail.get("sha") or diff_refs.get("head_sha") or ""),
+            labels=tuple(sorted(str(label) for label in detail.get("labels", []))),
+            approvals=len(approved_by),
+            pipeline_status=str(pipeline.get("status") or "unknown"),
+            merge_status=str(
+                detail.get("detailed_merge_status")
+                or detail.get("merge_status")
+                or "unknown"
+            ),
+            updated_at=parse_datetime(detail.get("updated_at")),
+            web_url=str(detail.get("web_url") or ""),
+            raw={"merge_request": detail, "approvals": approvals},
+        )

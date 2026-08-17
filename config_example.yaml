@@ -1,0 +1,144 @@
+database:
+  path: ./data/teamwork-review-agents.db
+
+scanner:
+  interval_seconds: 60
+  max_pages: 2
+  page_size: 50
+  emit_initial_events: false
+
+runtime:
+  max_concurrent_agents: 4
+  lock_timeout_seconds: 300
+  lock_ttl_seconds: 120
+  max_sub_agent_depth: 2
+  max_agent_runs_per_root: 8
+  event_retry_count: 2
+
+web:
+  host: 127.0.0.1
+  port: 8080
+  config_poll_seconds: 2
+  log_retention_days: 30
+  # 非本机监听时必须启用，并在宿主机设置同名变量。
+  # admin_token_env: TEAMWORK_ADMIN_TOKEN
+
+environment:
+  global:
+    ORGANIZATION_NAME: Example Team
+    DOCS_LANGUAGE: zh-CN
+    INTERNAL_API_TOKEN:
+      from_system: TEAMWORK_INTERNAL_API_TOKEN
+      secret: true
+      expose_to_prompt: false
+      expose_to_process: true
+
+providers:
+  github-main:
+    kind: github
+    base_url: https://api.github.com
+    token_env: GITHUB_TOKEN
+
+  gitlab-main:
+    kind: gitlab
+    base_url: https://gitlab.example.com/api/v4
+    token_env: GITLAB_TOKEN
+
+repositories:
+  - id: example-github
+    provider: github-main
+    project: owner/repository
+    workspace: ./workspaces/example-github
+    enabled: false
+    environment:
+      REPOSITORY_TIER: production
+
+  - id: example-gitlab
+    provider: gitlab-main
+    project: group/project
+    workspace: ./workspaces/example-gitlab
+    enabled: false
+    environment: {}
+
+agents:
+  code-reviewer:
+    prompt_file: ./prompts/code-reviewer.md
+    sandbox: read-only
+    timeout_seconds: 1200
+    write_scopes: []
+    allowed_sub_agents:
+      - security-reviewer
+    environment:
+      REVIEW_STYLE: concise
+
+  security-reviewer:
+    prompt_file: ./prompts/security-reviewer.md
+    sandbox: read-only
+    timeout_seconds: 1200
+    write_scopes: []
+    allowed_sub_agents: []
+    environment: {}
+
+  docs-updater:
+    prompt_file: ./prompts/docs-updater.md
+    sandbox: workspace-write
+    timeout_seconds: 1800
+    write_scopes:
+      - workspace
+      - change_request
+    allowed_sub_agents: []
+    environment:
+      DOCS_LANGUAGE: zh-CN
+
+  merge-manager:
+    prompt_file: ./prompts/merge-manager.md
+    sandbox: read-only
+    timeout_seconds: 600
+    write_scopes:
+      - change_request
+    allowed_sub_agents:
+      - code-reviewer
+    environment: {}
+
+rules:
+  - name: review-new-commit
+    events:
+      - change_request.commits_changed
+    conditions:
+      state: opened
+      draft: false
+    agents:
+      - code-reviewer
+
+  - name: review-security-change
+    events:
+      - change_request.labels_changed
+    conditions:
+      state: opened
+      labels__contains: security
+    agents:
+      - security-reviewer
+
+  - name: update-docs-after-merge
+    events:
+      - change_request.merged
+    agents:
+      - docs-updater
+
+  - name: check-merge-readiness
+    events:
+      - change_request.pipeline_changed
+      - change_request.approvals_changed
+      - change_request.merge_status_changed
+    conditions:
+      state: opened
+      draft: false
+      pipeline_status__in:
+        - success
+        - skipped
+      merge_status__in:
+        - mergeable
+        - can_be_merged
+      approvals__gte: 2
+    agents:
+      - merge-manager

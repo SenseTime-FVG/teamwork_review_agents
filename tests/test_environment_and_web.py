@@ -1,0 +1,212 @@
+"""分层环境、配置管理和 Web API 测试。"""
+
+from __future__ import annotations
+
+import yaml
+from fastapi.testclient import TestClient
+
+from teamwork_review_agents.config import load_config
+from teamwork_review_agents.config_manager import ConfigManager
+from teamwork_review_agents.environment import MASK, SecretRedactor, render_prompt, resolve_environment
+from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.models import AgentResult
+from teamwork_review_agents.webapp import create_app
+
+
+def write_config(tmp_path):
+    """创建包含两级 Secret 和内联 Prompt 的最小配置。"""
+
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    document = {
+        "database": {"path": str(tmp_path / "state.db")},
+        "scanner": {"interval_seconds": 60},
+        "environment": {
+            "global": {
+                "LEVEL": "global",
+                "GLOBAL_SECRET": {
+                    "from_system": "TEST_GLOBAL_SECRET",
+                    "secret": True,
+                },
+            }
+        },
+        "providers": {
+            "provider-main": {
+                "kind": "github",
+                "base_url": "https://api.github.com",
+                "token_env": "GITHUB_TEST_TOKEN",
+            }
+        },
+        "repositories": [
+            {
+                "id": "first",
+                "provider": "provider-main",
+                "project": "owner/first",
+                "workspace": str(first_workspace),
+                "environment": {
+                    "LEVEL": "repository",
+                    "REPOSITORY_SECRET": {
+                        "value": "first-secret",
+                        "secret": True,
+                    },
+                },
+            },
+            {
+                "id": "second",
+                "provider": "provider-main",
+                "project": "owner/second",
+                "workspace": str(second_workspace),
+                "environment": {
+                    "REPOSITORY_SECRET": {
+                        "value": "second-secret",
+                        "secret": True,
+                    }
+                },
+            },
+        ],
+        "agents": {
+            "reviewer": {
+                "prompt": "级别=${{LEVEL}} Secret=${{GLOBAL_SECRET}} Missing=${{MISSING}}",
+                "sandbox": "read-only",
+                "environment": {
+                    "LEVEL": "agent",
+                    "MR_NUMBER": "不能覆盖运行变量",
+                },
+            }
+        },
+        "rules": [
+            {
+                "name": "review",
+                "events": ["change_request.discovered"],
+                "agents": ["reviewer"],
+            }
+        ],
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_environment_precedence_template_and_redaction(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("TEST_GLOBAL_SECRET", "system-secret")
+    config = load_config(config_path)
+    repository = config.repository_map()["first"]
+    snapshot = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+    )
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    resolved = resolve_environment(
+        config,
+        repository,
+        config.agents["reviewer"],
+        event,
+        "run-test",
+    )
+
+    assert resolved.all_values["LEVEL"] == "agent"
+    assert resolved.all_values["MR_NUMBER"] == "7"
+    assert resolved.prompt_values["GLOBAL_SECRET"] == ""
+    assert resolved.process_values["GLOBAL_SECRET"] == "system-secret"
+    assert resolved.audit_values["GLOBAL_SECRET"] == MASK
+    assert render_prompt("${{LEVEL}}/${{MISSING}}", resolved.prompt_values) == "agent/"
+    assert SecretRedactor(resolved.secret_values).text(
+        "system-secret first-secret"
+    ) == f"{MASK} {MASK}"
+
+
+def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> None:
+    config_path = write_config(tmp_path)
+    manager = ConfigManager(config_path)
+    document = manager.document()
+    assert document["repositories"][0]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
+    assert document["repositories"][1]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
+
+    document["repositories"].reverse()
+    manager.save(document)
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    secrets = {
+        item["id"]: item["environment"]["REPOSITORY_SECRET"]["value"]
+        for item in saved["repositories"]
+    }
+    assert secrets == {"first": "first-secret", "second": "second-secret"}
+    versions = manager.store.list_config_versions()
+    assert versions
+    assert MASK in manager.store.get_config_version(versions[0]["revision"])["content"]
+    assert "first-secret" not in manager.store.get_config_version(versions[0]["revision"])["content"]
+
+
+def test_web_api_config_preview_logs_and_static_ui(tmp_path) -> None:
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        assert client.get("/api/health").json()["status"] == "ok"
+        response = client.get("/api/config")
+        assert response.status_code == 200
+        document = response.json()["document"]
+        assert document["repositories"][0]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
+
+        preview = client.post(
+            "/api/prompts/preview",
+            json={"template": "A=${{A}}, B=${{B}}", "variables": {"A": "1"}},
+        )
+        assert preview.json()["rendered"] == "A=1, B="
+
+        invalid = document | {
+            "agents": {
+                **document["agents"],
+                "reviewer": {**document["agents"]["reviewer"], "prompt": ""},
+            }
+        }
+        assert client.put("/api/config", json={"document": invalid}).status_code == 422
+
+        store = app.state.config_manager.store
+        reservation = store.begin_agent_run(
+            proposed_run_id="run-web",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key="web-test",
+            event_id=None,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key="github:first:7",
+            prompt="测试 Prompt",
+            environment={"SECRET": MASK},
+            config_revision="revision-test",
+            max_attempts=1,
+        )
+        assert reservation is not None
+        store.append_run_log(
+            "run-web",
+            stream="stdout",
+            event_type="item.completed",
+            payload={"message": "完成"},
+        )
+        store.finish_agent_run(
+            AgentResult(
+                run_id="run-web",
+                root_run_id="run-web",
+                agent_name="reviewer",
+                status="completed",
+                final_message="完成",
+            )
+        )
+        assert client.get("/api/runs/run-web").json()["environment"] == {"SECRET": MASK}
+        assert client.get("/api/runs/run-web/logs").json()[0]["event_type"] == "item.completed"
+        stream = client.get("/api/runs/run-web/stream")
+        assert "event: item.completed" in stream.text
+        assert "event: end" in stream.text
+
+        static = client.get("/")
+        assert static.status_code == 200
+        assert "Teamwork Review Agents" in static.text

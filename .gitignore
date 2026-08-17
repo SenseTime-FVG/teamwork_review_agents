@@ -1,0 +1,11 @@
+.idea/
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+config.yaml
+ui/node_modules/
+ui/*.tsbuildinfo
+data/*.db
+data/*.db-shm
+data/*.db-wal

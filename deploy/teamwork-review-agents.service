@@ -1,0 +1,19 @@
+[Unit]
+Description=Teamwork Review Agents 后台服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=teamwork-agents
+Group=teamwork-agents
+WorkingDirectory=/opt/teamwork-review-agents
+EnvironmentFile=/etc/teamwork-review-agents.env
+ExecStart=/opt/teamwork-review-agents/.venv/bin/teamwork-review-agents serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=1800
+
+[Install]
+WantedBy=multi-user.target
