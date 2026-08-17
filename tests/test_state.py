@@ -490,6 +490,11 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert saved is not None
     assert saved.status == "success"
     assert saved.output == "4 tests passed"
+    assert saved.status_published is False
+    store.mark_preflight_status_published(saved.run_id)
+    published = store.load_preflight_result("demo:7:sha-a:revision-a")
+    assert published is not None
+    assert published.status_published is True
     assert store.begin_preflight_run(
         proposed_run_id="after-success",
         idempotency_key="demo:7:sha-a:revision-a",

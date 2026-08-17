@@ -123,6 +123,7 @@ class PreflightResult(BaseModel):
     exit_code: int | None = None
     output: str = ""
     error: str | None = None
+    status_published: bool = False
 
 
 class InvocationContext(BaseModel):

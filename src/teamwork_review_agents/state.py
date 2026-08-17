@@ -154,6 +154,7 @@ class StateStore:
                     exit_code INTEGER,
                     output TEXT NOT NULL DEFAULT '',
                     error TEXT,
+                    status_published INTEGER NOT NULL DEFAULT 0,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -216,6 +217,12 @@ class StateStore:
                 connection,
                 "agent_runs",
                 "cancel_requested",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "preflight_runs",
+                "status_published",
                 "INTEGER NOT NULL DEFAULT 0",
             )
 
@@ -775,7 +782,7 @@ class StateStore:
             row = connection.execute(
                 """
                 SELECT run_id, repository_id, number, head_sha, status,
-                       failed_step, exit_code, output, error
+                       failed_step, exit_code, output, error, status_published
                 FROM preflight_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -792,6 +799,7 @@ class StateStore:
             exit_code=row["exit_code"],
             output=str(row["output"] or ""),
             error=row["error"],
+            status_published=bool(row["status_published"]),
         )
 
     def finish_preflight_run(self, result: PreflightResult) -> None:
@@ -802,7 +810,7 @@ class StateStore:
                 """
                 UPDATE preflight_runs
                 SET status = ?, failed_step = ?, exit_code = ?, output = ?,
-                    error = ?, finished_at = ?
+                    error = ?, status_published = ?, finished_at = ?
                 WHERE run_id = ?
                 """,
                 (
@@ -811,9 +819,23 @@ class StateStore:
                     result.exit_code,
                     result.output,
                     result.error,
+                    int(result.status_published),
                     time.time(),
                     result.run_id,
                 ),
+            )
+
+    def mark_preflight_status_published(self, run_id: str) -> None:
+        """记录终态 Commit Status 已成功发布，重试时无需重新执行 CI。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status_published = 1
+                WHERE run_id = ?
+                """,
+                (run_id,),
             )
 
     def begin_agent_run(

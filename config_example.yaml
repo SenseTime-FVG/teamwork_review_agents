@@ -19,7 +19,7 @@ database:
 #   api_page_size: 50
 #   # 只控制首次建立快照时是否额外产生 discovered；扫描周期内真实发生的
 #   # opened、closed、reopened 等事件始终会输出，不受该开关影响。
-#   # 启用仓库 Preflight 时应设为 true，让新 PR 首次扫描即进入门禁。
+#   # 启用仓库 Preflight 时，该仓库会自动产生首次事件，不受此开关影响。
 #   emit_initial_events: false
 
 # 可选：Codex Agent、sub-agent、重试和写资源锁参数。
@@ -164,7 +164,8 @@ web:
 #     # 具体命令和 CI 脚本由目标仓库维护；当前仅支持 GitHub Commit Status。
 #     preflight:
 #       enabled: true
-#       # 应同时配置为 GitHub Ruleset 的 required status check。
+#       # 仅运行可信内部 PR；环境会过滤，但这不是容器或系统级安全沙箱。
+#       # 应同时将此名称配置为 GitHub Ruleset 的 required status check。
 #       status_context: teamwork/local-ci
 #       # 全部步骤共享的总超时和最大持久化日志字节数。
 #       timeout_seconds: 1800

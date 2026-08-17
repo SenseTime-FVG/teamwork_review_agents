@@ -152,3 +152,41 @@ async def test_preflight_infrastructure_error_requeues_event(
     assert [pending.id for pending in orchestrator.store.pending_events()] == [event.id]
     assert summary.preflight_errors == 1
     assert any("GitHub 状态 API 不可用" in error for error in summary.errors)
+
+
+async def test_preflight_repository_emits_initial_event_without_global_opt_in(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """启用门禁的仓库必须在首次发现 PR 时自动进入 CI，不能静默只建快照。"""
+
+    config = preflight_config(tmp_path)
+    assert config.scanner.emit_initial_events is False
+    snapshot = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        head_sha="c" * 40,
+    )
+
+    class FakeProvider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def list_change_requests(self, _repository, *, updated_since=None):
+            return [snapshot]
+
+    monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+
+    await orchestrator.scan(CycleSummary())
+
+    events = orchestrator.store.pending_events()
+    assert [event.type for event in events] == ["change_request.discovered"]

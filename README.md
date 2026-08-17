@@ -147,6 +147,7 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 ```yaml
 scanner:
+  # Preflight 仓库会自动产生首次事件；显式开启后，其他仓库也会产生。
   emit_initial_events: true
 
 repositories:
@@ -164,9 +165,11 @@ repositories:
           command: [bash, ci/preflight.sh]
 ```
 
-Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。命令以参数数组执行且不经过 shell；同一仓库、PR、Head SHA 和配置版本只运行一次。代码失败或超时会阻断 Agent；Git、进程或平台 API 等基础设施错误沿用事件重试。
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次；代码失败或超时会阻断 Agent，基础设施错误沿用事件重试。终态已生成但 Commit Status 回写失败时，只补发状态，不重跑仓库命令。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限，但不会传给 CI 子进程或 Codex。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。当前 Preflight 通过 YAML 配置，具体步骤、工具安装和目标仓库脚本均由接入仓库维护。
+Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+
+Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 
 ## 常用命令
 

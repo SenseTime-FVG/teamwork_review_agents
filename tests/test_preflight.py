@@ -72,7 +72,7 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
         {
             "enabled": True,
             "timeout_seconds": 3,
-            "max_output_bytes": 64,
+            "max_output_bytes": 62,
             "steps": [
                 {
                     "name": "slow",
@@ -80,7 +80,7 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
                     "command": [
                         sys.executable,
                         "-c",
-                        "import time; print('x' * 200, flush=True); time.sleep(30)",
+                        "import time; print('测' * 200, flush=True); time.sleep(30)",
                     ],
                 }
             ],
@@ -95,20 +95,23 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
 
     assert outcome.status == "timed_out"
     assert outcome.failed_step == "slow"
-    assert len(outcome.output.encode("utf-8")) <= 64
+    assert "测" in outcome.output
+    assert len(outcome.output.encode("utf-8")) <= 62
 
 
-def test_preflight_environment_excludes_host_credentials(monkeypatch) -> None:
+def test_preflight_environment_excludes_host_credentials(monkeypatch, tmp_path) -> None:
     """被测 PR 代码不得继承 Provider、Codex 或 OpenAI 凭据。"""
 
     monkeypatch.setenv("GITHUB_TOKEN", "provider-secret")
     monkeypatch.setenv("CODEX_API_KEY", "codex-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("HOME", "/home/service-with-credentials")
     monkeypatch.setenv("PATH", "/safe/bin")
 
-    environment = build_preflight_environment()
+    environment = build_preflight_environment(home=tmp_path)
 
     assert environment["PATH"] == "/safe/bin"
+    assert environment["HOME"] == str(tmp_path)
     assert "GITHUB_TOKEN" not in environment
     assert "CODEX_API_KEY" not in environment
     assert "OPENAI_API_KEY" not in environment
@@ -201,3 +204,96 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
     assert statuses == ["pending", "success"]
+
+
+async def test_preflight_retries_only_final_status_delivery(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """本地命令已有终态后，状态回写失败只能补发，不能重跑命令。"""
+
+    counter = tmp_path / "counter.txt"
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {
+                                "name": "count",
+                                "command": [
+                                    sys.executable,
+                                    "-c",
+                                    f"from pathlib import Path; p=Path({str(counter)!r}); p.write_text((p.read_text() if p.exists() else '')+'run\\n')",
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    snapshot = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        head_sha="c" * 40,
+    )
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+
+    @contextmanager
+    def fake_worktree(*_args, **_kwargs):
+        yield tmp_path
+
+    statuses: list[str] = []
+    final_attempts = 0
+
+    class FakeProvider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def set_commit_status(self, _repository, _sha, *, state, **_kwargs):
+            nonlocal final_attempts
+            statuses.append(state)
+            if state == "success":
+                final_attempts += 1
+                if final_attempts == 1:
+                    raise RuntimeError("temporary GitHub outage")
+
+    monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        fake_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = PreflightExecutor(config, store)
+
+    first = await executor.ensure_passed(event)
+    second = await executor.ensure_passed(event)
+
+    assert first.status == "error"
+    assert second.status == "success"
+    assert counter.read_text(encoding="utf-8") == "run\n"
+    assert statuses == ["pending", "success", "success"]

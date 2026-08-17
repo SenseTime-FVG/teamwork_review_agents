@@ -285,6 +285,7 @@ class Orchestrator:
                                         event_window_start=event_window_start,
                                         emit_discovered=(
                                             self.config.scanner.emit_initial_events
+                                            or repository.preflight.enabled
                                         ),
                                         batch_id=scan_batch_id,
                                     )
