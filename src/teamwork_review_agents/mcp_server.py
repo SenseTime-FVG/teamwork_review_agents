@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp.server import FastMCP, Settings
@@ -21,9 +23,14 @@ mcp = FastMCP(
     "teamwork-agent-gateway",
     instructions=(
         "invoke_agent 只能调用当前 Agent 配置白名单中的 sub-agent。"
-        "委托内容必须具体、最小化，并复用当前仓库和变更请求上下文。"
+        "委托内容必须具体、最小化；sub-agent 只自动复用当前仓库上下文，"
+        "是否传递 MR / PR 信息由父 Agent 决定。"
     ),
 )
+
+
+# 一个父 Agent 的 MCP 进程内，共享目录或写源分支的委托必须串行。
+_sub_agent_write_lock = asyncio.Lock()
 
 
 @mcp.tool(
@@ -61,20 +68,25 @@ async def invoke_agent(
         raise RuntimeError(
             f"检测到 Agent 调用环：{' -> '.join((*context.call_chain, agent_name))}"
         )
+    child = config.agents[agent_name]
 
     store = StateStore(config.database.path)
     store.initialize()
     executor = AgentExecutor(config, store)
-    result = await executor.execute(
-        agent_name=agent_name,
-        event=context.event,
-        task=task,
-        extra_context=extra_context,
-        root_run_id=context.root_run_id,
-        parent_run_id=context.run_id,
-        depth=child_depth,
-        call_chain=context.call_chain,
-        idempotency_key=sub_agent_idempotency_key(
+    execute_arguments = {
+        "agent_name": agent_name,
+        "event": context.event,
+        "task": task,
+        "extra_context": extra_context,
+        "root_run_id": context.root_run_id,
+        "parent_run_id": context.run_id,
+        "depth": child_depth,
+        "call_chain": context.call_chain,
+        "inherit_workspace": context.inherit_workspace,
+        "parent_workspace": (
+            Path(context.active_workspace) if context.active_workspace else None
+        ),
+        "idempotency_key": sub_agent_idempotency_key(
             root_run_id=context.root_run_id,
             parent_run_id=context.run_id,
             agent_name=agent_name,
@@ -82,7 +94,12 @@ async def invoke_agent(
             task=task,
             extra_context=extra_context,
         ),
-    )
+    }
+    if context.inherit_workspace or "workspace" in child.write_scopes:
+        async with _sub_agent_write_lock:
+            result = await executor.execute(**execute_arguments)
+    else:
+        result = await executor.execute(**execute_arguments)
     if result is None:
         return {
             "status": "deduplicated",

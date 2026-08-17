@@ -1,7 +1,7 @@
 # Teamwork Review Agents 完整配置参考
 #
 # 这个文件可以直接复制为 config.yaml。只有 database 和 web 保持启用，
-# Provider、仓库、Agent 与规则均为注释示例，因此首次打开管理 UI 仍是空白状态。
+# Provider、仓库、Skill、Agent 与规则均为注释示例，因此首次打开管理 UI 仍是空白状态。
 # 所有相对路径都以 config.yaml 所在目录为基准。
 
 # 必填：SQLite 用于保存 MR/PR 快照、事件、运行记录、日志和资源锁。
@@ -33,8 +33,29 @@ database:
 #   max_agent_runs_per_root: 8
 #   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。
 #   event_retry_count: 2
+#   # 失败、超时、存在未提交文件或未推送提交的临时 worktree 保留天数。
+#   # 到期后会在下次准备同一仓库时强制清理；默认 7 天。
+#   worktree_retention_days: 7
 #   # Codex CLI 命令名，也可以配置为绝对路径。
 #   codex_binary: codex
+#   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
+#   codex:
+#     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
+#     model: gpt-5.6-sol
+#     # 可选：默认推理强度。具体可用值取决于模型，常见值如下。
+#     model_reasoning_effort: high
+#     # inherit：继承 Codex 配置；standard：显式关闭；fast：显式开启快速模式。
+#     fast_mode: inherit
+#     # 可选：模型输出详细度，可选 low、medium、high。
+#     model_verbosity: medium
+#     # 可选：交互风格，可选 none、friendly、pragmatic。
+#     personality: pragmatic
+#     # 可选：联网搜索策略，可选 disabled、cached、live。
+#     web_search: cached
+#     # 可选：其他 Codex config.toml 点号键。值支持字符串、数字、布尔值和简单数组。
+#     # 模型结构化字段、Sandbox、审批策略、MCP 和 Skill 不能在这里覆盖。
+#     extra_config:
+#       history.max_bytes: 1048576
 #   # 等待 sub-agent MCP Server 启动的最长秒数。
 #   mcp_startup_timeout_seconds: 15
 #   # 单次 invoke_agent MCP 调用的最长秒数。
@@ -112,14 +133,27 @@ web:
 #     provider: github-main
 #     # 支持 owner/repository、group/project、SSH 或 HTTPS Git 地址。
 #     project: git@github.com:owner/repository.git
-#     # Codex CLI 执行时使用的本地 Git 工作目录；不存在时会自动克隆。
-#     # 已存在的目录必须是 Git 仓库，服务只会 fetch，不会覆盖文件或切换当前分支。
+#     # 基础 Git 仓库目录；不存在时会自动克隆，已存在时只校验并 fetch。
+#     # Codex 不直接在这里运行，每次 Agent 会在 data/worktrees/ 下创建独立 worktree。
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true
 #     # 可选：只覆盖当前仓库的环境变量。
 #     environment:
 #       REPOSITORY_TIER: production
+
+# 可选：可由 Agent 独立装载的 Codex Skill。键名是本系统内引用的 Skill ID。
+# skills:
+#   incremental-doc-update:
+#     # Skill 文件夹根部必须包含 SKILL.md；其中 YAML frontmatter 必须配置
+#     # name 与 description。scripts/、references/、assets/ 等子目录会完整装载。
+#     # 路径相对于 config.yaml；UI 支持从电脑导入整个文件夹到 ./skills/。
+#     # 仓库根目录的 skills/ 默认被 Git 忽略，本地 Skill 不会自动提交。
+#     path: ./skills/incremental-doc-update
+#
+#   security-review:
+#     # 也可以引用运行服务的机器上已经存在的绝对目录。
+#     path: /opt/teamwork-skills/security-review
 
 # 可选：Codex CLI Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
 # agents:
@@ -132,19 +166,34 @@ web:
 #     # prompt: |
 #     #   请审查 ${{REPOSITORY_PROJECT}} 的 MR #${{MR_NUMBER}}。
 #     #   输出风格：${{REVIEW_STYLE}}
-#     # 可选：留空时继承 Codex CLI 默认模型。
-#     model: gpt-5.4
+#     # 可选：覆盖 runtime.codex.model；省略时继承 Teamwork 运行时或 Codex 默认模型。
+#     model: gpt-5.6-sol
+#     # 下列字段均为当前 Agent 的可选覆盖；sub-agent 使用目标 Agent 自己的设置。
+#     model_reasoning_effort: high
+#     # inherit：继承 runtime.codex；standard：关闭；fast：开启快速模式。
+#     fast_mode: inherit
+#     # 可选：low、medium、high。
+#     model_verbosity: medium
+#     # 可选：none、friendly、pragmatic。
+#     personality: pragmatic
+#     # 可选：disabled、cached、live。
+#     web_search: cached
 #     # read-only：本地只读；workspace-write：工作区可写；danger-full-access：完全访问。
 #     sandbox: read-only
 #     # 单次 Codex CLI 运行最长秒数。
 #     timeout_seconds: 1200
 #     # 写操作声明用于申请串行锁，不等同于平台账号授权。
 #     # change_request：评论、标签、审批、合并等 MR/PR 写操作。
-#     # workspace：修改代码、提交、推送等本地工作目录写操作。
+#     # workspace：修改代码、提交、推送等操作；同一 MR/PR 源分支会串行。
 #     write_scopes: []
 #     # 只授予 invoke_agent 调用权限，不会自动启动这些 Agent。
 #     allowed_sub_agents:
 #       - security-reviewer
+#     # 可选：只装载这里选择的应用 Skill。选择表示 Codex 可以按 description
+#     # 隐式匹配或通过 $skill-name 显式使用，不代表每次运行都强制执行。
+#     # sub-agent 使用自己的 skills，不继承父 Agent 的选择。
+#     skills:
+#       - incremental-doc-update
 #     # 可选：要求 Codex 最终输出符合指定 JSON Schema。
 #     output_schema: ./schemas/review-result.json
 #     # true 时允许工作目录不是 Git 仓库，通常保持 false。
@@ -161,6 +210,8 @@ web:
 #     timeout_seconds: 1200
 #     write_scopes: []
 #     allowed_sub_agents: []
+#     skills:
+#       - security-review
 
 # 可选：MR/PR 状态变化到 Agent 的映射规则。
 # rules:
@@ -190,6 +241,15 @@ web:
 #         - skipped
 #       approvals__gte: 2
 #       head_sha__changed: true
+#     # 可选：同一轮扫描中，同一个 MR/PR 的多个匹配事件是否合并运行。
+#     # false（默认）表示每个匹配事件分别触发；true 表示每个目标 Agent 只触发一次，
+#     # 并把本轮匹配动作合并到根 Agent 输入的 mr.action 数组。
+#     deduplicate_per_scan: false
+#     # 可选：sub-agent 是否复用父 Agent 本次运行的临时 worktree，默认 false。
+#     # true 时整条调用链能看到父 Agent 的当前分支、暂存区和未提交文件，
+#     # 但不会自动继承 MR 输入或父 Agent 对话；共享工作区委托会串行执行。
+#     # false 时 sub-agent 为自己的运行创建基于 MR/PR Head 的独立 worktree。
+#     inherit_workspace: false
 #     # false 时保留规则但不参与匹配。
 #     enabled: true
 

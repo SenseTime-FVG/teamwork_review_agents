@@ -3,16 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from typing import Any
 
 from ..config import RepositoryConfig
-from ..models import ChangeRequestSnapshot
+from ..models import (
+    ChangeRequestActivity,
+    ChangeRequestActivityBatch,
+    ChangeRequestSnapshot,
+    stable_hash,
+)
 from .base import BaseProvider, ProviderError, parse_datetime
 
 
 class GitHubProvider(BaseProvider):
     """将 GitHub Pull Request 规范化为统一快照。"""
+
+    TIMELINE_EVENT_TYPES = {
+        "closed",
+        "reopened",
+        "merged",
+        "committed",
+        "head_ref_force_pushed",
+        "convert_to_draft",
+        "ready_for_review",
+        "labeled",
+        "unlabeled",
+    }
+    TIMELINE_PAGE_SIZE = 100
+    MAX_TIMELINE_PAGES_PER_SCAN = 100
 
     def headers(self) -> dict[str, str]:
         return {
@@ -68,6 +88,230 @@ class GitHubProvider(BaseProvider):
                 return await self._build_snapshot(repository, item)
 
         return await asyncio.gather(*(guarded(item) for item in pulls))
+
+    @staticmethod
+    def _timeline_item_id(item: dict[str, Any]) -> str:
+        """返回所有 Timeline 项都可使用的稳定标识。"""
+
+        identity = item.get("node_id") or item.get("id")
+        if identity is not None:
+            return str(identity)
+        return stable_hash(
+            "github-timeline",
+            item.get("event"),
+            item.get("sha"),
+            item.get("created_at"),
+            item.get("url"),
+        )
+
+    @staticmethod
+    def _last_timeline_page(headers: dict[str, str]) -> int:
+        """从 GitHub Link 响应头解析最后一页，缺失时按单页处理。"""
+
+        link = headers.get("link") or headers.get("Link") or ""
+        for part in link.split(","):
+            if 'rel="last"' not in part:
+                continue
+            match = re.search(r"[?&]page=(\d+)", part)
+            if match:
+                return max(1, int(match.group(1)))
+        return 1
+
+    @classmethod
+    def _timeline_activity(
+        cls,
+        item: dict[str, Any],
+    ) -> ChangeRequestActivity | None:
+        """将 GitHub Timeline 项收敛为事件检测需要的最小活动。"""
+
+        event_type = str(item.get("event") or "")
+        if event_type not in cls.TIMELINE_EVENT_TYPES:
+            return None
+        author = item.get("author") or {}
+        committer = item.get("committer") or {}
+        if not isinstance(author, dict):
+            author = {}
+        if not isinstance(committer, dict):
+            committer = {}
+        occurred_value = (
+            item.get("created_at")
+            or item.get("submitted_at")
+            or author.get("date")
+            or committer.get("date")
+        )
+        label = item.get("label") or {}
+        if not isinstance(label, dict):
+            label = {}
+        return ChangeRequestActivity(
+            id=cls._timeline_item_id(item),
+            type=event_type,
+            occurred_at=parse_datetime(str(occurred_value)) if occurred_value else None,
+            data={
+                "sha": str(item.get("sha") or ""),
+                "commit_id": str(item.get("commit_id") or ""),
+                "label": str(label.get("name") or ""),
+            },
+        )
+
+    async def list_change_request_activities(
+        self,
+        repository: RepositoryConfig,
+        number: int,
+        *,
+        cursor: dict[str, object] | None = None,
+    ) -> ChangeRequestActivityBatch:
+        """按不透明游标增量读取单个 PR 的 GitHub Timeline。"""
+
+        path = f"repos/{repository.project}/issues/{number}/timeline"
+        first_payload, headers = await self.get_json_response(
+            path,
+            params={"per_page": self.TIMELINE_PAGE_SIZE, "page": 1},
+        )
+        if not isinstance(first_payload, list):
+            raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+
+        if cursor is None:
+            last_page = self._last_timeline_page(headers)
+            last_payload = first_payload
+            if last_page > 1:
+                last_payload = await self.get_json(
+                    path,
+                    params={
+                        "per_page": self.TIMELINE_PAGE_SIZE,
+                        "page": last_page,
+                    },
+                )
+                if not isinstance(last_payload, list):
+                    raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+            elif len(first_payload) == self.TIMELINE_PAGE_SIZE:
+                # 非 GitHub 兼容服务可能省略 Link，首次基线需顺序找到真正末页。
+                page = 2
+                while True:
+                    payload = await self.get_json(
+                        path,
+                        params={
+                            "per_page": self.TIMELINE_PAGE_SIZE,
+                            "page": page,
+                        },
+                    )
+                    if not isinstance(payload, list):
+                        raise ProviderError(
+                            f"GitHub PR #{number} Timeline 返回格式异常"
+                        )
+                    if payload:
+                        last_page = page
+                        last_payload = payload
+                    if len(payload) < self.TIMELINE_PAGE_SIZE:
+                        break
+                    if page >= self.MAX_TIMELINE_PAGES_PER_SCAN:
+                        raise ProviderError(
+                            f"GitHub PR #{number} Timeline 首次基线超过 "
+                            f"{self.MAX_TIMELINE_PAGES_PER_SCAN} 页"
+                        )
+                    page += 1
+            latest_id = (
+                self._timeline_item_id(last_payload[-1])
+                if last_payload and isinstance(last_payload[-1], dict)
+                else ""
+            )
+            return ChangeRequestActivityBatch(
+                cursor={"page": last_page, "item_id": latest_id},
+                baseline=True,
+            )
+
+        try:
+            cursor_page = max(1, int(cursor.get("page") or 1))
+        except (TypeError, ValueError):
+            cursor_page = 1
+        cursor_item_id = str(cursor.get("item_id") or "")
+        start_page = max(1, cursor_page - 1)
+        entries: list[tuple[int, dict[str, Any]]] = []
+        page = start_page
+        pages_read = 0
+        while True:
+            if page == 1:
+                payload = first_payload
+            else:
+                payload = await self.get_json(
+                    path,
+                    params={"per_page": self.TIMELINE_PAGE_SIZE, "page": page},
+                )
+            if not isinstance(payload, list):
+                raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+            entries.extend(
+                (page, item) for item in payload if isinstance(item, dict)
+            )
+            pages_read += 1
+            if len(payload) < self.TIMELINE_PAGE_SIZE:
+                break
+            if pages_read >= self.MAX_TIMELINE_PAGES_PER_SCAN:
+                raise ProviderError(
+                    f"GitHub PR #{number} Timeline 单轮增量超过 "
+                    f"{self.MAX_TIMELINE_PAGES_PER_SCAN} 页"
+                )
+            page += 1
+
+        marker_index = next(
+            (
+                index
+                for index, (_, item) in enumerate(entries)
+                if self._timeline_item_id(item) == cursor_item_id
+            ),
+            None,
+        )
+        earlier_page = start_page - 1
+        while marker_index is None and cursor_item_id and earlier_page >= 1:
+            payload = await self.get_json(
+                path,
+                params={
+                    "per_page": self.TIMELINE_PAGE_SIZE,
+                    "page": earlier_page,
+                },
+            )
+            if not isinstance(payload, list):
+                raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+            prefix = [
+                (earlier_page, item) for item in payload if isinstance(item, dict)
+            ]
+            entries = prefix + entries
+            pages_read += 1
+            marker_index = next(
+                (
+                    index
+                    for index, (_, item) in enumerate(entries)
+                    if self._timeline_item_id(item) == cursor_item_id
+                ),
+                None,
+            )
+            if pages_read >= self.MAX_TIMELINE_PAGES_PER_SCAN:
+                break
+            earlier_page -= 1
+
+        if not entries:
+            return ChangeRequestActivityBatch(
+                cursor={"page": 1, "item_id": ""},
+                baseline=bool(cursor_item_id),
+            )
+
+        latest_page, latest_item = entries[-1]
+        next_cursor = {
+            "page": latest_page,
+            "item_id": self._timeline_item_id(latest_item),
+        }
+        if cursor_item_id and marker_index is None:
+            # 游标对应的 Timeline 项可能被删除；重建基线比重放历史更安全。
+            return ChangeRequestActivityBatch(cursor=next_cursor, baseline=True)
+
+        new_entries = entries[(marker_index + 1) if marker_index is not None else 0 :]
+        activities = tuple(
+            activity
+            for _, item in new_entries
+            if (activity := self._timeline_activity(item)) is not None
+        )
+        return ChangeRequestActivityBatch(
+            activities=activities,
+            cursor=next_cursor,
+        )
 
     async def _build_snapshot(
         self,

@@ -54,14 +54,22 @@ def runtime_variables(
     repository: RepositoryConfig,
     event: ChangeEvent,
     run_id: str,
+    *,
+    include_change_request: bool = True,
 ) -> dict[str, str]:
     """生成不可由用户覆盖的仓库、MR 和运行变量。"""
 
-    snapshot = event.new
-    return {
+    variables = {
         "REPOSITORY_ID": repository.id,
         "REPOSITORY_PROJECT": repository.project,
         "REPOSITORY_WORKSPACE": str(repository.workspace),
+        "RUN_ID": run_id,
+    }
+    if not include_change_request:
+        return variables
+
+    snapshot = event.current_snapshot
+    variables.update({
         "MR_NUMBER": str(snapshot.number),
         "MR_TITLE": snapshot.title,
         "MR_STATE": snapshot.state,
@@ -70,8 +78,8 @@ def runtime_variables(
         "MR_TARGET_BRANCH": snapshot.target_branch,
         "MR_URL": snapshot.web_url,
         "EVENT_TYPE": event.type,
-        "RUN_ID": run_id,
-    }
+    })
+    return variables
 
 
 def resolve_environment(
@@ -80,6 +88,8 @@ def resolve_environment(
     agent: AgentConfig,
     event: ChangeEvent,
     run_id: str,
+    *,
+    include_change_request: bool = True,
 ) -> ResolvedEnvironment:
     """按全局、仓库、Agent、运行变量顺序合并。"""
 
@@ -112,7 +122,12 @@ def resolve_environment(
         if is_secret and value:
             secrets.append(value)
 
-    builtins = runtime_variables(repository, event, run_id)
+    builtins = runtime_variables(
+        repository,
+        event,
+        run_id,
+        include_change_request=include_change_request,
+    )
     all_values.update(builtins)
     prompt_values.update(builtins)
     process_values.update(builtins)

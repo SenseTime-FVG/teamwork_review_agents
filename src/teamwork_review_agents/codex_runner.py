@@ -10,11 +10,13 @@ import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from .config import AgentConfig, AppConfig, RepositoryConfig
+from .codex_settings import agent_overrides, runtime_overrides
 from .environment import SecretRedactor
 from .models import AgentResult, InvocationContext
+from .skill_files import SkillProjection
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
@@ -42,7 +44,15 @@ BASE_ENVIRONMENT_NAMES = {
 def encode_invocation_context(context: InvocationContext) -> str:
     """将 MCP 调用上下文编码为适合环境变量传递的文本。"""
 
-    payload = context.model_dump_json(exclude={"event": {"old": {"raw"}, "new": {"raw"}}})
+    payload = context.model_dump_json(
+        exclude={
+            "event": {
+                "old": {"raw"},
+                "new": {"raw"},
+                "current": {"raw"},
+            }
+        }
+    )
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
@@ -59,6 +69,37 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _skills_config_override(
+    skill_files: Mapping[str, Path],
+    enabled_skill_ids: list[str],
+) -> str:
+    """生成 Codex `skills.config` 的 TOML 内联表数组。"""
+
+    enabled = set(enabled_skill_ids)
+    entries = [
+        (
+            "{ path = "
+            f"{_toml_string(str(path))}, enabled = "
+            f"{'true' if skill_id in enabled else 'false'}"
+            " }"
+        )
+        for skill_id, path in sorted(skill_files.items())
+    ]
+    return f"skills.config=[{', '.join(entries)}]"
+
+
+def _add_git_excludes_file(environment: dict[str, str], path: Path) -> None:
+    """用 Git 的进程级配置隐藏临时 Skill 投影，不修改仓库配置。"""
+
+    try:
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    environment[f"GIT_CONFIG_KEY_{count}"] = "core.excludesFile"
+    environment[f"GIT_CONFIG_VALUE_{count}"] = str(path)
+
+
 class CodexRunner:
     """启动 `codex exec` 并提取最终消息、线程和用量。"""
 
@@ -70,8 +111,9 @@ class CodexRunner:
         agent: AgentConfig,
         repository: RepositoryConfig,
         context: InvocationContext,
+        skill_files: Mapping[str, Path] | None = None,
     ) -> list[str]:
-        """构造不加载用户工具配置的可审计 Codex 命令。"""
+        """构造显式叠加 Teamwork 默认和 Agent 覆盖的 Codex 命令。"""
 
         server_name = "teamwork_agent_gateway"
         command = [
@@ -79,7 +121,6 @@ class CodexRunner:
             "exec",
             "--json",
             "--ephemeral",
-            "--ignore-user-config",
             "--sandbox",
             agent.sandbox,
             "--cd",
@@ -95,6 +136,8 @@ class CodexRunner:
         mcp_args = ["-m", "teamwork_review_agents.mcp_server"]
         context_value = encode_invocation_context(context)
         overrides = [
+            *runtime_overrides(self.config.runtime.codex),
+            *agent_overrides(agent),
             f"mcp_servers.{server_name}.command={_toml_string(sys.executable)}",
             f"mcp_servers.{server_name}.args={json.dumps(mcp_args)}",
             f"mcp_servers.{server_name}.required=true",
@@ -117,6 +160,8 @@ class CodexRunner:
                 f"{_toml_string(context_value)}"
             ),
         ]
+        if skill_files:
+            overrides.append(_skills_config_override(skill_files, agent.skills))
         for override in overrides:
             command.extend(["--config", override])
         command.extend(agent.extra_codex_args)
@@ -156,9 +201,55 @@ class CodexRunner:
         redactor: SecretRedactor | None = None,
         log_callback: LogCallback | None = None,
     ) -> AgentResult:
+        """准备当前工作区的 Skill 投影，并保证 Codex 退出后立即清理。"""
+
+        projection = SkillProjection(
+            repository.workspace,
+            {
+                skill_id: skill.path
+                for skill_id, skill in self.config.skills.items()
+            },
+            self.config.revision,
+        ).prepare()
+        try:
+            return await self._run_with_projection(
+                run_id=run_id,
+                root_run_id=root_run_id,
+                parent_run_id=parent_run_id,
+                agent_name=agent_name,
+                agent=agent,
+                repository=repository,
+                context=context,
+                prompt=prompt,
+                process_environment=process_environment,
+                redactor=redactor,
+                log_callback=log_callback,
+                skill_files=projection.skill_files,
+                git_excludes_file=projection.marker if self.config.skills else None,
+            )
+        finally:
+            projection.cleanup()
+
+    async def _run_with_projection(
+        self,
+        *,
+        run_id: str,
+        root_run_id: str,
+        parent_run_id: str | None,
+        agent_name: str,
+        agent: AgentConfig,
+        repository: RepositoryConfig,
+        context: InvocationContext,
+        prompt: str,
+        process_environment: dict[str, str] | None = None,
+        redactor: SecretRedactor | None = None,
+        log_callback: LogCallback | None = None,
+        skill_files: Mapping[str, Path],
+        git_excludes_file: Path | None,
+    ) -> AgentResult:
         """流式执行 Codex CLI；超时后终止整个进程组。"""
 
-        command = self.build_command(agent, repository, context)
+        command = self.build_command(agent, repository, context, skill_files)
         active_redactor = redactor or SecretRedactor(())
 
         async def emit(
@@ -175,13 +266,16 @@ class CodexRunner:
             except Exception:
                 return
 
+        child_environment = self.child_environment(process_environment)
+        if git_excludes_file is not None:
+            _add_git_excludes_file(child_environment, git_excludes_file)
         process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=repository.workspace,
-            env=self.child_environment(process_environment),
+            env=child_environment,
             start_new_session=True,
         )
         assert process.stdin is not None

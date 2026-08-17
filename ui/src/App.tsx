@@ -5,11 +5,14 @@ import {
   setToken as persistToken,
   streamRunLogs,
   uploadPromptFile,
+  uploadSkillDirectory,
 } from "./api";
-import type { ManagedPromptFile } from "./api";
+import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
 import type {
   Agent,
   ChangeRequestRecord,
+  CodexRuntimeConfig,
+  CodexRuntimeOptions,
   ConfigDocument,
   EnvironmentMap,
   EnvironmentVariable,
@@ -20,9 +23,10 @@ import type {
   RunLog,
   RunSummary,
   RuntimeStatus,
+  Skill,
 } from "./types";
 
-type Tab = "overview" | "repositories" | "environment" | "agents" | "rules" | "runs";
+type Tab = "overview" | "repositories" | "environment" | "skills" | "agents" | "rules" | "runtime" | "runs";
 
 const EMPTY_STATUS: RuntimeStatus = {
   paused: false,
@@ -30,6 +34,19 @@ const EMPTY_STATUS: RuntimeStatus = {
   config_revision: "",
   stats: { runs: {}, events: {}, change_requests: {} },
 };
+
+const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
+  models: [],
+  inherited_model: {
+    value: null,
+    source: "builtin",
+    label: "继承 Codex CLI / 账号默认（未配置固定模型）",
+  },
+  user_model: null,
+  user_config_path: "~/.codex/config.toml",
+};
+
+const REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
   const scannerInput = { ...(value.scanner ?? {}) };
@@ -41,6 +58,8 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
   );
   delete scannerInput.max_pages;
   delete scannerInput.page_size;
+  const runtimeInput = { ...(value.runtime ?? {}) };
+  const codexInput = { ...(runtimeInput.codex ?? {}) };
   return {
     database: value.database ?? { path: "../data/teamwork-review-agents.db" },
     scanner: {
@@ -56,8 +75,14 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       max_sub_agent_depth: 2,
       max_agent_runs_per_root: 8,
       event_retry_count: 2,
+      worktree_retention_days: 7,
       codex_binary: "codex",
-      ...(value.runtime ?? {}),
+      ...runtimeInput,
+      codex: {
+        fast_mode: "inherit",
+        extra_config: {},
+        ...codexInput,
+      },
     },
     web: {
       host: "127.0.0.1",
@@ -69,6 +94,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
     environment: { global: value.environment?.global ?? {} },
     providers: value.providers ?? {},
     repositories: value.repositories ?? [],
+    skills: value.skills ?? {},
     agents: value.agents ?? {},
     rules: value.rules ?? [],
   };
@@ -102,6 +128,17 @@ function statusLabel(status: string): string {
   return labels[status] ?? status;
 }
 
+function workspaceStatusLabel(status?: string | null): string {
+  const labels: Record<string, string> = {
+    active: "使用中",
+    removed: "已清理",
+    retained: "待清理",
+    inherited: "继承父工作区",
+    "not-created": "未创建",
+  };
+  return status ? labels[status] ?? status : "未知";
+}
+
 function Field(props: {
   label: string;
   value: string | number;
@@ -121,6 +158,50 @@ function Field(props: {
         disabled={props.disabled}
         onChange={(event) => props.onChange(event.target.value)}
       />
+      {props.help && <small>{props.help}</small>}
+    </label>
+  );
+}
+
+function SelectField(props: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: Array<{ value: string; label: string }>;
+  help?: string;
+}) {
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <select value={props.value} onChange={(event) => props.onChange(event.target.value)}>
+        {props.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+      {props.help && <small>{props.help}</small>}
+    </label>
+  );
+}
+
+function ModelField(props: {
+  id: string;
+  label: string;
+  value: string;
+  placeholder: string;
+  models: CodexRuntimeOptions["models"];
+  onChange: (value: string) => void;
+  help?: string;
+}) {
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <input
+        list={props.id}
+        value={props.value}
+        placeholder={props.placeholder}
+        onChange={(event) => props.onChange(event.target.value)}
+      />
+      <datalist id={props.id}>
+        {props.models.map((model) => <option key={model.slug} value={model.slug}>{model.display_name}</option>)}
+      </datalist>
       {props.help && <small>{props.help}</small>}
     </label>
   );
@@ -172,22 +253,41 @@ function MultiSelect(props: {
   options: string[];
   onChange: (values: string[]) => void;
 }) {
+  function toggle(option: string) {
+    props.onChange(
+      props.values.includes(option)
+        ? props.values.filter((value) => value !== option)
+        : [...props.values, option],
+    );
+  }
+
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <select
-        multiple
-        value={props.values}
-        onChange={(event) =>
-          props.onChange(Array.from(event.target.selectedOptions, (option) => option.value))
-        }
-      >
-        {props.options.map((option) => (
-          <option key={option} value={option}>{option}</option>
-        ))}
-      </select>
-      <small>按住 Command / Ctrl 可多选</small>
-    </label>
+    <div className="multi-choice-field">
+      <div className="multi-choice-head">
+        <span>{props.label}</span>
+        <small>已选择 {props.values.length} 个</small>
+      </div>
+      {props.options.length === 0 ? (
+        <div className="multi-choice-empty">暂无可选项</div>
+      ) : (
+        <div className="multi-choice-list">
+          {props.options.map((option) => {
+            const checked = props.values.includes(option);
+            return (
+              <label className={`multi-choice-option ${checked ? "selected" : ""}`} key={option}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggle(option)}
+                />
+                <span>{option}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+      <small className="multi-choice-help">直接点击选项即可多选或取消，不需要按 Command / Ctrl。</small>
+    </div>
   );
 }
 
@@ -621,6 +721,7 @@ function GlobalEnvironment(props: {
           <Field label="配置检测（秒）" type="number" value={Number(props.document.web.config_poll_seconds)} onChange={(value) => patchSection("web", "config_poll_seconds", Number(value))} />
           <Field label="日志保留（天）" type="number" value={Number(props.document.web.log_retention_days)} onChange={(value) => patchSection("web", "log_retention_days", Number(value))} />
           <Field label="最大并行 Agent" type="number" value={Number(props.document.runtime.max_concurrent_agents)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} />
+          <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
           <Field label="管理员 Token 环境变量" value={String(props.document.web.admin_token_env ?? "")} onChange={(value) => patchSection("web", "admin_token_env", value || undefined)} help="非本机监听时必填" />
@@ -628,6 +729,166 @@ function GlobalEnvironment(props: {
         <div className="toggle-grid">
           <Toggle label="首次发现 MR / PR 时触发事件" checked={Boolean(props.document.scanner.emit_initial_events)} onChange={(value) => patchSection("scanner", "emit_initial_events", value)} />
         </div>
+      </section>
+    </div>
+  );
+}
+
+function effectiveInheritedModel(
+  document: ConfigDocument,
+  options: CodexRuntimeOptions,
+): { value?: string | null; label: string } {
+  const runtimeModel = document.runtime.codex?.model?.trim();
+  if (runtimeModel) {
+    return {
+      value: runtimeModel,
+      label: `继承 Teamwork 运行时默认（${runtimeModel}）`,
+    };
+  }
+  if (options.user_model) {
+    return {
+      value: options.user_model,
+      label: `继承 Codex 用户配置（${options.user_model}）`,
+    };
+  }
+  return {
+    value: null,
+    label: "继承 Codex CLI / 账号默认（未配置固定模型）",
+  };
+}
+
+function reasoningLevels(
+  options: CodexRuntimeOptions,
+  model?: string | null,
+  current?: string,
+): string[] {
+  const modelEntry = options.models.find((item) => item.slug === model);
+  return Array.from(new Set([
+    ...(modelEntry?.supported_reasoning_levels ?? REASONING_LEVELS),
+    ...(current ? [current] : []),
+  ]));
+}
+
+function CodexRuntimeEditor(props: {
+  document: ConfigDocument;
+  options: CodexRuntimeOptions;
+  onChange: (document: ConfigDocument) => void;
+}) {
+  const codex = props.document.runtime.codex ?? {};
+  const inherited = effectiveInheritedModel(props.document, props.options);
+  const selectedModel = codex.model || props.options.user_model;
+
+  function patchRuntime(patch: Record<string, unknown>) {
+    props.onChange({
+      ...props.document,
+      runtime: { ...props.document.runtime, ...patch },
+    });
+  }
+
+  function patchCodex(patch: Partial<CodexRuntimeConfig>) {
+    patchRuntime({ codex: { ...codex, ...patch } });
+  }
+
+  return (
+    <div className="page-stack">
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>Codex CLI 默认参数</h2>
+            <p>只影响 Teamwork 发起的 Codex 进程，不会修改你的 Codex 用户配置文件。</p>
+          </div>
+        </div>
+        <div className="agent-workspace-note">
+          <strong>当前模型来源</strong>
+          <span>{inherited.label}。Agent 可以单独覆盖；仓库中的 `.codex/config.toml` 仅在没有更高优先级覆盖时参与 Codex 原生合并。</span>
+        </div>
+        <div className="form-grid three runtime-config-grid">
+          <Field
+            label="Codex CLI 命令"
+            value={String(props.document.runtime.codex_binary ?? "codex")}
+            onChange={(codex_binary) => patchRuntime({ codex_binary: codex_binary || "codex" })}
+            help="可以填写命令名或服务端绝对路径"
+          />
+          <ModelField
+            id="runtime-codex-models"
+            label="默认模型"
+            value={codex.model ?? ""}
+            placeholder="继承 Codex 配置或账号默认"
+            models={props.options.models}
+            onChange={(model) => patchCodex({ model: model || undefined })}
+            help={props.options.catalog_error ? "无法读取本机模型目录，仍可手工填写模型 ID" : "候选项来自当前服务使用的 Codex CLI"}
+          />
+          <SelectField
+            label="默认推理强度"
+            value={codex.model_reasoning_effort ?? ""}
+            onChange={(value) => patchCodex({ model_reasoning_effort: value || undefined })}
+            options={[
+              { value: "", label: "继承 Codex 配置 / 模型默认" },
+              ...reasoningLevels(props.options, selectedModel, codex.model_reasoning_effort).map((value) => ({ value, label: value })),
+            ]}
+            help="不同模型支持的强度可能不同"
+          />
+          <SelectField
+            label="快速模式"
+            value={codex.fast_mode ?? "inherit"}
+            onChange={(value) => patchCodex({ fast_mode: value as CodexRuntimeConfig["fast_mode"] })}
+            options={[
+              { value: "inherit", label: "继承 Codex 配置" },
+              { value: "standard", label: "标准模式" },
+              { value: "fast", label: "快速模式" },
+            ]}
+            help="快速模式的可用性和用量倍率由当前模型与账号决定"
+          />
+          <SelectField
+            label="输出详细度"
+            value={codex.model_verbosity ?? ""}
+            onChange={(value) => patchCodex({ model_verbosity: value ? value as CodexRuntimeConfig["model_verbosity"] : undefined })}
+            options={[
+              { value: "", label: "继承 Codex 配置" },
+              { value: "low", label: "低" },
+              { value: "medium", label: "中" },
+              { value: "high", label: "高" },
+            ]}
+          />
+          <SelectField
+            label="交互风格"
+            value={codex.personality ?? ""}
+            onChange={(value) => patchCodex({ personality: value ? value as CodexRuntimeConfig["personality"] : undefined })}
+            options={[
+              { value: "", label: "继承 Codex 配置" },
+              { value: "none", label: "无预设" },
+              { value: "friendly", label: "友好" },
+              { value: "pragmatic", label: "务实" },
+            ]}
+          />
+          <SelectField
+            label="联网搜索"
+            value={codex.web_search ?? ""}
+            onChange={(value) => patchCodex({ web_search: value ? value as CodexRuntimeConfig["web_search"] : undefined })}
+            options={[
+              { value: "", label: "继承 Codex 配置" },
+              { value: "disabled", label: "禁用" },
+              { value: "cached", label: "缓存搜索" },
+              { value: "live", label: "实时搜索" },
+            ]}
+          />
+        </div>
+      </section>
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>高级 Codex 配置</h2>
+            <p>使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。</p>
+          </div>
+        </div>
+        <JsonEditor
+          label="额外配置（JSON）"
+          value={codex.extra_config ?? {}}
+          help={'示例：{ "features.some_flag": true, "history.max_bytes": 1048576 }'}
+          onChange={(extra_config) => patchCodex({
+            extra_config: extra_config as CodexRuntimeConfig["extra_config"],
+          })}
+        />
       </section>
     </div>
   );
@@ -841,7 +1102,7 @@ function RepositoriesEditor(props: {
       </section>
       <section className="section-card">
         <div className="section-title-row">
-          <div><h2>仓库</h2><p>选择上方的平台连接来扫描远端 MR / PR；本地工作目录则供 Codex CLI 读取或修改代码。</p></div>
+          <div><h2>仓库</h2><p>选择上方的平台连接扫描远端 MR / PR；基础 Git 仓库用于 fetch，并为每次 Agent 运行创建独立临时 worktree。</p></div>
           <button
             className="button primary"
             disabled={providerNames.length === 0}
@@ -866,7 +1127,7 @@ function RepositoriesEditor(props: {
                 <CommitField label="仓库 ID" value={repository.id} onCommit={(id) => renameRepository(index, id)} />
                 <label className="field"><span>所属 GitHub / GitLab 连接</span><select value={repository.provider} onChange={(event) => updateRepository(index, { provider: event.target.value })}>{providerNames.map((provider) => <option key={provider}>{provider}</option>)}</select><small>决定使用哪个平台 API 和 Token 扫描此仓库</small></label>
                 <Field label="远端仓库地址 / 项目路径" value={repository.clone_url ?? repository.project} onChange={(project) => updateRepository(index, { project, clone_url: undefined })} placeholder="git@github.com:owner/repository.git" help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后后台会自动解析为平台项目路径" />
-                <Field label="本地 Git 工作目录（自动管理）" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="默认使用 ./workspaces/<仓库ID>；目录不存在时自动克隆，已有目录只校验和 fetch，不会覆盖文件或自动切换分支" />
+                <Field label="基础 Git 仓库目录（自动管理）" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="默认使用 ./workspaces/<仓库ID>；这里只负责克隆、校验、fetch 和管理 worktree，Codex 实际在每次运行独享的临时目录中工作" />
               </div>
               <EnvironmentEditor compact title="仓库环境变量" value={repository.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => updateRepository(index, { environment })} />
             </article>
@@ -877,12 +1138,228 @@ function RepositoriesEditor(props: {
   );
 }
 
-function AgentsEditor(props: {
+function SkillsEditor(props: {
   document: ConfigDocument;
   onChange: (document: ConfigDocument) => void;
 }) {
+  const [directories, setDirectories] = useState<ManagedSkillDirectory[]>([]);
+  const [inspected, setInspected] = useState<Record<string, ManagedSkillDirectory>>({});
+  const [uploading, setUploading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const skillEntries = Object.entries(props.document.skills);
+  const skillSignature = JSON.stringify(skillEntries.map(([id, skill]) => [id, skill.path]));
+
+  const loadDirectories = useCallback(async () => {
+    try {
+      setDirectories(await api<ManagedSkillDirectory[]>("/api/skill-directories"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取 Skill 目录失败");
+    }
+  }, []);
+
+  useEffect(() => { void loadDirectories(); }, [loadDirectories]);
+  useEffect(() => {
+    let cancelled = false;
+    async function inspectConfiguredSkills() {
+      const results = await Promise.all(skillEntries.map(async ([id, skill]) => {
+        try {
+          const metadata = await api<ManagedSkillDirectory>("/api/skill-directories/inspect", {
+            method: "POST",
+            body: JSON.stringify({ path: skill.path }),
+          });
+          return [id, metadata] as const;
+        } catch (reason) {
+          return [id, {
+            path: skill.path,
+            name: id,
+            description: "",
+            valid: false,
+            error: reason instanceof Error ? reason.message : "Skill 路径检查失败",
+          }] as const;
+        }
+      }));
+      if (!cancelled) setInspected(Object.fromEntries(results));
+    }
+    void inspectConfiguredSkills();
+    return () => { cancelled = true; };
+  }, [skillSignature]);
+
+  function uniqueId(name: string): string {
+    const normalized = name
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^[-._]+|[-._]+$/g, "") || "skill";
+    let id = normalized;
+    let index = 2;
+    while (props.document.skills[id]) id = `${normalized}-${index++}`;
+    return id;
+  }
+
+  function addSkill(skill?: ManagedSkillDirectory) {
+    const id = uniqueId(skill?.name ?? `skill-${skillEntries.length + 1}`);
+    const value: Skill = { path: skill?.path ?? `./skills/${id}` };
+    props.onChange({
+      ...props.document,
+      skills: { ...props.document.skills, [id]: value },
+    });
+  }
+
+  function renameSkill(id: string, nextId: string): boolean {
+    if (!nextId || (nextId !== id && props.document.skills[nextId])) return false;
+    const skills = Object.fromEntries(
+      Object.entries(props.document.skills).map(([key, value]) => [
+        key === id ? nextId : key,
+        value,
+      ]),
+    );
+    const agents = Object.fromEntries(
+      Object.entries(props.document.agents).map(([name, agent]) => [
+        name,
+        {
+          ...agent,
+          skills: agent.skills?.map((skillId) => skillId === id ? nextId : skillId),
+        },
+      ]),
+    );
+    props.onChange({ ...props.document, skills, agents });
+    return true;
+  }
+
+  async function importDirectory(files: File[]) {
+    if (files.length === 0) return;
+    setUploading(true);
+    setMessage("");
+    setError("");
+    try {
+      const imported = await uploadSkillDirectory(files);
+      addSkill(imported);
+      setMessage(`已导入并加入配置：${imported.name}`);
+      await loadDirectories();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "导入 Skill 文件夹失败");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  const configuredPaths = new Set(skillEntries.map(([, skill]) => skill.path));
+  const availableDirectories = directories.filter((item) => !configuredPaths.has(item.path));
+
+  return (
+    <div className="page-stack">
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>Codex Skill</h2>
+            <p>注册包含 SKILL.md 的技能目录；每个 Agent 再独立选择允许装载的 Skill。</p>
+          </div>
+          <div className="button-group">
+            <button className="button secondary" type="button" onClick={() => addSkill()}>+ 配置服务端目录</button>
+            <label className={`button primary file-button ${uploading ? "disabled" : ""}`}>
+              {uploading ? "正在导入…" : "从电脑导入文件夹"}
+              <input
+                type="file"
+                multiple
+                disabled={uploading}
+                ref={(input) => {
+                  if (input) {
+                    input.setAttribute("webkitdirectory", "");
+                    input.setAttribute("directory", "");
+                  }
+                }}
+                onChange={(event) => {
+                  void importDirectory(Array.from(event.target.files ?? []));
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+        </div>
+        <div className="agent-workspace-note">
+          <strong>原生 Skill 装载</strong>
+          <span>目录根部必须有带 name 和 description 的 SKILL.md；scripts、references、assets 等子目录会完整保留。选择 Skill 只是让 Codex 可以按描述匹配或通过 $skill-name 显式使用，不代表每次都强制执行。</span>
+        </div>
+        {message && <p className="inline-message success-text skill-message">{message}</p>}
+        {error && <p className="inline-message error-text skill-message">{error}</p>}
+        <div className="card-list compact">
+          {skillEntries.map(([id, skill]) => {
+            const metadata = inspected[id];
+            return (
+              <article className="sub-card skill-card" key={id}>
+                <div className="sub-card-head">
+                  <div className="skill-heading">
+                    <CommitField label="配置 ID" value={id} onCommit={(nextId) => renameSkill(id, nextId)} />
+                    {metadata && (
+                      <div className={`skill-metadata ${metadata.valid ? "valid" : "invalid"}`}>
+                        <strong>{metadata.valid ? metadata.name : "校验失败"}</strong>
+                        <span>{metadata.valid ? metadata.description : metadata.error}</span>
+                      </div>
+                    )}
+                  </div>
+                  <button className="icon-button danger" type="button" onClick={() => {
+                    const skills = { ...props.document.skills };
+                    delete skills[id];
+                    const agents = Object.fromEntries(
+                      Object.entries(props.document.agents).map(([name, agent]) => [
+                        name,
+                        { ...agent, skills: agent.skills?.filter((skillId) => skillId !== id) },
+                      ]),
+                    );
+                    props.onChange({ ...props.document, skills, agents });
+                  }}>×</button>
+                </div>
+                <Field
+                  label="Skill 文件夹路径"
+                  value={skill.path}
+                  onChange={(path) => props.onChange({
+                    ...props.document,
+                    skills: { ...props.document.skills, [id]: { path } },
+                  })}
+                  placeholder="./skills/my-skill"
+                  help="相对路径以 config.yaml 所在目录为基准，也可以填写服务端绝对路径"
+                />
+              </article>
+            );
+          })}
+          {skillEntries.length === 0 && (
+            <div className="empty-config-state">
+              <strong>还没有配置 Skill</strong>
+              <p>可以从电脑选择整个 Skill 文件夹，或填写服务端已经存在的目录。导入文件会保存到 `./skills/`，但只有加入配置并被 Agent 选中后才会装载。</p>
+            </div>
+          )}
+        </div>
+      </section>
+      {availableDirectories.length > 0 && (
+        <section className="section-card">
+          <div className="section-title-row"><div><h2>已导入但未配置</h2><p>这些目录保留在 `./skills/`，可以重新加入当前配置。</p></div></div>
+          <div className="managed-skill-list">
+            {availableDirectories.map((skill) => (
+              <div className={`managed-skill ${skill.valid ? "" : "invalid"}`} key={skill.path}>
+                <div><strong>{skill.name}</strong><span>{skill.valid ? skill.description : skill.error}</span><code>{skill.path}</code></div>
+                <button className="button secondary compact" type="button" disabled={!skill.valid} onClick={() => addSkill(skill)}>加入配置</button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function AgentsEditor(props: {
+  document: ConfigDocument;
+  codexOptions: CodexRuntimeOptions;
+  onChange: (document: ConfigDocument) => void;
+}) {
   const names = Object.keys(props.document.agents);
+  const skillOptions = Object.entries(props.document.skills).map(([skillId, skill]) => ({
+    value: skillId,
+    label: skillId,
+    description: skill.path,
+  }));
   const protectedNames = providerCredentialNames(props.document);
+  const inheritedModel = effectiveInheritedModel(props.document, props.codexOptions);
   function update(name: string, patch: Partial<Agent>) {
     props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { ...props.document.agents[name], ...patch } } });
   }
@@ -912,8 +1389,12 @@ function AgentsEditor(props: {
           let index = names.length + 1;
           let name = `agent-${index}`;
           while (props.document.agents[name]) name = `agent-${++index}`;
-          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { prompt: "请处理当前 MR / PR。", sandbox: "read-only", timeout_seconds: 1200, write_scopes: [], allowed_sub_agents: [], environment: {} } } });
+          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { prompt: "请处理当前 MR / PR。", sandbox: "read-only", timeout_seconds: 1200, write_scopes: [], allowed_sub_agents: [], skills: [], environment: {} } } });
         }}>+ 添加 Agent</button>
+      </div>
+      <div className="agent-workspace-note">
+        <strong>每次运行使用独立 worktree</strong>
+        <span>Agent 本身不绑定固定目录；仓库配置目录只作基础仓库。每次根 Agent 在 MR / PR Head 上创建独立临时 worktree，不同分支可以并发；声明“本地仓库写操作”后，同一源分支会串行。sub-agent 是否复用父 Agent 当前 worktree，由触发规则中的“继承当前工作区”决定。</span>
       </div>
       <div className="card-list">
         {names.map((name) => {
@@ -954,7 +1435,15 @@ function AgentsEditor(props: {
                 }}>×</button>
               </div>
               <div className="form-grid three">
-                <Field label="模型（可选）" value={agent.model ?? ""} onChange={(model) => update(name, { model: model || undefined })} placeholder="继承 Codex 默认模型" help="留空时使用 Codex CLI 当前默认模型" />
+                <ModelField
+                  id={`agent-models-${name.replace(/[^A-Za-z0-9_-]/g, "-")}`}
+                  label="模型（可选）"
+                  value={agent.model ?? ""}
+                  placeholder={inheritedModel.label}
+                  models={props.codexOptions.models}
+                  onChange={(model) => update(name, { model: model || undefined })}
+                  help={agent.model ? "当前 Agent 显式覆盖运行时默认" : inheritedModel.label}
+                />
                 <label className="field"><span>本地文件权限（Sandbox）</span><select value={agent.sandbox ?? "read-only"} onChange={(event) => {
                   const sandbox = event.target.value as Agent["sandbox"];
                   const nextScopes = sandbox === "read-only"
@@ -965,6 +1454,64 @@ function AgentsEditor(props: {
                 <Field label="超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>
+              <div className="form-grid three agent-runtime-overrides">
+                <SelectField
+                  label="推理强度（可选）"
+                  value={agent.model_reasoning_effort ?? ""}
+                  onChange={(value) => update(name, { model_reasoning_effort: value || undefined })}
+                  options={[
+                    { value: "", label: "继承运行时默认" },
+                    ...reasoningLevels(
+                      props.codexOptions,
+                      agent.model || inheritedModel.value,
+                      agent.model_reasoning_effort,
+                    ).map((value) => ({ value, label: value })),
+                  ]}
+                />
+                <SelectField
+                  label="快速模式（可选）"
+                  value={agent.fast_mode ?? "inherit"}
+                  onChange={(value) => update(name, { fast_mode: value as Agent["fast_mode"] })}
+                  options={[
+                    { value: "inherit", label: "继承运行时默认" },
+                    { value: "standard", label: "标准模式" },
+                    { value: "fast", label: "快速模式" },
+                  ]}
+                />
+                <SelectField
+                  label="输出详细度（可选）"
+                  value={agent.model_verbosity ?? ""}
+                  onChange={(value) => update(name, { model_verbosity: value ? value as Agent["model_verbosity"] : undefined })}
+                  options={[
+                    { value: "", label: "继承运行时默认" },
+                    { value: "low", label: "低" },
+                    { value: "medium", label: "中" },
+                    { value: "high", label: "高" },
+                  ]}
+                />
+                <SelectField
+                  label="交互风格（可选）"
+                  value={agent.personality ?? ""}
+                  onChange={(value) => update(name, { personality: value ? value as Agent["personality"] : undefined })}
+                  options={[
+                    { value: "", label: "继承运行时默认" },
+                    { value: "none", label: "无预设" },
+                    { value: "friendly", label: "友好" },
+                    { value: "pragmatic", label: "务实" },
+                  ]}
+                />
+                <SelectField
+                  label="联网搜索（可选）"
+                  value={agent.web_search ?? ""}
+                  onChange={(value) => update(name, { web_search: value ? value as Agent["web_search"] : undefined })}
+                  options={[
+                    { value: "", label: "继承运行时默认" },
+                    { value: "disabled", label: "禁用" },
+                    { value: "cached", label: "缓存搜索" },
+                    { value: "live", label: "实时搜索" },
+                  ]}
+                />
+              </div>
               <div className="permissions-grid">
                 <ChoiceCards
                   title="写操作声明"
@@ -972,7 +1519,7 @@ function AgentsEditor(props: {
                   values={writeScopes}
                   options={[
                     { value: "change_request", label: "MR / PR 写操作", description: "评论、标签、审批或合并时锁定当前变更请求" },
-                    { value: "workspace", label: "本地仓库写操作", description: "修改代码、提交或推送时锁定当前工作目录" },
+                    { value: "workspace", label: "本地仓库写操作", description: "修改、提交或推送时锁定当前仓库的 MR / PR 源分支" },
                   ]}
                   onChange={(values) => {
                     const hasWorkspace = values.includes("workspace");
@@ -986,11 +1533,21 @@ function AgentsEditor(props: {
                 />
                 <ChoiceCards
                   title="允许调用的 sub-agent"
-                  description="只是授予 invoke_agent 委托权限，不会自动运行；MR 规则仍只触发当前 Agent。"
+                  description="只是授予 invoke_agent 委托权限，不会自动运行；sub-agent 使用自己的 Skill 配置。"
                   values={agent.allowed_sub_agents ?? []}
                   options={subAgentOptions}
                   emptyText="暂无其他 Agent。请先创建另一个 Agent，再回来授予调用权限。"
                   onChange={(allowed_sub_agents) => update(name, { allowed_sub_agents })}
+                />
+              </div>
+              <div className="agent-skill-section">
+                <ChoiceCards
+                  title="本 Agent 装载的 Skill"
+                  description="只影响当前 Agent；sub-agent 不继承这里的选择，即使复用父 Agent 工作区也使用它自己的 Skill 列表。"
+                  values={agent.skills ?? []}
+                  options={skillOptions}
+                  emptyText="暂无已配置 Skill。请先到左侧“SKILL”页面导入或配置。"
+                  onChange={(skills) => update(name, { skills })}
                 />
               </div>
               <div className="prompt-editor">
@@ -1016,7 +1573,12 @@ function AgentsEditor(props: {
   );
 }
 
-function JsonEditor(props: { value: Record<string, unknown>; onChange: (value: Record<string, unknown>) => void }) {
+function JsonEditor(props: {
+  value: Record<string, unknown>;
+  onChange: (value: Record<string, unknown>) => void;
+  label?: string;
+  help?: string;
+}) {
   const [text, setText] = useState(JSON.stringify(props.value, null, 2));
   const [error, setError] = useState("");
   useEffect(() => setText(JSON.stringify(props.value, null, 2)), [props.value]);
@@ -1031,9 +1593,9 @@ function JsonEditor(props: { value: Record<string, unknown>; onChange: (value: R
   }
   return (
     <label className="field json-field">
-      <span>条件（JSON）</span>
+      <span>{props.label ?? "条件（JSON）"}</span>
       <textarea className="mono" rows={7} value={text} onChange={(event) => setText(event.target.value)} onBlur={apply} />
-      {error ? <small className="error-text">{error}</small> : <small>字段名可使用 __contains、__gte、__in 等操作符后缀</small>}
+      {error ? <small className="error-text">{error}</small> : <small>{props.help ?? "字段名可使用 __contains、__gte、__in 等操作符后缀"}</small>}
     </label>
   );
 }
@@ -1054,7 +1616,7 @@ function RulesEditor(props: {
     <section className="section-card">
       <div className="section-title-row">
         <div><h2>MR / PR 触发规则</h2><p>状态变化生成事件，匹配规则后按顺序触发所选 Agent。</p></div>
-        <button className="button primary" onClick={() => props.onChange({ ...props.document, rules: [...props.document.rules, { name: `rule-${props.document.rules.length + 1}`, events: [props.events[0] ?? "change_request.updated"], agents: agentNames.slice(0, 1), conditions: {}, enabled: true }] })}>+ 添加规则</button>
+        <button className="button primary" onClick={() => props.onChange({ ...props.document, rules: [...props.document.rules, { name: `rule-${props.document.rules.length + 1}`, events: [props.events[0] ?? "change_request.updated"], agents: agentNames.slice(0, 1), conditions: {}, deduplicate_per_scan: false, inherit_workspace: false, enabled: true }] })}>+ 添加规则</button>
       </div>
       <div className="card-list">
         {props.document.rules.map((rule, index) => (
@@ -1068,6 +1630,24 @@ function RulesEditor(props: {
               <MultiSelect label="触发事件" values={rule.events} options={props.events} onChange={(events) => update(index, { events })} />
               <MultiSelect label="触发 Agent" values={rule.agents} options={agentNames} onChange={(agents) => update(index, { agents })} />
               <MultiSelect label="限制仓库（留空为全部）" values={rule.repositories ?? []} options={repositoryNames} onChange={(repositories) => update(index, { repositories: repositories.length ? repositories : undefined })} />
+            </div>
+            <div className="rule-options">
+              <div className="rule-option">
+                <Toggle
+                  label="单轮扫描同一 MR / PR 只触发一次"
+                  checked={rule.deduplicate_per_scan ?? false}
+                  onChange={(deduplicate_per_scan) => update(index, { deduplicate_per_scan })}
+                />
+                <p>开启后，本轮同一 MR / PR 的多个已选事件会合并为一次 Agent 运行，动作统一写入 mr.action 数组。</p>
+              </div>
+              <div className="rule-option">
+                <Toggle
+                  label="sub-agent 继承当前工作区"
+                  checked={rule.inherit_workspace ?? false}
+                  onChange={(inherit_workspace) => update(index, { inherit_workspace })}
+                />
+                <p>开启后，sub-agent 复用父 Agent 本次运行的临时 worktree，共享当前分支、暂存区和未提交文件；只继承工作区，不自动继承 MR 输入或父 Agent 对话。</p>
+              </div>
             </div>
             <JsonEditor value={rule.conditions ?? {}} onChange={(conditions) => update(index, { conditions })} />
           </article>
@@ -1125,7 +1705,7 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
           {props.runs.map((run) => (
             <button key={run.run_id} className={`run-item ${selectedId === run.run_id ? "selected" : ""}`} onClick={() => setSelectedId(run.run_id)}>
               <span className="run-status-dot" data-status={run.status} />
-              <span><strong>{run.agent_name}</strong><small>{run.resource_key}</small></span>
+              <span><strong>{run.agent_name}</strong><small>{run.resource_key}</small>{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
               <span><StatusPill value={run.status} /><small>{timeText(run.started_at)}</small></span>
             </button>
           ))}
@@ -1147,6 +1727,13 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
               <details><summary>最终消息</summary><pre className="detail-pre">{detail.final_message ?? detail.error ?? "暂无"}</pre></details>
               <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>
               <details><summary>环境变量审计</summary><pre className="detail-pre">{JSON.stringify(detail.environment, null, 2)}</pre></details>
+              <details>
+                <summary>运行工作区 <span className={`workspace-state workspace-${detail.workspace_status ?? "unknown"}`}>{workspaceStatusLabel(detail.workspace_status)}</span></summary>
+                <pre className="detail-pre">{[
+                  detail.workspace_path ? `路径：${detail.workspace_path}` : "路径：未创建",
+                  detail.workspace_reason ? `说明：${detail.workspace_reason}` : "",
+                ].filter(Boolean).join("\n")}</pre>
+              </details>
               {detail.children.length > 0 && <details><summary>Sub-agent <span>{detail.children.length}</span></summary><div className="children-list">{detail.children.map((child) => <button key={child.run_id} onClick={() => setSelectedId(child.run_id)}>{child.agent_name}<StatusPill value={child.status} /></button>)}</div></details>}
             </div>
           </>
@@ -1166,6 +1753,7 @@ export default function App() {
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
   const [emittingKey, setEmittingKey] = useState("");
   const [eventOptions, setEventOptions] = useState<string[]>([]);
+  const [codexOptions, setCodexOptions] = useState<CodexRuntimeOptions>(EMPTY_CODEX_OPTIONS);
   const [revision, setRevision] = useState("");
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -1192,9 +1780,10 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const [config, options] = await Promise.all([
+      const [config, options, nextCodexOptions] = await Promise.all([
         api<{ revision: string; document: ConfigDocument; error?: string }>("/api/config"),
         api<{ events: string[] }>("/api/options"),
+        api<CodexRuntimeOptions>("/api/codex/runtime-options"),
         refreshOperationalData(),
       ]);
       const normalized = normalizeDocument(config.document);
@@ -1202,6 +1791,7 @@ export default function App() {
       setSavedDocument(structuredClone(normalized));
       setRevision(config.revision);
       setEventOptions(options.events);
+      setCodexOptions(nextCodexOptions);
       setDirty(false);
       setEditing(false);
       if (config.error) setError(config.error);
@@ -1255,6 +1845,7 @@ export default function App() {
       setDocument(normalized);
       setSavedDocument(structuredClone(normalized));
       setRevision(result.revision);
+      setCodexOptions(await api<CodexRuntimeOptions>("/api/codex/runtime-options"));
       setDirty(false);
       setEditing(false);
       setNotice("配置已校验、保存并通知后台热加载");
@@ -1308,11 +1899,13 @@ export default function App() {
     { id: "overview", label: "运行概览", mark: "01" },
     { id: "repositories", label: "仓库", mark: "02" },
     { id: "environment", label: "全局环境", mark: "03" },
-    { id: "agents", label: "Agent", mark: "04" },
-    { id: "rules", label: "触发规则", mark: "05" },
-    { id: "runs", label: "运行与日志", mark: "06" },
+    { id: "skills", label: "SKILL", mark: "04" },
+    { id: "agents", label: "Agent", mark: "05" },
+    { id: "rules", label: "触发规则", mark: "06" },
+    { id: "runtime", label: "运行时配置", mark: "07" },
+    { id: "runs", label: "运行与日志", mark: "08" },
   ], []);
-  const configurableTab = tab === "repositories" || tab === "environment" || tab === "agents" || tab === "rules";
+  const configurableTab = tab === "repositories" || tab === "environment" || tab === "skills" || tab === "agents" || tab === "rules" || tab === "runtime";
 
   return (
     <div className="app-shell">
@@ -1363,8 +1956,10 @@ export default function App() {
                   <fieldset className="config-editor-surface" disabled={!editing}>
                     {tab === "repositories" && <RepositoriesEditor document={document} onChange={changeDocument} />}
                     {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
-                    {tab === "agents" && <AgentsEditor document={document} onChange={changeDocument} />}
+                    {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
+                    {tab === "agents" && <AgentsEditor document={document} codexOptions={codexOptions} onChange={changeDocument} />}
                     {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
+                    {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
                   </fieldset>
                   {tab === "environment" && <ConfigHistory />}
                 </>

@@ -102,6 +102,8 @@ Agent 可声明以下写作用域：
 
 sub-agent 不是模型内部的逻辑角色，而是由编排器启动的另一个真实 `codex exec` 进程，因此具有独立日志、运行 ID 和超时。
 
+父 Agent 调用 `invoke_agent(agent_name, task, extra_context)` 时负责指定目标 sub-agent 和具体委托任务。sub-agent 自动继承仓库标识与远端项目，但不自动继承根 Agent 的 MR / PR 数据或动作列表。父 Agent 判断任务确有需要时，可在 `task` 或 `extra_context` 中明确传递所需信息。sub-agent 是否与父 Agent 共用本地工作目录由触发规则的 `inherit_workspace` 决定。
+
 ## 9. 凭据与权限
 
 Provider Token 优先从全局环境配置中的同名变量解析，没有配置时回退到宿主机环境。它只用于扫描器调用 API，并被强制标记为 Secret；启动 Codex CLI 前会从 Prompt 和子进程环境中移除，不把高权限 Provider Token 直接交给模型。
@@ -110,7 +112,7 @@ Provider Token 优先从全局环境配置中的同名变量解析，没有配�
 
 Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工作目录的 Agent 才使用 `workspace-write`，不默认开放 `danger-full-access`。
 
-本地工作目录不存在时，执行器根据仓库 SSH/HTTPS 地址原子克隆；已存在时只校验 Git 仓库并 fetch。当前 MR/PR head 写入 `refs/teamwork/change-requests/<编号>/head`，不会自动 checkout 或覆盖用户工作区。
+基础 Git 仓库不存在时，执行器根据仓库 SSH/HTTPS 地址原子克隆；已存在时只校验并 fetch。当前 MR/PR head 写入 `refs/teamwork/change-requests/<编号>/head`，每次运行再从该引用创建独立临时 worktree，不会 checkout 或覆盖基础仓库。
 
 ## 10. 已知边界
 
@@ -118,7 +120,7 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 - 扫描器按更新时间自动分页，并在上次成功扫描时间水位处提前停止；`max_items_per_repository` 作为单仓库单轮安全上限，`api_page_size` 只控制内部 API 分页大小。
 - GitHub 审批数按每位用户最新有效 Review 粗略计算；复杂分支保护规则仍由合并前的远端检查兜底。
 - 单机 SQLite 适合初期部署，多实例生产部署应迁移到 PostgreSQL。
-- 系统不会自动创建工作分支或 Git worktree；首次运行可自动克隆仓库，后续仅校验并拉取远端引用，Agent 的分支策略仍由 Prompt 与权限边界决定。
+- 根 Agent 与未继承父目录的 sub-agent 都使用按运行 ID 创建的独立 detached worktree；规则开启工作区继承时，sub-agent 调用链复用根 Agent 本次运行的 worktree 和实时 Git 状态。
 - 第一版尚未提供窄权限的平台写入 MCP，评论、审批和合并依赖部署方预先认证的 `gh`/`glab`。
 
 ## 11. 后台管理服务
@@ -172,6 +174,8 @@ React 管理 UI 包含：
 - 运行：过滤列表、父子 Agent 关系、最终结果和实时日志。
 - 配置历史：版本、来源、时间和内容查看。
 
+规则中的触发事件、目标 Agent 和仓库范围均使用直接点击的复选框多选，不依赖浏览器原生 `Command/Ctrl` 多选操作；界面显示已选数量，底层 YAML 仍保存为字符串数组。
+
 ## 16. 已扫描变更请求与首次事件补发
 
 管理首页分别展示“已扫描 MR / PR”与“变化事件”，避免把事件数量误认为远端变更请求数量。已扫描列表直接读取 SQLite 中的最新快照，展示仓库、编号、标题、远端状态、更新时间、最近扫描时间和原始链接。
@@ -179,3 +183,63 @@ React 管理 UI 包含：
 对于首次建立基线时没有产生 `change_request.discovered` 的快照，管理员可以手动补发首次发现事件。补发操作不会删除或改写快照，也不会重新请求 Provider；它只根据当前快照幂等写入一条 `change_request.discovered` 事件，并唤醒后台周期按当前规则处理。若该 MR / PR 已存在首次发现事件，接口返回已存在状态，不会重复入队或重复运行 Agent。
 
 由于补发事件可能触发具有写权限的 Agent，UI 必须在操作前说明影响并要求确认。没有匹配规则时事件仍会被记录，但不会启动 Agent。
+
+## 17. 重复变化、规则去重与 Agent 输入
+
+事件 ID 同时包含 MR / PR 的远端更新时间，因此同一个变更请求先后多次发生 `closed -> reopened` 等相同字段转换时，每一次被扫描器观察到的转换都会形成不同事件；同一远端快照被重复扫描时仍保持幂等。
+
+规则可启用“单轮扫描同一 MR / PR 只触发一次”。启用后，一次扫描为同一个 MR / PR 产生的多个事件如果同时匹配同一规则，则每个目标 Agent 只运行一次，`action` 按事件产生顺序合并为数组。不同规则彼此独立，不同目标 Agent 也各自运行一次；后续扫描再次发生变化时仍可重新触发。
+
+根 Agent 的动态输入只提供统一 MR / PR 信息，不暴露旧快照、新快照、变化字段或内部匹配字段。其 JSON 结构以 `mr` 为根对象，`mr.action` 始终是短动作名数组，例如 `["reopened", "updated"]`。sub-agent 的动态输入只包含仓库上下文，以及父 Agent 指定的 `delegated_task` 和可选 `delegated_context`；系统内部用于准备工作目录、加锁和审计的事件不会自动暴露给 sub-agent。
+
+仅依靠快照轮询只能识别相邻两次扫描之间最终可见的状态。如果一次扫描间隔内先关闭又重新打开，且扫描器没有看到中间关闭状态，则平台最终快照仍是打开。GitHub 仓库额外读取 PR Timeline，以稳定的 `id` / `node_id` 恢复同一周期内的 `closed`、`reopened`、`merged`、`committed`、Draft 和标签变化；GitLab 等尚未实现活动流的 Provider 继续使用快照差异。需要更低延迟或更强投递保证时，仍应增加带签名校验的 Webhook 事件源，并保留周期扫描用于对账。
+
+## 18. 每次运行独立工作区与 sub-agent 继承
+
+仓库配置中的 `workspace` 是基础 Git 仓库，只负责克隆、校验、fetch 和管理 worktree，不再直接作为 Codex CLI 的工作目录。每次根 Agent 运行都会在数据库目录旁的 `worktrees/<仓库>/<run-id>/` 创建以当前 MR / PR Head 为起点的 detached Git worktree，并将该路径写入 Prompt 仓库上下文、`REPOSITORY_WORKSPACE`、运行审计和日志。这样同一仓库的不同 MR、不同分支或同一 Agent 的不同运行可以真正并发，互不共享当前分支、暂存区和未提交文件。
+
+声明 `workspace` 写作用域时，资源锁按仓库与 MR 源分支生成，而不是按临时目录生成。同一源分支的写 Agent 串行执行，防止不同临时 worktree 同时 push 覆盖远端；不同源分支可以并发。`change_request` 写作用域仍按 MR / PR 资源键串行。
+
+规则可配置 `inherit_workspace`，默认关闭。开启时，根 Agent 的后代 sub-agent 共用父 Agent 本次运行的临时 worktree，因此父 Agent 的分支切换、暂存区和未提交文件对子 Agent 可见；共享工作区委托在单个 MCP 进程内串行执行。关闭时，sub-agent 为自己的运行创建另一个独立 worktree。该选项只继承文件系统与 Git 状态，不自动继承 MR / PR Prompt、动作数组或父 Agent 对话内容。
+
+拥有 worktree 的 Agent 结束后执行安全清理：运行成功且工作区无修改、没有新增提交，或者新增提交已经存在于远端引用时立即使用 `git worktree remove` 删除。失败、超时、存在未提交文件或新增提交尚未推送时保留工作区，并在运行记录中标记“待清理”。保留超过 `runtime.worktree_retention_days` 后，后台在下次准备同仓库工作区时强制清理；这项期限明确代表对遗留本地修改的最长恢复窗口。
+
+Agent 配置本身不绑定仓库或固定目录。管理 UI 在 Agent 页面说明基础仓库与临时运行工作区的关系，并在运行详情展示本次实际路径、清理状态和保留原因。
+
+## 19. SKILL 管理与按 Agent 装载
+
+配置顶层增加 `skills`，每个条目引用一个符合 Codex Skill 规范的目录；目录中必须存在带 `name` 与 `description` 元数据的 `SKILL.md`，并可同时包含 `scripts/`、`references/`、`assets/` 等资源。Agent 通过 `skills` 字符串数组独立选择本次运行允许装载的技能。sub-agent 使用自己的 Agent 配置，不继承父 Agent 的技能选择；规则的 `inherit_workspace` 仍只控制文件系统与 Git 状态。
+
+管理 UI 增加独立的 SKILL 页面，支持填写服务端已有目录，也支持从浏览器选择整个技能文件夹并复制到配置文件旁的 `./skills/`。导入时校验目录层级、文件数量、总大小和 `SKILL.md` 元数据，并拒绝路径穿越、重复目标及非法文件。导入只负责保存技能目录，管理员仍需将其加入配置后再在 Agent 中选择。
+
+运行 Codex CLI 前，执行器把应用配置中的技能完整投影到本次临时 worktree 的 `.agents/skills/` 下，并通过当前 Agent 的 Codex 配置显式启用已选技能、禁用其他由本应用管理的技能。投影保留技能内部相对路径和资源，但不修改技能源目录；Codex 子进程同时使用仅对本次进程生效的 Git 忽略文件，使投影不会出现在 `git status` 或普通 `git add -A` 中；进程结束后立即清理。根 Agent 与继承工作区的 sub-agent 可以看到同一份稳定投影，但各自的启用列表仍由各自 Agent 配置决定。未继承工作区的 sub-agent 在自己的临时 worktree 中创建和清理投影。
+
+技能装载表示该技能可被 Codex 根据 `description` 隐式匹配，也可由 Prompt 使用 `$skill-name` 显式要求；选择技能不等于每次运行都强制执行。应用只控制 `skills` 中注册的技能，Codex 自带技能及部署环境原有的其他发现来源不在这份选择列表内。
+
+## 20. GitHub Timeline 增量事件与快照对账
+
+GitHub 扫描采用“候选 PR、活动流、当前快照”三层模型。PR 列表继续按 `updated_at` 倒序筛出本周期发生过活动的候选项；对每个候选 PR，Provider 在读取详情、Review 和提交状态之外读取 Issue Timeline。Timeline 不能替代 PR 列表，因为它按单个 PR 分页，也不能替代 PR 详情，因为审批汇总、流水线、可合并状态和完整分支信息仍来自其他接口。
+
+Timeline 游标按 Provider、仓库和 PR 编号持久化。游标记录最后一个可见 Timeline 项的稳定标识和所在页；后续扫描从上一页开始重叠读取并寻找该标识，只转换它之后的新项目。每轮在按 `updated_at` 筛选候选 PR 之前，先为数据库中已有但缺少游标的快照补齐基线，避免升级后的第一次变化才开始初始化。游标与快照、语义事件在同一 SQLite 事务中提交，进程在事务前退出时可以安全重试；单独的首次基线不产生事件。首次启用 Timeline 或游标无法恢复时不重放不确定的历史动作，同时仍执行一次快照对账。
+
+时间范围不作为幂等依据。`committed` Timeline 项没有统一的活动发生时间，commit 作者时间也可能早于它被推送到 PR 的时间；扫描请求延迟和失败重试还会跨越周期边界。因此系统使用 Timeline `id` / `node_id` 生成稳定事件 ID，时间只用于展示和排序。
+
+Timeline 负责能够明确还原的离散动作：关闭、重新打开、合并、新增提交、强制推送、Draft 切换和标签变化。转换时按 Timeline 顺序构造事件发生时的旧、新快照，以便规则继续匹配 `old.*` 与 `new.*`；事件同时携带本轮最终快照，Agent 的 Prompt、环境变量、工作区和分支锁始终使用扫描结束时的当前真值。每个离散动作仍配套产生一条 `change_request.updated`，规则可通过 `deduplicate_per_scan` 合并同轮多动作。
+
+活动转换完成后，系统从已应用活动的中间快照与最终 PR 快照继续执行差异检测，以补充审批数、流水线状态、可合并状态、标题等 Timeline 未覆盖或不适合直接汇总的字段。Timeline 已消费的状态、提交、Draft 和标签变化不会被快照逻辑重复生成。Provider 不支持活动流、首次建立活动基线或游标重置时，快照差异仍作为完整兜底路径。
+
+## 21. 通用审核标准扩展
+
+通用审核 Prompt 增加改动范围与爆炸半径、仓库卫生、路径可移植性、配置命名与归属四类跨项目检查。这些检查不引入 aGen 的目录白名单、环境变量前缀、Workflow 入口、Agent 工具边界或 Router 契约等项目专属规则。
+
+新检查只扩展审核覆盖面，不改变阻塞问题的证据和影响门槛。改动较广、未拆分、出现普通临时产物、采用某种路径写法或命名不一致，都不会自动导致拒绝合并；仍需证明问题由本次变更引入、触发路径现实可达且具有实质影响，或由项目审核 Skill 明确规定为阻塞项。
+
+## 22. Codex CLI 运行时默认配置
+
+管理 UI 增加独立的“运行时配置”页面，用于配置本服务启动 Codex CLI 时采用的默认模型、推理强度、快速模式、输出详细度、交互风格和联网搜索策略。配置保存于 `runtime.codex`，只影响 Teamwork 发起的 Codex 进程，不修改用户的 `~/.codex/config.toml`。高级配置使用 Codex 原生点号键，并禁止覆盖 Sandbox、审批策略、MCP Server、Skill、模型结构化字段等由应用负责管理的安全或集成配置。
+
+运行时参数遵循“Codex 用户/仓库配置 → Teamwork 运行时默认 → Agent 显式覆盖 → 应用托管安全与 MCP 参数”的合并顺序。Teamwork 通过每次 `codex exec` 的 `--config key=value` 注入运行时默认；Agent 的模型和同类可选字段在其后覆盖。sub-agent 使用目标 Agent 自己的设置，不继承父 Agent 的模型、推理强度、快速模式或其他运行参数；未设置时仍回退到同一份 Teamwork 运行时默认。
+
+服务不再强制使用 `--ignore-user-config`，因此未被 Teamwork 或 Agent 覆盖的 Codex 配置仍按 CLI 原生层级生效。Teamwork 的应用托管 MCP 网关、当前运行 Skill 选择、工作目录和 Sandbox 继续由命令行显式指定，不能被运行时高级配置覆盖。
+
+后端提供只读的 Codex 运行能力接口：优先调用当前配置的 `codex_binary debug models --bundled` 获取本机 CLI 已知模型、各模型支持的推理强度、默认推理强度和快速模式能力；命令不可用时 UI 仍允许手工填写。Agent 模型留空时，UI 按可验证来源显示继承结果：先显示 `runtime.codex.model`，否则尝试读取 `$CODEX_HOME/config.toml` 或 `~/.codex/config.toml` 的顶层 `model`；两者都没有时显示“由 CLI 与账号决定”，不猜测内置默认模型。仓库级 `.codex/config.toml` 可能因实际运行仓库不同而改变结果，UI 会明确提示这一点。

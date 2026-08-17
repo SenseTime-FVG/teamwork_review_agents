@@ -11,7 +11,44 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field, PositiveInt, model_validator
+from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator
+
+
+CodexConfigPrimitive = str | int | float | bool
+CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
+
+CODEX_STRUCTURED_CONFIG_KEYS = {
+    "model",
+    "model_reasoning_effort",
+    "model_verbosity",
+    "personality",
+    "web_search",
+    "features.fast_mode",
+    "service_tier",
+}
+CODEX_MANAGED_CONFIG_KEYS = {
+    "approval_policy",
+    "chatgpt_base_url",
+    "hooks",
+    "model_provider",
+    "notify",
+    "openai_base_url",
+    "profile",
+    "sandbox_mode",
+    "shell_environment_policy",
+}
+CODEX_MANAGED_CONFIG_PREFIXES = (
+    "agents.",
+    "hooks.",
+    "mcp_servers.",
+    "skills.",
+    "permissions.",
+    "profiles.",
+    "model_providers.",
+    "otel.",
+    "sandbox_workspace_write.",
+    "shell_environment_policy.",
+)
 
 
 class DatabaseConfig(BaseModel):
@@ -49,6 +86,49 @@ class ScannerConfig(BaseModel):
         return data
 
 
+class CodexRuntimeConfig(BaseModel):
+    """Teamwork 启动 Codex CLI 时注入的默认运行参数。"""
+
+    model: str | None = None
+    model_reasoning_effort: str | None = None
+    fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
+    model_verbosity: Literal["low", "medium", "high"] | None = None
+    personality: Literal["none", "friendly", "pragmatic"] | None = None
+    web_search: Literal["disabled", "cached", "live"] | None = None
+    extra_config: dict[str, CodexConfigValue] = Field(default_factory=dict)
+
+    @field_validator("extra_config")
+    @classmethod
+    def validate_extra_config(
+        cls,
+        value: dict[str, CodexConfigValue],
+    ) -> dict[str, CodexConfigValue]:
+        """禁止高级项绕过结构化字段和应用托管的安全边界。"""
+
+        invalid_format = sorted(
+            key
+            for key in value
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", key) is None
+        )
+        if invalid_format:
+            raise ValueError(
+                f"Codex 高级配置键格式无效：{invalid_format}"
+            )
+        protected = sorted(
+            key
+            for key in value
+            if key in CODEX_STRUCTURED_CONFIG_KEYS
+            or key in CODEX_MANAGED_CONFIG_KEYS
+            or key.startswith(CODEX_MANAGED_CONFIG_PREFIXES)
+        )
+        if protected:
+            raise ValueError(
+                "Codex 高级配置不能覆盖结构化字段或应用托管配置："
+                f"{protected}"
+            )
+        return value
+
+
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
@@ -58,7 +138,9 @@ class RuntimeConfig(BaseModel):
     max_sub_agent_depth: int = Field(default=2, ge=0)
     max_agent_runs_per_root: PositiveInt = 8
     event_retry_count: int = Field(default=2, ge=0)
+    worktree_retention_days: PositiveInt = 7
     codex_binary: str = "codex"
+    codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
     mcp_tool_timeout_seconds: PositiveInt = 1800
     max_jsonl_events: PositiveInt = 2000
@@ -125,6 +207,12 @@ class ProviderConfig(BaseModel):
     request_timeout_seconds: PositiveInt = 30
 
 
+class SkillConfig(BaseModel):
+    """一个可由 Agent 独立装载的 Codex Skill 目录。"""
+
+    path: Path
+
+
 class RepositoryConfig(BaseModel):
     """被扫描仓库及 Agent 本地工作目录配置。"""
 
@@ -173,10 +261,16 @@ class AgentConfig(BaseModel):
     prompt_file: Path | None = None
     prompt: str | None = None
     model: str | None = None
+    model_reasoning_effort: str | None = None
+    fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
+    model_verbosity: Literal["low", "medium", "high"] | None = None
+    personality: Literal["none", "friendly", "pragmatic"] | None = None
+    web_search: Literal["disabled", "cached", "live"] | None = None
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
     timeout_seconds: PositiveInt = 1200
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     allowed_sub_agents: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
     output_schema: Path | None = None
     skip_git_repo_check: bool = False
     extra_codex_args: list[str] = Field(default_factory=list)
@@ -199,6 +293,8 @@ class RuleConfig(BaseModel):
     agents: list[str]
     repositories: list[str] | None = None
     conditions: dict[str, Any] = Field(default_factory=dict)
+    deduplicate_per_scan: bool = False
+    inherit_workspace: bool = False
     enabled: bool = True
 
 
@@ -212,6 +308,7 @@ class AppConfig(BaseModel):
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     repositories: list[RepositoryConfig] = Field(default_factory=list)
+    skills: dict[str, SkillConfig] = Field(default_factory=dict)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
     rules: list[RuleConfig] = Field(default_factory=list)
     config_path: Path = Field(exclude=True)
@@ -272,11 +369,32 @@ class AppConfig(BaseModel):
                 )
 
         agent_names = set(self.agents)
+        skill_names = set(self.skills)
+        skill_metadata_names: dict[str, str] = {}
+        from .skill_files import read_skill_metadata
+
+        for skill_id, skill in self.skills.items():
+            try:
+                metadata = read_skill_metadata(skill.path)
+            except ValueError as exc:
+                raise ValueError(f"Skill {skill_id} 无效：{exc}") from exc
+            previous = skill_metadata_names.get(metadata.name)
+            if previous is not None:
+                raise ValueError(
+                    f"Skill {skill_id} 与 {previous} 的 SKILL.md name 重复："
+                    f"{metadata.name}"
+                )
+            skill_metadata_names[metadata.name] = skill_id
         for agent_name, agent in self.agents.items():
             unknown = set(agent.allowed_sub_agents) - agent_names
             if unknown:
                 raise ValueError(
                     f"Agent {agent_name} 引用了不存在的 sub-agent：{sorted(unknown)}"
+                )
+            unknown_skills = set(agent.skills) - skill_names
+            if unknown_skills:
+                raise ValueError(
+                    f"Agent {agent_name} 引用了不存在的 Skill：{sorted(unknown_skills)}"
                 )
             if "workspace" in agent.write_scopes and agent.sandbox == "read-only":
                 raise ValueError(
@@ -392,6 +510,14 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
         repositories.append(repository)
     data["repositories"] = repositories
 
+    skills: dict[str, dict[str, Any]] = {}
+    for name, item in data.get("skills", {}).items():
+        skill = dict(item)
+        if skill.get("path"):
+            skill["path"] = _resolve_path(base_dir, skill["path"])
+        skills[name] = skill
+    data["skills"] = skills
+
     agents: dict[str, dict[str, Any]] = {}
     for name, item in data.get("agents", {}).items():
         agent = dict(item)
@@ -431,6 +557,22 @@ def validate_runtime_files(config: AppConfig) -> list[str]:
     """返回提示词、工作目录和可选 Schema 的文件问题。"""
 
     errors: list[str] = []
+    skill_metadata_names: dict[str, str] = {}
+    from .skill_files import read_skill_metadata
+
+    for skill_id, skill in config.skills.items():
+        try:
+            metadata = read_skill_metadata(skill.path)
+        except ValueError as exc:
+            errors.append(f"Skill {skill_id} 无效：{exc}")
+            continue
+        previous = skill_metadata_names.get(metadata.name)
+        if previous is not None:
+            errors.append(
+                f"Skill {skill_id} 与 {previous} 的 SKILL.md name 重复：{metadata.name}"
+            )
+        else:
+            skill_metadata_names[metadata.name] = skill_id
     for name, agent in config.agents.items():
         if agent.prompt_file and not agent.prompt_file.is_file():
             errors.append(f"Agent {name} 的提示词文件不存在：{agent.prompt_file}")

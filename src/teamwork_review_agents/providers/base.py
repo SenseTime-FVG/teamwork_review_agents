@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 import httpx
 
 from ..config import ProviderConfig, RepositoryConfig, ScannerConfig
-from ..models import ChangeRequestSnapshot
+from ..models import ChangeRequestActivityBatch, ChangeRequestSnapshot
 
 
 class ProviderError(RuntimeError):
@@ -58,19 +58,29 @@ class BaseProvider(ABC):
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
-    async def get_json(self, path: str, **kwargs: object) -> object:
-        """执行 GET 并将平台错误转换为不泄露凭据的异常。"""
+    async def get_json_response(
+        self,
+        path: str,
+        **kwargs: object,
+    ) -> tuple[object, dict[str, str]]:
+        """执行 GET，并同时返回分页所需的响应头。"""
 
         try:
             response = await self.client.get(path, **kwargs)
             response.raise_for_status()
-            return response.json()
+            return response.json(), dict(response.headers)
         except httpx.HTTPStatusError as exc:
             raise ProviderError(
                 f"Provider {self.name} 请求失败：{exc.response.status_code} {path}"
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
+    async def get_json(self, path: str, **kwargs: object) -> object:
+        """执行 GET 并将平台错误转换为不泄露凭据的异常。"""
+
+        payload, _ = await self.get_json_response(path, **kwargs)
+        return payload
 
     async def get_optional_json(
         self,
@@ -101,6 +111,17 @@ class BaseProvider(ABC):
         updated_since: datetime | None = None,
     ) -> list[ChangeRequestSnapshot]:
         """列出数量上限内、指定时间之后更新的变更请求。"""
+
+    async def list_change_request_activities(
+        self,
+        repository: RepositoryConfig,
+        number: int,
+        *,
+        cursor: dict[str, object] | None = None,
+    ) -> ChangeRequestActivityBatch | None:
+        """读取单个 MR/PR 的增量活动；不支持时返回空能力。"""
+
+        return None
 
 
 def parse_datetime(value: str | None) -> datetime:

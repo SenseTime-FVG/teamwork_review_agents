@@ -139,6 +139,19 @@ def test_environment_precedence_template_and_redaction(
         "system-secret first-secret"
     ) == f"{MASK} {MASK}"
 
+    delegated = resolve_environment(
+        config,
+        repository,
+        config.agents["reviewer"],
+        event,
+        "run-child",
+        include_change_request=False,
+    )
+    assert delegated.all_values["REPOSITORY_ID"] == repository.id
+    assert delegated.all_values["RUN_ID"] == "run-child"
+    assert "MR_TITLE" not in delegated.all_values
+    assert "EVENT_TYPE" not in delegated.process_values
+
 
 def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> None:
     config_path = write_config(tmp_path)
@@ -324,3 +337,46 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         static = client.get("/")
         assert static.status_code == 200
         assert "Teamwork Review Agents" in static.text
+
+
+def test_codex_runtime_options_report_catalog_and_user_model(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """运行时接口应返回本机模型目录和可验证的用户模型来源。"""
+
+    config_path = write_config(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-user"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"models\":[{\"slug\":\"gpt-test\",\"display_name\":\"GPT Test\",\"default_reasoning_level\":\"medium\",\"supported_reasoning_levels\":[{\"effort\":\"low\"},{\"effort\":\"medium\"}],\"additional_speed_tiers\":[\"fast\"]}]}'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["runtime"] = {"codex_binary": str(fake_codex)}
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        result = client.get("/api/codex/runtime-options").json()
+
+    assert result["models"][0]["slug"] == "gpt-test"
+    assert result["models"][0]["supported_reasoning_levels"] == ["low", "medium"]
+    assert result["models"][0]["supports_fast_mode"] is True
+    assert result["user_model"] == "gpt-user"
+    assert result["inherited_model"] == {
+        "value": "gpt-user",
+        "source": "user",
+        "label": "继承 Codex 用户配置（gpt-user）",
+    }

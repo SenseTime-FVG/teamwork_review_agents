@@ -32,6 +32,16 @@ export type ManagedPromptFile = {
   size: number;
 };
 
+export type ManagedSkillDirectory = {
+  directory?: string;
+  path: string;
+  resolved_path?: string;
+  name: string;
+  description: string;
+  valid: boolean;
+  error?: string | null;
+};
+
 export async function uploadPromptFile(file: File): Promise<ManagedPromptFile> {
   const body = new FormData();
   body.set("file", file);
@@ -45,6 +55,26 @@ export async function uploadPromptFile(file: File): Promise<ManagedPromptFile> {
     throw new Error(result.detail ?? `导入失败：${response.status}`);
   }
   return result as ManagedPromptFile;
+}
+
+export async function uploadSkillDirectory(
+  files: File[],
+): Promise<ManagedSkillDirectory> {
+  const body = new FormData();
+  for (const file of files) {
+    const relativePath = file.webkitRelativePath || file.name;
+    body.append("files", file, relativePath);
+  }
+  const response = await fetch("/api/skill-directories/import", {
+    method: "POST",
+    headers: headers(undefined, false),
+    body,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result.detail ?? `导入失败：${response.status}`);
+  }
+  return result as ManagedSkillDirectory;
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

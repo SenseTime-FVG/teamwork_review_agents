@@ -22,14 +22,59 @@ export type Agent = {
   prompt_file?: string;
   prompt?: string;
   model?: string;
+  model_reasoning_effort?: string;
+  fast_mode?: "inherit" | "standard" | "fast";
+  model_verbosity?: "low" | "medium" | "high";
+  personality?: "none" | "friendly" | "pragmatic";
+  web_search?: "disabled" | "cached" | "live";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   timeout_seconds?: number;
   write_scopes?: Array<"change_request" | "workspace">;
   allowed_sub_agents?: string[];
+  skills?: string[];
   output_schema?: string;
   skip_git_repo_check?: boolean;
   extra_codex_args?: string[];
   environment?: EnvironmentMap;
+};
+
+export type CodexConfigValue = string | number | boolean | Array<string | number | boolean>;
+
+export type CodexRuntimeConfig = {
+  model?: string;
+  model_reasoning_effort?: string;
+  fast_mode?: "inherit" | "standard" | "fast";
+  model_verbosity?: "low" | "medium" | "high";
+  personality?: "none" | "friendly" | "pragmatic";
+  web_search?: "disabled" | "cached" | "live";
+  extra_config?: Record<string, CodexConfigValue>;
+};
+
+export type RuntimeConfig = Record<string, unknown> & {
+  codex?: CodexRuntimeConfig;
+};
+
+export type CodexRuntimeOptions = {
+  models: Array<{
+    slug: string;
+    display_name: string;
+    default_reasoning_level?: string | null;
+    supported_reasoning_levels: string[];
+    supports_fast_mode: boolean;
+  }>;
+  inherited_model: {
+    value?: string | null;
+    source: "runtime" | "user" | "builtin";
+    label: string;
+  };
+  user_model?: string | null;
+  user_config_path: string;
+  catalog_error?: string | null;
+  user_config_error?: string | null;
+};
+
+export type Skill = {
+  path: string;
 };
 
 export type Rule = {
@@ -38,17 +83,20 @@ export type Rule = {
   agents: string[];
   repositories?: string[];
   conditions?: Record<string, unknown>;
+  deduplicate_per_scan?: boolean;
+  inherit_workspace?: boolean;
   enabled?: boolean;
 };
 
 export type ConfigDocument = {
   database: { path: string };
   scanner: Record<string, unknown>;
-  runtime: Record<string, unknown>;
+  runtime: RuntimeConfig;
   web: Record<string, unknown>;
   environment: { global: EnvironmentMap };
   providers: Record<string, Record<string, unknown>>;
   repositories: Repository[];
+  skills: Record<string, Skill>;
   agents: Record<string, Agent>;
   rules: Rule[];
 };
@@ -101,6 +149,9 @@ export type RunSummary = {
   status: string;
   attempts: number;
   error?: string | null;
+  workspace_path?: string | null;
+  workspace_status?: "active" | "removed" | "retained" | "inherited" | "not-created" | null;
+  workspace_reason?: string | null;
   started_at: number;
   finished_at?: number | null;
 };

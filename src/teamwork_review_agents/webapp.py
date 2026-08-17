@@ -15,10 +15,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config_manager import ConfigManager
+from .codex_settings import inspect_runtime_options
 from .environment import render_prompt
 from .events import FIELD_EVENTS, detect_events
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
 from .runtime import BackgroundRuntime
+from .skill_files import (
+    MAX_SKILL_FILE_BYTES,
+    MAX_SKILL_FILES,
+    MAX_SKILL_TOTAL_BYTES,
+    import_skill_directory,
+    inspect_skill_path,
+    list_skill_directories,
+)
 
 
 class ConfigDocumentRequest(BaseModel):
@@ -32,6 +41,12 @@ class PromptPreviewRequest(BaseModel):
 
     template: str
     variables: dict[str, str] = Field(default_factory=dict)
+
+
+class SkillInspectRequest(BaseModel):
+    """服务端 Skill 目录检查请求。"""
+
+    path: str
 
 
 def create_app(
@@ -170,6 +185,16 @@ def create_app(
             ],
         }
 
+    @app.get("/api/codex/runtime-options")
+    async def codex_runtime_options() -> dict[str, Any]:
+        """返回本机 Codex 模型目录和当前可验证的继承模型来源。"""
+
+        return await asyncio.to_thread(
+            inspect_runtime_options,
+            manager.config.runtime.codex,
+            manager.config.runtime.codex_binary,
+        )
+
     @app.post("/api/prompts/preview")
     async def preview_prompt(body: PromptPreviewRequest) -> dict[str, str]:
         """按运行时相同规则预览模板，未定义变量渲染为空字符串。"""
@@ -203,6 +228,64 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             await file.close()
+
+    @app.get("/api/skill-directories")
+    async def skill_directories() -> list[dict[str, Any]]:
+        """列出配置目录旁已经导入的 Skill 文件夹。"""
+
+        return await asyncio.to_thread(list_skill_directories, manager.path)
+
+    @app.post("/api/skill-directories/inspect")
+    async def inspect_skill(body: SkillInspectRequest) -> dict[str, Any]:
+        """检查服务端已有 Skill 路径并读取展示元数据。"""
+
+        try:
+            return await asyncio.to_thread(inspect_skill_path, manager.path, body.path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/skill-directories/import")
+    async def upload_skill_directory(
+        files: list[UploadFile] = File(...),
+    ) -> dict[str, Any]:
+        """将浏览器选择的完整 Skill 文件夹复制到配置旁的 skills 目录。"""
+
+        if len(files) > MAX_SKILL_FILES:
+            for file in files:
+                await file.close()
+            raise HTTPException(
+                status_code=413,
+                detail=f"单个 Skill 最多包含 {MAX_SKILL_FILES} 个文件",
+            )
+        uploaded: list[tuple[str, bytes]] = []
+        total_bytes = 0
+        try:
+            for file in files:
+                content = await file.read(MAX_SKILL_FILE_BYTES + 1)
+                if len(content) > MAX_SKILL_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Skill 单个文件不能超过 8 MiB：{file.filename or ''}",
+                    )
+                total_bytes += len(content)
+                if total_bytes > MAX_SKILL_TOTAL_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="单个 Skill 全部文件合计不能超过 32 MiB",
+                    )
+                uploaded.append((file.filename or "", content))
+            return await asyncio.to_thread(
+                import_skill_directory,
+                manager.path,
+                uploaded,
+            )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            for file in files:
+                await file.close()
 
     @app.get("/api/runs")
     async def runs(

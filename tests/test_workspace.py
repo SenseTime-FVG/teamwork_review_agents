@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+from pathlib import Path
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig
-from teamwork_review_agents.workspace import prepare_change_request_workspace
+from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.executor import AgentExecutor
+from teamwork_review_agents.state import StateStore
+from teamwork_review_agents.workspace import (
+    cleanup_expired_worktrees,
+    cleanup_run_worktree,
+    ensure_isolated_worktree,
+    prepare_change_request_workspace,
+    retained_marker_path,
+    validate_linked_workspace,
+)
 
 
 def run_git(*arguments: str, cwd=None) -> str:
@@ -68,3 +80,141 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
     assert change_ref == "refs/teamwork/change-requests/7/head"
     assert (workspace / ".git").exists()
     assert run_git("rev-parse", change_ref, cwd=workspace) == head_sha
+
+    (workspace / "parent-only.txt").write_text("父工作区未提交文件\n", encoding="utf-8")
+    isolated = ensure_isolated_worktree(
+        workspace,
+        tmp_path / "data" / "worktrees" / "child",
+        change_ref,
+    )
+    assert isolated != workspace.resolve()
+    assert run_git("rev-parse", "HEAD", cwd=isolated) == head_sha
+    assert not (isolated / "parent-only.txt").exists()
+    assert validate_linked_workspace(workspace, workspace) == workspace.resolve()
+    assert ensure_isolated_worktree(workspace, isolated, change_ref) == isolated
+
+    cleanup = cleanup_run_worktree(
+        workspace,
+        isolated,
+        run_status="completed",
+        starting_head=head_sha,
+        retention_days=7,
+    )
+    assert cleanup.status == "removed"
+    assert not isolated.exists()
+
+    retained = ensure_isolated_worktree(
+        workspace,
+        tmp_path / "data" / "worktrees" / "retained",
+        change_ref,
+    )
+    (retained / "未提交.txt").write_text("需要恢复\n", encoding="utf-8")
+    cleanup = cleanup_run_worktree(
+        workspace,
+        retained,
+        run_status="completed",
+        starting_head=head_sha,
+        retention_days=7,
+    )
+    assert cleanup.status == "retained"
+    assert retained.exists()
+    assert retained_marker_path(retained).exists()
+
+    removed = cleanup_expired_worktrees(
+        workspace,
+        retained.parent,
+        now=float("inf"),
+    )
+    assert removed == [retained.resolve()]
+    assert not retained.exists()
+    assert not retained_marker_path(retained).exists()
+
+
+async def test_root_agent_runs_in_its_own_temporary_worktree(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """根 Agent 不应直接在基础仓库运行，干净结束后应删除临时目录。"""
+
+    origin = tmp_path / "agent-origin.git"
+    source = tmp_path / "agent-source"
+    run_git("init", "--bare", str(origin))
+    source.mkdir()
+    run_git("init", "--initial-branch=main", cwd=source)
+    run_git("config", "user.name", "Test User", cwd=source)
+    run_git("config", "user.email", "test@example.com", cwd=source)
+    (source / "README.md").write_text("Agent 测试\n", encoding="utf-8")
+    run_git("add", "README.md", cwd=source)
+    run_git("commit", "-m", "初始化 Agent 测试", cwd=source)
+    head_sha = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("remote", "add", "origin", str(origin), cwd=source)
+    run_git("push", "origin", "main", cwd=source)
+    run_git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    run_git("push", "origin", "HEAD:refs/pull/7/head", cwd=source)
+
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+sys.stdin.read()
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "完成"}}}}, ensure_ascii=False), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+
+    config = configured_app_factory()
+    config.runtime.codex_binary = str(fake_codex)
+    repository = config.repositories[0]
+    repository.clone_url = str(origin)
+    repository.workspace = tmp_path / "base-repository"
+    snapshot = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+        head_sha=head_sha,
+    )
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store = StateStore(config.database.path)
+    store.initialize()
+
+    result = await AgentExecutor(config, store).execute(
+        agent_name="code-reviewer",
+        event=event,
+        idempotency_key="root-worktree-run",
+        rule_name="review",
+    )
+
+    assert result is not None
+    detail = store.get_run(result.run_id)
+    assert detail is not None
+    assert detail["workspace_status"] == "removed"
+    assert detail["workspace_path"] != str(repository.workspace.resolve())
+    assert not Path(detail["workspace_path"]).exists()
+
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+sys.stdin.read()
+Path("agent-change.txt").write_text("尚未提交\\n", encoding="utf-8")
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "完成但有修改"}}}}, ensure_ascii=False), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    retained_result = await AgentExecutor(config, store).execute(
+        agent_name="code-reviewer",
+        event=event,
+        idempotency_key="root-worktree-retained",
+        rule_name="review",
+    )
+
+    assert retained_result is not None
+    retained_detail = store.get_run(retained_result.run_id)
+    assert retained_detail is not None
+    assert retained_detail["workspace_status"] == "retained"
+    assert Path(retained_detail["workspace_path"]).exists()
+    assert "未提交" in retained_detail["workspace_reason"]

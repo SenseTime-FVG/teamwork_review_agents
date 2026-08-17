@@ -6,7 +6,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .codex_runner import CodexRunner
 from .config import AppConfig, RepositoryConfig
@@ -14,20 +14,70 @@ from .environment import SecretRedactor, render_prompt, resolve_environment
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .state import StateStore
-from .workspace import prepare_change_request_workspace
+from .workspace import (
+    change_request_ref,
+    cleanup_expired_worktrees,
+    cleanup_run_worktree,
+    ensure_isolated_worktree,
+    mark_active_worktree,
+    prepare_change_request_workspace,
+    validate_linked_workspace,
+    worktree_head,
+    worktree_starting_head,
+)
 
 
 class AgentExecutionError(RuntimeError):
     """表示 Agent 配置、限额、资源或 Codex 执行失败。"""
 
 
-def event_payload(event: ChangeEvent) -> dict[str, Any]:
-    """返回适合提示词使用且不包含冗余平台原始响应的事件。"""
+def _action_name(event_type: str) -> str:
+    """将内部完整事件名转换为给 Agent 使用的短动作名。"""
 
-    return event.model_dump(
-        mode="json",
-        exclude={"old": {"raw"}, "new": {"raw"}},
-    )
+    return event_type.removeprefix("change_request.")
+
+
+def _repository_payload(
+    repository: RepositoryConfig,
+) -> dict[str, Any]:
+    """返回根 Agent 与 sub-agent 共用的仓库上下文。"""
+
+    return {
+        "id": repository.id,
+        "project": repository.project,
+        "provider": repository.provider,
+        "workspace": str(repository.workspace),
+    }
+
+
+def _mr_payload(
+    event: ChangeEvent,
+    repository: RepositoryConfig,
+    actions: Sequence[str],
+    change_ref: str,
+) -> dict[str, Any]:
+    """返回根 Agent 所需的统一 MR / PR 当前信息。"""
+
+    snapshot = event.current_snapshot
+    return {
+        "repository": _repository_payload(repository),
+        "number": snapshot.number,
+        "title": snapshot.title,
+        "state": snapshot.state,
+        "action": [_action_name(action) for action in actions],
+        "draft": snapshot.draft,
+        "source_branch": snapshot.source_branch,
+        "target_branch": snapshot.target_branch,
+        "head_sha": snapshot.head_sha,
+        "labels": list(snapshot.labels),
+        "approvals": snapshot.approvals,
+        "pipeline_status": snapshot.pipeline_status,
+        "merge_status": snapshot.merge_status,
+        "updated_at": snapshot.updated_at.isoformat(),
+        "url": snapshot.web_url,
+        "change_ref": change_ref,
+        "target_ref": f"refs/remotes/origin/{snapshot.target_branch}",
+    }
 
 
 class AgentExecutor:
@@ -38,7 +88,26 @@ class AgentExecutor:
         self.store = store
         self.runner = CodexRunner(config)
         self.repositories = config.repository_map()
-        self.workspace_prepare_locks: dict[str, asyncio.Lock] = {}
+
+    def run_workspace_path(
+        self,
+        repository: RepositoryConfig,
+        run_id: str,
+    ) -> Path:
+        """返回一次 Agent 运行专属的临时 worktree 路径。"""
+
+        repository_directory = stable_hash(repository.id)[:16]
+        return (
+            self.config.database.path.parent
+            / "worktrees"
+            / repository_directory
+            / run_id
+        ).resolve()
+
+    def git_admin_lock_key(self, repository: RepositoryConfig) -> str:
+        """返回基础仓库 fetch 与 worktree 管理使用的短时锁。"""
+
+        return f"git_repository:{repository.workspace.resolve()}"
 
     def build_prompt(
         self,
@@ -46,11 +115,11 @@ class AgentExecutor:
         agent_name: str,
         event: ChangeEvent,
         repository: RepositoryConfig,
-        rule_name: str | None,
         task: str | None,
         extra_context: dict[str, Any] | None,
         prompt_values: dict[str, str],
         change_ref: str,
+        actions: Sequence[str],
     ) -> str:
         """组合 Agent 固定角色、触发上下文和临时委托任务。"""
 
@@ -60,21 +129,17 @@ class AgentExecutor:
         else:
             template = agent.prompt or ""
         role_prompt = render_prompt(template, prompt_values).strip()
-        context = {
-            "repository": {
-                "id": repository.id,
-                "project": repository.project,
-                "workspace": str(repository.workspace),
-                "provider": repository.provider,
-                "change_ref": change_ref,
-                "target_ref": f"refs/remotes/origin/{event.new.target_branch}",
-            },
-            "rule": rule_name,
-            "event": event_payload(event),
-            "delegated_task": task,
-            "extra_context": extra_context or {},
-            "allowed_sub_agents": agent.allowed_sub_agents,
-        }
+        if task is None:
+            context: dict[str, Any] = {
+                "mr": _mr_payload(event, repository, actions, change_ref),
+            }
+        else:
+            context = {
+                "repository": _repository_payload(repository),
+                "delegated_task": task,
+            }
+            if extra_context:
+                context["delegated_context"] = extra_context
         return (
             f"{role_prompt}\n\n"
             "# 本次运行上下文\n\n"
@@ -90,14 +155,17 @@ class AgentExecutor:
         event: ChangeEvent,
         repository: RepositoryConfig,
     ) -> list[str]:
-        """按 Agent 声明生成变更请求级和工作目录级写锁。"""
+        """按 Agent 声明生成变更请求级和源分支级写锁。"""
 
         scopes = self.config.agents[agent_name].write_scopes
         keys: list[str] = []
         if "change_request" in scopes:
             keys.append(f"change_request:{event.resource_key}")
         if "workspace" in scopes:
-            keys.append(f"workspace:{Path(repository.workspace).resolve()}")
+            keys.append(
+                "repository_branch:"
+                f"{event.provider}:{repository.id}:{event.current_snapshot.source_branch}"
+            )
         return keys
 
     async def execute(
@@ -113,6 +181,9 @@ class AgentExecutor:
         parent_run_id: str | None = None,
         depth: int = 0,
         call_chain: tuple[str, ...] = (),
+        actions: Sequence[str] | None = None,
+        inherit_workspace: bool = False,
+        parent_workspace: Path | None = None,
     ) -> AgentResult | None:
         """申请审计记录与写锁，然后运行一个 Codex CLI Agent。"""
 
@@ -136,45 +207,10 @@ class AgentExecutor:
                 f"{self.config.runtime.max_agent_runs_per_root}"
             )
 
-        repository = self.repositories[event.repository_id]
-        provider = self.config.providers[repository.provider]
-        workspace_key = str(repository.workspace.resolve())
-        prepare_lock = self.workspace_prepare_locks.setdefault(
-            workspace_key,
-            asyncio.Lock(),
-        )
-        async with prepare_lock:
-            try:
-                change_ref = await asyncio.to_thread(
-                    prepare_change_request_workspace,
-                    provider,
-                    repository,
-                    event.new,
-                )
-            except Exception as exc:
-                raise AgentExecutionError(
-                    f"准备仓库 {repository.id} 失败：{exc}"
-                ) from exc
-        proposed_run_id = str(uuid.uuid4())
+        configured_repository = self.repositories[event.repository_id]
+        provider = self.config.providers[configured_repository.provider]
         agent = self.config.agents[agent_name]
-        resolved_environment = resolve_environment(
-            self.config,
-            repository,
-            agent,
-            event,
-            proposed_run_id,
-        )
-        redactor = SecretRedactor(resolved_environment.secret_values)
-        prompt = self.build_prompt(
-            agent_name=agent_name,
-            event=event,
-            repository=repository,
-            rule_name=rule_name,
-            task=task,
-            extra_context=extra_context,
-            prompt_values=resolved_environment.prompt_values,
-            change_ref=change_ref,
-        )
+        proposed_run_id = str(uuid.uuid4())
         reservation = await asyncio.to_thread(
             self.store.begin_agent_run,
             proposed_run_id=proposed_run_id,
@@ -185,8 +221,8 @@ class AgentExecutor:
             rule_name=rule_name,
             agent_name=agent_name,
             resource_key=event.resource_key,
-            prompt=redactor.text(prompt),
-            environment=resolved_environment.audit_values,
+            prompt="",
+            environment={},
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
         )
@@ -201,43 +237,7 @@ class AgentExecutor:
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
             )
 
-        if reservation.run_id != proposed_run_id:
-            resolved_environment = resolve_environment(
-                self.config,
-                repository,
-                agent,
-                event,
-                reservation.run_id,
-            )
-            redactor = SecretRedactor(resolved_environment.secret_values)
-            prompt = self.build_prompt(
-                agent_name=agent_name,
-                event=event,
-                repository=repository,
-                rule_name=rule_name,
-                task=task,
-                extra_context=extra_context,
-                prompt_values=resolved_environment.prompt_values,
-                change_ref=change_ref,
-            )
-            await asyncio.to_thread(
-                self.store.update_agent_run_inputs,
-                reservation.run_id,
-                prompt=redactor.text(prompt),
-                environment=resolved_environment.audit_values,
-                config_revision=self.config.revision,
-            )
-
-        context = InvocationContext(
-            config_path=str(self.config.config_path),
-            current_agent=agent_name,
-            run_id=reservation.run_id,
-            root_run_id=reservation.root_run_id,
-            depth=depth,
-            call_chain=(*call_chain, agent_name),
-            event=event,
-        )
-        keys = self.lock_keys(agent_name, event, repository)
+        keys = self.lock_keys(agent_name, event, configured_repository)
         lease = ResourceLease(
             self.store,
             keys,
@@ -261,17 +261,147 @@ class AgentExecutor:
                 payload=payload,
             )
 
-        await persist_log(
-            "system",
-            "run.started",
-            {
-                "agent_name": agent_name,
-                "config_revision": self.config.revision,
-                "environment": resolved_environment.audit_values,
-            },
-        )
+        redactor = SecretRedactor(())
+        active_workspace: Path | None = None
+        owned_workspace = False
+        workspace_prepared = False
+        starting_head = event.current_snapshot.head_sha
+        result: AgentResult
         try:
             async with lease:
+                if task is not None and inherit_workspace:
+                    if parent_workspace is None:
+                        raise AgentExecutionError(
+                            "工作区继承已开启，但父 Agent 工作目录缺失"
+                        )
+                    active_workspace = await asyncio.to_thread(
+                        validate_linked_workspace,
+                        configured_repository.workspace,
+                        parent_workspace,
+                    )
+                    change_ref = change_request_ref(provider, event.number)[1]
+                    workspace_mode = "inherited"
+                    workspace_reason = "复用父 Agent 本次运行的临时 worktree"
+                else:
+                    active_workspace = self.run_workspace_path(
+                        configured_repository,
+                        reservation.run_id,
+                    )
+                    git_admin_lease = ResourceLease(
+                        self.store,
+                        [self.git_admin_lock_key(configured_repository)],
+                        reservation.run_id,
+                        ttl_seconds=self.config.runtime.lock_ttl_seconds,
+                        timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                    )
+                    async with git_admin_lease:
+                        change_ref = await asyncio.to_thread(
+                            prepare_change_request_workspace,
+                            provider,
+                            configured_repository,
+                            event.current_snapshot,
+                        )
+                        await asyncio.to_thread(
+                            cleanup_expired_worktrees,
+                            configured_repository.workspace,
+                            active_workspace.parent,
+                        )
+                        original_starting_head = await asyncio.to_thread(
+                            worktree_starting_head,
+                            active_workspace,
+                        )
+                        active_workspace = await asyncio.to_thread(
+                            ensure_isolated_worktree,
+                            configured_repository.workspace,
+                            active_workspace,
+                            change_ref,
+                        )
+                        starting_head = original_starting_head or await asyncio.to_thread(
+                            worktree_head,
+                            active_workspace,
+                        )
+                        await asyncio.to_thread(
+                            mark_active_worktree,
+                            active_workspace,
+                            starting_head=starting_head,
+                            retention_days=self.config.runtime.worktree_retention_days,
+                            timeout_seconds=agent.timeout_seconds,
+                        )
+                    owned_workspace = True
+                    workspace_mode = (
+                        "root-isolated" if task is None else "sub-agent-isolated"
+                    )
+                    workspace_reason = "本次 Agent 运行独享临时 worktree"
+
+                repository = configured_repository.model_copy(
+                    update={"workspace": active_workspace},
+                )
+                resolved_environment = resolve_environment(
+                    self.config,
+                    repository,
+                    agent,
+                    event,
+                    reservation.run_id,
+                    include_change_request=task is None,
+                )
+                redactor = SecretRedactor(resolved_environment.secret_values)
+                effective_actions = tuple(actions or (event.type,))
+                prompt = self.build_prompt(
+                    agent_name=agent_name,
+                    event=event,
+                    repository=repository,
+                    task=task,
+                    extra_context=extra_context,
+                    prompt_values=resolved_environment.prompt_values,
+                    change_ref=change_ref,
+                    actions=effective_actions,
+                )
+                await asyncio.to_thread(
+                    self.store.update_agent_run_inputs,
+                    reservation.run_id,
+                    prompt=redactor.text(prompt),
+                    environment=resolved_environment.audit_values,
+                    config_revision=self.config.revision,
+                )
+                await asyncio.to_thread(
+                    self.store.update_agent_run_workspace,
+                    reservation.run_id,
+                    path=str(active_workspace),
+                    status="inherited" if not owned_workspace else "active",
+                    reason=workspace_reason,
+                )
+                workspace_prepared = True
+                await persist_log(
+                    "system",
+                    "workspace.prepared",
+                    {
+                        "mode": workspace_mode,
+                        "path": str(active_workspace),
+                        "reason": workspace_reason,
+                    },
+                )
+                await persist_log(
+                    "system",
+                    "run.started",
+                    {
+                        "agent_name": agent_name,
+                        "config_revision": self.config.revision,
+                        "environment": resolved_environment.audit_values,
+                        "workspace_mode": workspace_mode,
+                        "workspace": str(active_workspace),
+                    },
+                )
+                context = InvocationContext(
+                    config_path=str(self.config.config_path),
+                    current_agent=agent_name,
+                    run_id=reservation.run_id,
+                    root_run_id=reservation.root_run_id,
+                    depth=depth,
+                    call_chain=(*call_chain, agent_name),
+                    inherit_workspace=inherit_workspace,
+                    active_workspace=str(active_workspace),
+                    event=event,
+                )
                 result = await self.runner.run(
                     run_id=reservation.run_id,
                     root_run_id=reservation.root_run_id,
@@ -290,7 +420,6 @@ class AgentExecutor:
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
         except Exception as exc:
             error = redactor.text(str(exc))
-            await persist_log("system", "run.failed", error)
             result = AgentResult(
                 run_id=reservation.run_id,
                 root_run_id=reservation.root_run_id,
@@ -298,6 +427,59 @@ class AgentExecutor:
                 agent_name=agent_name,
                 status="failed",
                 error=error,
+            )
+
+        if owned_workspace and active_workspace is not None:
+            try:
+                cleanup_lease = ResourceLease(
+                    self.store,
+                    [self.git_admin_lock_key(configured_repository)],
+                    reservation.run_id,
+                    ttl_seconds=self.config.runtime.lock_ttl_seconds,
+                    timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                )
+                async with cleanup_lease:
+                    cleanup = await asyncio.to_thread(
+                        cleanup_run_worktree,
+                        configured_repository.workspace,
+                        active_workspace,
+                        run_status=result.status,
+                        starting_head=starting_head,
+                        retention_days=self.config.runtime.worktree_retention_days,
+                    )
+                await asyncio.to_thread(
+                    self.store.update_agent_run_workspace,
+                    reservation.run_id,
+                    path=str(active_workspace),
+                    status=cleanup.status,
+                    reason=cleanup.reason,
+                )
+                await persist_log(
+                    "system",
+                    f"workspace.{cleanup.status}",
+                    {"path": str(active_workspace), "reason": cleanup.reason},
+                )
+            except Exception as exc:
+                cleanup_error = redactor.text(f"工作区清理检查失败：{exc}")
+                await asyncio.to_thread(
+                    self.store.update_agent_run_workspace,
+                    reservation.run_id,
+                    path=str(active_workspace),
+                    status="retained",
+                    reason=cleanup_error,
+                )
+                await persist_log(
+                    "system",
+                    "workspace.retained",
+                    {"path": str(active_workspace), "reason": cleanup_error},
+                )
+        elif not workspace_prepared:
+            await asyncio.to_thread(
+                self.store.update_agent_run_workspace,
+                reservation.run_id,
+                path="",
+                status="not-created",
+                reason="Agent 启动前未能准备临时工作区",
             )
         await persist_log(
             "system",

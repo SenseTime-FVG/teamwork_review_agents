@@ -45,8 +45,25 @@ class ChangeRequestSnapshot(BaseModel):
         return self.model_dump(mode="json", exclude={"raw"})
 
 
+class ChangeRequestActivity(BaseModel):
+    """Provider 活动流中的一条稳定 MR/PR 动作。"""
+
+    id: str
+    type: str
+    occurred_at: datetime | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChangeRequestActivityBatch(BaseModel):
+    """一次活动流增量读取结果及下一次使用的不透明游标。"""
+
+    activities: tuple[ChangeRequestActivity, ...] = ()
+    cursor: dict[str, Any] = Field(default_factory=dict)
+    baseline: bool = False
+
+
 class ChangeEvent(BaseModel):
-    """由相邻两次快照差异生成的语义事件。"""
+    """由快照差异或 Provider 活动生成的语义事件。"""
 
     id: str
     type: str
@@ -55,6 +72,8 @@ class ChangeEvent(BaseModel):
     number: int
     old: ChangeRequestSnapshot | None
     new: ChangeRequestSnapshot
+    current: ChangeRequestSnapshot | None = None
+    batch_id: str = ""
     changed_fields: tuple[str, ...] = ()
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -63,6 +82,12 @@ class ChangeEvent(BaseModel):
         """返回变更请求级资源键。"""
 
         return f"{self.provider}:{self.repository_id}:{self.number}"
+
+    @property
+    def current_snapshot(self) -> ChangeRequestSnapshot:
+        """返回扫描结束时的当前快照，兼容旧事件数据。"""
+
+        return self.current or self.new
 
 
 class AgentResult(BaseModel):
@@ -89,6 +114,8 @@ class InvocationContext(BaseModel):
     root_run_id: str
     depth: int = 0
     call_chain: tuple[str, ...] = ()
+    inherit_workspace: bool = False
+    active_workspace: str = ""
     event: ChangeEvent
 
 

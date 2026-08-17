@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .config import AppConfig
+from .config import AppConfig, RepositoryConfig, RuleConfig
 from .environment import resolve_provider_token
-from .events import detect_events
+from .events import detect_activity_events, detect_events
 from .executor import AgentExecutor
 from .models import ChangeEvent, stable_hash
-from .providers import ProviderError, create_provider
-from .rules import matching_rules
+from .providers import BaseProvider, ProviderError, create_provider
+from .rules import rule_matches
 from .state import StateStore
 
 
@@ -31,6 +32,42 @@ class CycleSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RuleInvocation:
+    """一条规则在一个扫描批次中计划出的 Agent 调用。"""
+
+    rule: RuleConfig
+    agent_name: str
+    events: tuple[ChangeEvent, ...]
+
+    @property
+    def actions(self) -> tuple[str, ...]:
+        """按事件产生顺序返回去重后的动作列表。"""
+
+        return tuple(dict.fromkeys(event.type for event in self.events))
+
+
+def plan_rule_invocations(
+    rules: list[RuleConfig],
+    events: list[ChangeEvent],
+) -> list[RuleInvocation]:
+    """按规则配置将同批次事件规划为一次或多次 Agent 调用。"""
+
+    invocations: list[RuleInvocation] = []
+    for rule in rules:
+        matched = [event for event in events if rule_matches(rule, event)]
+        if not matched:
+            continue
+        for agent_name in dict.fromkeys(rule.agents):
+            if rule.deduplicate_per_scan:
+                invocations.append(RuleInvocation(rule, agent_name, tuple(matched)))
+            else:
+                invocations.extend(
+                    RuleInvocation(rule, agent_name, (event,)) for event in matched
+                )
+    return invocations
 
 
 class Orchestrator:
@@ -74,9 +111,44 @@ class Orchestrator:
             {"completed_at": datetime.now(UTC).isoformat()},
         )
 
+    async def _initialize_activity_cursors(
+        self,
+        provider: BaseProvider,
+        repository: RepositoryConfig,
+    ) -> None:
+        """在候选筛选前为已有快照补齐活动基线，避免首次变化被吞掉。"""
+
+        while True:
+            snapshots = await asyncio.to_thread(
+                self.store.snapshots_without_activity_cursor,
+                provider.name,
+                repository.id,
+                limit=self.config.scanner.max_items_per_repository,
+            )
+            if not snapshots:
+                return
+            for snapshot in snapshots:
+                activity_batch = await provider.list_change_request_activities(
+                    repository,
+                    snapshot.number,
+                    cursor=None,
+                )
+                if activity_batch is None:
+                    return
+                await asyncio.to_thread(
+                    self.store.save_activity_cursor,
+                    snapshot.provider,
+                    snapshot.repository_id,
+                    snapshot.number,
+                    activity_batch.cursor,
+                )
+            if len(snapshots) < self.config.scanner.max_items_per_repository:
+                return
+
     async def scan(self, summary: CycleSummary) -> None:
         """按 Provider 分组扫描所有启用仓库。"""
 
+        scan_batch_id = uuid.uuid4().hex
         enabled = [repository for repository in self.config.repositories if repository.enabled]
         for provider_name, provider_config in self.config.providers.items():
             repositories = [
@@ -94,6 +166,10 @@ class Orchestrator:
                     for repository in repositories:
                         summary.repositories += 1
                         try:
+                            await self._initialize_activity_cursors(
+                                provider,
+                                repository,
+                            )
                             updated_since = await asyncio.to_thread(
                                 self._updated_since,
                                 repository.id,
@@ -107,15 +183,44 @@ class Orchestrator:
                                     self.store.load_snapshot,
                                     snapshot.key,
                                 )
-                                events = detect_events(
-                                    old,
-                                    snapshot,
-                                    emit_initial=self.config.scanner.emit_initial_events,
+                                activity_cursor = await asyncio.to_thread(
+                                    self.store.load_activity_cursor,
+                                    snapshot.provider,
+                                    snapshot.repository_id,
+                                    snapshot.number,
                                 )
+                                activity_batch = await provider.list_change_request_activities(
+                                    repository,
+                                    snapshot.number,
+                                    cursor=activity_cursor,
+                                )
+                                if (
+                                    old is not None
+                                    and activity_batch is not None
+                                    and not activity_batch.baseline
+                                ):
+                                    events = detect_activity_events(
+                                        old,
+                                        snapshot,
+                                        activity_batch.activities,
+                                        batch_id=scan_batch_id,
+                                    )
+                                else:
+                                    events = detect_events(
+                                        old,
+                                        snapshot,
+                                        emit_initial=self.config.scanner.emit_initial_events,
+                                        batch_id=scan_batch_id,
+                                    )
                                 inserted = await asyncio.to_thread(
                                     self.store.save_snapshot_and_events,
                                     snapshot,
                                     events,
+                                    activity_cursor=(
+                                        activity_batch.cursor
+                                        if activity_batch is not None
+                                        else None
+                                    ),
                                 )
                                 summary.snapshots += 1
                                 summary.new_events += inserted
@@ -130,18 +235,24 @@ class Orchestrator:
 
     async def _run_agent(
         self,
-        event: ChangeEvent,
-        rule_name: str,
-        agent_name: str,
+        invocation: RuleInvocation,
     ) -> bool:
         """在全局并发额度内执行一条规则产生的 Agent 任务。"""
 
+        event = invocation.events[0]
+        event_ids = tuple(item.id for item in invocation.events)
         async with self.agent_semaphore:
             result = await self.executor.execute(
-                agent_name=agent_name,
+                agent_name=invocation.agent_name,
                 event=event,
-                rule_name=rule_name,
-                idempotency_key=stable_hash(event.id, rule_name, agent_name),
+                actions=invocation.actions,
+                rule_name=invocation.rule.name,
+                inherit_workspace=invocation.rule.inherit_workspace,
+                idempotency_key=stable_hash(
+                    event_ids[0] if len(event_ids) == 1 else event_ids,
+                    invocation.rule.name,
+                    invocation.agent_name,
+                ),
             )
         return result is not None
 
@@ -150,43 +261,59 @@ class Orchestrator:
 
         events = await asyncio.to_thread(self.store.pending_events)
         max_attempts = self.config.runtime.event_retry_count + 1
+        batches: dict[tuple[str, int, str], list[ChangeEvent]] = {}
         for event in events:
-            claimed = await asyncio.to_thread(
-                self.store.claim_event,
-                event.id,
-                max_attempts,
+            batch_key = (
+                event.repository_id,
+                event.number,
+                event.batch_id or event.current_snapshot.updated_at.isoformat(),
             )
-            if not claimed:
+            batches.setdefault(batch_key, []).append(event)
+
+        for batch_events in batches.values():
+            claimed_events: list[ChangeEvent] = []
+            for event in batch_events:
+                claimed = await asyncio.to_thread(
+                    self.store.claim_event,
+                    event.id,
+                    max_attempts,
+                )
+                if claimed:
+                    claimed_events.append(event)
+            if not claimed_events:
                 continue
-            repository = self.config.repository_map().get(event.repository_id)
+
+            repository = self.config.repository_map().get(claimed_events[0].repository_id)
             if repository is None or not repository.enabled:
-                await asyncio.to_thread(self.store.finish_event, event.id)
-                summary.processed_events += 1
+                for event in claimed_events:
+                    await asyncio.to_thread(self.store.finish_event, event.id)
+                    summary.processed_events += 1
                 continue
-            error: str | None = None
+
+            errors_by_event: dict[str, list[str]] = {
+                event.id: [] for event in claimed_events
+            }
             try:
-                rules = matching_rules(self.config.rules, event)
-                tasks = [
-                    asyncio.create_task(self._run_agent(event, rule.name, agent_name))
-                    for rule in rules
-                    for agent_name in rule.agents
-                ]
+                invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                tasks = [asyncio.create_task(self._run_agent(item)) for item in invocations]
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     summary.agent_runs += sum(result is True for result in results)
-                    failures = [
-                        str(result)
-                        for result in results
-                        if isinstance(result, BaseException)
-                    ]
-                    if failures:
-                        error = "; ".join(failures)
+                    for invocation, result in zip(invocations, results, strict=True):
+                        if not isinstance(result, BaseException):
+                            continue
+                        for event in invocation.events:
+                            errors_by_event[event.id].append(str(result))
             except Exception as exc:
-                error = str(exc)
-            if error:
-                summary.errors.append(f"处理事件 {event.id} 失败：{error}")
-            await asyncio.to_thread(self.store.finish_event, event.id, error=error)
-            summary.processed_events += 1
+                for event in claimed_events:
+                    errors_by_event[event.id].append(str(exc))
+
+            for event in claimed_events:
+                error = "; ".join(errors_by_event[event.id]) or None
+                if error:
+                    summary.errors.append(f"处理事件 {event.id} 失败：{error}")
+                await asyncio.to_thread(self.store.finish_event, event.id, error=error)
+                summary.processed_events += 1
 
     async def run_once(self, *, dry_run: bool = False) -> CycleSummary:
         """执行一次完整扫描；dry-run 时保留事件但不启动 Agent。"""

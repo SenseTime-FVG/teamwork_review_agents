@@ -119,3 +119,147 @@ async def test_github_provider_stops_at_previous_scan_watermark(snapshot_factory
 
     assert [snapshot.number for snapshot in snapshots] == [1]
     assert call_count == 1
+
+
+async def test_github_timeline_builds_baseline_then_returns_new_activities() -> None:
+    """首次只建立 Timeline 基线，后续按稳定项 ID 返回新增动作。"""
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    timeline: list[dict[str, object]] = [
+        {
+            "event": "committed",
+            "node_id": "commit-initial",
+            "sha": "a" * 40,
+            "author": {"date": "2026-08-17T08:00:00Z"},
+        }
+    ]
+
+    async def fake_get_json_response(_: str, **__: object):
+        return list(timeline), {}
+
+    setattr(provider, "get_json_response", fake_get_json_response)
+    try:
+        baseline = await provider.list_change_request_activities(repository, 7)
+        assert baseline.baseline is True
+        assert baseline.activities == ()
+        assert baseline.cursor == {"page": 1, "item_id": "commit-initial"}
+
+        timeline.extend(
+            [
+                {
+                    "event": "closed",
+                    "id": 101,
+                    "created_at": "2026-08-17T08:01:00Z",
+                },
+                {
+                    "event": "reopened",
+                    "id": 102,
+                    "created_at": "2026-08-17T08:02:00Z",
+                },
+                {
+                    "event": "committed",
+                    "node_id": "commit-next",
+                    "sha": "b" * 40,
+                    "author": {"date": "2026-08-17T08:03:00Z"},
+                },
+            ]
+        )
+        incremental = await provider.list_change_request_activities(
+            repository,
+            7,
+            cursor=baseline.cursor,
+        )
+        assert incremental.baseline is False
+        assert [item.type for item in incremental.activities] == [
+            "closed",
+            "reopened",
+            "committed",
+        ]
+        assert incremental.activities[-1].data["sha"] == "b" * 40
+
+        repeated = await provider.list_change_request_activities(
+            repository,
+            7,
+            cursor=incremental.cursor,
+        )
+        assert repeated.activities == ()
+    finally:
+        await provider.close()
+
+
+async def test_github_timeline_reads_across_page_boundary() -> None:
+    """游标位于满页末尾时，下一页活动仍必须被读取。"""
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    first_page = [
+        {
+            "event": "commented",
+            "id": index,
+            "created_at": "2026-08-17T08:00:00Z",
+        }
+        for index in range(1, 101)
+    ]
+    second_page = [
+        {
+            "event": "closed",
+            "id": 101,
+            "created_at": "2026-08-17T08:01:00Z",
+        },
+        {
+            "event": "reopened",
+            "id": 102,
+            "created_at": "2026-08-17T08:02:00Z",
+        },
+    ]
+
+    async def fake_get_json_response(_: str, **__: object):
+        return first_page, {}
+
+    async def fake_get_json(_: str, **kwargs: object):
+        params = kwargs["params"]
+        assert isinstance(params, dict)
+        return second_page if params["page"] == 2 else []
+
+    setattr(provider, "get_json_response", fake_get_json_response)
+    setattr(provider, "get_json", fake_get_json)
+    try:
+        result = await provider.list_change_request_activities(
+            repository,
+            7,
+            cursor={"page": 1, "item_id": "100"},
+        )
+    finally:
+        await provider.close()
+
+    assert [item.type for item in result.activities] == ["closed", "reopened"]
+    assert result.cursor == {"page": 2, "item_id": "102"}

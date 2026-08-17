@@ -3,15 +3,20 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 from teamwork_review_agents.codex_runner import CodexRunner
 from teamwork_review_agents.cli import _server_settings, build_parser
 from teamwork_review_agents.config import (
+    CodexRuntimeConfig,
     RepositoryConfig,
     ScannerConfig,
     load_config,
     validate_runtime_files,
 )
 from teamwork_review_agents.models import InvocationContext
+from teamwork_review_agents.executor import AgentExecutor
+from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.process_manager import (
     ServiceLease,
     management_url,
@@ -103,6 +108,8 @@ def test_example_config_is_valid() -> None:
     assert config.scanner.interval_seconds == 300
     assert config.scanner.max_items_per_repository == 100
     assert config.scanner.api_page_size == 50
+    assert config.runtime.worktree_retention_days == 7
+    assert config.runtime.codex.fast_mode == "inherit"
 
 
 def test_scanner_migrates_legacy_pagination_settings() -> None:
@@ -172,9 +179,237 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
         context,
     )
     joined = " ".join(command)
-    assert "--ignore-user-config" in command
+    assert "--ignore-user-config" not in command
     assert "enabled_tools=[\"invoke_agent\"]" in joined
     assert command[-1] == "-"
+
+
+def test_runner_merges_runtime_and_agent_codex_options(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """Agent 覆盖应排在 Teamwork 运行时默认之后。"""
+
+    config = configured_app_factory()
+    config.runtime.codex = CodexRuntimeConfig(
+        model="gpt-runtime",
+        model_reasoning_effort="medium",
+        fast_mode="fast",
+        model_verbosity="low",
+        personality="friendly",
+        web_search="cached",
+        extra_config={"history.max_bytes": 1048576},
+    )
+    agent = config.agents["code-reviewer"]
+    agent.model = "gpt-agent"
+    agent.model_reasoning_effort = "high"
+    agent.fast_mode = "standard"
+    agent.web_search = "live"
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-options",
+        root_run_id="run-options",
+        event=event,
+    )
+    command = CodexRunner(config).build_command(agent, repository, context)
+    overrides = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+
+    assert command[command.index("--model") + 1] == "gpt-agent"
+    assert 'model="gpt-runtime"' in overrides
+    assert overrides.index('model_reasoning_effort="medium"') < overrides.index(
+        'model_reasoning_effort="high"'
+    )
+    assert overrides.index('service_tier="fast"') < overrides.index(
+        'service_tier="default"'
+    )
+    assert overrides.index('web_search="cached"') < overrides.index(
+        'web_search="live"'
+    )
+    assert "history.max_bytes=1048576" in overrides
+
+
+def test_codex_advanced_config_protects_managed_keys() -> None:
+    """高级配置不能绕过结构化字段或应用托管的 MCP 与安全配置。"""
+
+    for key in (
+        "model",
+        "features.fast_mode",
+        "service_tier",
+        "approval_policy",
+        "model_provider",
+        "mcp_servers.untrusted.command",
+        "shell_environment_policy.include_only",
+        "skills.config",
+    ):
+        with pytest.raises(ValueError, match="不能覆盖"):
+            CodexRuntimeConfig(extra_config={key: "blocked"})
+
+
+def test_root_and_sub_agent_prompt_contexts_are_separated(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """根 Agent 接收 MR 信息，sub-agent 只自动接收仓库与父任务。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = AgentExecutor(config, store)
+    root_prompt = executor.build_prompt(
+        agent_name="code-reviewer",
+        event=event,
+        repository=repository,
+        task=None,
+        extra_context=None,
+        prompt_values={},
+        change_ref="refs/teamwork/change-requests/7/head",
+        actions=("change_request.reopened", "change_request.updated"),
+    )
+    child_prompt = executor.build_prompt(
+        agent_name="security-reviewer",
+        event=event,
+        repository=repository,
+        task="只检查依赖安全风险",
+        extra_context={"focus": "dependencies"},
+        prompt_values={},
+        change_ref="refs/teamwork/change-requests/7/head",
+        actions=(event.type,),
+    )
+
+    assert '"mr"' in root_prompt
+    assert '"action": [' in root_prompt
+    assert '"reopened"' in root_prompt
+    assert '"old"' not in root_prompt
+    assert '"changed_fields"' not in root_prompt
+    assert '"repository"' in child_prompt
+    assert '"delegated_task": "只检查依赖安全风险"' in child_prompt
+    assert '"delegated_context"' in child_prompt
+    assert '"mr"' not in child_prompt
+    assert '"action"' not in child_prompt
+    assert snapshot.title not in child_prompt
+
+
+def test_timeline_event_prompt_uses_final_snapshot(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """历史活动用于规则匹配，但根 Agent 输入必须使用扫描结束时的真值。"""
+
+    from teamwork_review_agents.events import detect_activity_events
+    from teamwork_review_agents.models import ChangeRequestActivity
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    expected_head = "b" * 40
+    old = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+        state="opened",
+        updated_at="2026-08-17T08:00:00Z",
+    )
+    current = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+        state="opened",
+        head_sha=expected_head,
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    event = detect_activity_events(
+        old,
+        current,
+        [
+            ChangeRequestActivity(
+                id="closed-1",
+                type="closed",
+                occurred_at="2026-08-17T08:01:00Z",
+            )
+        ],
+    )[0]
+    prompt = AgentExecutor(config, StateStore(config.database.path)).build_prompt(
+        agent_name="code-reviewer",
+        event=event,
+        repository=repository,
+        task=None,
+        extra_context=None,
+        prompt_values={},
+        change_ref="refs/teamwork/change-requests/7/head",
+        actions=(event.type,),
+    )
+
+    assert event.new.state == "closed"
+    assert '"state": "opened"' in prompt
+    assert f'"head_sha": "{expected_head}"' in prompt
+
+
+def test_workspace_write_lock_uses_repository_source_branch(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """不同源分支可以并行，同一源分支必须命中同一个写锁。"""
+
+    config = configured_app_factory()
+    config.agents["code-reviewer"].write_scopes = ["workspace"]
+    repository = config.repositories[0]
+    executor = AgentExecutor(config, StateStore(config.database.path))
+    from teamwork_review_agents.events import detect_events
+
+    first = detect_events(
+        None,
+        snapshot_factory(
+            provider=repository.provider,
+            repository_id=repository.id,
+            source_branch="feature/first",
+        ),
+        emit_initial=True,
+    )[0]
+    same_branch = detect_events(
+        None,
+        snapshot_factory(
+            provider=repository.provider,
+            repository_id=repository.id,
+            number=8,
+            source_branch="feature/first",
+        ),
+        emit_initial=True,
+    )[0]
+    other_branch = detect_events(
+        None,
+        snapshot_factory(
+            provider=repository.provider,
+            repository_id=repository.id,
+            number=9,
+            source_branch="feature/other",
+        ),
+        emit_initial=True,
+    )[0]
+
+    first_keys = executor.lock_keys("code-reviewer", first, repository)
+    assert first_keys == [
+        "repository_branch:github-main:demo:feature/first"
+    ]
+    assert executor.lock_keys("code-reviewer", same_branch, repository) == first_keys
+    assert executor.lock_keys("code-reviewer", other_branch, repository) != first_keys
 
 
 async def test_runner_parses_jsonl_from_process(

@@ -67,6 +67,15 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_event_inbox_status
                 ON event_inbox(status, updated_at);
 
+                CREATE TABLE IF NOT EXISTS provider_activity_cursors (
+                    provider TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    cursor TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(provider, repository_id, number)
+                );
+
                 CREATE TABLE IF NOT EXISTS agent_runs (
                     run_id TEXT PRIMARY KEY,
                     root_run_id TEXT NOT NULL,
@@ -86,6 +95,9 @@ class StateStore:
                     usage TEXT,
                     events TEXT,
                     error TEXT,
+                    workspace_path TEXT,
+                    workspace_status TEXT,
+                    workspace_reason TEXT,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -141,6 +153,9 @@ class StateStore:
                 "config_revision",
                 "TEXT",
             )
+            self._ensure_column(connection, "agent_runs", "workspace_path", "TEXT")
+            self._ensure_column(connection, "agent_runs", "workspace_status", "TEXT")
+            self._ensure_column(connection, "agent_runs", "workspace_reason", "TEXT")
 
     @staticmethod
     def _ensure_column(
@@ -175,7 +190,17 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'failed', error = '服务异常退出，运行未正常结束', finished_at = ?
+                SET status = 'failed', error = '服务异常退出，运行未正常结束',
+                    workspace_status = CASE
+                        WHEN workspace_status = 'active' THEN 'retained'
+                        ELSE workspace_status
+                    END,
+                    workspace_reason = CASE
+                        WHEN workspace_status = 'active'
+                        THEN '服务异常退出，保留临时工作区用于恢复'
+                        ELSE workspace_reason
+                    END,
+                    finished_at = ?
                 WHERE status = 'running'
                 """,
                 (now,),
@@ -194,6 +219,86 @@ class StateStore:
         if row is None:
             return None
         return ChangeRequestSnapshot.model_validate_json(row["payload"])
+
+    def load_activity_cursor(
+        self,
+        provider: str,
+        repository_id: str,
+        number: int,
+    ) -> dict[str, Any] | None:
+        """读取 Provider 为单个 MR/PR 保存的不透明活动游标。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT cursor FROM provider_activity_cursors
+                WHERE provider = ? AND repository_id = ? AND number = ?
+                """,
+                (provider, repository_id, number),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["cursor"])
+        return value if isinstance(value, dict) else None
+
+    def snapshots_without_activity_cursor(
+        self,
+        provider: str,
+        repository_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[ChangeRequestSnapshot]:
+        """返回已有快照中尚未建立 Provider 活动基线的项目。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT snapshot.payload
+                FROM snapshots AS snapshot
+                LEFT JOIN provider_activity_cursors AS activity
+                  ON activity.provider = ?
+                 AND activity.repository_id = ?
+                 AND activity.number = json_extract(snapshot.payload, '$.number')
+                WHERE json_extract(snapshot.payload, '$.provider') = ?
+                  AND json_extract(snapshot.payload, '$.repository_id') = ?
+                  AND activity.provider IS NULL
+                ORDER BY snapshot.updated_at ASC
+                LIMIT ?
+                """,
+                (provider, repository_id, provider, repository_id, limit),
+            ).fetchall()
+        return [
+            ChangeRequestSnapshot.model_validate_json(row["payload"])
+            for row in rows
+        ]
+
+    def save_activity_cursor(
+        self,
+        provider: str,
+        repository_id: str,
+        number: int,
+        cursor: dict[str, Any],
+    ) -> None:
+        """单独保存首次初始化的 Provider 活动游标。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_activity_cursors (
+                    provider, repository_id, number, cursor, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provider, repository_id, number) DO UPDATE SET
+                    cursor = excluded.cursor,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider,
+                    repository_id,
+                    number,
+                    json.dumps(cursor, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
 
     @staticmethod
     def _insert_events(
@@ -300,8 +405,10 @@ class StateStore:
         self,
         snapshot: ChangeRequestSnapshot,
         events: Iterable[ChangeEvent],
+        *,
+        activity_cursor: dict[str, Any] | None = None,
     ) -> int:
-        """在一个事务中更新快照并幂等写入事件收件箱。"""
+        """在一个事务中更新快照、事件和可选 Provider 活动游标。"""
 
         now = time.time()
         with self.connect() as connection:
@@ -317,6 +424,24 @@ class StateStore:
                 """,
                 (snapshot.key, snapshot.model_dump_json(), now),
             )
+            if activity_cursor is not None:
+                connection.execute(
+                    """
+                    INSERT INTO provider_activity_cursors (
+                        provider, repository_id, number, cursor, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, repository_id, number) DO UPDATE SET
+                        cursor = excluded.cursor,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        snapshot.provider,
+                        snapshot.repository_id,
+                        snapshot.number,
+                        json.dumps(activity_cursor, ensure_ascii=False),
+                        now,
+                    ),
+                )
             connection.commit()
         return inserted
 
@@ -443,6 +568,8 @@ class StateStore:
                 SET status = 'running', attempts = ?, prompt = ?, environment = ?,
                     config_revision = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
+                    workspace_path = NULL, workspace_status = NULL,
+                    workspace_reason = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
@@ -496,6 +623,26 @@ class StateStore:
                     config_revision,
                     run_id,
                 ),
+            )
+
+    def update_agent_run_workspace(
+        self,
+        run_id: str,
+        *,
+        path: str,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        """保存本次运行的实际工作区与清理状态。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET workspace_path = ?, workspace_status = ?, workspace_reason = ?
+                WHERE run_id = ?
+                """,
+                (path, status, reason, run_id),
             )
 
     def finish_agent_run(self, result: AgentResult) -> None:
@@ -694,7 +841,8 @@ class StateStore:
                 return None
             children = connection.execute(
                 """
-                SELECT run_id, agent_name, status, started_at, finished_at
+                SELECT run_id, agent_name, status, started_at, finished_at,
+                       workspace_path, workspace_status, workspace_reason
                 FROM agent_runs WHERE parent_run_id = ? ORDER BY started_at ASC
                 """,
                 (run_id,),
@@ -736,6 +884,7 @@ class StateStore:
                 f"""
                 SELECT run_id, root_run_id, parent_run_id, event_id, rule_name,
                        agent_name, resource_key, status, attempts, error,
+                       workspace_path, workspace_status, workspace_reason,
                        started_at, finished_at
                 FROM agent_runs {where} ORDER BY started_at DESC LIMIT ?
                 """,
