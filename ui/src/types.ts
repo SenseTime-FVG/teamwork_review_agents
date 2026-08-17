@@ -65,7 +65,29 @@ export type RuntimeStatus = {
   stats: {
     runs: Record<string, number>;
     events: Record<string, number>;
+    change_requests: Record<string, number>;
   };
+};
+
+export type ChangeRequestRecord = {
+  snapshot_key: string;
+  provider: string;
+  repository_id: string;
+  number: number;
+  title: string;
+  state: "opened" | "closed" | "merged";
+  draft: boolean;
+  source_branch: string;
+  target_branch: string;
+  head_sha: string;
+  labels: string[];
+  approvals: number;
+  pipeline_status: string;
+  merge_status: string;
+  updated_at: string;
+  web_url: string;
+  scanned_at: number;
+  discovered_event_emitted: boolean;
 };
 
 export type RunSummary = {

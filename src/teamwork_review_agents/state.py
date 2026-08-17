@@ -195,6 +195,107 @@ class StateStore:
             return None
         return ChangeRequestSnapshot.model_validate_json(row["payload"])
 
+    @staticmethod
+    def _insert_events(
+        connection: sqlite3.Connection,
+        events: Iterable[ChangeEvent],
+        now: float,
+    ) -> int:
+        """在已有事务中幂等写入事件并返回新增数量。"""
+
+        inserted = 0
+        for event in events:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO event_inbox (
+                    event_id, event_type, repository_id, number, payload,
+                    status, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.type,
+                    event.repository_id,
+                    event.number,
+                    event.model_dump_json(),
+                    now,
+                    now,
+                ),
+            )
+            inserted += cursor.rowcount
+        return inserted
+
+    def enqueue_events(self, events: Iterable[ChangeEvent]) -> int:
+        """不改写快照，幂等追加管理员补发或其他外部产生的事件。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = self._insert_events(connection, events, now)
+            connection.commit()
+        return inserted
+
+    def has_event_type(
+        self,
+        repository_id: str,
+        number: int,
+        event_type: str,
+    ) -> bool:
+        """判断指定 MR/PR 是否已经产生过某类事件。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM event_inbox
+                WHERE repository_id = ? AND number = ? AND event_type = ?
+                LIMIT 1
+                """,
+                (repository_id, number, event_type),
+            ).fetchone()
+        return row is not None
+
+    def list_snapshots(
+        self,
+        limit: int = 100,
+        *,
+        repository_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
+
+        where = "WHERE json_extract(payload, '$.repository_id') = ?" if repository_id else ""
+        parameters: list[Any] = [repository_id] if repository_id else []
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT snapshot_key, payload, updated_at,
+                       EXISTS(
+                           SELECT 1 FROM event_inbox event
+                           WHERE event.repository_id = json_extract(snapshots.payload, '$.repository_id')
+                             AND event.number = json_extract(snapshots.payload, '$.number')
+                             AND event.event_type = 'change_request.discovered'
+                       ) AS discovered_event_emitted
+                FROM snapshots {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            snapshot = ChangeRequestSnapshot.model_validate_json(row["payload"])
+            summary = snapshot.model_dump(mode="json", exclude={"raw"})
+            summary.update(
+                {
+                    "snapshot_key": row["snapshot_key"],
+                    "scanned_at": row["updated_at"],
+                    "discovered_event_emitted": bool(row["discovered_event_emitted"]),
+                }
+            )
+            results.append(summary)
+        return results
+
     def save_snapshot_and_events(
         self,
         snapshot: ChangeRequestSnapshot,
@@ -203,28 +304,9 @@ class StateStore:
         """在一个事务中更新快照并幂等写入事件收件箱。"""
 
         now = time.time()
-        inserted = 0
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for event in events:
-                cursor = connection.execute(
-                    """
-                    INSERT OR IGNORE INTO event_inbox (
-                        event_id, event_type, repository_id, number, payload,
-                        status, attempts, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-                    """,
-                    (
-                        event.id,
-                        event.type,
-                        event.repository_id,
-                        event.number,
-                        event.model_dump_json(),
-                        now,
-                        now,
-                    ),
-                )
-                inserted += cursor.rowcount
+            inserted = self._insert_events(connection, events, now)
             connection.execute(
                 """
                 INSERT INTO snapshots (snapshot_key, payload, updated_at)
@@ -671,9 +753,17 @@ class StateStore:
             event_rows = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM event_inbox GROUP BY status"
             ).fetchall()
+            snapshot_rows = connection.execute(
+                "SELECT payload FROM snapshots"
+            ).fetchall()
+        change_requests: dict[str, int] = {"total": len(snapshot_rows)}
+        for row in snapshot_rows:
+            state = ChangeRequestSnapshot.model_validate_json(row["payload"]).state
+            change_requests[state] = change_requests.get(state, 0) + 1
         return {
             "runs": {row["status"]: row["count"] for row in run_rows},
             "events": {row["status"]: row["count"] for row in event_rows},
+            "change_requests": change_requests,
         }
 
     def list_events(

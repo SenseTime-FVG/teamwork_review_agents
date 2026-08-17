@@ -202,7 +202,7 @@ def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypa
     assert resolve_provider_token(config, config.providers["provider-main"]) == "host-fallback-token"
 
 
-def test_web_api_config_preview_logs_and_static_ui(tmp_path) -> None:
+def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -> None:
     config_path = write_config(tmp_path)
     app = create_app(config_path, start_scheduler=False)
     with TestClient(app) as client:
@@ -254,6 +254,37 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path) -> None:
         assert client.put("/api/config", json={"document": invalid}).status_code == 422
 
         store = app.state.config_manager.store
+        snapshot = snapshot_factory(
+            provider="provider-main",
+            repository_id="first",
+            number=12,
+            title="等待首次事件的 PR",
+        )
+        store.save_snapshot_and_events(snapshot, [])
+        change_requests = client.get("/api/change-requests").json()
+        assert change_requests[0]["number"] == 12
+        assert change_requests[0]["discovered_event_emitted"] is False
+        assert client.get("/api/status").json()["stats"]["change_requests"] == {
+            "total": 1,
+            "opened": 1,
+        }
+
+        emitted = client.post(
+            "/api/change-requests/first/12/emit-discovered"
+        ).json()
+        assert emitted["created"] is True
+        repeated = client.post(
+            "/api/change-requests/first/12/emit-discovered"
+        ).json()
+        assert repeated == {"created": False, "reason": "首次发现事件已经存在"}
+        assert client.get("/api/change-requests").json()[0][
+            "discovered_event_emitted"
+        ] is True
+        assert len(store.pending_events()) == 1
+        assert client.post(
+            "/api/change-requests/first/999/emit-discovered"
+        ).status_code == 404
+
         reservation = store.begin_agent_run(
             proposed_run_id="run-web",
             root_run_id=None,

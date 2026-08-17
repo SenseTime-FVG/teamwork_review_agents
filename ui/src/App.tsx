@@ -9,6 +9,7 @@ import {
 import type { ManagedPromptFile } from "./api";
 import type {
   Agent,
+  ChangeRequestRecord,
   ConfigDocument,
   EnvironmentMap,
   EnvironmentVariable,
@@ -27,7 +28,7 @@ const EMPTY_STATUS: RuntimeStatus = {
   paused: false,
   running_cycle: false,
   config_revision: "",
-  stats: { runs: {}, events: {} },
+  stats: { runs: {}, events: {}, change_requests: {} },
 };
 
 function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
@@ -77,6 +78,10 @@ function timeText(timestamp?: number | null): string {
   return timestamp ? new Date(timestamp * 1000).toLocaleString("zh-CN") : "—";
 }
 
+function dateTimeText(value?: string | null): string {
+  return value ? new Date(value).toLocaleString("zh-CN") : "—";
+}
+
 function shortRevision(revision?: string): string {
   return revision ? revision.slice(0, 9) : "—";
 }
@@ -90,6 +95,9 @@ function statusLabel(status: string): string {
     cancelled: "已取消",
     pending: "待处理",
     processing: "处理中",
+    opened: "打开",
+    closed: "已关闭",
+    merged: "已合并",
   };
   return labels[status] ?? status;
 }
@@ -487,10 +495,14 @@ function EnvironmentEditor(props: {
 function Overview(props: {
   status: RuntimeStatus;
   events: EventRecord[];
+  changeRequests: ChangeRequestRecord[];
+  emittingKey: string;
   onAction: (action: "scan" | "pause" | "resume") => void;
+  onEmitDiscovered: (item: ChangeRequestRecord) => void;
 }) {
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
+  const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
   return (
     <div className="page-stack">
       <section className="hero-card">
@@ -513,13 +525,53 @@ function Overview(props: {
         <div className="alert error">{props.status.config_error ?? props.status.last_error}</div>
       )}
       <div className="metric-grid">
+        <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{props.status.stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
+        <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{props.status.stats.events.pending ?? 0} 个待处理</small></div>
         <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个正在执行</small></div>
-        <div className="metric-card"><span>MR / PR 事件</span><strong>{eventTotal}</strong><small>{props.status.stats.events.pending ?? 0} 个待处理</small></div>
         <div className="metric-card"><span>最近周期</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
-        <div className="metric-card"><span>配置</span><strong>{shortRevision(props.status.config_revision)}</strong><small>{props.status.config_error ? "热加载失败" : "已生效"}</small></div>
       </div>
       <section className="section-card">
-        <div className="section-title-row"><div><h2>最近事件</h2><p>扫描器生成的 MR / PR 语义变化</p></div></div>
+        <div className="section-title-row">
+          <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；这里的数量与变化事件分开统计。</p></div>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th></tr></thead>
+            <tbody>
+              {props.changeRequests.map((item) => (
+                <tr key={item.snapshot_key}>
+                  <td>
+                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer">
+                      <strong>#{item.number} {item.title}</strong>
+                      <small>{item.source_branch} → {item.target_branch}</small>
+                    </a>
+                  </td>
+                  <td>{item.repository_id}</td>
+                  <td><StatusPill value={item.state} /></td>
+                  <td>{dateTimeText(item.updated_at)}</td>
+                  <td>{timeText(item.scanned_at)}</td>
+                  <td>
+                    {item.discovered_event_emitted ? (
+                      <span className="event-emitted">已产生</span>
+                    ) : (
+                      <button
+                        className="button secondary compact"
+                        disabled={props.emittingKey === item.snapshot_key}
+                        onClick={() => props.onEmitDiscovered(item)}
+                      >
+                        {props.emittingKey === item.snapshot_key ? "补发中…" : "补发首次事件"}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {props.changeRequests.length === 0 && <div className="empty">尚未扫描到 MR / PR，请确认仓库已启用并执行扫描。</div>}
+        </div>
+      </section>
+      <section className="section-card">
+        <div className="section-title-row"><div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div></div>
         <div className="table-wrap">
           <table>
             <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>状态</th><th>时间</th></tr></thead>
@@ -1006,7 +1058,7 @@ function RulesEditor(props: {
       </div>
       <div className="card-list">
         {props.document.rules.map((rule, index) => (
-          <article className="sub-card rule-card" key={`${rule.name}-${index}`}>
+          <article className="sub-card rule-card" key={index}>
             <div className="sub-card-head">
               <div><h3>{rule.name}</h3><p>{rule.events.length} 个事件 · {rule.agents.length} 个 Agent</p></div>
               <div className="button-group"><Toggle label="启用" checked={rule.enabled ?? true} onChange={(enabled) => update(index, { enabled })} /><button className="icon-button danger" onClick={() => props.onChange({ ...props.document, rules: props.document.rules.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>
@@ -1111,6 +1163,8 @@ export default function App() {
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
+  const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
+  const [emittingKey, setEmittingKey] = useState("");
   const [eventOptions, setEventOptions] = useState<string[]>([]);
   const [revision, setRevision] = useState("");
   const [editing, setEditing] = useState(false);
@@ -1122,14 +1176,16 @@ export default function App() {
   const [token, setToken] = useState(getToken());
 
   const refreshOperationalData = useCallback(async () => {
-    const [nextStatus, nextRuns, nextEvents] = await Promise.all([
+    const [nextStatus, nextRuns, nextEvents, nextChangeRequests] = await Promise.all([
       api<RuntimeStatus>("/api/status"),
       api<RunSummary[]>("/api/runs?limit=100"),
       api<EventRecord[]>("/api/events?limit=50"),
+      api<ChangeRequestRecord[]>("/api/change-requests?limit=100"),
     ]);
     setStatus(nextStatus);
     setRuns(nextRuns);
     setEvents(nextEvents);
+    setChangeRequests(nextChangeRequests);
   }, []);
 
   const load = useCallback(async () => {
@@ -1220,6 +1276,34 @@ export default function App() {
     }
   }
 
+  async function emitDiscovered(item: ChangeRequestRecord) {
+    const hasMatchingRule = Boolean(document?.rules.some((rule) => (
+      rule.enabled !== false
+      && rule.events.includes("change_request.discovered")
+      && (!rule.repositories || rule.repositories.includes(item.repository_id))
+    )));
+    const impact = hasMatchingRule
+      ? "补发后会立即按当前触发规则调度 Agent，可能执行规则允许的写操作。"
+      : "当前没有匹配的首次发现规则，补发只会记录事件，不会运行 Agent。";
+    if (!window.confirm(`确定为 ${item.repository_id} #${item.number} 补发首次发现事件吗？\n\n${impact}`)) return;
+
+    setEmittingKey(item.snapshot_key);
+    setError("");
+    try {
+      const result = await api<{ created: boolean; reason: string }>(
+        `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/emit-discovered`,
+        { method: "POST" },
+      );
+      await refreshOperationalData();
+      setNotice(result.reason);
+      window.setTimeout(() => setNotice(""), 3500);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "补发首次发现事件失败");
+    } finally {
+      setEmittingKey("");
+    }
+  }
+
   const tabs = useMemo<Array<{ id: Tab; label: string; mark: string }>>(() => [
     { id: "overview", label: "运行概览", mark: "01" },
     { id: "repositories", label: "仓库", mark: "02" },
@@ -1260,7 +1344,16 @@ export default function App() {
           {loading && <div className="loading-screen"><span className="spinner" />正在连接后台服务…</div>}
           {!loading && document && (
             <>
-              {tab === "overview" && <Overview status={status} events={events} onAction={control} />}
+              {tab === "overview" && (
+                <Overview
+                  status={status}
+                  events={events}
+                  changeRequests={changeRequests}
+                  emittingKey={emittingKey}
+                  onAction={control}
+                  onEmitDiscovered={(item) => { void emitDiscovered(item); }}
+                />
+              )}
               {configurableTab && (
                 <>
                   <div className={`edit-mode-banner ${editing ? "editing" : ""}`}>

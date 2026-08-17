@@ -17,6 +17,31 @@ def test_snapshot_and_events_are_idempotent(tmp_path, snapshot_factory) -> None:
     assert store.load_snapshot(new.key) == new
 
 
+def test_lists_snapshot_stats_and_enqueues_discovered_event(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """快照应独立展示，管理员补发事件不能改写快照且必须幂等。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(repository_id="demo", number=9)
+    store.save_snapshot_and_events(snapshot, [])
+
+    items = store.list_snapshots()
+    assert len(items) == 1
+    assert items[0]["number"] == 9
+    assert items[0]["discovered_event_emitted"] is False
+    assert store.dashboard_stats()["change_requests"] == {"total": 1, "opened": 1}
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    assert store.enqueue_events([event]) == 1
+    assert store.enqueue_events([event]) == 0
+    assert store.has_event_type("demo", 9, "change_request.discovered")
+    assert store.load_snapshot(snapshot.key) == snapshot
+    assert store.list_snapshots()[0]["discovered_event_emitted"] is True
+
+
 def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
     store = StateStore(tmp_path / "state.db")
     store.initialize()

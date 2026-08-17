@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from .config_manager import ConfigManager
 from .environment import render_prompt
-from .events import FIELD_EVENTS
+from .events import FIELD_EVENTS, detect_events
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
 from .runtime import BackgroundRuntime
 
@@ -307,6 +307,50 @@ def create_app(
             limit,
             status=status,
         )
+
+    @app.get("/api/change-requests")
+    async def change_requests(
+        limit: int = Query(default=100, ge=1, le=500),
+        repository_id: str | None = None,
+    ):
+        """返回扫描器已经建立基线的 MR/PR 最新快照。"""
+
+        return await asyncio.to_thread(
+            manager.store.list_snapshots,
+            limit,
+            repository_id=repository_id,
+        )
+
+    @app.post("/api/change-requests/{repository_id}/{number}/emit-discovered")
+    async def emit_discovered(repository_id: str, number: int):
+        """为已有快照幂等补发首次发现事件，并唤醒后台处理规则。"""
+
+        snapshot = await asyncio.to_thread(
+            manager.store.load_snapshot,
+            f"{repository_id}:{number}",
+        )
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="MR / PR 快照不存在，请先执行扫描")
+
+        event_type = "change_request.discovered"
+        already_emitted = await asyncio.to_thread(
+            manager.store.has_event_type,
+            repository_id,
+            number,
+            event_type,
+        )
+        if already_emitted:
+            return {"created": False, "reason": "首次发现事件已经存在"}
+
+        event = detect_events(None, snapshot, emit_initial=True)[0]
+        inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
+        if inserted:
+            runtime.scan_now()
+        return {
+            "created": bool(inserted),
+            "event_id": event.id,
+            "reason": "首次发现事件已补发" if inserted else "首次发现事件已经存在",
+        }
 
     static_directory = Path(__file__).parent / "web" / "dist"
     index_file = static_directory / "index.html"

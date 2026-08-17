@@ -104,6 +104,8 @@ teamwork-review-agents scan-once --dry-run
 
 首次看到一个 MR/PR 时，系统默认只建立快照基线，不产生触发事件。将 `scanner.emit_initial_events` 改为 `true` 后，首次发现会生成 `change_request.discovered` 事件，并按照规则决定是否启动 Agent。
 
+管理界面的“已扫描 MR / PR”统计和列表来自已保存的最新快照；“变化事件”是新发现、提交、状态、标签等变化产生的事件，两者不会混为一个计数。对于已经建立基线但没有首次事件的 MR / PR，可以在列表中选择“补发首次事件”。补发不会删除快照或重新请求 Provider，只会幂等写入 `change_request.discovered`，并按当前规则调度；操作前请先确认规则与 Agent 权限。
+
 ## GitHub / GitLab 连接与仓库
 
 “GitHub / GitLab 连接”是后台扫描远端 MR / PR 时使用的平台 API 配置，不是 Git clone 或 SSH 地址。连接中的 `token_env` 保存 Provider Token 的变量名，例如 `GITHUB_TOKEN`。系统按以下顺序取值：

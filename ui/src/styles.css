@@ -98,6 +98,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .button.primary:hover:not(:disabled) { background: #79e2aa; box-shadow: 0 5px 18px rgba(96, 211, 148, .16); }
 .button.secondary { background: #151e2a; color: #b8c4d3; border-color: #2a3544; }
 .button.secondary:hover:not(:disabled) { border-color: #435166; color: var(--bright); }
+.button.compact { padding: 7px 10px; font-size: 9px; white-space: nowrap; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 7px; background: #111925; cursor: pointer; color: var(--muted); font-size: 18px; }
 .icon-button.danger:hover { color: var(--red); border-color: #623439; background: #211419; }
 .icon-button:disabled { opacity: .38; cursor: not-allowed; }
@@ -191,11 +192,19 @@ table { width: 100%; border-collapse: collapse; font-size: 11px; }
 th { padding: 9px 10px; color: #647287; text-align: left; font-size: 9px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
 td { padding: 11px 10px; color: #aab6c5; border-bottom: 1px solid var(--line-soft); }
 tbody tr:last-child td { border-bottom: 0; }
+.change-request-link { display: flex; min-width: 220px; max-width: 440px; flex-direction: column; gap: 4px; color: var(--bright); text-decoration: none; }
+.change-request-link:hover strong { color: var(--accent); }
+.change-request-link strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.change-request-link small { color: #607086; font: 400 9px "SFMono-Regular", Consolas, monospace; }
+.event-emitted { color: #7de5ad; font-size: 10px; white-space: nowrap; }
 .status-pill { display: inline-flex; align-items: center; padding: 3px 7px; border: 1px solid #344052; border-radius: 10px; color: #9aa8b9; background: #141c27; font-size: 9px; white-space: nowrap; }
 .status-completed { color: #7de5ad; border-color: #28553c; background: #10271b; }
 .status-running, .status-processing { color: #8eb8ff; border-color: #294f75; background: #101f33; }
 .status-failed, .status-timed_out { color: #ff9191; border-color: #623439; background: #291419; }
 .status-pending { color: #f4bb7f; border-color: #664a2d; background: #2a1e12; }
+.status-opened { color: #7de5ad; border-color: #28553c; background: #10271b; }
+.status-closed { color: #a8b2c0; border-color: #3c4756; background: #171e27; }
+.status-merged { color: #c9a7ff; border-color: #564078; background: #241936; }
 
 .runs-layout { display: grid; grid-template-columns: minmax(360px, .82fr) minmax(500px, 1.35fr); gap: 16px; align-items: start; }
 .runs-list, .log-panel { min-height: calc(100vh - 150px); }
