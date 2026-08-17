@@ -111,6 +111,20 @@ class AgentResult(BaseModel):
     error: str | None = None
 
 
+class PreflightResult(BaseModel):
+    """一次确定性 CI 前置检查的最终结果。"""
+
+    run_id: str
+    repository_id: str
+    number: int
+    head_sha: str
+    status: Literal["running", "success", "failure", "timed_out", "error"]
+    failed_step: str | None = None
+    exit_code: int | None = None
+    output: str = ""
+    error: str | None = None
+
+
 class InvocationContext(BaseModel):
     """传递给 sub-agent MCP Server 的最小调用上下文。"""
 
