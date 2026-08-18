@@ -19,6 +19,10 @@
 
 ## 3. 数据流
 
+下图是面向部署和评审人员的流程概览；后面的 Mermaid 图保留为可维护、可检索的结构化版本。
+
+![本地 CI 与 Review Agent 完整流程](assets/local-ci-review-agent-flow.png)
+
 ```mermaid
 flowchart LR
     A[定时扫描] --> B[Provider Adapter]

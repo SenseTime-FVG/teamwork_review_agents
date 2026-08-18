@@ -223,6 +223,32 @@ class SkillConfig(BaseModel):
     path: Path
 
 
+class PreflightStepConfig(BaseModel):
+    """一个按参数数组执行的确定性 CI 步骤。"""
+
+    name: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    timeout_seconds: PositiveInt | None = None
+
+
+class PreflightConfig(BaseModel):
+    """仓库级 CI 前置门禁配置。"""
+
+    enabled: bool = False
+    status_context: str = Field(default="teamwork/local-ci", min_length=1)
+    timeout_seconds: PositiveInt = 1800
+    max_output_bytes: PositiveInt = 1_000_000
+    steps: list[PreflightStepConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_enabled_steps(self) -> "PreflightConfig":
+        """启用门禁时至少需要一个可执行步骤。"""
+
+        if self.enabled and not self.steps:
+            raise ValueError("启用 Preflight 时必须配置至少一个步骤")
+        return self
+
+
 class RepositoryConfig(BaseModel):
     """被扫描仓库及 Agent 本地工作目录配置。"""
 
@@ -233,6 +259,7 @@ class RepositoryConfig(BaseModel):
     clone_url: str | None = None
     enabled: bool = True
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
+    preflight: PreflightConfig = Field(default_factory=PreflightConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -422,6 +449,13 @@ class AppConfig(BaseModel):
             if repository.provider not in self.providers:
                 raise ValueError(
                     f"仓库 {repository.id} 引用了不存在的 Provider：{repository.provider}"
+                )
+            if (
+                repository.preflight.enabled
+                and self.providers[repository.provider].kind != "github"
+            ):
+                raise ValueError(
+                    f"仓库 {repository.id} 启用了 Preflight，第一版仅支持 GitHub"
                 )
 
         agent_names = set(self.agents)

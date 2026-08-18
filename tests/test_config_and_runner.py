@@ -16,6 +16,7 @@ from teamwork_review_agents.config import (
     RepositoryConfig,
     ScannerConfig,
     load_config,
+    parse_config_data,
     validate_runtime_files,
 )
 from teamwork_review_agents.models import InvocationContext
@@ -169,6 +170,114 @@ def test_repository_accepts_project_path_ssh_and_https() -> None:
         assert repository.project == expected
         assert repository.clone_url == (
             value if value.startswith(("git@", "http", "ssh://")) else None
+        )
+
+
+def test_repository_preflight_parses_ordered_commands(tmp_path) -> None:
+    """启用 Preflight 后应保留步骤顺序、参数边界和默认状态名称。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": "./state.db"},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": "./workspace",
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {"name": "install", "command": ["uv", "sync", "--frozen"]},
+                            {"name": "test", "command": ["uv", "run", "pytest"]},
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+
+    preflight = config.repositories[0].preflight
+    assert preflight.enabled is True
+    assert preflight.status_context == "teamwork/local-ci"
+    assert [step.name for step in preflight.steps] == ["install", "test"]
+    assert preflight.steps[0].command == ["uv", "sync", "--frozen"]
+
+
+@pytest.mark.parametrize(
+    "preflight",
+    [
+        {"enabled": True, "steps": []},
+        {"enabled": True, "steps": [{"name": "test", "command": []}]},
+    ],
+)
+def test_enabled_repository_preflight_requires_executable_steps(
+    tmp_path,
+    preflight,
+) -> None:
+    """启用但无法执行的 Preflight 配置必须在服务启动前被拒绝。"""
+
+    with pytest.raises(ValueError):
+        parse_config_data(
+            {
+                "database": {"path": "./state.db"},
+                "providers": {
+                    "github-main": {
+                        "kind": "github",
+                        "base_url": "https://api.github.com",
+                        "token_env": "GITHUB_TOKEN",
+                    }
+                },
+                "repositories": [
+                    {
+                        "id": "demo",
+                        "provider": "github-main",
+                        "project": "owner/demo",
+                        "workspace": "./workspace",
+                        "preflight": preflight,
+                    }
+                ],
+            },
+            tmp_path / "config.yaml",
+        )
+
+
+def test_enabled_repository_preflight_rejects_unsupported_provider(tmp_path) -> None:
+    """第一版门禁必须在配置阶段拒绝尚不能回写状态的 Provider。"""
+
+    with pytest.raises(ValueError, match="GitHub"):
+        parse_config_data(
+            {
+                "database": {"path": "./state.db"},
+                "providers": {
+                    "gitlab-main": {
+                        "kind": "gitlab",
+                        "base_url": "https://gitlab.example.com/api/v4",
+                        "token_env": "GITLAB_TOKEN",
+                    }
+                },
+                "repositories": [
+                    {
+                        "id": "demo",
+                        "provider": "gitlab-main",
+                        "project": "owner/demo",
+                        "workspace": "./workspace",
+                        "preflight": {
+                            "enabled": True,
+                            "steps": [{"name": "test", "command": ["pytest"]}],
+                        },
+                    }
+                ],
+            },
+            tmp_path / "config.yaml",
         )
 
 

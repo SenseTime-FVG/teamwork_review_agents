@@ -16,6 +16,7 @@ from .models import (
     ChangeEvent,
     ChangeRequestActivity,
     ChangeRequestSnapshot,
+    PreflightResult,
 )
 
 
@@ -26,6 +27,14 @@ class RunReservation:
     run_id: str
     root_run_id: str
     parent_run_id: str | None
+    attempts: int
+
+
+@dataclass(frozen=True)
+class PreflightReservation:
+    """一次新建或基础设施错误重试的 CI 运行占位。"""
+
+    run_id: str
     attempts: int
 
 
@@ -131,6 +140,28 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_agent_runs_root
                 ON agent_runs(root_run_id, started_at);
 
+                CREATE TABLE IF NOT EXISTS preflight_runs (
+                    run_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    event_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    config_revision TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    failed_step TEXT,
+                    exit_code INTEGER,
+                    output TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    status_published INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL NOT NULL,
+                    finished_at REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_runs_change_request
+                ON preflight_runs(repository_id, number, head_sha);
+
                 CREATE TABLE IF NOT EXISTS run_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL,
@@ -188,6 +219,12 @@ class StateStore:
                 "cancel_requested",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_column(
+                connection,
+                "preflight_runs",
+                "status_published",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
 
     @staticmethod
     def _ensure_column(
@@ -234,6 +271,15 @@ class StateStore:
                     END,
                     finished_at = ?
                 WHERE status IN ('queued', 'preparing', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status = 'error', error = '服务异常退出，CI 运行未正常结束',
+                    finished_at = ?
+                WHERE status = 'running'
                 """,
                 (now,),
             )
@@ -664,6 +710,132 @@ class StateStore:
                 WHERE event_id = ?
                 """,
                 (final_status, error, time.time(), event_id),
+            )
+
+    def begin_preflight_run(
+        self,
+        *,
+        proposed_run_id: str,
+        idempotency_key: str,
+        event_id: str,
+        repository_id: str,
+        number: int,
+        head_sha: str,
+        config_revision: str,
+        max_attempts: int,
+    ) -> PreflightReservation | None:
+        """幂等创建 CI 运行；只有基础设施 error 可以复用记录重试。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT run_id, status, attempts
+                FROM preflight_runs WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO preflight_runs (
+                        run_id, idempotency_key, event_id, repository_id, number,
+                        head_sha, config_revision, status, attempts, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 1, ?)
+                    """,
+                    (
+                        proposed_run_id,
+                        idempotency_key,
+                        event_id,
+                        repository_id,
+                        number,
+                        head_sha,
+                        config_revision,
+                        now,
+                    ),
+                )
+                connection.commit()
+                return PreflightReservation(proposed_run_id, 1)
+
+            if row["status"] != "error" or row["attempts"] >= max_attempts:
+                connection.rollback()
+                return None
+            attempts = int(row["attempts"]) + 1
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status = 'running', attempts = ?, event_id = ?,
+                    failed_step = NULL, exit_code = NULL, output = '', error = NULL,
+                    started_at = ?, finished_at = NULL
+                WHERE run_id = ?
+                """,
+                (attempts, event_id, now, row["run_id"]),
+            )
+            connection.commit()
+            return PreflightReservation(str(row["run_id"]), attempts)
+
+    def load_preflight_result(self, idempotency_key: str) -> PreflightResult | None:
+        """按幂等键读取当前 CI 结果。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, repository_id, number, head_sha, status,
+                       failed_step, exit_code, output, error, status_published
+                FROM preflight_runs WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return PreflightResult(
+            run_id=str(row["run_id"]),
+            repository_id=str(row["repository_id"]),
+            number=int(row["number"]),
+            head_sha=str(row["head_sha"]),
+            status=str(row["status"]),
+            failed_step=row["failed_step"],
+            exit_code=row["exit_code"],
+            output=str(row["output"] or ""),
+            error=row["error"],
+            status_published=bool(row["status_published"]),
+        )
+
+    def finish_preflight_run(self, result: PreflightResult) -> None:
+        """保存一次 CI 运行的终态与有界输出。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status = ?, failed_step = ?, exit_code = ?, output = ?,
+                    error = ?, status_published = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    result.status,
+                    result.failed_step,
+                    result.exit_code,
+                    result.output,
+                    result.error,
+                    int(result.status_published),
+                    time.time(),
+                    result.run_id,
+                ),
+            )
+
+    def mark_preflight_status_published(self, run_id: str) -> None:
+        """记录终态 Commit Status 已成功发布，重试时无需重新执行 CI。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status_published = 1
+                WHERE run_id = ?
+                """,
+                (run_id,),
             )
 
     def begin_agent_run(

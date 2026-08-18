@@ -14,6 +14,7 @@ from .environment import resolve_provider_token
 from .events import detect_activity_events, detect_events, detect_first_seen_events
 from .executor import AgentExecutor
 from .models import AgentResult, ChangeEvent, ChangeRequestActivityBatch, stable_hash
+from .preflight import PreflightExecutor
 from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
 from .state import StateStore
@@ -27,6 +28,9 @@ class CycleSummary:
     snapshots: int = 0
     new_events: int = 0
     processed_events: int = 0
+    preflight_runs: int = 0
+    preflight_failures: int = 0
+    preflight_errors: int = 0
     agent_runs: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -91,6 +95,7 @@ class Orchestrator:
         if recover_interrupted:
             self.store.recover_interrupted_work()
         self.executor = AgentExecutor(config, self.store)
+        self.preflight = PreflightExecutor(config, self.store)
         self.agent_semaphore = asyncio.Semaphore(config.runtime.max_concurrent_agents)
 
     @staticmethod
@@ -280,6 +285,7 @@ class Orchestrator:
                                         event_window_start=event_window_start,
                                         emit_discovered=(
                                             self.config.scanner.emit_initial_events
+                                            or repository.preflight.enabled
                                         ),
                                         batch_id=scan_batch_id,
                                     )
@@ -384,6 +390,27 @@ class Orchestrator:
             matched_event_ids: set[str] = set()
             try:
                 invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                representative = claimed_events[0]
+                if (
+                    invocations
+                    and repository.preflight.enabled
+                    and representative.current_snapshot.state == "opened"
+                ):
+                    summary.preflight_runs += 1
+                    preflight_result = await self.preflight.ensure_passed(representative)
+                    if preflight_result.status in {"failure", "timed_out"}:
+                        summary.preflight_failures += 1
+                        for event in claimed_events:
+                            await asyncio.to_thread(self.store.finish_event, event.id)
+                            summary.processed_events += 1
+                        continue
+                    if preflight_result.status != "success":
+                        summary.preflight_errors += 1
+                        raise RuntimeError(
+                            preflight_result.error
+                            or f"Preflight 当前状态为 {preflight_result.status}"
+                        )
+
                 dispatches = [
                     (
                         event.id,

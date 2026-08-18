@@ -12,6 +12,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 - 每次 Agent 使用独立 Git worktree，避免并发任务互相污染。
 - 合并后按净差异和文档索引，只更新受影响文档。
 - 快照、事件、规则、运行和日志统一写入 SQLite，并在管理界面展示。
+- GitHub PR 可在 Review Agent 前执行仓库自定义的确定性 Preflight CI。
 
 主链路：`扫描 PR/MR → 语义事件 → 规则匹配 → Codex Agent → 审计与日志`
 
@@ -140,6 +141,38 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库执行 fetch，再为每次运行创建独立 worktree；这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
 
+## GitHub 本地 CI 门禁
+
+通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。启用后，只有 Preflight 成功才启动匹配的 Review Agent。
+
+![本地 CI 与 Review Agent 完整流程](docs/assets/local-ci-review-agent-flow.png)
+
+```yaml
+scanner:
+  # Preflight 仓库会自动产生首次事件；显式开启后，其他仓库也会产生。
+  emit_initial_events: true
+
+repositories:
+  - id: example-github
+    provider: github-main
+    project: owner/repository
+    workspace: ./workspaces/example-github
+    preflight:
+      enabled: true
+      status_context: teamwork/local-ci
+      timeout_seconds: 1800
+      max_output_bytes: 1000000
+      steps:
+        - name: repository-ci
+          command: [bash, ci/preflight.sh]
+```
+
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次；代码失败或超时会阻断 Agent。Git、进程启动或首次状态发布等基础设施错误沿用事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
+
+Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+
+Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
+
 ## 常用命令
 
 ```bash
@@ -161,6 +194,7 @@ teamwork-review-agents runs --limit 20
 | --- | --- |
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
 | [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
+| [`docs/preflight-ci.md`](docs/preflight-ci.md) | GitHub Preflight 的执行、幂等与安全边界 |
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
 | [`docs/architecture.md`](docs/architecture.md) | 架构、Agent 边界和数据流 |
 | [`docs/design.md`](docs/design.md) | 精确实现语义 |

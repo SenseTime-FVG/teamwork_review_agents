@@ -5,7 +5,11 @@ import sqlite3
 import pytest
 
 from teamwork_review_agents.events import create_manual_activity_event, detect_events
-from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
+from teamwork_review_agents.models import (
+    AgentResult,
+    ChangeRequestActivity,
+    PreflightResult,
+)
 from teamwork_review_agents.state import StateStore
 
 
@@ -442,3 +446,112 @@ def test_activity_cursor_is_saved_with_snapshot_and_events(
         "item_id": "timeline-21",
     }
     assert len(store.pending_events()) == 1
+
+
+def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) -> None:
+    """同一 SHA 和配置版本只能产生一次终态 CI，配置变化应创建新运行。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    reservation = store.begin_preflight_run(
+        proposed_run_id="preflight-1",
+        idempotency_key="demo:7:sha-a:revision-a",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+    assert reservation.attempts == 1
+    assert store.begin_preflight_run(
+        proposed_run_id="duplicate",
+        idempotency_key="demo:7:sha-a:revision-a",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-a",
+        max_attempts=2,
+    ) is None
+
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id=reservation.run_id,
+            repository_id="demo",
+            number=7,
+            head_sha="a" * 40,
+            status="success",
+            output="4 tests passed",
+        )
+    )
+    saved = store.load_preflight_result("demo:7:sha-a:revision-a")
+    assert saved is not None
+    assert saved.status == "success"
+    assert saved.output == "4 tests passed"
+    assert saved.status_published is False
+    store.mark_preflight_status_published(saved.run_id)
+    published = store.load_preflight_result("demo:7:sha-a:revision-a")
+    assert published is not None
+    assert published.status_published is True
+    assert store.begin_preflight_run(
+        proposed_run_id="after-success",
+        idempotency_key="demo:7:sha-a:revision-a",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-a",
+        max_attempts=2,
+    ) is None
+
+    changed = store.begin_preflight_run(
+        proposed_run_id="preflight-2",
+        idempotency_key="demo:7:sha-a:revision-b",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-b",
+        max_attempts=2,
+    )
+    assert changed is not None
+    assert changed.run_id == "preflight-2"
+
+
+def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
+    """服务异常退出后的 CI 应转成 error，并允许按次数限制复用运行记录。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    reservation = store.begin_preflight_run(
+        proposed_run_id="preflight-1",
+        idempotency_key="demo:7:sha-a:revision-a",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+
+    store.recover_interrupted_work()
+
+    recovered = store.load_preflight_result("demo:7:sha-a:revision-a")
+    assert recovered is not None
+    assert recovered.status == "error"
+    retried = store.begin_preflight_run(
+        proposed_run_id="unused-new-id",
+        idempotency_key="demo:7:sha-a:revision-a",
+        event_id="event-1",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert retried is not None
+    assert retried.run_id == "preflight-1"
+    assert retried.attempts == 2

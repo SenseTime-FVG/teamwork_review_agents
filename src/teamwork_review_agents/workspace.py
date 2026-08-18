@@ -11,10 +11,10 @@ import subprocess
 import tempfile
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
@@ -758,3 +758,66 @@ def prepare_change_request_workspace(
                 "无法获取 MR/PR 代码引用，请检查远端权限或平台引用格式"
             )
     return destination_ref
+
+
+@contextmanager
+def temporary_change_request_worktree(
+    provider: ProviderConfig,
+    repository: RepositoryConfig,
+    snapshot: ChangeRequestSnapshot,
+) -> Iterator[Path]:
+    """在临时 worktree 中检出准确的 MR/PR Head，并在退出时清理。"""
+
+    change_ref = prepare_change_request_workspace(provider, repository, snapshot)
+    workspace = repository.workspace.resolve()
+    with tempfile.TemporaryDirectory(
+        dir=workspace.parent,
+        prefix=f".{workspace.name}.preflight-",
+    ) as temporary_root:
+        checkout = Path(temporary_root) / "checkout"
+        _run_git(
+            [
+                "-C",
+                str(workspace),
+                "worktree",
+                "add",
+                "--detach",
+                str(checkout),
+                change_ref,
+            ]
+        )
+        try:
+            actual_head = _run_git(
+                ["-C", str(checkout), "rev-parse", "HEAD"]
+            ).stdout.strip()
+            if actual_head != snapshot.head_sha:
+                raise WorkspaceError(
+                    f"临时工作目录 Head 不匹配：期望 {snapshot.head_sha}，实际 {actual_head}"
+                )
+            _run_git(
+                [
+                    "-C",
+                    str(checkout),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                ]
+            )
+            yield checkout
+        finally:
+            _run_git(
+                [
+                    "-C",
+                    str(workspace),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(checkout),
+                ],
+                check=False,
+            )
+            _run_git(
+                ["-C", str(workspace), "worktree", "prune"],
+                check=False,
+            )

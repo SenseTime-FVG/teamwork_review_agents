@@ -23,6 +23,7 @@ from teamwork_review_agents.workspace import (
     ensure_isolated_worktree,
     prepare_change_request_workspace,
     retained_marker_path,
+    temporary_change_request_worktree,
     validate_linked_workspace,
     WorkspaceCancelled,
     WorkspaceError,
@@ -345,3 +346,59 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert retained_detail["workspace_status"] == "retained"
     assert Path(retained_detail["workspace_path"]).exists()
     assert "未提交" in retained_detail["workspace_reason"]
+
+
+def test_temporary_change_request_worktree_isolated_and_removed(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """CI 检出必须使用临时 worktree，且不能改动持久工作目录。"""
+
+    origin = tmp_path / "origin.git"
+    source = tmp_path / "source"
+    workspace = tmp_path / "managed" / "demo"
+    run_git("init", "--bare", str(origin))
+    source.mkdir()
+    run_git("init", "--initial-branch=main", cwd=source)
+    run_git("config", "user.name", "Test User", cwd=source)
+    run_git("config", "user.email", "test@example.com", cwd=source)
+    (source / "README.md").write_text("PR 内容\n", encoding="utf-8")
+    run_git("add", "README.md", cwd=source)
+    run_git("commit", "-m", "初始化", cwd=source)
+    head_sha = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("remote", "add", "origin", str(origin), cwd=source)
+    run_git("push", "origin", "main", cwd=source)
+    run_git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    run_git("push", "origin", "HEAD:refs/pull/7/head", cwd=source)
+
+    provider = ProviderConfig(
+        kind="github",
+        base_url="https://api.github.com",
+        token_env="GITHUB_TOKEN",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        clone_url=str(origin),
+        workspace=workspace,
+    )
+    snapshot = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        number=7,
+        head_sha=head_sha,
+    )
+    prepare_change_request_workspace(provider, repository, snapshot)
+    dirty_file = workspace / "local-notes.txt"
+    dirty_file.write_text("保留本地修改\n", encoding="utf-8")
+
+    with temporary_change_request_worktree(provider, repository, snapshot) as checkout:
+        checkout_path = checkout
+        assert checkout != workspace
+        assert run_git("rev-parse", "HEAD", cwd=checkout) == head_sha
+        assert (checkout / "README.md").read_text(encoding="utf-8") == "PR 内容\n"
+
+    assert not checkout_path.exists()
+    assert dirty_file.read_text(encoding="utf-8") == "保留本地修改\n"
+    assert run_git("branch", "--show-current", cwd=workspace) == "main"
