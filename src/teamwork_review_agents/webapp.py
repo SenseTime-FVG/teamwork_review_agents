@@ -18,9 +18,10 @@ from .codex_account import (
     CodexAccountError,
     CodexLoginManager,
     inspect_codex_account,
+    read_codex_effective_config,
 )
 from .config_manager import ConfigManager, ConfigRevisionConflict
-from .codex_settings import inspect_runtime_options
+from .codex_settings import codex_home, inspect_runtime_options
 from .environment import render_prompt
 from .events import FIELD_EVENTS, create_manual_activity_event, detect_events
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
@@ -498,12 +499,24 @@ def create_app(
     async def codex_runtime_options() -> dict[str, Any]:
         """返回本机 Codex 模型目录和当前可验证的继承模型来源。"""
 
+        effective_config = None
+        effective_config_error = None
+        try:
+            effective_config = await read_codex_effective_config(
+                manager.config.runtime.codex_binary,
+                codex_home(manager.config.runtime.codex_home),
+            )
+        except (CodexAccountError, OSError) as exc:
+            effective_config_error = str(exc)
+
         return await asyncio.to_thread(
             inspect_runtime_options,
             manager.config.runtime.codex,
             manager.config.runtime.codex_binary,
             manager.config.runtime.codex_home,
             manager.config.runtime.expected_codex_version,
+            effective_config,
+            effective_config_error,
         )
 
     @app.get("/api/codex/account")

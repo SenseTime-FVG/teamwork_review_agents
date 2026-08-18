@@ -13,6 +13,7 @@ import type {
   Agent,
   ChangeRequestRecord,
   CodexAccountStatus,
+  CodexInheritedSetting,
   CodexLoginSession,
   CodexRuntimeConfig,
   CodexRuntimeOptions,
@@ -99,7 +100,16 @@ const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   inherited_model: {
     value: null,
     source: "builtin",
-    label: "继承 Codex CLI / 账号默认（未配置固定模型）",
+    label: "继承 Codex CLI / 账号默认（UNK）",
+  },
+  codex_model: null,
+  codex_model_source: "builtin",
+  inherited_settings: {
+    model_reasoning_effort: { value: null, source: "unknown", known: false },
+    fast_mode: { value: null, source: "unknown", known: false },
+    model_verbosity: { value: null, source: "unknown", known: false },
+    personality: { value: null, source: "unknown", known: false },
+    web_search: { value: null, source: "unknown", known: false },
   },
   user_model: null,
   user_config_path: "~/.codex/config.toml",
@@ -1236,16 +1246,128 @@ function effectiveInheritedModel(
       label: `继承 Teamwork 运行时默认（${runtimeModel}）`,
     };
   }
-  if (options.user_model) {
+  if (options.codex_model) {
     return {
-      value: options.user_model,
-      label: `继承 Codex 用户配置（${options.user_model}）`,
+      value: options.codex_model,
+      label: options.codex_model_source === "codex"
+        ? `继承 Codex 有效配置（${options.codex_model}）`
+        : `继承 Codex 用户配置（${options.codex_model}）`,
     };
   }
   return {
     value: null,
-    label: "继承 Codex CLI / 账号默认（未配置固定模型）",
+    label: "继承 Codex CLI / 账号默认（UNK）",
   };
+}
+
+type InheritedSettingKey = keyof CodexRuntimeOptions["inherited_settings"];
+
+const SETTING_VALUE_LABELS: Record<InheritedSettingKey, Record<string, string>> = {
+  model_reasoning_effort: {
+    minimal: "最小",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "超高",
+    max: "最大",
+    ultra: "极高",
+  },
+  fast_mode: {
+    standard: "标准模式",
+    default: "标准模式",
+    fast: "快速模式",
+  },
+  model_verbosity: { low: "低", medium: "中", high: "高" },
+  personality: { none: "无预设", friendly: "友好", pragmatic: "务实" },
+  web_search: {
+    disabled: "禁用",
+    cached: "缓存搜索",
+    indexed: "索引搜索",
+    live: "实时搜索",
+  },
+};
+
+const SETTING_SOURCE_LABELS: Record<CodexInheritedSetting["source"], string> = {
+  codex: "Codex 有效配置",
+  user: "Codex 用户配置",
+  model: "模型默认",
+  builtin: "Codex 默认",
+  runtime: "运行时默认",
+  unknown: "Codex / 模型默认",
+};
+
+function settingValueLabel(key: InheritedSettingKey, setting: CodexInheritedSetting): string {
+  if (!setting.known || !setting.value) return "UNK";
+  return SETTING_VALUE_LABELS[key][setting.value] ?? setting.value;
+}
+
+function baseInheritedSetting(
+  options: CodexRuntimeOptions,
+  key: InheritedSettingKey,
+  model?: string | null,
+  sandbox?: Agent["sandbox"],
+): CodexInheritedSetting {
+  const configured = options.inherited_settings?.[key] ?? {
+    value: null,
+    source: "unknown",
+    known: false,
+  };
+  if (key === "model_reasoning_effort" && !configured.known) {
+    const modelEntry = options.models.find((item) => item.slug === model);
+    if (modelEntry?.default_reasoning_level) {
+      return {
+        value: modelEntry.default_reasoning_level,
+        source: "model",
+        known: true,
+      };
+    }
+  }
+  if (
+    key === "web_search"
+    && configured.source === "builtin"
+    && sandbox === "danger-full-access"
+  ) {
+    return { value: "live", source: "builtin", known: true };
+  }
+  return configured;
+}
+
+function runtimeInheritedSetting(
+  document: ConfigDocument,
+  options: CodexRuntimeOptions,
+  key: InheritedSettingKey,
+  model?: string | null,
+  sandbox?: Agent["sandbox"],
+): CodexInheritedSetting {
+  const codex = document.runtime.codex ?? {};
+  const explicitValue = codex[key];
+  const hasExplicitValue = key === "fast_mode"
+    ? Boolean(explicitValue && explicitValue !== "inherit")
+    : Boolean(explicitValue);
+  if (hasExplicitValue) {
+    return {
+      value: String(explicitValue),
+      source: "runtime",
+      known: true,
+    };
+  }
+  return baseInheritedSetting(options, key, model, sandbox);
+}
+
+function runtimeInheritanceLabel(
+  key: InheritedSettingKey,
+  setting: CodexInheritedSetting,
+): string {
+  return `继承 ${SETTING_SOURCE_LABELS[setting.source]}（${settingValueLabel(key, setting)}）`;
+}
+
+function agentInheritanceLabel(
+  key: InheritedSettingKey,
+  setting: CodexInheritedSetting,
+): string {
+  const value = settingValueLabel(key, setting);
+  if (value === "UNK") return "继承运行时默认（UNK）";
+  return `继承运行时默认（${value} · ${SETTING_SOURCE_LABELS[setting.source]}）`;
 }
 
 function reasoningLevels(
@@ -1267,7 +1389,16 @@ function CodexRuntimeEditor(props: {
 }) {
   const codex = props.document.runtime.codex ?? {};
   const inherited = effectiveInheritedModel(props.document, props.options);
-  const selectedModel = codex.model || props.options.user_model;
+  const selectedModel = codex.model || props.options.codex_model;
+  const inheritedReasoning = baseInheritedSetting(
+    props.options,
+    "model_reasoning_effort",
+    selectedModel,
+  );
+  const inheritedFastMode = baseInheritedSetting(props.options, "fast_mode", selectedModel);
+  const inheritedVerbosity = baseInheritedSetting(props.options, "model_verbosity", selectedModel);
+  const inheritedPersonality = baseInheritedSetting(props.options, "personality", selectedModel);
+  const inheritedWebSearch = baseInheritedSetting(props.options, "web_search", selectedModel);
 
   function patchRuntime(patch: Record<string, unknown>) {
     props.onChange({
@@ -1291,7 +1422,7 @@ function CodexRuntimeEditor(props: {
         </div>
         <div className="agent-workspace-note">
           <strong>当前模型来源</strong>
-          <span>{inherited.label}。Agent 可以单独覆盖；仓库中的 `.codex/config.toml` 仅在没有更高优先级覆盖时参与 Codex 原生合并。</span>
+          <span>{inherited.label}。下面展示的是没有单一仓库上下文时的后台全局继承值；Agent 可以单独覆盖，仓库中的 `.codex/config.toml` 仍可能参与 Codex 原生合并。</span>
         </div>
         <div className="agent-workspace-note">
           <strong>实际后台 CLI</strong>
@@ -1302,6 +1433,11 @@ function CodexRuntimeEditor(props: {
           </span>
         </div>
         {props.options.version_warning && <div className="alert error">{props.options.version_warning}</div>}
+        {props.options.effective_config_error && (
+          <div className="alert error">
+            无法通过 Codex 读取完整有效配置，当前继承值已回退到用户配置；无法确定的字段显示 UNK。
+          </div>
+        )}
         <div className="form-grid three runtime-config-grid">
           <Field
             label="Codex CLI 命令"
@@ -1348,7 +1484,7 @@ function CodexRuntimeEditor(props: {
             id="runtime-codex-models"
             label="默认模型"
             value={codex.model ?? ""}
-            placeholder="继承 Codex 配置或账号默认"
+            placeholder={inherited.label}
             models={props.options.models}
             onChange={(model) => patchCodex({ model: model || undefined })}
             help={props.options.catalog_error ? "无法读取本机模型目录，仍可手工填写模型 ID" : "候选项来自当前服务使用的 Codex CLI"}
@@ -1358,7 +1494,10 @@ function CodexRuntimeEditor(props: {
             value={codex.model_reasoning_effort ?? ""}
             onChange={(value) => patchCodex({ model_reasoning_effort: value || undefined })}
             options={[
-              { value: "", label: "继承 Codex 配置 / 模型默认" },
+              {
+                value: "",
+                label: runtimeInheritanceLabel("model_reasoning_effort", inheritedReasoning),
+              },
               ...reasoningLevels(props.options, selectedModel, codex.model_reasoning_effort).map((value) => ({ value, label: value })),
             ]}
             help="不同模型支持的强度可能不同"
@@ -1368,7 +1507,10 @@ function CodexRuntimeEditor(props: {
             value={codex.fast_mode ?? "inherit"}
             onChange={(value) => patchCodex({ fast_mode: value as CodexRuntimeConfig["fast_mode"] })}
             options={[
-              { value: "inherit", label: "继承 Codex 配置" },
+              {
+                value: "inherit",
+                label: runtimeInheritanceLabel("fast_mode", inheritedFastMode),
+              },
               { value: "standard", label: "标准模式" },
               { value: "fast", label: "快速模式" },
             ]}
@@ -1379,7 +1521,10 @@ function CodexRuntimeEditor(props: {
             value={codex.model_verbosity ?? ""}
             onChange={(value) => patchCodex({ model_verbosity: value ? value as CodexRuntimeConfig["model_verbosity"] : undefined })}
             options={[
-              { value: "", label: "继承 Codex 配置" },
+              {
+                value: "",
+                label: runtimeInheritanceLabel("model_verbosity", inheritedVerbosity),
+              },
               { value: "low", label: "低" },
               { value: "medium", label: "中" },
               { value: "high", label: "高" },
@@ -1390,7 +1535,10 @@ function CodexRuntimeEditor(props: {
             value={codex.personality ?? ""}
             onChange={(value) => patchCodex({ personality: value ? value as CodexRuntimeConfig["personality"] : undefined })}
             options={[
-              { value: "", label: "继承 Codex 配置" },
+              {
+                value: "",
+                label: runtimeInheritanceLabel("personality", inheritedPersonality),
+              },
               { value: "none", label: "无预设" },
               { value: "friendly", label: "友好" },
               { value: "pragmatic", label: "务实" },
@@ -1401,7 +1549,10 @@ function CodexRuntimeEditor(props: {
             value={codex.web_search ?? ""}
             onChange={(value) => patchCodex({ web_search: value ? value as CodexRuntimeConfig["web_search"] : undefined })}
             options={[
-              { value: "", label: "继承 Codex 配置" },
+              {
+                value: "",
+                label: runtimeInheritanceLabel("web_search", inheritedWebSearch),
+              },
               { value: "disabled", label: "禁用" },
               { value: "cached", label: "缓存搜索" },
               { value: "live", label: "实时搜索" },
@@ -2875,6 +3026,42 @@ function AgentsEditor(props: {
       <div className="card-list">
         {names.map((name) => {
           const agent = props.document.agents[name];
+          const agentModel = agent.model || inheritedModel.value;
+          const inheritedReasoning = runtimeInheritedSetting(
+            props.document,
+            props.codexOptions,
+            "model_reasoning_effort",
+            agentModel,
+            agent.sandbox,
+          );
+          const inheritedFastMode = runtimeInheritedSetting(
+            props.document,
+            props.codexOptions,
+            "fast_mode",
+            agentModel,
+            agent.sandbox,
+          );
+          const inheritedVerbosity = runtimeInheritedSetting(
+            props.document,
+            props.codexOptions,
+            "model_verbosity",
+            agentModel,
+            agent.sandbox,
+          );
+          const inheritedPersonality = runtimeInheritedSetting(
+            props.document,
+            props.codexOptions,
+            "personality",
+            agentModel,
+            agent.sandbox,
+          );
+          const inheritedWebSearch = runtimeInheritedSetting(
+            props.document,
+            props.codexOptions,
+            "web_search",
+            agentModel,
+            agent.sandbox,
+          );
           const promptSource = agent.prompt_file ? "file" : "inline";
           const writeScopes = agent.write_scopes ?? [];
           const subAgentOptions = allNames
@@ -2940,13 +3127,25 @@ function AgentsEditor(props: {
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>
+              {props.showOverview === false && (
+                <div className="agent-workspace-note">
+                  <strong>当前继承值</strong>
+                  <span>选择框会显示运行时默认解析到的具体值；无法可靠确定时显示 UNK。仓库 `.codex/config.toml` 仍可能让实际运行值随仓库变化。</span>
+                </div>
+              )}
               <div className="form-grid three agent-runtime-overrides">
                 <SelectField
                   label="推理强度（可选）"
                   value={agent.model_reasoning_effort ?? ""}
                   onChange={(value) => update(name, { model_reasoning_effort: value || undefined })}
                   options={[
-                    { value: "", label: "继承运行时默认" },
+                    {
+                      value: "",
+                      label: agentInheritanceLabel(
+                        "model_reasoning_effort",
+                        inheritedReasoning,
+                      ),
+                    },
                     ...reasoningLevels(
                       props.codexOptions,
                       agent.model || inheritedModel.value,
@@ -2959,7 +3158,10 @@ function AgentsEditor(props: {
                   value={agent.fast_mode ?? "inherit"}
                   onChange={(value) => update(name, { fast_mode: value as Agent["fast_mode"] })}
                   options={[
-                    { value: "inherit", label: "继承运行时默认" },
+                    {
+                      value: "inherit",
+                      label: agentInheritanceLabel("fast_mode", inheritedFastMode),
+                    },
                     { value: "standard", label: "标准模式" },
                     { value: "fast", label: "快速模式" },
                   ]}
@@ -2969,7 +3171,10 @@ function AgentsEditor(props: {
                   value={agent.model_verbosity ?? ""}
                   onChange={(value) => update(name, { model_verbosity: value ? value as Agent["model_verbosity"] : undefined })}
                   options={[
-                    { value: "", label: "继承运行时默认" },
+                    {
+                      value: "",
+                      label: agentInheritanceLabel("model_verbosity", inheritedVerbosity),
+                    },
                     { value: "low", label: "低" },
                     { value: "medium", label: "中" },
                     { value: "high", label: "高" },
@@ -2980,7 +3185,10 @@ function AgentsEditor(props: {
                   value={agent.personality ?? ""}
                   onChange={(value) => update(name, { personality: value ? value as Agent["personality"] : undefined })}
                   options={[
-                    { value: "", label: "继承运行时默认" },
+                    {
+                      value: "",
+                      label: agentInheritanceLabel("personality", inheritedPersonality),
+                    },
                     { value: "none", label: "无预设" },
                     { value: "friendly", label: "友好" },
                     { value: "pragmatic", label: "务实" },
@@ -2991,7 +3199,10 @@ function AgentsEditor(props: {
                   value={agent.web_search ?? ""}
                   onChange={(value) => update(name, { web_search: value ? value as Agent["web_search"] : undefined })}
                   options={[
-                    { value: "", label: "继承运行时默认" },
+                    {
+                      value: "",
+                      label: agentInheritanceLabel("web_search", inheritedWebSearch),
+                    },
                     { value: "disabled", label: "禁用" },
                     { value: "cached", label: "缓存搜索" },
                     { value: "live", label: "实时搜索" },

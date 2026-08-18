@@ -96,6 +96,12 @@ export type CodexRuntimeConfig = {
   extra_config?: Record<string, CodexConfigValue>;
 };
 
+export type CodexInheritedSetting = {
+  value?: string | null;
+  source: "codex" | "user" | "model" | "builtin" | "runtime" | "unknown";
+  known: boolean;
+};
+
 export type RuntimeConfig = Record<string, unknown> & {
   codex_binary?: string;
   codex_home?: string;
@@ -118,9 +124,20 @@ export type CodexRuntimeOptions = {
   }>;
   inherited_model: {
     value?: string | null;
-    source: "runtime" | "user" | "builtin";
+    source: "runtime" | "codex" | "user" | "builtin";
     label: string;
   };
+  codex_model?: string | null;
+  codex_model_source: "codex" | "user" | "builtin";
+  inherited_settings: {
+    model_reasoning_effort: CodexInheritedSetting;
+    fast_mode: CodexInheritedSetting;
+    model_verbosity: CodexInheritedSetting;
+    personality: CodexInheritedSetting;
+    web_search: CodexInheritedSetting;
+  };
+  inherited_settings_error?: string | null;
+  effective_config_error?: string | null;
   user_model?: string | null;
   user_config_path: string;
   catalog_error?: string | null;

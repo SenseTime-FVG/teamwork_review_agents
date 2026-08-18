@@ -46,9 +46,19 @@ def _codex_environment(home: Path) -> dict[str, str]:
 class CodexAppServer:
     """封装一个基于标准输入输出的 Codex App Server 连接。"""
 
-    def __init__(self, codex_binary: str, home: Path) -> None:
+    def __init__(
+        self,
+        codex_binary: str,
+        home: Path,
+        working_directory: Path | None = None,
+    ) -> None:
         self.codex_binary = codex_binary
         self.home = home.expanduser().resolve()
+        self.working_directory = (
+            working_directory.expanduser().resolve()
+            if working_directory is not None
+            else None
+        )
         self.process: asyncio.subprocess.Process | None = None
         self._request_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -69,6 +79,7 @@ class CodexAppServer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_codex_environment(self.home),
+                cwd=str(self.working_directory) if self.working_directory else None,
                 start_new_session=os.name != "nt",
             )
             self._reader_task = asyncio.create_task(self._read_stdout())
@@ -223,6 +234,25 @@ class CodexAppServer:
 
     async def __aexit__(self, *_: object) -> None:
         await self.close()
+
+
+async def read_codex_effective_config(
+    codex_binary: str,
+    home: Path,
+) -> dict[str, Any]:
+    """通过官方 App Server 接口读取完成分层后的 Codex 配置。"""
+
+    inspection_directory = home if home.is_dir() else Path.home()
+    async with CodexAppServer(
+        codex_binary,
+        home,
+        working_directory=inspection_directory,
+    ) as server:
+        result = await server.request("config/read", {"includeLayers": False})
+    config = result.get("config") if isinstance(result, dict) else None
+    if not isinstance(config, dict):
+        raise CodexAccountError("Codex App Server 未返回有效配置")
+    return config
 
 
 def _safe_window(value: Any) -> dict[str, Any] | None:

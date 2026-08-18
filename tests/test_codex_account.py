@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from teamwork_review_agents.codex_account import (
     CodexLoginManager,
     inspect_codex_account,
+    read_codex_effective_config,
 )
 from teamwork_review_agents.webapp import create_app
 
@@ -66,6 +67,13 @@ for line in sys.stdin:
         result = {"loginId": "login-test", "authUrl": "https://example.com/login"}
     elif method == "account/login/cancel":
         result = {"cancelled": True}
+    elif method == "config/read":
+        result = {
+            "config": {
+                "model": "gpt-effective",
+                "service_tier": "fast",
+            }
+        }
     else:
         result = {}
     print(json.dumps({"id": request_id, "result": result}), flush=True)
@@ -110,6 +118,18 @@ async def test_inspect_codex_account_returns_only_safe_fields(tmp_path) -> None:
     }
     assert result["usage"] == {"summary": {"lifetimeTokens": 1234}}
     assert "accessToken" not in result["account"]
+
+
+async def test_read_codex_effective_config_uses_app_server(tmp_path) -> None:
+    """有效配置诊断应使用 App Server 完成配置分层。"""
+
+    fake_codex = _write_fake_codex(tmp_path / "fake-codex")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    result = await read_codex_effective_config(str(fake_codex), codex_home)
+
+    assert result == {"model": "gpt-effective", "service_tier": "fast"}
 
 
 async def test_missing_independent_home_is_signed_out_without_creation(tmp_path) -> None:

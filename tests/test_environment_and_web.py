@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from teamwork_review_agents.config import load_config
 from teamwork_review_agents.config_manager import ConfigManager, ConfigRevisionConflict
+from teamwork_review_agents.codex_settings import read_user_inherited_settings
 from teamwork_review_agents.environment import (
     MASK,
     SecretRedactor,
@@ -849,7 +850,12 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
-        'model = "gpt-user"\n',
+        'model = "gpt-user"\n'
+        'model_reasoning_effort = "high"\n'
+        'service_tier = "fast"\n'
+        'model_verbosity = "low"\n'
+        'personality = "friendly"\n'
+        'web_search = "live"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -867,6 +873,22 @@ def test_codex_runtime_options_report_catalog_and_user_model(
         encoding="utf-8",
     )
 
+    async def effective_config(*_args):
+        return {
+            "model": "gpt-user",
+            "model_reasoning_effort": "high",
+            "service_tier": "fast",
+            "model_verbosity": "low",
+            "personality": "friendly",
+            "web_search": "live",
+            "credential": "不得返回的配置",
+        }
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.read_codex_effective_config",
+        effective_config,
+    )
+
     app = create_app(config_path, start_scheduler=False)
     with TestClient(app) as client:
         result = client.get("/api/codex/runtime-options").json()
@@ -877,6 +899,109 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     assert result["user_model"] == "gpt-user"
     assert result["inherited_model"] == {
         "value": "gpt-user",
-        "source": "user",
-        "label": "继承 Codex 用户配置（gpt-user）",
+        "source": "codex",
+        "label": "继承 Codex 有效配置（gpt-user）",
+    }
+    assert result["codex_model"] == "gpt-user"
+    assert result["codex_model_source"] == "codex"
+    assert result["inherited_settings"] == {
+        "model_reasoning_effort": {
+            "value": "high",
+            "source": "codex",
+            "known": True,
+        },
+        "fast_mode": {"value": "fast", "source": "codex", "known": True},
+        "model_verbosity": {
+            "value": "low",
+            "source": "codex",
+            "known": True,
+        },
+        "personality": {
+            "value": "friendly",
+            "source": "codex",
+            "known": True,
+        },
+        "web_search": {"value": "live", "source": "codex", "known": True},
+    }
+    assert "credential" not in result
+    assert "不得返回的配置" not in str(result)
+
+
+def test_codex_runtime_options_use_known_defaults_and_unknown_markers(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """未配置的公开默认应解析，未公开值应保持未知。"""
+
+    config_path = write_config(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"models\":[]}'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["runtime"] = {"codex_binary": str(fake_codex)}
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    async def effective_config(*_args):
+        return {}
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.read_codex_effective_config",
+        effective_config,
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        settings = client.get("/api/codex/runtime-options").json()[
+            "inherited_settings"
+        ]
+
+    assert settings["fast_mode"] == {
+        "value": "standard",
+        "source": "builtin",
+        "known": True,
+    }
+    assert settings["web_search"] == {
+        "value": "cached",
+        "source": "builtin",
+        "known": True,
+    }
+    assert settings["model_reasoning_effort"] == {
+        "value": None,
+        "source": "unknown",
+        "known": False,
+    }
+    assert settings["model_verbosity"]["known"] is False
+    assert settings["personality"]["known"] is False
+
+
+def test_user_config_fallback_does_not_guess_missing_layered_values(tmp_path) -> None:
+    """无法读取完整配置分层时，缺失字段必须保持未知。"""
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text("", encoding="utf-8")
+
+    settings, error = read_user_inherited_settings(codex_home)
+
+    assert error is None
+    assert settings["fast_mode"] == {
+        "value": None,
+        "source": "unknown",
+        "known": False,
+    }
+    assert settings["web_search"] == {
+        "value": None,
+        "source": "unknown",
+        "known": False,
     }

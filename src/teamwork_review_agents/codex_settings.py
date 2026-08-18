@@ -137,6 +137,115 @@ def read_user_mcp_servers(home: Path | None = None) -> tuple[list[str], str | No
     return sorted(str(name) for name in servers), None
 
 
+def _inherited_setting(
+    value: str | None,
+    source: str,
+    *,
+    known: bool,
+) -> dict[str, Any]:
+    """构造可安全返回给管理界面的单项继承诊断。"""
+
+    return {
+        "value": value,
+        "source": source,
+        "known": known,
+    }
+
+
+def _inherited_settings_from_document(
+    document: dict[str, Any],
+    *,
+    configured_source: str,
+    allow_builtin_defaults: bool,
+) -> dict[str, dict[str, Any]]:
+    """从已完成分层的配置中裁剪允许展示的继承字段。"""
+
+    def configured_string(key: str) -> str | None:
+        value = document.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    reasoning = configured_string("model_reasoning_effort")
+    verbosity = configured_string("model_verbosity")
+    personality = configured_string("personality")
+    service_tier = configured_string("service_tier")
+    web_search = configured_string("web_search")
+
+    if service_tier == "fast":
+        fast_mode = _inherited_setting("fast", configured_source, known=True)
+    elif service_tier == "default":
+        fast_mode = _inherited_setting("standard", configured_source, known=True)
+    elif service_tier:
+        fast_mode = _inherited_setting(service_tier, configured_source, known=True)
+    elif allow_builtin_defaults:
+        fast_mode = _inherited_setting("standard", "builtin", known=True)
+    else:
+        fast_mode = _inherited_setting(None, "unknown", known=False)
+
+    if not web_search:
+        features = document.get("features")
+        if isinstance(features, dict) and features.get("web_search_request") is True:
+            web_search = "live"
+        elif isinstance(features, dict) and features.get("web_search_cached") is True:
+            web_search = "cached"
+
+    if web_search:
+        inherited_web_search = _inherited_setting(
+            web_search,
+            configured_source,
+            known=True,
+        )
+    elif allow_builtin_defaults:
+        inherited_web_search = _inherited_setting(
+            "cached",
+            "builtin",
+            known=True,
+        )
+    else:
+        inherited_web_search = _inherited_setting(None, "unknown", known=False)
+
+    return {
+        "model_reasoning_effort": _inherited_setting(
+            reasoning,
+            configured_source if reasoning else "unknown",
+            known=bool(reasoning),
+        ),
+        "fast_mode": fast_mode,
+        "model_verbosity": _inherited_setting(
+            verbosity,
+            configured_source if verbosity else "unknown",
+            known=bool(verbosity),
+        ),
+        "personality": _inherited_setting(
+            personality,
+            configured_source if personality else "unknown",
+            known=bool(personality),
+        ),
+        "web_search": inherited_web_search,
+    }
+
+
+def read_user_inherited_settings(
+    home: Path | None = None,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """读取允许展示的 Codex 用户默认值，不返回其他配置内容。"""
+
+    document, error, _ = _read_user_config(home or codex_home())
+    if error:
+        unknown = _inherited_setting(None, "unknown", known=False)
+        return {
+            "model_reasoning_effort": dict(unknown),
+            "fast_mode": dict(unknown),
+            "model_verbosity": dict(unknown),
+            "personality": dict(unknown),
+            "web_search": dict(unknown),
+        }, error
+    return _inherited_settings_from_document(
+        document,
+        configured_source="user",
+        allow_builtin_defaults=False,
+    ), None
+
+
 def _codex_environment(home: Path | None) -> dict[str, str]:
     """为诊断命令构造与后台 Agent 一致的 Codex Home 环境。"""
 
@@ -275,6 +384,8 @@ def inspect_runtime_options(
     codex_binary: str,
     configured_home: Path | None = None,
     expected_version: str | None = None,
+    effective_config: dict[str, Any] | None = None,
+    effective_config_error: str | None = None,
 ) -> dict[str, Any]:
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
@@ -284,6 +395,26 @@ def inspect_runtime_options(
     binary = inspect_codex_binary(codex_binary, home)
     cache = inspect_model_cache(home)
     user_mcp_servers, user_mcp_error = read_user_mcp_servers(home)
+    if effective_config is not None:
+        inherited_settings = _inherited_settings_from_document(
+            effective_config,
+            configured_source="codex",
+            allow_builtin_defaults=True,
+        )
+        inherited_settings_error = None
+        effective_model_value = effective_config.get("model")
+        effective_model = (
+            effective_model_value.strip()
+            if isinstance(effective_model_value, str) and effective_model_value.strip()
+            else None
+        )
+    else:
+        inherited_settings, inherited_settings_error = read_user_inherited_settings(home)
+        effective_model = None
+    codex_model = effective_model or user_model
+    codex_model_source = (
+        "codex" if effective_model else "user" if user_model else "builtin"
+    )
     version_warning: str | None = None
     actual_version = binary.get("version")
     cache_version = cache.get("client_version")
@@ -303,6 +434,12 @@ def inspect_runtime_options(
             "source": "runtime",
             "label": f"继承 Teamwork 运行时默认（{settings.model}）",
         }
+    elif effective_model:
+        inherited_model = {
+            "value": effective_model,
+            "source": "codex",
+            "label": f"继承 Codex 有效配置（{effective_model}）",
+        }
     elif user_model:
         inherited_model = {
             "value": user_model,
@@ -318,6 +455,8 @@ def inspect_runtime_options(
     return {
         "models": models,
         "inherited_model": inherited_model,
+        "codex_model": codex_model,
+        "codex_model_source": codex_model_source,
         "user_model": user_model,
         "user_config_path": user_config_path,
         "catalog_error": catalog_error,
@@ -329,4 +468,7 @@ def inspect_runtime_options(
         "version_warning": version_warning,
         "user_mcp_servers": user_mcp_servers,
         "user_mcp_error": user_mcp_error,
+        "inherited_settings": inherited_settings,
+        "inherited_settings_error": inherited_settings_error,
+        "effective_config_error": effective_config_error,
     }
