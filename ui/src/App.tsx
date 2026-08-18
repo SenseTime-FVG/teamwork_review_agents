@@ -21,6 +21,7 @@ import type {
   EnvironmentVariable,
   EventRecord,
   Repository,
+  RepositoryGitDetail,
   RepositoryWorkspaceStatus,
   Rule,
   RunDetail,
@@ -52,6 +53,17 @@ type OverviewConfirmation = {
   impactTone: "attention" | "quiet";
   safetyNote: string;
   confirmLabel: string;
+};
+
+type AgentActionConfirmation = {
+  eyebrow?: string;
+  title: string;
+  description: string;
+  details: Array<{ label: string; value: string; mono?: boolean }>;
+  impactTitle: string;
+  impact: string;
+  confirmLabel: string;
+  dangerous?: boolean;
 };
 
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
@@ -130,6 +142,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       codex_binary: "codex",
       inherit_user_mcp_servers: false,
       allowed_user_mcp_servers: [],
+      repository_initialization_timeout_seconds: 1800,
       git_timeout_seconds: 600,
       agent_idle_timeout_seconds: 300,
       ...runtimeInput,
@@ -152,6 +165,20 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
     skills: value.skills ?? {},
     agents: value.agents ?? {},
     rules: value.rules ?? [],
+  };
+}
+
+function createEmptyAgent(): Agent {
+  return {
+    prompt: "请处理当前 MR / PR。",
+    sandbox: "read-only",
+    network_access: false,
+    network_domains: [],
+    timeout_seconds: 1200,
+    write_scopes: [],
+    allowed_sub_agents: [],
+    skills: [],
+    environment: {},
   };
 }
 
@@ -906,6 +933,89 @@ function OverviewConfirmationDialog(props: {
   );
 }
 
+function AgentActionConfirmationDialog(props: {
+  model: AgentActionConfirmation | null;
+  busy?: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { model, busy = false, onCancel } = props;
+
+  useEffect(() => {
+    if (!model) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [busy, model, onCancel]);
+
+  if (!model) return null;
+  return (
+    <div className="overview-confirmation-layer">
+      <button
+        type="button"
+        className="overview-confirmation-backdrop"
+        aria-label="取消当前操作"
+        disabled={busy}
+        onClick={onCancel}
+      />
+      <section
+        className="overview-confirmation agent-action-confirmation"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agent-action-confirmation-title"
+        aria-describedby="agent-action-confirmation-description"
+      >
+        <header className="overview-confirmation-head">
+          <div className={`overview-confirmation-icon ${model.dangerous ? "danger" : "latest"}`} aria-hidden="true">!</div>
+          <div>
+            <span className="eyebrow">{model.eyebrow ?? "AGENT CONFIGURATION"}</span>
+            <h2 id="agent-action-confirmation-title">{model.title}</h2>
+            <p id="agent-action-confirmation-description">{model.description}</p>
+          </div>
+          <button
+            type="button"
+            className="overview-confirmation-close"
+            aria-label="关闭确认弹窗"
+            disabled={busy}
+            onClick={onCancel}
+          >×</button>
+        </header>
+        <dl className="overview-confirmation-details">
+          {model.details.map((detail) => (
+            <div key={detail.label}>
+              <dt>{detail.label}</dt>
+              <dd className={detail.mono ? "mono" : ""}>{detail.value}</dd>
+            </div>
+          ))}
+        </dl>
+        <div className={`overview-confirmation-impact ${model.dangerous ? "attention" : "quiet"}`}>
+          <span>{model.impactTitle}</span>
+          <p>{model.impact}</p>
+        </div>
+        <footer className="overview-confirmation-actions">
+          <button type="button" className="button secondary" disabled={busy} onClick={onCancel}>取消</button>
+          <button
+            type="button"
+            className={`button ${model.dangerous ? "danger" : "primary"}`}
+            disabled={busy}
+            autoFocus
+            onClick={props.onConfirm}
+          >
+            {busy ? "正在处理…" : model.confirmLabel}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function Overview(props: {
   status: RuntimeStatus;
   events: EventRecord[];
@@ -1214,11 +1324,18 @@ function CodexRuntimeEditor(props: {
             help="填写后版本不一致会阻止 Agent 启动"
           />
           <Field
+            label="基础仓库初始化超时（秒）"
+            type="number"
+            value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)}
+            onChange={(value) => patchRuntime({ repository_initialization_timeout_seconds: Number(value) })}
+            help="首次克隆基础仓库默认最多等待 30 分钟"
+          />
+          <Field
             label="Git 操作超时（秒）"
             type="number"
             value={Number(props.document.runtime.git_timeout_seconds ?? 600)}
             onChange={(value) => patchRuntime({ git_timeout_seconds: Number(value) })}
-            help="克隆、fetch 和 worktree 操作默认最多等待 10 分钟"
+            help="基础仓库就绪后，fetch 和 worktree 等命令默认最多等待 10 分钟"
           />
           <Field
             label="默认无进展超时（秒）"
@@ -1566,12 +1683,11 @@ function ConfigHistory() {
   );
 }
 
-function RepositoriesEditor(props: {
+function RepositoryConnectionsEditor(props: {
   document: ConfigDocument;
   onChange: (document: ConfigDocument) => void;
 }) {
   const providerNames = Object.keys(props.document.providers);
-  const protectedNames = providerCredentialNames(props.document);
   const repositoryCount = props.document.repositories.length;
 
   function providerDefaults(kind: "github" | "gitlab") {
@@ -1593,12 +1709,6 @@ function RepositoriesEditor(props: {
     });
   }
 
-  function updateRepository(index: number, patch: Partial<Repository>) {
-    const repositories = [...props.document.repositories];
-    repositories[index] = { ...repositories[index], ...patch };
-    props.onChange({ ...props.document, repositories });
-  }
-
   function updateProvider(name: string, patch: Record<string, unknown>) {
     props.onChange({
       ...props.document,
@@ -1606,25 +1716,6 @@ function RepositoriesEditor(props: {
         ...props.document.providers,
         [name]: { ...props.document.providers[name], ...patch },
       },
-    });
-  }
-
-  function addRepository() {
-    let index = props.document.repositories.length + 1;
-    let id = `repository-${index}`;
-    while (props.document.repositories.some((repository) => repository.id === id)) {
-      id = `repository-${++index}`;
-    }
-    props.onChange({
-      ...props.document,
-      repositories: [...props.document.repositories, {
-        id,
-        provider: providerNames[0],
-        project: "owner/repository",
-        workspace: `./workspaces/${id}`,
-        enabled: false,
-        environment: {},
-      }],
     });
   }
 
@@ -1641,26 +1732,6 @@ function RepositoriesEditor(props: {
       provider: repository.provider === name ? nextName : repository.provider,
     }));
     props.onChange({ ...props.document, providers, repositories });
-    return true;
-  }
-
-  function renameRepository(index: number, id: string): boolean {
-    if (!id || props.document.repositories.some((item, itemIndex) => itemIndex !== index && item.id === id)) return false;
-    const oldId = props.document.repositories[index].id;
-    const repositories = [...props.document.repositories];
-    const oldDefaultWorkspace = `./workspaces/${oldId}`;
-    repositories[index] = {
-      ...repositories[index],
-      id,
-      workspace: repositories[index].workspace === oldDefaultWorkspace
-        ? `./workspaces/${id}`
-        : repositories[index].workspace,
-    };
-    const rules = props.document.rules.map((rule) => ({
-      ...rule,
-      repositories: rule.repositories?.map((repositoryId) => repositoryId === oldId ? id : repositoryId),
-    }));
-    props.onChange({ ...props.document, repositories, rules });
     return true;
   }
 
@@ -1730,40 +1801,6 @@ function RepositoriesEditor(props: {
           })}
         </div>
       </section>
-      <section className="section-card">
-        <div className="section-title-row">
-          <div><h2>仓库</h2><p>选择上方的平台连接扫描远端 MR / PR；基础 Git 仓库用于 fetch，并为每次 Agent 运行创建独立临时 worktree。</p></div>
-          <button
-            className="button primary"
-            disabled={providerNames.length === 0}
-            title={providerNames.length === 0 ? "请先添加 GitHub / GitLab 连接" : "添加仓库"}
-            onClick={addRepository}
-          >+ 添加仓库</button>
-        </div>
-        <div className="card-list">
-          {props.document.repositories.length === 0 && (
-            <div className="empty-config-state">
-              <strong>{providerNames.length === 0 ? "请先连接 GitHub 或 GitLab" : "还没有配置仓库"}</strong>
-              <p>{providerNames.length === 0 ? "添加平台连接后，才可以创建仓库配置。" : "点击“添加仓库”，关联远端项目和已经准备好的本地 Git 工作目录。"}</p>
-            </div>
-          )}
-          {props.document.repositories.map((repository, index) => (
-            <article className="sub-card" key={index}>
-              <div className="sub-card-head">
-                <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.project}</p></div>
-                <div className="button-group"><Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => updateRepository(index, { enabled })} /><button className="icon-button danger" onClick={() => props.onChange({ ...props.document, repositories: props.document.repositories.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>
-              </div>
-              <div className="form-grid two">
-                <CommitField label="仓库 ID" value={repository.id} onCommit={(id) => renameRepository(index, id)} />
-                <label className="field"><span>所属 GitHub / GitLab 连接</span><select value={repository.provider} onChange={(event) => updateRepository(index, { provider: event.target.value })}>{providerNames.map((provider) => <option key={provider}>{provider}</option>)}</select><small>决定使用哪个平台 API 和 Token 扫描此仓库</small></label>
-                <Field label="远端仓库地址 / 项目路径" value={repository.clone_url ?? repository.project} onChange={(project) => updateRepository(index, { project, clone_url: undefined })} placeholder="git@github.com:owner/repository.git" help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后后台会自动解析为平台项目路径" />
-                <Field label="基础 Git 仓库目录（自动管理）" value={repository.workspace} onChange={(workspace) => updateRepository(index, { workspace })} help="默认使用 ./workspaces/<仓库ID>；这里只负责克隆、校验、fetch 和管理 worktree，Codex 实际在每次运行独享的临时目录中工作" />
-              </div>
-              <EnvironmentEditor compact title="仓库环境变量" value={repository.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => updateRepository(index, { environment })} />
-            </article>
-          ))}
-        </div>
-      </section>
     </div>
   );
 }
@@ -1780,14 +1817,100 @@ function bytesText(value?: number | null): string {
   return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
+function gitCommandStatusText(state: RepositoryGitDetail["commands"][number]["state"]): string {
+  return {
+    waiting: "等待中",
+    started: "执行中",
+    progress: "执行中",
+    completed: "已完成",
+    failed: "失败",
+    timed_out: "超时",
+    cancelled: "已取消",
+  }[state];
+}
+
+function RepositoryGitDetailDrawer(props: {
+  repositoryId: string | null;
+  detail: RepositoryGitDetail | null;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+  onOpenRun: (runId: string) => void;
+}) {
+  if (!props.repositoryId) return null;
+  return (
+    <div className="run-drawer-layer">
+      <button className="run-drawer-backdrop" aria-label="关闭 Git 操作详情" onClick={props.onClose} />
+      <aside className="run-drawer git-detail-drawer" role="dialog" aria-modal="true" aria-label="Git 操作详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">REPOSITORY GIT</span>
+            <h2>{props.repositoryId}</h2>
+            <p>{props.detail?.source === "agent" ? "Agent 工作区准备" : props.detail?.source === "manual" ? "仓库页操作" : "Git 操作详情"}</p>
+          </div>
+          <div className="run-drawer-actions">
+            {props.detail?.run_id && (
+              <button className="button secondary" onClick={() => props.onOpenRun(props.detail?.run_id ?? "")}>查看 Agent 运行</button>
+            )}
+            <button className="run-drawer-close" aria-label="关闭" onClick={props.onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body git-detail-body">
+          {props.error && <div className="alert error">{props.error}</div>}
+          {props.loading && !props.detail && <div className="empty tall"><span className="spinner" />正在读取 Git 操作…</div>}
+          {props.detail && (
+            <>
+              <div className="git-detail-summary">
+                <div><span>当前阶段</span><strong>{props.detail.phase}</strong></div>
+                <div><span>开始时间</span><strong>{timeText(props.detail.started_at)}</strong></div>
+                <div><span>总耗时</span><strong>{props.detail.started_at ? durationText(props.detail.started_at, props.detail.finished_at) : "—"}</strong></div>
+              </div>
+              <div className="git-command-list">
+                {props.detail.commands.map((command, index) => (
+                  <article className="git-command-card" key={command.command_id}>
+                    <div className="git-command-index">{index + 1}</div>
+                    <div className="git-command-content">
+                      <header>
+                        <strong>{command.operation}</strong>
+                        <span className={`git-command-status status-${command.state}`}>{gitCommandStatusText(command.state)}</span>
+                      </header>
+                      {command.command && <pre>{command.command}</pre>}
+                      <dl>
+                        <div><dt>耗时</dt><dd>{command.elapsed_seconds} 秒</dd></div>
+                        <div><dt>超时</dt><dd>{command.timeout_seconds} 秒</dd></div>
+                        <div><dt>退出码</dt><dd>{command.exit_code ?? "—"}</dd></div>
+                        <div><dt>完成时间</dt><dd>{timeText(command.finished_at)}</dd></div>
+                      </dl>
+                      {command.error && <p>{command.error}</p>}
+                    </div>
+                  </article>
+                ))}
+                {props.detail.commands.length === 0 && <div className="empty tall">还没有 Git 命令记录。</div>}
+              </div>
+              <p className="git-detail-safety">命令已隐藏 URL 认证信息和查询参数；不会展示原始 stdout、stderr 或 Token。</p>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
 function RepositoryWorkspaceManager(props: {
   configuredRepositories: Repository[];
   draftRepositories: Repository[];
+  repositoryIds?: string[];
+  showHeader?: boolean;
+  onOpenRun: (runId: string) => void;
 }) {
   const [items, setItems] = useState<RepositoryWorkspaceStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [workingId, setWorkingId] = useState("");
+  const [detailRepositoryId, setDetailRepositoryId] = useState<string | null>(null);
+  const [gitDetail, setGitDetail] = useState<RepositoryGitDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -1805,6 +1928,53 @@ function RepositoryWorkspaceManager(props: {
     const timer = window.setInterval(() => { void refresh(); }, 2000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!detailRepositoryId) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const next = await api<RepositoryGitDetail>(
+          `/api/repositories/${encodeURIComponent(detailRepositoryId)}/workspace/details`,
+        );
+        if (!cancelled) {
+          setGitDetail(next);
+          setDetailError("");
+        }
+      } catch (reason) {
+        if (!cancelled) setDetailError(reason instanceof Error ? reason.message : "读取 Git 操作详情失败");
+      } finally {
+        if (!cancelled) setDetailLoading(false);
+      }
+    };
+    setDetailLoading(true);
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 1000);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDetailRepositoryId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [detailRepositoryId]);
+
+  function openDetail(repositoryId: string) {
+    setGitDetail(null);
+    setDetailError("");
+    setDetailRepositoryId(repositoryId);
+  }
+
+  function closeDetail() {
+    setDetailRepositoryId(null);
+    setGitDetail(null);
+    setDetailError("");
+  }
 
   function targetChanged(repository: Repository): boolean {
     const draft = props.draftRepositories.find((item) => item.id === repository.id);
@@ -1848,7 +2018,11 @@ function RepositoryWorkspaceManager(props: {
     }
   }
 
-  const configured = props.configuredRepositories.filter((repository) => repository.enabled !== false);
+  const repositoryIds = props.repositoryIds ? new Set(props.repositoryIds) : null;
+  const configured = props.configuredRepositories.filter((repository) => (
+    repository.enabled !== false
+    && (!repositoryIds || repositoryIds.has(repository.id))
+  ));
   const byId = new Map(items.map((item) => [item.repository_id, item]));
   const statusLabels: Record<RepositoryWorkspaceStatus["status"], string> = {
     uninitialized: "未初始化",
@@ -1862,14 +2036,17 @@ function RepositoryWorkspaceManager(props: {
   };
 
   return (
+    <>
     <section className="section-card repository-workspace-manager">
-      <div className="section-title-row">
-        <div>
-          <h2>基础仓库状态</h2>
-          <p>初始化一次后，Agent 只增量 fetch 并创建独立 worktree；操作始终绑定当前已保存配置。</p>
+      {props.showHeader !== false && (
+        <div className="section-title-row">
+          <div>
+            <h2>基础仓库状态</h2>
+            <p>初始化一次后，Agent 只增量 fetch 并创建独立 worktree；操作始终绑定当前已保存配置。</p>
+          </div>
+          <button className="button secondary" disabled={loading} onClick={() => { void refresh(); }}>刷新</button>
         </div>
-        <button className="button secondary" disabled={loading} onClick={() => { void refresh(); }}>刷新</button>
-      </div>
+      )}
       {error && <div className="alert error">{error}</div>}
       {loading && <div className="repository-workspace-empty"><span className="spinner" />正在检查基础仓库…</div>}
       {!loading && configured.length === 0 && <div className="repository-workspace-empty">当前没有已保存并启用的仓库。</div>}
@@ -1882,22 +2059,31 @@ function RepositoryWorkspaceManager(props: {
             const busy = workingId === repository.id;
             return (
               <article className="repository-workspace-row" key={repository.id}>
-                <div className="repository-workspace-main">
+                <button
+                  type="button"
+                  className="repository-workspace-main repository-workspace-detail-trigger"
+                  disabled={!item?.detail_available}
+                  title={item?.detail_available ? "查看 Git 操作详情" : "还没有 Git 操作详情"}
+                  onClick={() => openDetail(repository.id)}
+                >
                   <div className="repository-workspace-title">
                     <strong>{repository.id}</strong>
                     {item && <span className={`repository-workspace-status status-${item.status}`}>{statusLabels[item.status]}</span>}
+                    {item?.detail_source === "agent" && <span className="repository-workspace-source">Agent</span>}
                   </div>
                   <code>{item?.workspace ?? repository.workspace}</code>
                   <small>{item?.phase ?? "正在读取状态"}{item && active ? ` · ${item.elapsed_seconds} 秒` : ""}</small>
                   {changed && <small className="repository-workspace-warning">仓库目标有未保存修改，请先保存或取消编辑。</small>}
                   {item?.error && <small className="repository-workspace-error">{item.error}</small>}
-                </div>
+                </button>
                 <dl className="repository-workspace-metrics">
                   <div><dt>磁盘占用</dt><dd>{bytesText(item?.size_bytes)}</dd></div>
                   <div><dt>最近完成</dt><dd>{timeText(item?.finished_at)}</dd></div>
                 </dl>
                 <div className="repository-workspace-actions">
-                  {active ? (
+                  {active && item?.detail_source === "agent" && item.detail_run_id ? (
+                    <button className="button secondary" onClick={() => props.onOpenRun(item.detail_run_id ?? "")}>查看 Agent 运行</button>
+                  ) : active ? (
                     <button className="button danger" disabled={busy || item?.cancel_requested} onClick={() => { void cancel(repository.id); }}>
                       {item?.cancel_requested ? "取消中…" : "取消操作"}
                     </button>
@@ -1913,6 +2099,512 @@ function RepositoryWorkspaceManager(props: {
         </div>
       )}
     </section>
+    <RepositoryGitDetailDrawer
+      repositoryId={detailRepositoryId}
+      detail={gitDetail}
+      loading={detailLoading}
+      error={detailError}
+      onClose={closeDetail}
+      onOpenRun={(runId) => {
+        closeDetail();
+        props.onOpenRun(runId);
+      }}
+    />
+    </>
+  );
+}
+
+function repositoryWorkspaceStatusLabel(status: RepositoryWorkspaceStatus["status"]): string {
+  return {
+    uninitialized: "未初始化",
+    invalid: "目录无效",
+    ready: "已就绪",
+    waiting: "等待仓库锁",
+    initializing: "初始化中",
+    updating: "更新中",
+    failed: "失败",
+    cancelled: "已取消",
+  }[status];
+}
+
+function RepositoryDetailEditor(props: {
+  document: ConfigDocument;
+  repositoryIndex: number;
+  creating: boolean;
+  onIdChange: (repositoryId: string) => void;
+  onChange: (document: ConfigDocument) => void;
+}) {
+  const repository = props.document.repositories[props.repositoryIndex];
+  const providerNames = Object.keys(props.document.providers);
+  const protectedNames = providerCredentialNames(props.document);
+  if (!repository) return <div className="empty tall">仓库配置不存在</div>;
+
+  function update(patch: Partial<Repository>) {
+    const repositories = [...props.document.repositories];
+    repositories[props.repositoryIndex] = { ...repository, ...patch };
+    props.onChange({ ...props.document, repositories });
+  }
+
+  function updateId(repositoryId: string) {
+    const oldDefaultWorkspace = `./workspaces/${repository.id}`;
+    update({
+      id: repositoryId,
+      workspace: repository.workspace === oldDefaultWorkspace
+        ? `./workspaces/${repositoryId}`
+        : repository.workspace,
+    });
+    props.onIdChange(repositoryId);
+  }
+
+  return (
+    <section className="section-card repository-detail-form">
+      <article className="sub-card repository-detail-card">
+        <div className="sub-card-head">
+          <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
+          <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
+        </div>
+        <div className="form-grid two">
+          {props.creating ? (
+            <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
+          ) : (
+            <label className="field">
+              <span>仓库 ID</span>
+              <input value={repository.id} disabled />
+              <small>关联历史事件、运行记录和 worktree，已有仓库不可修改 ID</small>
+            </label>
+          )}
+          <label className="field">
+            <span>所属 GitHub / GitLab 连接</span>
+            <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
+              {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
+            </select>
+            <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
+          </label>
+          <Field
+            label="远端仓库地址 / 项目路径"
+            value={repository.clone_url ?? repository.project}
+            onChange={(project) => update({ project, clone_url: undefined })}
+            placeholder="git@github.com:owner/repository.git"
+            help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后自动解析平台项目路径"
+          />
+          <Field
+            label="基础 Git 仓库目录（自动管理）"
+            value={repository.workspace}
+            onChange={(workspace) => update({ workspace })}
+            help="只负责克隆、校验、fetch 和 worktree 管理；Codex 在每次运行独享的临时目录中工作"
+          />
+        </div>
+        <EnvironmentEditor
+          compact
+          title="仓库环境变量"
+          value={repository.environment ?? {}}
+          protectedNames={protectedNames}
+          onChange={(environment) => update({ environment })}
+        />
+      </article>
+    </section>
+  );
+}
+
+function RepositoriesView(props: {
+  document: ConfigDocument;
+  revision: string;
+  blocked: boolean;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onDetailOpenChange: (open: boolean) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+  onOpenRun: (runId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
+  const [draftId, setDraftId] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(true);
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "discard" } | { kind: "delete" } | null
+  >(null);
+
+  const refreshWorkspaceItems = useCallback(async () => {
+    try {
+      setWorkspaceItems(await api<RepositoryWorkspaceStatus[]>("/api/repositories/workspaces"));
+    } catch {
+      // 列表状态读取失败不覆盖页面级配置错误，详情操作仍会给出明确反馈。
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshWorkspaceItems();
+    const timer = window.setInterval(() => { void refreshWorkspaceItems(); }, 2000);
+    return () => window.clearInterval(timer);
+  }, [refreshWorkspaceItems]);
+
+  const repositories = useMemo(
+    () => [...props.document.repositories].sort((left, right) => left.id.localeCompare(right.id)),
+    [props.document.repositories],
+  );
+  const visibleRepositories = useMemo(() => {
+    const keyword = query.trim().toLocaleLowerCase();
+    if (!keyword) return repositories;
+    return repositories.filter((repository) => [
+      repository.id,
+      repository.provider,
+      repository.project,
+      repository.clone_url ?? "",
+      repository.workspace,
+    ].some((value) => value.toLocaleLowerCase().includes(keyword)));
+  }, [query, repositories]);
+  const originalRepository = detailId
+    ? props.document.repositories.find((repository) => repository.id === detailId)
+    : undefined;
+  const detailIndex = creating
+    ? (draftDocument?.repositories.length ?? 0) - 1
+    : detailId
+      ? props.document.repositories.findIndex((repository) => repository.id === detailId)
+      : -1;
+  const draftRepository = detailIndex >= 0
+    ? draftDocument?.repositories[detailIndex]
+    : undefined;
+  const dirty = editing && Boolean(
+    creating || JSON.stringify(draftRepository) !== JSON.stringify(originalRepository),
+  );
+  const workspaceById = useMemo(
+    () => new Map(workspaceItems.map((item) => [item.repository_id, item])),
+    [workspaceItems],
+  );
+  const currentWorkspace = detailId ? workspaceById.get(detailId) : undefined;
+  const gitActive = Boolean(currentWorkspace && [
+    "waiting",
+    "initializing",
+    "updating",
+  ].includes(currentWorkspace.status));
+  const referencingRules = detailId
+    ? props.document.rules.filter((rule) => rule.repositories?.includes(detailId))
+    : [];
+
+  useEffect(() => {
+    props.onDirtyChange(dirty);
+  }, [dirty, props.onDirtyChange]);
+  useEffect(() => {
+    props.onDetailOpenChange(creating || detailId !== null);
+  }, [creating, detailId, props.onDetailOpenChange]);
+  useEffect(() => () => {
+    props.onDirtyChange(false);
+    props.onDetailOpenChange(false);
+  }, [props.onDetailOpenChange, props.onDirtyChange]);
+
+  function clearDraft() {
+    setCreating(false);
+    setEditing(false);
+    setDraftDocument(null);
+    setDraftId("");
+  }
+
+  function openDetail(repositoryId: string) {
+    clearDraft();
+    setDetailId(repositoryId);
+  }
+
+  function requestList() {
+    if (dirty) {
+      setPendingAction({ kind: "discard" });
+      return;
+    }
+    clearDraft();
+    setDetailId(null);
+  }
+
+  function beginCreate() {
+    const providerNames = Object.keys(props.document.providers);
+    if (providerNames.length === 0 || props.blocked) return;
+    let index = props.document.repositories.length + 1;
+    let repositoryId = `repository-${index}`;
+    while (props.document.repositories.some((repository) => repository.id === repositoryId)) {
+      repositoryId = `repository-${++index}`;
+    }
+    const nextDocument = structuredClone(props.document);
+    nextDocument.repositories.push({
+      id: repositoryId,
+      provider: providerNames[0],
+      project: "owner/repository",
+      workspace: `./workspaces/${repositoryId}`,
+      enabled: false,
+      environment: {},
+    });
+    setDetailId(null);
+    setCreating(true);
+    setEditing(true);
+    setDraftId(repositoryId);
+    setDraftDocument(nextDocument);
+  }
+
+  function beginEdit() {
+    if (!detailId || !originalRepository || gitActive) return;
+    setCreating(false);
+    setEditing(true);
+    setDraftId(detailId);
+    setDraftDocument(structuredClone(props.document));
+  }
+
+  function cancelEdit() {
+    if (creating) {
+      clearDraft();
+      setDetailId(null);
+      return;
+    }
+    clearDraft();
+  }
+
+  async function saveRepository() {
+    if (!editing || !draftRepository || !draftId.trim()) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/repositories"
+        : `/api/config/repositories/${encodeURIComponent(detailId ?? "")}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          repository_id: draftId,
+          repository: draftRepository,
+        }),
+      });
+      const normalized = normalizeDocument(result.document);
+      props.onSaved(normalized, result.revision);
+      setDetailId(draftId);
+      clearDraft();
+      await refreshWorkspaceItems();
+      props.onNotice(creating ? `仓库 ${draftId} 已创建并热加载` : `仓库 ${draftId} 已保存并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存仓库失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteRepository() {
+    if (!detailId || referencingRules.length > 0 || gitActive) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/repositories/${encodeURIComponent(detailId)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`仓库 ${detailId} 的配置已删除，本地目录和历史记录未改动`);
+      setPendingAction(null);
+      setDetailId(null);
+      clearDraft();
+      await refreshWorkspaceItems();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除仓库失败");
+      setPendingAction(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const confirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!pendingAction) return null;
+    if (pendingAction.kind === "discard") {
+      return {
+        eyebrow: "REPOSITORY CONFIGURATION",
+        title: "放弃未保存的仓库修改？",
+        description: "当前详情中的修改尚未保存，继续后无法从页面恢复。",
+        details: [
+          { label: "仓库", value: draftId || detailId || "新仓库", mono: true },
+          { label: "配置版本", value: shortRevision(props.revision), mono: true },
+        ],
+        impactTitle: "只放弃当前草稿",
+        impact: "已保存配置、基础仓库目录、历史事件和运行记录不会受到影响。",
+        confirmLabel: "放弃修改",
+        dangerous: true,
+      };
+    }
+    if (!detailId || !originalRepository) return null;
+    return {
+      eyebrow: "REPOSITORY CONFIGURATION",
+      title: `删除仓库 ${detailId} 的配置？`,
+      description: "删除后后台将不再扫描该仓库，也不能再为它创建新的 Agent 运行。",
+      details: [
+        { label: "仓库", value: detailId, mono: true },
+        { label: "远端项目", value: originalRepository.project, mono: true },
+        { label: "基础仓库目录", value: originalRepository.workspace, mono: true },
+      ],
+      impactTitle: "不会删除磁盘与历史数据",
+      impact: "本地基础仓库、worktree、SQLite 快照、事件和运行记录均会保留；如需清理应另行确认具体目标。",
+      confirmLabel: "确认删除配置",
+      dangerous: true,
+    };
+  }, [detailId, draftId, originalRepository, pendingAction, props.revision]);
+
+  function confirmPendingAction() {
+    if (pendingAction?.kind === "delete") {
+      void deleteRepository();
+      return;
+    }
+    if (pendingAction?.kind === "discard") {
+      setPendingAction(null);
+      clearDraft();
+      setDetailId(null);
+    }
+  }
+
+  if (!creating && detailId === null) {
+    const hasProviders = Object.keys(props.document.providers).length > 0;
+    return (
+      <section className="section-card repository-list-page">
+        <div className="section-title-row agent-list-title">
+          <div>
+            <h2>仓库</h2>
+            <p>点击一行查看配置与基础仓库状态；每个仓库在详情页独立编辑和保存。</p>
+          </div>
+          <button
+            type="button"
+            className="button primary"
+            disabled={!hasProviders || props.blocked}
+            title={!hasProviders ? "请先添加 GitHub / GitLab 连接" : props.blocked ? "请先保存或取消平台连接修改" : "添加仓库"}
+            onClick={beginCreate}
+          >+ 添加仓库</button>
+        </div>
+        <div className="agent-list-toolbar">
+          <label>
+            <span>搜索仓库</span>
+            <input value={query} placeholder="输入仓库、平台连接或远端项目…" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <span>共 {repositories.length} 个仓库</span>
+        </div>
+        <div className="repository-config-table">
+          <div className="repository-config-table-head" aria-hidden="true">
+            <span>仓库</span><span>状态</span><span>平台连接</span><span>远端项目</span><span>基础目录</span><span>仓库状态</span><span />
+          </div>
+          <div className="repository-config-items">
+            {visibleRepositories.map((repository) => {
+              const workspace = workspaceById.get(repository.id);
+              return (
+                <button
+                  type="button"
+                  className="repository-config-row"
+                  key={repository.id}
+                  disabled={props.blocked}
+                  onClick={() => openDetail(repository.id)}
+                >
+                  <span className="agent-config-identity"><span className="repository-config-avatar" aria-hidden="true">G</span><span><strong>{repository.id}</strong><small>{repository.environment && Object.keys(repository.environment).length > 0 ? `${Object.keys(repository.environment).length} 个环境变量` : "无仓库环境变量"}</small></span></span>
+                  <span><strong className={repository.enabled !== false ? "success-text" : "muted-text"}>{repository.enabled !== false ? "已启用" : "已停用"}</strong></span>
+                  <span><strong>{repository.provider}</strong></span>
+                  <span className="agent-config-summary"><strong>{repository.project}</strong><small>{repository.clone_url ?? "使用平台默认克隆地址"}</small></span>
+                  <span className="agent-config-summary"><strong>{repository.workspace}</strong><small>基础 Git 仓库</small></span>
+                  <span className="agent-config-summary"><strong>{workspaceLoading && !workspace ? "检查中" : workspace ? repositoryWorkspaceStatusLabel(workspace.status) : "未读取"}</strong><small>{workspace?.phase ?? "等待状态检查"}</small></span>
+                  <span className="agent-config-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+            {visibleRepositories.length === 0 && (
+              <div className="empty tall">
+                {repositories.length === 0
+                  ? hasProviders ? "尚未配置仓库" : "请先添加 GitHub / GitLab 连接"
+                  : "没有匹配的仓库"}
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const activeDocument = editing && draftDocument ? draftDocument : props.document;
+  const activeRepository = detailIndex >= 0
+    ? activeDocument.repositories[detailIndex]
+    : undefined;
+  const activeId = creating ? draftId : detailId ?? "";
+  return (
+    <div className="agent-detail-page repository-detail-page">
+      <header className="agent-detail-header">
+        <button type="button" className="agent-detail-back" onClick={requestList}><span aria-hidden="true">←</span>返回仓库列表</button>
+        <div className="agent-detail-heading">
+          <div>
+            <span className="eyebrow">REPOSITORY</span>
+            <h2>{activeId}</h2>
+            <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新仓库" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
+          </div>
+          <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
+        </div>
+        <div className="button-group agent-detail-actions">
+          {editing ? (
+            <>
+              <button type="button" className="button secondary" disabled={saving} onClick={cancelEdit}>取消</button>
+              <button type="button" className="button primary" disabled={!dirty || !draftId.trim() || saving || gitActive} onClick={() => { void saveRepository(); }}>{saving ? "保存中…" : "保存仓库"}</button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="button danger"
+                disabled={gitActive || referencingRules.length > 0}
+                title={gitActive ? "仓库正在执行 Git 操作" : referencingRules.length > 0 ? `仍被规则引用：${referencingRules.map((rule) => rule.name).join("、")}` : "删除仓库配置"}
+                onClick={() => setPendingAction({ kind: "delete" })}
+              >删除仓库</button>
+              <button type="button" className="button primary" disabled={gitActive} title={gitActive ? "仓库正在执行 Git 操作" : "编辑仓库"} onClick={beginEdit}>编辑仓库</button>
+            </>
+          )}
+        </div>
+      </header>
+      {referencingRules.length > 0 && !creating && (
+        <div className="repository-reference-warning">
+          <strong>当前仓库不能删除</strong>
+          <span>仍被触发规则引用：{referencingRules.map((rule) => rule.name).join("、")}。请先修改这些规则的仓库范围。</span>
+        </div>
+      )}
+      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving || gitActive}>
+        {activeRepository && (
+          <RepositoryDetailEditor
+            document={activeDocument}
+            repositoryIndex={detailIndex}
+            creating={creating}
+            onIdChange={setDraftId}
+            onChange={setDraftDocument}
+          />
+        )}
+      </fieldset>
+      {creating ? (
+        <section className="section-card repository-workspace-manager">
+          <div className="section-title-row"><div><h2>基础仓库状态</h2><p>保存仓库配置后才能初始化基础 Git 仓库。</p></div></div>
+          <div className="repository-workspace-empty">当前仓库尚未保存。</div>
+        </section>
+      ) : (
+        <RepositoryWorkspaceManager
+          configuredRepositories={props.document.repositories}
+          draftRepositories={activeDocument.repositories}
+          repositoryIds={detailId ? [detailId] : []}
+          onOpenRun={(runId) => {
+            if (dirty) {
+              props.onError("请先保存或取消当前仓库修改，再打开 Agent 运行");
+              return;
+            }
+            props.onOpenRun(runId);
+          }}
+        />
+      )}
+      <AgentActionConfirmationDialog
+        model={confirmation}
+        busy={saving}
+        onCancel={() => { if (!saving) setPendingAction(null); }}
+        onConfirm={confirmPendingAction}
+      />
+    </div>
   );
 }
 
@@ -2129,8 +2821,13 @@ function AgentsEditor(props: {
   document: ConfigDocument;
   codexOptions: CodexRuntimeOptions;
   onChange: (document: ConfigDocument) => void;
+  visibleNames?: string[];
+  showOverview?: boolean;
+  allowDelete?: boolean;
+  onRename?: (name: string) => void;
 }) {
-  const names = Object.keys(props.document.agents);
+  const allNames = Object.keys(props.document.agents);
+  const names = props.visibleNames ?? allNames;
   const skillOptions = Object.entries(props.document.skills).map(([skillId, skill]) => ({
     value: skillId,
     label: skillId,
@@ -2157,29 +2854,30 @@ function AgentsEditor(props: {
       agents: rule.agents.map((item) => item === name ? nextName : item),
     }));
     props.onChange({ ...props.document, agents, rules });
+    props.onRename?.(nextName);
     return true;
   }
   return (
-    <section className="section-card">
-      <div className="section-title-row">
+    <section className={`section-card ${props.showOverview === false ? "agent-detail-form" : ""}`}>
+      {props.showOverview !== false && <div className="section-title-row">
         <div><h2>Agent</h2><p>每个 Agent 由 Codex CLI 执行，并可通过白名单调用其他 Agent。</p></div>
         <button className="button primary" onClick={() => {
-          let index = names.length + 1;
+          let index = allNames.length + 1;
           let name = `agent-${index}`;
           while (props.document.agents[name]) name = `agent-${++index}`;
-          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { prompt: "请处理当前 MR / PR。", sandbox: "read-only", network_access: false, network_domains: [], timeout_seconds: 1200, write_scopes: [], allowed_sub_agents: [], skills: [], environment: {} } } });
+          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: createEmptyAgent() } });
         }}>+ 添加 Agent</button>
-      </div>
-      <div className="agent-workspace-note">
+      </div>}
+      {props.showOverview !== false && <div className="agent-workspace-note">
         <strong>每次运行使用独立 worktree</strong>
         <span>Agent 本身不绑定固定目录；仓库配置目录只作基础仓库。每次根 Agent 在 MR / PR Head 上创建独立临时 worktree，不同分支可以并发；声明“本地仓库写操作”后，同一源分支会串行。sub-agent 是否复用父 Agent 当前 worktree，由触发规则中的“继承当前工作区”决定。</span>
-      </div>
+      </div>}
       <div className="card-list">
         {names.map((name) => {
           const agent = props.document.agents[name];
           const promptSource = agent.prompt_file ? "file" : "inline";
           const writeScopes = agent.write_scopes ?? [];
-          const subAgentOptions = names
+          const subAgentOptions = allNames
             .filter((item) => item !== name)
             .map((item) => {
               const candidate = props.document.agents[item];
@@ -2193,7 +2891,7 @@ function AgentsEditor(props: {
             <article className="sub-card" key={name}>
               <div className="sub-card-head">
                 <div className="agent-name"><span className="eyebrow">CODEX AGENT</span><CommitField label="Agent 名称" value={name} onCommit={(nextName) => rename(name, nextName)} /></div>
-                <button className="icon-button danger" onClick={() => {
+                {props.allowDelete !== false && <button className="icon-button danger" onClick={() => {
                   const agents = { ...props.document.agents };
                   delete agents[name];
                   const cleanedAgents = Object.fromEntries(
@@ -2210,7 +2908,7 @@ function AgentsEditor(props: {
                     agents: rule.agents.filter((item) => item !== name),
                   }));
                   props.onChange({ ...props.document, agents: cleanedAgents, rules });
-                }}>×</button>
+                }}>×</button>}
               </div>
               <div className="form-grid three">
                 <ModelField
@@ -2397,6 +3095,319 @@ function AgentsEditor(props: {
   );
 }
 
+function agentSandboxLabel(sandbox: Agent["sandbox"]): string {
+  if (sandbox === "workspace-write") return "工作区可写";
+  if (sandbox === "danger-full-access") return "完全访问";
+  return "只读";
+}
+
+function agentNetworkLabel(agent: Agent): string {
+  if (agent.sandbox === "danger-full-access") return "不受限制";
+  if (!agent.network_access) return "关闭";
+  const domainCount = agent.network_domains?.length ?? 0;
+  return domainCount > 0 ? `${domainCount} 个域名` : "允许联网";
+}
+
+function AgentsView(props: {
+  document: ConfigDocument;
+  revision: string;
+  codexOptions: CodexRuntimeOptions;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [detailName, setDetailName] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "discard"; nextName: string | null } | { kind: "delete" } | null
+  >(null);
+
+  const inheritedModel = effectiveInheritedModel(props.document, props.codexOptions);
+  const names = useMemo(
+    () => Object.keys(props.document.agents).sort((left, right) => left.localeCompare(right)),
+    [props.document.agents],
+  );
+  const visibleNames = useMemo(() => {
+    const keyword = query.trim().toLocaleLowerCase();
+    return keyword
+      ? names.filter((name) => name.toLocaleLowerCase().includes(keyword))
+      : names;
+  }, [names, query]);
+  const originalAgent = detailName ? props.document.agents[detailName] : undefined;
+  const draftAgent = draftDocument?.agents[draftName];
+  const dirty = editing && Boolean(
+    creating
+    || draftName !== detailName
+    || JSON.stringify(draftAgent) !== JSON.stringify(originalAgent),
+  );
+
+  useEffect(() => {
+    props.onDirtyChange(dirty);
+  }, [dirty, props.onDirtyChange]);
+  useEffect(() => () => props.onDirtyChange(false), [props.onDirtyChange]);
+
+  function clearDraft() {
+    setCreating(false);
+    setEditing(false);
+    setDraftDocument(null);
+    setDraftName("");
+  }
+
+  function openDetail(name: string) {
+    clearDraft();
+    setDetailName(name);
+  }
+
+  function requestDetail(name: string | null) {
+    if (dirty) {
+      setPendingAction({ kind: "discard", nextName: name });
+      return;
+    }
+    if (name) openDetail(name);
+    else {
+      clearDraft();
+      setDetailName(null);
+    }
+  }
+
+  function beginCreate() {
+    let index = names.length + 1;
+    let name = `agent-${index}`;
+    while (props.document.agents[name]) name = `agent-${++index}`;
+    const nextDocument = structuredClone(props.document);
+    nextDocument.agents[name] = createEmptyAgent();
+    setDetailName(null);
+    setCreating(true);
+    setEditing(true);
+    setDraftName(name);
+    setDraftDocument(nextDocument);
+  }
+
+  function beginEdit() {
+    if (!detailName || !props.document.agents[detailName]) return;
+    setCreating(false);
+    setEditing(true);
+    setDraftName(detailName);
+    setDraftDocument(structuredClone(props.document));
+  }
+
+  function cancelEdit() {
+    if (creating) {
+      clearDraft();
+      setDetailName(null);
+      return;
+    }
+    clearDraft();
+  }
+
+  async function saveAgent() {
+    if (!editing || !draftDocument || !draftAgent || !draftName.trim()) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/agents"
+        : `/api/config/agents/${encodeURIComponent(detailName ?? "")}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          name: draftName,
+          agent: draftAgent,
+        }),
+      });
+      const normalized = normalizeDocument(result.document);
+      props.onSaved(normalized, result.revision);
+      setDetailName(draftName);
+      clearDraft();
+      props.onNotice(creating ? `Agent ${draftName} 已创建并热加载` : `Agent ${draftName} 已保存并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存 Agent 失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteAgent() {
+    if (!detailName) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/agents/${encodeURIComponent(detailName)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`Agent ${detailName} 已删除，相关规则与 sub-agent 引用已清理`);
+      setPendingAction(null);
+      setDetailName(null);
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除 Agent 失败");
+      setPendingAction(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const confirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!pendingAction) return null;
+    if (pendingAction.kind === "discard") {
+      return {
+        title: "放弃未保存的 Agent 修改？",
+        description: "当前详情中的修改尚未保存，继续后无法从页面恢复。",
+        details: [
+          { label: "Agent", value: draftName || detailName || "新 Agent", mono: true },
+          { label: "配置版本", value: shortRevision(props.revision), mono: true },
+        ],
+        impactTitle: "只放弃当前草稿",
+        impact: "已保存配置和正在运行的 Agent 不会受到影响。",
+        confirmLabel: "放弃修改",
+        dangerous: true,
+      };
+    }
+    if (!detailName) return null;
+    const ruleCount = props.document.rules.filter((rule) => rule.agents.includes(detailName)).length;
+    const callerCount = Object.entries(props.document.agents).filter(
+      ([name, agent]) => name !== detailName && agent.allowed_sub_agents?.includes(detailName),
+    ).length;
+    return {
+      title: `删除 Agent ${detailName}？`,
+      description: "删除后会立即保存配置并通知后台热加载。",
+      details: [
+        { label: "Agent", value: detailName, mono: true },
+        { label: "触发规则引用", value: `${ruleCount} 条` },
+        { label: "sub-agent 引用", value: `${callerCount} 个` },
+      ],
+      impactTitle: "同步清理名称引用",
+      impact: "引用该 Agent 的触发规则和其他 Agent 白名单会同时移除对应名称；历史运行记录不会删除。",
+      confirmLabel: "确认删除",
+      dangerous: true,
+    };
+  }, [detailName, draftName, pendingAction, props.document.agents, props.document.rules, props.revision]);
+
+  function confirmPendingAction() {
+    if (pendingAction?.kind === "delete") {
+      void deleteAgent();
+      return;
+    }
+    if (pendingAction?.kind === "discard") {
+      const nextName = pendingAction.nextName;
+      setPendingAction(null);
+      if (nextName) openDetail(nextName);
+      else {
+        clearDraft();
+        setDetailName(null);
+      }
+    }
+  }
+
+  const detailOpen = creating || detailName !== null;
+  if (!detailOpen) {
+    return (
+      <section className="section-card agent-list-page">
+        <div className="section-title-row agent-list-title">
+          <div>
+            <h2>Agent</h2>
+            <p>点击一行查看完整配置；每个 Agent 在详情页独立编辑和保存。</p>
+          </div>
+          <button type="button" className="button primary" onClick={beginCreate}>+ 添加 Agent</button>
+        </div>
+        <div className="agent-workspace-note">
+          <strong>每次运行使用独立 worktree</strong>
+          <span>Agent 不绑定固定目录；文件权限、命令联网、Skill 与 sub-agent 白名单均在各自详情中独立配置。</span>
+        </div>
+        <div className="agent-list-toolbar">
+          <label>
+            <span>搜索 Agent</span>
+            <input value={query} placeholder="输入 Agent 名称…" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <span>共 {names.length} 个 Agent</span>
+        </div>
+        <div className="agent-config-table">
+          <div className="agent-config-table-head" aria-hidden="true">
+            <span>Agent</span><span>Prompt / 模型</span><span>本地文件权限</span><span>命令联网</span><span>Skill</span><span>Sub-agent</span><span />
+          </div>
+          <div className="agent-config-items">
+            {visibleNames.map((name) => {
+              const agent = props.document.agents[name];
+              return (
+                <button type="button" className="agent-config-row" key={name} onClick={() => requestDetail(name)}>
+                  <span className="agent-config-identity"><span className="agent-config-avatar" aria-hidden="true">A</span><span><strong>{name}</strong><small>Codex Agent</small></span></span>
+                  <span className="agent-config-summary"><strong>{agent.prompt_file ? "文件 Prompt" : "内联 Prompt"}</strong><small>{agent.model || inheritedModel.value || "Codex 默认模型"}</small></span>
+                  <span><strong>{agentSandboxLabel(agent.sandbox)}</strong></span>
+                  <span><strong className={agent.network_access || agent.sandbox === "danger-full-access" ? "success-text" : ""}>{agentNetworkLabel(agent)}</strong></span>
+                  <span><strong>{agent.skills?.length ?? 0}</strong><small>项</small></span>
+                  <span><strong>{agent.allowed_sub_agents?.length ?? 0}</strong><small>个</small></span>
+                  <span className="agent-config-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+            {visibleNames.length === 0 && <div className="empty tall">{names.length === 0 ? "尚未配置 Agent" : "没有匹配的 Agent"}</div>}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const activeDocument = editing && draftDocument ? draftDocument : props.document;
+  const activeName = editing ? draftName : detailName ?? "";
+  return (
+    <div className="agent-detail-page">
+      <header className="agent-detail-header">
+        <button type="button" className="agent-detail-back" onClick={() => requestDetail(null)}><span aria-hidden="true">←</span>返回 Agent 列表</button>
+        <div className="agent-detail-heading">
+          <div>
+            <span className="eyebrow">CODEX AGENT</span>
+            <h2>{activeName}</h2>
+            <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新 Agent" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
+          </div>
+          <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
+        </div>
+        <div className="button-group agent-detail-actions">
+          {editing ? (
+            <>
+              <button type="button" className="button secondary" disabled={saving} onClick={cancelEdit}>取消</button>
+              <button type="button" className="button primary" disabled={!dirty || saving} onClick={() => { void saveAgent(); }}>{saving ? "保存中…" : "保存 Agent"}</button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="button danger" onClick={() => setPendingAction({ kind: "delete" })}>删除 Agent</button>
+              <button type="button" className="button primary" onClick={beginEdit}>编辑 Agent</button>
+            </>
+          )}
+        </div>
+      </header>
+      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving}>
+        <AgentsEditor
+          document={activeDocument}
+          codexOptions={props.codexOptions}
+          visibleNames={[activeName]}
+          showOverview={false}
+          allowDelete={false}
+          onRename={setDraftName}
+          onChange={setDraftDocument}
+        />
+      </fieldset>
+      <AgentActionConfirmationDialog
+        model={confirmation}
+        busy={saving}
+        onCancel={() => { if (!saving) setPendingAction(null); }}
+        onConfirm={confirmPendingAction}
+      />
+    </div>
+  );
+}
+
 function JsonEditor(props: {
   value: Record<string, unknown>;
   onChange: (value: Record<string, unknown>) => void;
@@ -2424,30 +3435,76 @@ function JsonEditor(props: {
   );
 }
 
+function createEmptyRule(document: ConfigDocument, events: string[]): Rule {
+  let index = document.rules.length + 1;
+  let name = `rule-${index}`;
+  const existingNames = new Set(document.rules.map((rule) => rule.name));
+  while (existingNames.has(name)) name = `rule-${++index}`;
+  return {
+    name,
+    events: [events[0] ?? "change_request.updated"],
+    agents: Object.keys(document.agents).slice(0, 1),
+    conditions: {},
+    deduplicate_per_scan: false,
+    inherit_workspace: false,
+    enabled: true,
+  };
+}
+
 function RulesEditor(props: {
   document: ConfigDocument;
   events: string[];
+  visibleIndexes?: number[];
+  showOverview?: boolean;
+  allowDelete?: boolean;
+  onRename?: (name: string) => void;
   onChange: (document: ConfigDocument) => void;
 }) {
   const agentNames = Object.keys(props.document.agents);
   const repositoryNames = props.document.repositories.map((repository) => repository.id);
+  const visibleIndexes = props.visibleIndexes ? new Set(props.visibleIndexes) : null;
+  const entries = props.document.rules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ index }) => !visibleIndexes || visibleIndexes.has(index));
+
   function update(index: number, patch: Partial<Rule>) {
     const rules = [...props.document.rules];
     rules[index] = { ...rules[index], ...patch };
     props.onChange({ ...props.document, rules });
+    if (patch.name !== undefined) props.onRename?.(patch.name);
   }
+
+  function addRule() {
+    const rule = createEmptyRule(props.document, props.events);
+    props.onChange({ ...props.document, rules: [...props.document.rules, rule] });
+  }
+
   return (
-    <section className="section-card">
-      <div className="section-title-row">
-        <div><h2>MR / PR 触发规则</h2><p>状态变化生成事件，匹配规则后按顺序触发所选 Agent。</p></div>
-        <button className="button primary" onClick={() => props.onChange({ ...props.document, rules: [...props.document.rules, { name: `rule-${props.document.rules.length + 1}`, events: [props.events[0] ?? "change_request.updated"], agents: agentNames.slice(0, 1), conditions: {}, deduplicate_per_scan: false, inherit_workspace: false, enabled: true }] })}>+ 添加规则</button>
-      </div>
+    <section className={`section-card ${props.showOverview === false ? "rule-detail-form" : ""}`}>
+      {props.showOverview !== false && (
+        <div className="section-title-row">
+          <div><h2>MR / PR 触发规则</h2><p>状态变化生成事件，匹配规则后按顺序触发所选 Agent。</p></div>
+          <button type="button" className="button primary" onClick={addRule}>+ 添加规则</button>
+        </div>
+      )}
       <div className="card-list">
-        {props.document.rules.map((rule, index) => (
+        {entries.map(({ rule, index }) => (
           <article className="sub-card rule-card" key={index}>
             <div className="sub-card-head">
               <div><h3>{rule.name}</h3><p>{rule.events.length} 个事件 · {rule.agents.length} 个 Agent</p></div>
-              <div className="button-group"><Toggle label="启用" checked={rule.enabled ?? true} onChange={(enabled) => update(index, { enabled })} /><button className="icon-button danger" onClick={() => props.onChange({ ...props.document, rules: props.document.rules.filter((_, itemIndex) => itemIndex !== index) })}>×</button></div>
+              <div className="button-group">
+                <Toggle label="启用" checked={rule.enabled ?? true} onChange={(enabled) => update(index, { enabled })} />
+                {props.allowDelete !== false && (
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    onClick={() => props.onChange({
+                      ...props.document,
+                      rules: props.document.rules.filter((_, itemIndex) => itemIndex !== index),
+                    })}
+                  >×</button>
+                )}
+              </div>
             </div>
             <div className="form-grid two">
               <Field label="规则名称" value={rule.name} onChange={(name) => update(index, { name })} />
@@ -2478,6 +3535,311 @@ function RulesEditor(props: {
         ))}
       </div>
     </section>
+  );
+}
+
+function RulesView(props: {
+  document: ConfigDocument;
+  revision: string;
+  events: string[];
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [detailName, setDetailName] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "discard"; nextName: string | null } | { kind: "delete" } | null
+  >(null);
+
+  const rules = useMemo(
+    () => [...props.document.rules].sort((left, right) => left.name.localeCompare(right.name)),
+    [props.document.rules],
+  );
+  const visibleRules = useMemo(() => {
+    const keyword = query.trim().toLocaleLowerCase();
+    if (!keyword) return rules;
+    return rules.filter((rule) => [
+      rule.name,
+      ...rule.events,
+      ...rule.agents,
+      ...(rule.repositories ?? []),
+    ].some((value) => value.toLocaleLowerCase().includes(keyword)));
+  }, [query, rules]);
+  const originalRule = detailName
+    ? props.document.rules.find((rule) => rule.name === detailName)
+    : undefined;
+  const detailIndex = creating
+    ? (draftDocument?.rules.length ?? 0) - 1
+    : detailName
+      ? props.document.rules.findIndex((rule) => rule.name === detailName)
+      : -1;
+  const draftRule = detailIndex >= 0 ? draftDocument?.rules[detailIndex] : undefined;
+  const dirty = editing && Boolean(
+    creating
+    || draftName !== detailName
+    || JSON.stringify(draftRule) !== JSON.stringify(originalRule),
+  );
+
+  useEffect(() => {
+    props.onDirtyChange(dirty);
+  }, [dirty, props.onDirtyChange]);
+  useEffect(() => () => props.onDirtyChange(false), [props.onDirtyChange]);
+
+  function clearDraft() {
+    setCreating(false);
+    setEditing(false);
+    setDraftDocument(null);
+    setDraftName("");
+  }
+
+  function openDetail(name: string) {
+    clearDraft();
+    setDetailName(name);
+  }
+
+  function requestDetail(name: string | null) {
+    if (dirty) {
+      setPendingAction({ kind: "discard", nextName: name });
+      return;
+    }
+    if (name) openDetail(name);
+    else {
+      clearDraft();
+      setDetailName(null);
+    }
+  }
+
+  function beginCreate() {
+    const rule = createEmptyRule(props.document, props.events);
+    const nextDocument = structuredClone(props.document);
+    nextDocument.rules.push(rule);
+    setDetailName(null);
+    setCreating(true);
+    setEditing(true);
+    setDraftName(rule.name);
+    setDraftDocument(nextDocument);
+  }
+
+  function beginEdit() {
+    if (!detailName || !originalRule) return;
+    setCreating(false);
+    setEditing(true);
+    setDraftName(detailName);
+    setDraftDocument(structuredClone(props.document));
+  }
+
+  function cancelEdit() {
+    if (creating) {
+      clearDraft();
+      setDetailName(null);
+      return;
+    }
+    clearDraft();
+  }
+
+  async function saveRule() {
+    if (!editing || !draftDocument || !draftRule || !draftName.trim()) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/rules"
+        : `/api/config/rules/${encodeURIComponent(detailName ?? "")}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          name: draftName,
+          rule: draftRule,
+        }),
+      });
+      const normalized = normalizeDocument(result.document);
+      props.onSaved(normalized, result.revision);
+      setDetailName(draftName);
+      clearDraft();
+      props.onNotice(creating ? `规则 ${draftName} 已创建并热加载` : `规则 ${draftName} 已保存并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存规则失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteRule() {
+    if (!detailName) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/rules/${encodeURIComponent(detailName)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`规则 ${detailName} 已删除并热加载`);
+      setPendingAction(null);
+      setDetailName(null);
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除规则失败");
+      setPendingAction(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const confirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!pendingAction) return null;
+    if (pendingAction.kind === "discard") {
+      return {
+        eyebrow: "TRIGGER RULE",
+        title: "放弃未保存的规则修改？",
+        description: "当前详情中的修改尚未保存，继续后无法从页面恢复。",
+        details: [
+          { label: "规则", value: draftName || detailName || "新规则", mono: true },
+          { label: "配置版本", value: shortRevision(props.revision), mono: true },
+        ],
+        impactTitle: "只放弃当前草稿",
+        impact: "已保存配置、历史事件和正在运行的 Agent 不会受到影响。",
+        confirmLabel: "放弃修改",
+        dangerous: true,
+      };
+    }
+    if (!detailName || !originalRule) return null;
+    return {
+      eyebrow: "TRIGGER RULE",
+      title: `删除规则 ${detailName}？`,
+      description: "删除后会立即保存配置并通知后台热加载。",
+      details: [
+        { label: "规则", value: detailName, mono: true },
+        { label: "触发事件", value: `${originalRule.events.length} 个` },
+        { label: "Agent", value: `${originalRule.agents.length} 个` },
+      ],
+      impactTitle: "停止后续匹配",
+      impact: "后续事件不再匹配这条规则；已经生成的事件和历史 Agent 运行记录不会删除。",
+      confirmLabel: "确认删除",
+      dangerous: true,
+    };
+  }, [detailName, draftName, originalRule, pendingAction, props.revision]);
+
+  function confirmPendingAction() {
+    if (pendingAction?.kind === "delete") {
+      void deleteRule();
+      return;
+    }
+    if (pendingAction?.kind === "discard") {
+      const nextName = pendingAction.nextName;
+      setPendingAction(null);
+      if (nextName) openDetail(nextName);
+      else {
+        clearDraft();
+        setDetailName(null);
+      }
+    }
+  }
+
+  if (!creating && detailName === null) {
+    return (
+      <section className="section-card rule-list-page">
+        <div className="section-title-row agent-list-title">
+          <div>
+            <h2>MR / PR 触发规则</h2>
+            <p>点击一行查看完整配置；每条规则在详情页独立编辑和保存。</p>
+          </div>
+          <button type="button" className="button primary" onClick={beginCreate}>+ 添加规则</button>
+        </div>
+        <div className="agent-list-toolbar">
+          <label>
+            <span>搜索规则</span>
+            <input value={query} placeholder="输入规则、事件、Agent 或仓库…" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <span>共 {rules.length} 条规则</span>
+        </div>
+        <div className="rule-config-table">
+          <div className="rule-config-table-head" aria-hidden="true">
+            <span>规则</span><span>状态</span><span>触发事件</span><span>Agent</span><span>仓库范围</span><span>匹配选项</span><span />
+          </div>
+          <div className="rule-config-items">
+            {visibleRules.map((rule) => {
+              const conditionCount = Object.keys(rule.conditions ?? {}).length;
+              const optionLabels = [
+                rule.deduplicate_per_scan ? "单轮去重" : "逐事件触发",
+                rule.inherit_workspace ? "继承工作区" : "独立工作区",
+              ];
+              return (
+                <button type="button" className="rule-config-row" key={rule.name} onClick={() => requestDetail(rule.name)}>
+                  <span className="agent-config-identity"><span className="rule-config-avatar" aria-hidden="true">R</span><span><strong>{rule.name}</strong><small>{conditionCount > 0 ? `${conditionCount} 项条件` : "无附加条件"}</small></span></span>
+                  <span><strong className={rule.enabled !== false ? "success-text" : "muted-text"}>{rule.enabled !== false ? "已启用" : "已停用"}</strong></span>
+                  <span className="agent-config-summary"><strong>{rule.events.length} 个</strong><small>{rule.events[0] ?? "未选择事件"}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.agents.length} 个</strong><small>{rule.agents.join("、") || "未选择 Agent"}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.repositories?.length ? `${rule.repositories.length} 个` : "全部仓库"}</strong><small>{rule.repositories?.join("、") || "不限制仓库"}</small></span>
+                  <span className="agent-config-summary"><strong>{optionLabels[0]}</strong><small>{optionLabels[1]}</small></span>
+                  <span className="agent-config-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+            {visibleRules.length === 0 && <div className="empty tall">{rules.length === 0 ? "尚未配置触发规则" : "没有匹配的触发规则"}</div>}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const activeDocument = editing && draftDocument ? draftDocument : props.document;
+  const activeName = editing ? draftName : detailName ?? "";
+  return (
+    <div className="agent-detail-page rule-detail-page">
+      <header className="agent-detail-header">
+        <button type="button" className="agent-detail-back" onClick={() => requestDetail(null)}><span aria-hidden="true">←</span>返回规则列表</button>
+        <div className="agent-detail-heading">
+          <div>
+            <span className="eyebrow">TRIGGER RULE</span>
+            <h2>{activeName}</h2>
+            <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新规则" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
+          </div>
+          <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
+        </div>
+        <div className="button-group agent-detail-actions">
+          {editing ? (
+            <>
+              <button type="button" className="button secondary" disabled={saving} onClick={cancelEdit}>取消</button>
+              <button type="button" className="button primary" disabled={!dirty || saving} onClick={() => { void saveRule(); }}>{saving ? "保存中…" : "保存规则"}</button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="button danger" onClick={() => setPendingAction({ kind: "delete" })}>删除规则</button>
+              <button type="button" className="button primary" onClick={beginEdit}>编辑规则</button>
+            </>
+          )}
+        </div>
+      </header>
+      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving}>
+        <RulesEditor
+          document={activeDocument}
+          events={props.events}
+          visibleIndexes={[detailIndex]}
+          showOverview={false}
+          allowDelete={false}
+          onRename={setDraftName}
+          onChange={setDraftDocument}
+        />
+      </fieldset>
+      <AgentActionConfirmationDialog
+        model={confirmation}
+        busy={saving}
+        onCancel={() => { if (!saving) setPendingAction(null); }}
+        onConfirm={confirmPendingAction}
+      />
+    </div>
   );
 }
 
@@ -2567,7 +3929,12 @@ function runTargetText(run: RunSummary): string {
   return run.resource_key;
 }
 
-function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
+function RunsView(props: {
+  runs: RunSummary[];
+  requestedRunId?: string | null;
+  onRequestedRunOpened: () => void;
+  onRefresh: () => void;
+}) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
@@ -2586,6 +3953,13 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
     setLogs([]);
     setError("");
   }
+
+  useEffect(() => {
+    if (!props.requestedRunId) return;
+    setSelectedId(props.requestedRunId);
+    setDrawerTab("messages");
+    props.onRequestedRunOpened();
+  }, [props.requestedRunId, props.onRequestedRunOpened]);
 
   async function cancelSelectedRun() {
     if (!selectedId || !detail || !window.confirm(`确定取消 ${detail.agent_name} 的本次运行吗？\n\n它的全部 sub-agent 也会收到取消请求。`)) return;
@@ -2786,6 +4160,14 @@ export default function App() {
   const [revision, setRevision] = useState("");
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [agentDetailDirty, setAgentDetailDirty] = useState(false);
+  const [pendingAgentExitTab, setPendingAgentExitTab] = useState<Tab | null>(null);
+  const [ruleDetailDirty, setRuleDetailDirty] = useState(false);
+  const [pendingRuleExitTab, setPendingRuleExitTab] = useState<Tab | null>(null);
+  const [repositoryDetailDirty, setRepositoryDetailDirty] = useState(false);
+  const [repositoryDetailOpen, setRepositoryDetailOpen] = useState(false);
+  const [pendingRepositoryExitTab, setPendingRepositoryExitTab] = useState<Tab | null>(null);
+  const [requestedRunId, setRequestedRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -2828,6 +4210,10 @@ export default function App() {
       setCodexOptions(nextCodexOptions);
       setDirty(false);
       setEditing(false);
+      setAgentDetailDirty(false);
+      setRuleDetailDirty(false);
+      setRepositoryDetailDirty(false);
+      setRepositoryDetailOpen(false);
       if (config.error) setError(config.error);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
@@ -2854,6 +4240,33 @@ export default function App() {
     setDocument(next);
     setDirty(true);
     setNotice("");
+  }
+
+  function selectTab(nextTab: Tab) {
+    if (nextTab === tab) return;
+    if (tab === "agents" && agentDetailDirty) {
+      setPendingAgentExitTab(nextTab);
+      return;
+    }
+    if (tab === "rules" && ruleDetailDirty) {
+      setPendingRuleExitTab(nextTab);
+      return;
+    }
+    if (tab === "repositories" && repositoryDetailDirty) {
+      setPendingRepositoryExitTab(nextTab);
+      return;
+    }
+    setTab(nextTab);
+  }
+
+  function acceptItemConfig(nextDocument: ConfigDocument, nextRevision: string) {
+    setDocument(nextDocument);
+    setSavedDocument(structuredClone(nextDocument));
+    setRevision(nextRevision);
+    setAgentDetailDirty(false);
+    setRuleDetailDirty(false);
+    setRepositoryDetailDirty(false);
+    setError("");
   }
 
   function beginEditing() {
@@ -3028,13 +4441,18 @@ export default function App() {
     { id: "runtime", label: "运行时配置", mark: "07" },
     { id: "runs", label: "运行与日志", mark: "08" },
   ], []);
-  const configurableTab = tab === "repositories" || tab === "environment" || tab === "skills" || tab === "agents" || tab === "rules" || tab === "runtime";
+  const configurableTab = (
+    (tab === "repositories" && !repositoryDetailOpen)
+    || tab === "environment"
+    || tab === "skills"
+    || tab === "runtime"
+  );
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">TR</div><div><strong>Teamwork</strong><span>Review Agents</span></div></div>
-        <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
+        <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
         <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
       </aside>
       <main className="main">
@@ -3084,19 +4502,11 @@ export default function App() {
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
                   <fieldset className="config-editor-surface" disabled={!editing}>
-                    {tab === "repositories" && <RepositoriesEditor document={document} onChange={changeDocument} />}
+                    {tab === "repositories" && <RepositoryConnectionsEditor document={document} onChange={changeDocument} />}
                     {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
                     {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
-                    {tab === "agents" && <AgentsEditor document={document} codexOptions={codexOptions} onChange={changeDocument} />}
-                    {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
                     {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
                   </fieldset>
-                  {tab === "repositories" && (
-                    <RepositoryWorkspaceManager
-                      configuredRepositories={savedDocument?.repositories ?? []}
-                      draftRepositories={document.repositories}
-                    />
-                  )}
                   {tab === "runtime" && (
                     <CodexAccountCard
                       configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}
@@ -3106,7 +4516,61 @@ export default function App() {
                   {tab === "environment" && <ConfigHistory />}
                 </>
               )}
-              {tab === "runs" && <RunsView runs={runs} onRefresh={() => { void refreshOperationalData(); }} />}
+              {tab === "agents" && (
+                <AgentsView
+                  document={document}
+                  revision={revision}
+                  codexOptions={codexOptions}
+                  onSaved={acceptItemConfig}
+                  onDirtyChange={setAgentDetailDirty}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                />
+              )}
+              {tab === "repositories" && (
+                <RepositoriesView
+                  document={document}
+                  revision={revision}
+                  blocked={editing}
+                  onSaved={acceptItemConfig}
+                  onDirtyChange={setRepositoryDetailDirty}
+                  onDetailOpenChange={setRepositoryDetailOpen}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                  onOpenRun={(runId) => {
+                    setRequestedRunId(runId);
+                    setTab("runs");
+                  }}
+                />
+              )}
+              {tab === "rules" && (
+                <RulesView
+                  document={document}
+                  revision={revision}
+                  events={eventOptions}
+                  onSaved={acceptItemConfig}
+                  onDirtyChange={setRuleDetailDirty}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                />
+              )}
+              {tab === "runs" && (
+                <RunsView
+                  runs={runs}
+                  requestedRunId={requestedRunId}
+                  onRequestedRunOpened={() => setRequestedRunId(null)}
+                  onRefresh={() => { void refreshOperationalData(); }}
+                />
+              )}
             </>
           )}
         </div>
@@ -3116,6 +4580,73 @@ export default function App() {
         busy={confirmingOverviewAction}
         onCancel={closeOverviewConfirmation}
         onConfirm={() => { void confirmOverviewAction(); }}
+      />
+      <AgentActionConfirmationDialog
+        model={pendingAgentExitTab ? {
+          eyebrow: "AGENT CONFIGURATION",
+          title: "离开 Agent 编辑页？",
+          description: "当前 Agent 仍有未保存修改，离开后页面草稿将被放弃。",
+          details: [
+            { label: "即将前往", value: tabs.find((item) => item.id === pendingAgentExitTab)?.label ?? pendingAgentExitTab },
+            { label: "配置版本", value: shortRevision(revision), mono: true },
+          ],
+          impactTitle: "已保存配置不会变化",
+          impact: "只会放弃当前 Agent 的页面草稿，后台运行状态不会受到影响。",
+          confirmLabel: "放弃并离开",
+          dangerous: true,
+        } : null}
+        onCancel={() => setPendingAgentExitTab(null)}
+        onConfirm={() => {
+          if (!pendingAgentExitTab) return;
+          setAgentDetailDirty(false);
+          setTab(pendingAgentExitTab);
+          setPendingAgentExitTab(null);
+        }}
+      />
+      <AgentActionConfirmationDialog
+        model={pendingRuleExitTab ? {
+          eyebrow: "TRIGGER RULE",
+          title: "离开规则编辑页？",
+          description: "当前规则仍有未保存修改，离开后页面草稿将被放弃。",
+          details: [
+            { label: "即将前往", value: tabs.find((item) => item.id === pendingRuleExitTab)?.label ?? pendingRuleExitTab },
+            { label: "配置版本", value: shortRevision(revision), mono: true },
+          ],
+          impactTitle: "已保存配置不会变化",
+          impact: "只会放弃当前规则的页面草稿，历史事件和后台运行状态不会受到影响。",
+          confirmLabel: "放弃并离开",
+          dangerous: true,
+        } : null}
+        onCancel={() => setPendingRuleExitTab(null)}
+        onConfirm={() => {
+          if (!pendingRuleExitTab) return;
+          setRuleDetailDirty(false);
+          setTab(pendingRuleExitTab);
+          setPendingRuleExitTab(null);
+        }}
+      />
+      <AgentActionConfirmationDialog
+        model={pendingRepositoryExitTab ? {
+          eyebrow: "REPOSITORY CONFIGURATION",
+          title: "离开仓库编辑页？",
+          description: "当前仓库仍有未保存修改，离开后页面草稿将被放弃。",
+          details: [
+            { label: "即将前往", value: tabs.find((item) => item.id === pendingRepositoryExitTab)?.label ?? pendingRepositoryExitTab },
+            { label: "配置版本", value: shortRevision(revision), mono: true },
+          ],
+          impactTitle: "已保存配置和本地目录不会变化",
+          impact: "只会放弃当前仓库的页面草稿，基础仓库、历史事件和后台运行状态不会受到影响。",
+          confirmLabel: "放弃并离开",
+          dangerous: true,
+        } : null}
+        onCancel={() => setPendingRepositoryExitTab(null)}
+        onConfirm={() => {
+          if (!pendingRepositoryExitTab) return;
+          setRepositoryDetailDirty(false);
+          setRepositoryDetailOpen(false);
+          setTab(pendingRepositoryExitTab);
+          setPendingRepositoryExitTab(null);
+        }}
       />
     </div>
   );

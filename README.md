@@ -27,7 +27,10 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 
 ## 快速开始
 
-运行端需要 Linux / macOS、Python 3.11+、Git、已登录的 Codex CLI，以及 GitHub / GitLab Token。Agent 需要评论、推送或合并时，还需为同一系统用户配置 `gh` / `glab` 登录。
+运行端需要 Linux / macOS、Python 3.11+、Git、已登录的 Codex CLI，以及 GitHub / GitLab Token。
+
+> [!IMPORTANT]
+> 使用 GitHub 仓库前，必须为启动 Teamwork 服务的同一系统用户安装并登录 `gh`；使用 GitLab 仓库前，必须以相同方式配置 `glab`。否则 Agent 无法通过平台 CLI 读取或执行评论、审批、标签、合并等操作。具体命令见[配置 `gh` / `glab`](docs/platform-cli-auth.md)。
 
 ```bash
 python -m pip install -e .
@@ -44,7 +47,7 @@ teamwork-review-agents start
 4. 检查 Codex、Agent 权限和 Prompt，保存后执行“立即扫描”。
 5. 确认仓库、事件和日志正常，再启用触发规则。
 
-Provider Token 只供扫描器使用，不会传给 Codex。平台写操作使用独立的最小权限 `gh` / `glab` 身份。
+Provider Token 只供扫描器使用，不会传给 Codex，也不能代替 Agent 所需的本机 `gh` / `glab` 登录态。平台操作使用独立的最小权限 CLI 身份。
 
 ## 目标仓库准备
 
@@ -131,9 +134,11 @@ GitHub 历史 PR 的列表行会展示 Timeline 中最新一条可转换为规�
 
 Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 worktree 后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
-`runtime.git_timeout_seconds` 控制克隆、fetch 和 worktree 等单次 Git 操作的最长等待时间，默认 `600` 秒。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
+`runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
 
-仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库执行 fetch，再为每次运行创建独立 worktree；这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。
+这两个超时可以在管理界面左侧“运行时配置”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
+
+仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库执行 fetch，再为每次运行创建独立 worktree；这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
 
 ## 常用命令
 
@@ -155,6 +160,7 @@ teamwork-review-agents runs --limit 20
 | 文档 | 用途 |
 | --- | --- |
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
+| [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
 | [`docs/architecture.md`](docs/architecture.md) | 架构、Agent 边界和数据流 |
 | [`docs/design.md`](docs/design.md) | 精确实现语义 |

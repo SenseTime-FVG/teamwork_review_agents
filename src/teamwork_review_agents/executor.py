@@ -15,6 +15,7 @@ from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .state import StateStore
 from .workspace import (
+    GitProgressEvent,
     change_request_ref,
     cleanup_expired_worktrees,
     cleanup_run_worktree,
@@ -309,19 +310,19 @@ class AgentExecutor:
                         event_loop = asyncio.get_running_loop()
 
                         def report_git_progress(
-                            operation: str,
-                            state: str,
-                            elapsed_seconds: int,
+                            git_event: GitProgressEvent,
                         ) -> None:
                             """从 Git 工作线程向运行日志提交脱敏阶段进度。"""
 
                             asyncio.run_coroutine_threadsafe(
                                 persist_log(
                                     "system",
-                                    f"workspace.git.{state}",
+                                    f"workspace.git.{git_event.state}",
                                     {
-                                        "operation": operation,
-                                        "elapsed_seconds": elapsed_seconds,
+                                        **git_event.as_dict(),
+                                        "source": "agent",
+                                        "repository_id": configured_repository.id,
+                                        "run_id": reservation.run_id,
                                     },
                                 ),
                                 event_loop,
@@ -338,6 +339,9 @@ class AgentExecutor:
                             configured_repository,
                             event.current_snapshot,
                             timeout_seconds=self.config.runtime.git_timeout_seconds,
+                            initialization_timeout_seconds=(
+                                self.config.runtime.repository_initialization_timeout_seconds
+                            ),
                             cancel_check=git_cancel_check,
                             progress_callback=report_git_progress,
                         )

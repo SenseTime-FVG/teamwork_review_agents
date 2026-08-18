@@ -21,6 +21,10 @@ from .environment import MASK
 from .state import StateStore
 
 
+class ConfigRevisionConflict(ValueError):
+    """配置版本已经变化，当前局部修改不能安全合并。"""
+
+
 class ConfigManager:
     """维护最后一版有效配置，并允许 UI 与手工编辑安全共存。"""
 
@@ -130,33 +134,333 @@ class ConfigManager:
             merged = protect_provider_credentials(
                 self._merge_masked(incoming, current_raw)
             )
-            config = parse_config_data(merged, self.path)
-            if config.database.path != self._config.database.path:
-                raise ValueError("后台运行期间不允许通过 UI 修改 database.path")
-            content = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False)
-            temporary_path: str | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    "w",
-                    encoding="utf-8",
-                    dir=self.path.parent,
-                    prefix=f".{self.path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as file:
-                    temporary_path = file.name
-                    file.write(content)
-                    file.flush()
-                    os.fsync(file.fileno())
-                os.replace(temporary_path, self.path)
-            finally:
-                if temporary_path and os.path.exists(temporary_path):
-                    os.unlink(temporary_path)
-            self._config = config
-            self._mtime_ns = self.path.stat().st_mtime_ns
-            self.last_error = None
-            self._record_version(config, source)
-            return config
+            return self._persist_locked(merged, source=source)
+
+    def save_agent(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        agent: dict[str, Any],
+        original_name: str | None = None,
+        source: str = "ui-agent",
+    ) -> AppConfig:
+        """基于最新配置原子创建或更新一个 Agent。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            next_name = name.strip()
+            if not next_name:
+                raise ValueError("Agent 名称不能为空")
+            agents = current_raw.get("agents", {})
+            if not isinstance(agents, dict):
+                raise ValueError("agents 配置必须是对象")
+            current_name = original_name.strip() if original_name is not None else None
+            if current_name is None:
+                if next_name in agents:
+                    raise ValueError(f"Agent 已存在：{next_name}")
+            else:
+                if current_name not in agents:
+                    raise ValueError(f"Agent 不存在：{current_name}")
+                if next_name != current_name and next_name in agents:
+                    raise ValueError(f"Agent 已存在：{next_name}")
+
+            document = copy.deepcopy(current_raw)
+            next_agents: dict[str, Any] = {}
+            for agent_name, value in agents.items():
+                if current_name is not None and agent_name == current_name:
+                    next_agents[next_name] = copy.deepcopy(agent)
+                    continue
+                next_agents[agent_name] = copy.deepcopy(value)
+            if current_name is None:
+                next_agents[next_name] = copy.deepcopy(agent)
+
+            if current_name is not None and current_name != next_name:
+                for value in next_agents.values():
+                    if not isinstance(value, dict):
+                        continue
+                    allowed = value.get("allowed_sub_agents")
+                    if isinstance(allowed, list):
+                        value["allowed_sub_agents"] = [
+                            next_name if item == current_name else item
+                            for item in allowed
+                        ]
+                for rule in document.get("rules", []):
+                    if (
+                        not isinstance(rule, dict)
+                        or not isinstance(rule.get("agents"), list)
+                    ):
+                        continue
+                    rule["agents"] = [
+                        next_name if item == current_name else item
+                        for item in rule["agents"]
+                    ]
+            document["agents"] = next_agents
+            merged = protect_provider_credentials(
+                self._merge_masked(document, current_raw)
+            )
+            return self._persist_locked(merged, source=source)
+
+    def delete_agent(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        source: str = "ui-agent-delete",
+    ) -> AppConfig:
+        """删除一个 Agent，并同步清理规则和 sub-agent 引用。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            agents = current_raw.get("agents", {})
+            if not isinstance(agents, dict) or name not in agents:
+                raise ValueError(f"Agent 不存在：{name}")
+
+            document = copy.deepcopy(current_raw)
+            next_agents = {
+                agent_name: copy.deepcopy(value)
+                for agent_name, value in agents.items()
+                if agent_name != name
+            }
+            for value in next_agents.values():
+                if not isinstance(value, dict):
+                    continue
+                allowed = value.get("allowed_sub_agents")
+                if isinstance(allowed, list):
+                    value["allowed_sub_agents"] = [
+                        item for item in allowed if item != name
+                    ]
+            for rule in document.get("rules", []):
+                if (
+                    not isinstance(rule, dict)
+                    or not isinstance(rule.get("agents"), list)
+                ):
+                    continue
+                rule["agents"] = [item for item in rule["agents"] if item != name]
+            document["agents"] = next_agents
+            return self._persist_locked(document, source=source)
+
+    def save_rule(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        rule: dict[str, Any],
+        original_name: str | None = None,
+        source: str = "ui-rule",
+    ) -> AppConfig:
+        """基于最新配置原子创建或更新一条触发规则。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            next_name = name.strip()
+            if not next_name:
+                raise ValueError("规则名称不能为空")
+            rules = current_raw.get("rules", [])
+            if not isinstance(rules, list):
+                raise ValueError("rules 配置必须是数组")
+            if not all(isinstance(item, dict) for item in rules):
+                raise ValueError("rules 中的每一项都必须是对象")
+
+            current_name = original_name.strip() if original_name is not None else None
+            rule_names = [str(item.get("name", "")) for item in rules]
+            if current_name is None:
+                if next_name in rule_names:
+                    raise ValueError(f"规则已存在：{next_name}")
+                target_index = len(rules)
+            else:
+                if current_name not in rule_names:
+                    raise ValueError(f"规则不存在：{current_name}")
+                if next_name != current_name and next_name in rule_names:
+                    raise ValueError(f"规则已存在：{next_name}")
+                target_index = rule_names.index(current_name)
+
+            next_rule = copy.deepcopy(rule)
+            next_rule["name"] = next_name
+            next_rules = [copy.deepcopy(item) for item in rules]
+            if current_name is None:
+                next_rules.append(next_rule)
+            else:
+                # 保留原数组位置，避免修改单条规则时改变匹配顺序。
+                next_rules[target_index] = next_rule
+
+            document = copy.deepcopy(current_raw)
+            document["rules"] = next_rules
+            merged = protect_provider_credentials(
+                self._merge_masked(document, current_raw)
+            )
+            return self._persist_locked(merged, source=source)
+
+    def delete_rule(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        source: str = "ui-rule-delete",
+    ) -> AppConfig:
+        """基于最新配置原子删除一条触发规则。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            rules = current_raw.get("rules", [])
+            if not isinstance(rules, list):
+                raise ValueError("rules 配置必须是数组")
+            if not any(
+                isinstance(item, dict) and item.get("name") == name
+                for item in rules
+            ):
+                raise ValueError(f"规则不存在：{name}")
+
+            document = copy.deepcopy(current_raw)
+            document["rules"] = [
+                copy.deepcopy(item)
+                for item in rules
+                if not (isinstance(item, dict) and item.get("name") == name)
+            ]
+            return self._persist_locked(document, source=source)
+
+    def save_repository(
+        self,
+        *,
+        expected_revision: str,
+        repository_id: str,
+        repository: dict[str, Any],
+        original_id: str | None = None,
+        source: str = "ui-repository",
+    ) -> AppConfig:
+        """基于最新配置原子创建或更新一个仓库。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            next_id = repository_id.strip()
+            if not next_id:
+                raise ValueError("仓库 ID 不能为空")
+            repositories = current_raw.get("repositories", [])
+            if not isinstance(repositories, list):
+                raise ValueError("repositories 配置必须是数组")
+            if not all(isinstance(item, dict) for item in repositories):
+                raise ValueError("repositories 中的每一项都必须是对象")
+
+            current_id = original_id.strip() if original_id is not None else None
+            repository_ids = [str(item.get("id", "")) for item in repositories]
+            if current_id is None:
+                if next_id in repository_ids:
+                    raise ValueError(f"仓库已存在：{next_id}")
+                target_index = len(repositories)
+            else:
+                if current_id not in repository_ids:
+                    raise ValueError(f"仓库不存在：{current_id}")
+                if next_id != current_id:
+                    raise ValueError("已有仓库的 ID 不允许修改，请新建仓库")
+                target_index = repository_ids.index(current_id)
+
+            next_repository = copy.deepcopy(repository)
+            next_repository["id"] = next_id
+            next_repositories = [copy.deepcopy(item) for item in repositories]
+            if current_id is None:
+                next_repositories.append(next_repository)
+            else:
+                # 保留仓库数组位置，避免局部保存造成无意义的配置重排。
+                next_repositories[target_index] = next_repository
+
+            document = copy.deepcopy(current_raw)
+            document["repositories"] = next_repositories
+            merged = protect_provider_credentials(
+                self._merge_masked(document, current_raw)
+            )
+            return self._persist_locked(merged, source=source)
+
+    def delete_repository(
+        self,
+        *,
+        expected_revision: str,
+        repository_id: str,
+        source: str = "ui-repository-delete",
+    ) -> AppConfig:
+        """删除未被触发规则显式引用的仓库配置。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            repositories = current_raw.get("repositories", [])
+            if not isinstance(repositories, list) or not any(
+                isinstance(item, dict) and item.get("id") == repository_id
+                for item in repositories
+            ):
+                raise ValueError(f"仓库不存在：{repository_id}")
+            referencing_rules = [
+                str(rule.get("name", ""))
+                for rule in current_raw.get("rules", [])
+                if isinstance(rule, dict)
+                and isinstance(rule.get("repositories"), list)
+                and repository_id in rule["repositories"]
+            ]
+            if referencing_rules:
+                raise ValueError(
+                    f"仓库 {repository_id} 仍被触发规则引用：{referencing_rules}"
+                )
+
+            document = copy.deepcopy(current_raw)
+            document["repositories"] = [
+                copy.deepcopy(item)
+                for item in repositories
+                if not (isinstance(item, dict) and item.get("id") == repository_id)
+            ]
+            return self._persist_locked(document, source=source)
+
+    def _assert_revision(
+        self,
+        current_raw: dict[str, Any],
+        expected_revision: str,
+    ) -> None:
+        """确认局部保存仍基于管理员打开详情时的配置版本。"""
+
+        current_revision = parse_config_data(current_raw, self.path).revision
+        if current_revision != expected_revision:
+            raise ConfigRevisionConflict(
+                "配置已经被其他操作更新，请重新加载后再编辑"
+            )
+
+    def _persist_locked(
+        self,
+        document: dict[str, Any],
+        *,
+        source: str,
+    ) -> AppConfig:
+        """在已经持有配置锁时校验并原子写入配置。"""
+
+        config = parse_config_data(document, self.path)
+        if config.database.path != self._config.database.path:
+            raise ValueError("后台运行期间不允许通过 UI 修改 database.path")
+        content = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                temporary_path = file.name
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, self.path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        self._config = config
+        self._mtime_ns = self.path.stat().st_mtime_ns
+        self.last_error = None
+        self._record_version(config, source)
+        return config
 
     def reload_if_changed(self) -> bool:
         """检测手工编辑；无效时保留上一版配置。"""

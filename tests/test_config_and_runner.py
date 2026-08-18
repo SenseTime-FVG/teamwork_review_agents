@@ -128,6 +128,7 @@ def test_example_config_is_valid() -> None:
     assert config.scanner.api_page_size == 50
     assert config.runtime.worktree_retention_days == 7
     assert config.runtime.git_timeout_seconds == 600
+    assert config.runtime.repository_initialization_timeout_seconds == 1800
     assert config.runtime.codex.fast_mode == "inherit"
     for agent_name in (
         "general-reviewer",

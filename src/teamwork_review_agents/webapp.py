@@ -19,7 +19,7 @@ from .codex_account import (
     CodexLoginManager,
     inspect_codex_account,
 )
-from .config_manager import ConfigManager
+from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import inspect_runtime_options
 from .environment import render_prompt
 from .events import FIELD_EVENTS, create_manual_activity_event, detect_events
@@ -40,6 +40,48 @@ class ConfigDocumentRequest(BaseModel):
     """UI 提交的完整配置文档。"""
 
     document: dict[str, Any]
+
+
+class AgentConfigRequest(BaseModel):
+    """UI 提交的单个 Agent 配置。"""
+
+    revision: str
+    name: str
+    agent: dict[str, Any]
+
+
+class AgentDeleteRequest(BaseModel):
+    """UI 删除单个 Agent 时提交的配置版本。"""
+
+    revision: str
+
+
+class RuleConfigRequest(BaseModel):
+    """UI 提交的单条触发规则配置。"""
+
+    revision: str
+    name: str
+    rule: dict[str, Any]
+
+
+class RuleDeleteRequest(BaseModel):
+    """UI 删除单条触发规则时提交的配置版本。"""
+
+    revision: str
+
+
+class RepositoryConfigRequest(BaseModel):
+    """UI 提交的单个仓库配置。"""
+
+    revision: str
+    repository_id: str
+    repository: dict[str, Any]
+
+
+class RepositoryDeleteRequest(BaseModel):
+    """UI 删除单个仓库时提交的配置版本。"""
+
+    revision: str
 
 
 class PromptPreviewRequest(BaseModel):
@@ -159,6 +201,216 @@ def create_app(
             "document": await asyncio.to_thread(manager.document),
         }
 
+    async def item_config_response(config_revision: str) -> dict[str, Any]:
+        """返回单项操作后的最新完整配置视图。"""
+
+        return {
+            "revision": config_revision,
+            "document": await asyncio.to_thread(manager.document),
+        }
+
+    @app.post("/api/config/agents")
+    async def create_agent(body: AgentConfigRequest) -> dict[str, Any]:
+        """基于指定版本创建一个 Agent。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_agent,
+                expected_revision=body.revision,
+                name=body.name,
+                agent=body.agent,
+                source="ui-agent-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/agents/{agent_name:path}")
+    async def update_agent(
+        agent_name: str,
+        body: AgentConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新或重命名一个 Agent。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_agent,
+                expected_revision=body.revision,
+                original_name=agent_name,
+                name=body.name,
+                agent=body.agent,
+                source="ui-agent-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/agents/{agent_name:path}")
+    async def delete_agent(
+        agent_name: str,
+        body: AgentDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本删除一个 Agent。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_agent,
+                expected_revision=body.revision,
+                name=agent_name,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.post("/api/config/rules")
+    async def create_rule(body: RuleConfigRequest) -> dict[str, Any]:
+        """基于指定版本创建一条触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_rule,
+                expected_revision=body.revision,
+                name=body.name,
+                rule=body.rule,
+                source="ui-rule-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/rules/{rule_name:path}")
+    async def update_rule(
+        rule_name: str,
+        body: RuleConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新或重命名一条触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_rule,
+                expected_revision=body.revision,
+                original_name=rule_name,
+                name=body.name,
+                rule=body.rule,
+                source="ui-rule-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/rules/{rule_name:path}")
+    async def delete_rule(
+        rule_name: str,
+        body: RuleDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本删除一条触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_rule,
+                expected_revision=body.revision,
+                name=rule_name,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    async def ensure_repository_idle(repository_id: str) -> None:
+        """禁止在基础仓库或 Agent 正在准备工作区时修改目标配置。"""
+
+        status = await repository_initialization_manager.get(repository_id)
+        if status is not None and status.get("status") in {
+            "waiting",
+            "initializing",
+            "updating",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="仓库正在执行 Git 操作，请等待完成或先取消操作",
+            )
+
+    @app.post("/api/config/repositories")
+    async def create_repository(body: RepositoryConfigRequest) -> dict[str, Any]:
+        """基于指定版本创建一个仓库。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_repository,
+                expected_revision=body.revision,
+                repository_id=body.repository_id,
+                repository=body.repository,
+                source="ui-repository-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/repositories/{repository_id:path}")
+    async def update_repository(
+        repository_id: str,
+        body: RepositoryConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新一个仓库，仓库 ID 保持不变。"""
+
+        await ensure_repository_idle(repository_id)
+        try:
+            config = await asyncio.to_thread(
+                manager.save_repository,
+                expected_revision=body.revision,
+                original_id=repository_id,
+                repository_id=body.repository_id,
+                repository=body.repository,
+                source="ui-repository-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/repositories/{repository_id:path}")
+    async def delete_repository(
+        repository_id: str,
+        body: RepositoryDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本安全删除一个仓库配置。"""
+
+        await ensure_repository_idle(repository_id)
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_repository,
+                expected_revision=body.revision,
+                repository_id=repository_id,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
     @app.get("/api/config/versions")
     async def config_versions(limit: int = Query(default=20, ge=1, le=100)):
         return await asyncio.to_thread(manager.store.list_config_versions, limit)
@@ -208,6 +460,15 @@ def create_app(
         """返回一个已保存仓库的基础 Git 目录状态。"""
 
         result = await repository_initialization_manager.get(repository_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.get("/api/repositories/{repository_id}/workspace/details")
+    async def repository_workspace_details(repository_id: str) -> dict[str, Any]:
+        """返回最近一次基础仓库或 Agent Git 操作的脱敏详情。"""
+
+        result = await repository_initialization_manager.detail(repository_id)
         if result is None:
             raise HTTPException(status_code=404, detail="仓库配置不存在")
         return result

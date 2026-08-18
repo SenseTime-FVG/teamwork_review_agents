@@ -135,6 +135,17 @@ def test_repository_workspace_can_initialize_and_update(tmp_path: Path) -> None:
         assert ready["ready"] is True
         assert ready["operation"] == "initialize"
         assert ready["size_bytes"] > 0
+        detail = client.get(
+            "/api/repositories/demo/workspace/details"
+        ).json()
+        clone_command = next(
+            command
+            for command in detail["commands"]
+            if command["operation"] == "克隆基础仓库"
+        )
+        assert clone_command["state"] == "completed"
+        assert clone_command["timeout_seconds"] == 1800
+        assert clone_command["command"].startswith("git clone ")
         assert run_git("rev-parse", "HEAD", cwd=workspace) == run_git(
             "rev-parse",
             "HEAD",
@@ -153,6 +164,15 @@ def test_repository_workspace_can_initialize_and_update(tmp_path: Path) -> None:
         assert updated.status_code == 200
         ready = wait_for_status(client, {"ready"})
         assert ready["operation"] == "update"
+        detail = client.get(
+            "/api/repositories/demo/workspace/details"
+        ).json()
+        update_command = next(
+            command
+            for command in detail["commands"]
+            if command["operation"] == "更新基础仓库"
+        )
+        assert update_command["timeout_seconds"] == 10
         assert run_git("rev-parse", "origin/main", cwd=workspace) == updated_sha
 
 
@@ -211,3 +231,66 @@ def test_disabled_repository_cannot_be_initialized(tmp_path: Path) -> None:
         )
         assert response.status_code == 409
         assert not workspace.exists()
+
+
+def test_repository_detail_exposes_agent_git_steps_without_raw_output(
+    tmp_path: Path,
+) -> None:
+    """仓库详情应聚合 Agent Git 日志，并只返回安全命令元数据。"""
+
+    origin, _ = create_origin(tmp_path)
+    workspace = tmp_path / "managed" / "demo"
+    app = create_app(
+        write_config(tmp_path, origin, workspace),
+        start_scheduler=False,
+    )
+
+    with TestClient(app) as client:
+        store = app.state.config_manager.store
+        reservation = store.begin_agent_run(
+            proposed_run_id="run-git-detail",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key="git-detail-test",
+            event_id=None,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key="github:demo:7",
+            prompt="测试",
+            max_attempts=1,
+        )
+        assert reservation is not None
+        assert store.mark_agent_run_preparing(reservation.run_id)
+        store.append_run_log(
+            reservation.run_id,
+            stream="system",
+            event_type="workspace.git.started",
+            payload={
+                "command_id": "command-1",
+                "operation": "克隆基础仓库",
+                "command": "git clone git@github.com:owner/demo.git /tmp/demo",
+                "state": "started",
+                "elapsed_seconds": 0,
+                "timeout_seconds": 1800,
+                "started_at": time.time(),
+                "finished_at": None,
+                "exit_code": None,
+                "error": None,
+                "source": "agent",
+                "repository_id": "demo",
+                "run_id": reservation.run_id,
+            },
+        )
+
+        status = client.get("/api/repositories/demo/workspace").json()
+        assert status["status"] == "initializing"
+        assert status["detail_source"] == "agent"
+        detail = client.get(
+            "/api/repositories/demo/workspace/details"
+        ).json()
+        assert detail["source"] == "agent"
+        assert detail["run_id"] == reservation.run_id
+        assert detail["commands"][0]["command_id"] == "command-1"
+        encoded = json.dumps(detail, ensure_ascii=False)
+        assert "stdout" not in encoded
+        assert "stderr" not in encoded

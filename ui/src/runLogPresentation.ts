@@ -132,7 +132,13 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   let detail = "";
   if (log.event_type.startsWith("workspace.git.") && object) {
     body = textValue(object.operation);
-    detail = `耗时：${textValue(object.elapsed_seconds)} 秒`;
+    detail = [
+      object.command ? textValue(object.command) : "",
+      `耗时：${textValue(object.elapsed_seconds)} 秒`,
+      object.timeout_seconds ? `超时：${textValue(object.timeout_seconds)} 秒` : "",
+      object.exit_code !== undefined && object.exit_code !== null ? `退出码：${textValue(object.exit_code)}` : "",
+      object.error ? `错误：${textValue(object.error)}` : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type === "workspace.prepared" && object) {
     body = textValue(object.reason);
     detail = [object.path ? `路径：${textValue(object.path)}` : "", object.mode ? `模式：${textValue(object.mode)}` : ""]

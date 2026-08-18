@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from teamwork_review_agents.executor import AgentExecutor
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.workspace import (
     _run_git,
+    _safe_git_command,
     cleanup_expired_worktrees,
     cleanup_run_worktree,
     ensure_isolated_worktree,
@@ -40,6 +42,21 @@ def run_git(*arguments: str, cwd=None) -> str:
     return result.stdout.strip()
 
 
+def test_git_command_display_removes_url_credentials_and_query() -> None:
+    """Git 详情命令不得暴露 URL 用户信息或查询参数。"""
+
+    command = _safe_git_command(
+        [
+            "clone",
+            "https://user:secret@example.com/owner/demo.git?token=hidden",
+            "/tmp/demo",
+        ]
+    )
+    assert command == "git clone https://example.com/owner/demo.git /tmp/demo"
+    assert "secret" not in command
+    assert "hidden" not in command
+
+
 def test_git_cancel_terminates_process_group_and_reports_safe_progress(
     tmp_path,
     monkeypatch,
@@ -61,7 +78,7 @@ def test_git_cancel_terminates_process_group_and_reports_safe_progress(
         "teamwork_review_agents.workspace.shutil.which",
         lambda _: str(fake_git),
     )
-    progress: list[tuple[str, str, int]] = []
+    progress = []
 
     with pytest.raises(WorkspaceCancelled):
         _run_git(
@@ -69,9 +86,7 @@ def test_git_cancel_terminates_process_group_and_reports_safe_progress(
             timeout_seconds=5,
             operation="测试 Git 操作",
             cancel_check=child_pid_path.exists,
-            progress_callback=lambda operation, state, elapsed: progress.append(
-                (operation, state, elapsed)
-            ),
+            progress_callback=progress.append,
         )
 
     child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -83,8 +98,12 @@ def test_git_cancel_terminates_process_group_and_reports_safe_progress(
         time.sleep(0.02)
     else:
         pytest.fail("Git 子进程在取消后仍然存活")
-    assert progress[0] == ("测试 Git 操作", "started", 0)
-    assert progress[-1][1] == "cancelled"
+    assert progress[0].operation == "测试 Git 操作"
+    assert progress[0].state == "started"
+    assert progress[0].elapsed_seconds == 0
+    assert progress[0].command.startswith("git ")
+    assert progress[-1].state == "cancelled"
+    assert progress[-1].error == "Git 操作已由管理员取消"
 
 
 def test_git_timeout_terminates_process_group(tmp_path, monkeypatch) -> None:
@@ -286,6 +305,20 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert "workspace.git.started" in log_types
     assert "workspace.git.completed" in log_types
     assert "workspace.prepared" in log_types
+    git_payloads = [
+        json.loads(item["payload"])
+        for item in store.list_run_logs(result.run_id)
+        if item["event_type"].startswith("workspace.git.")
+    ]
+    assert all(payload["source"] == "agent" for payload in git_payloads)
+    assert all(payload["run_id"] == result.run_id for payload in git_payloads)
+    assert all(payload["command_id"] for payload in git_payloads)
+    clone_payload = next(
+        payload
+        for payload in git_payloads
+        if payload["operation"] == "克隆基础仓库"
+    )
+    assert clone_payload["timeout_seconds"] == 1800
 
     fake_codex.write_text(
         f"""#!{sys.executable}

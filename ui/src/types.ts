@@ -32,6 +32,33 @@ export type RepositoryWorkspaceStatus = {
   size_bytes?: number | null;
   error?: string | null;
   cancel_requested: boolean;
+  detail_available: boolean;
+  detail_source?: "manual" | "agent" | null;
+  detail_run_id?: string | null;
+};
+
+export type GitCommandDetail = {
+  command_id: string;
+  operation: string;
+  command: string;
+  state: "waiting" | "started" | "progress" | "completed" | "failed" | "timed_out" | "cancelled";
+  elapsed_seconds: number;
+  timeout_seconds: number;
+  started_at: number;
+  finished_at?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+};
+
+export type RepositoryGitDetail = {
+  repository_id: string;
+  source?: "manual" | "agent" | null;
+  run_id?: string | null;
+  status: string;
+  phase: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  commands: GitCommandDetail[];
 };
 
 export type Agent = {
@@ -75,6 +102,7 @@ export type RuntimeConfig = Record<string, unknown> & {
   expected_codex_version?: string;
   inherit_user_mcp_servers?: boolean;
   allowed_user_mcp_servers?: string[];
+  repository_initialization_timeout_seconds?: number;
   git_timeout_seconds?: number;
   agent_idle_timeout_seconds?: number;
   codex?: CodexRuntimeConfig;

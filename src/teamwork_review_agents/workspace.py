@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +30,41 @@ class WorkspaceCancelled(WorkspaceError):
 
 
 GitCancelCheck = Callable[[], bool]
-GitProgressCallback = Callable[[str, str, int], None]
+
+
+@dataclass(frozen=True)
+class GitProgressEvent:
+    """一条不包含原始输出或认证信息的 Git 命令状态。"""
+
+    command_id: str
+    operation: str
+    command: str
+    state: str
+    elapsed_seconds: int
+    timeout_seconds: int
+    started_at: float
+    finished_at: float | None = None
+    exit_code: int | None = None
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        """返回可直接写入日志或管理 API 的安全结构。"""
+
+        return {
+            "command_id": self.command_id,
+            "operation": self.operation,
+            "command": self.command,
+            "state": self.state,
+            "elapsed_seconds": self.elapsed_seconds,
+            "timeout_seconds": self.timeout_seconds,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "exit_code": self.exit_code,
+            "error": self.error,
+        }
+
+
+GitProgressCallback = Callable[[GitProgressEvent], None]
 
 
 @dataclass(frozen=True)
@@ -75,6 +111,23 @@ def change_request_ref(provider: ProviderConfig, number: int) -> tuple[str, str]
     return source, destination
 
 
+def _safe_git_command(arguments: list[str]) -> str:
+    """生成适合管理界面展示的 Git 命令，并移除 URL 认证和查询参数。"""
+
+    safe_arguments: list[str] = []
+    for argument in arguments:
+        parsed = urlparse(argument)
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            host = parsed.netloc.rsplit("@", 1)[-1]
+            argument = parsed._replace(
+                netloc=host,
+                query="",
+                fragment="",
+            ).geturl()
+        safe_arguments.append(argument)
+    return shlex.join(["git", *safe_arguments])
+
+
 def _run_git(
     arguments: list[str],
     *,
@@ -89,15 +142,40 @@ def _run_git(
     git_binary = shutil.which("git")
     if not git_binary:
         raise WorkspaceError("系统中没有找到 git 命令")
-    started_at = time.monotonic()
+    command_id = str(uuid.uuid4())
+    started_at = time.time()
+    monotonic_started_at = time.monotonic()
+    safe_command = _safe_git_command(arguments)
 
-    def report(state: str) -> None:
-        """回调只携带操作名称与耗时，禁止泄露完整 Git 参数。"""
+    def report(
+        state: str,
+        *,
+        exit_code: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """回调只携带脱敏命令元数据，禁止泄露原始 Git 输出。"""
 
         if progress_callback is None:
             return
         with suppress(Exception):
-            progress_callback(operation, state, int(time.monotonic() - started_at))
+            progress_callback(
+                GitProgressEvent(
+                    command_id=command_id,
+                    operation=operation,
+                    command=safe_command,
+                    state=state,
+                    elapsed_seconds=int(
+                        time.monotonic() - monotonic_started_at
+                    ),
+                    timeout_seconds=timeout_seconds,
+                    started_at=started_at,
+                    finished_at=time.time()
+                    if state in {"completed", "failed", "timed_out", "cancelled"}
+                    else None,
+                    exit_code=exit_code,
+                    error=error,
+                )
+            )
 
     def terminate(process: subprocess.Popen[str]) -> None:
         """终止 Git 进程组，避免 ssh 与 index-pack 成为遗留进程。"""
@@ -130,18 +208,22 @@ def _run_git(
             start_new_session=os.name != "nt",
         )
     except OSError as exc:
+        report("failed", error="无法启动 Git 命令")
         raise WorkspaceError("无法启动 Git 命令") from exc
     report("started")
     last_progress_at = 0
     while True:
         if cancel_check is not None and cancel_check():
             terminate(process)
-            report("cancelled")
+            report("cancelled", error="Git 操作已由管理员取消")
             raise WorkspaceCancelled("运行已在 Git 工作区准备期间取消")
-        elapsed = time.monotonic() - started_at
+        elapsed = time.monotonic() - monotonic_started_at
         if elapsed >= timeout_seconds:
             terminate(process)
-            report("timed_out")
+            report(
+                "timed_out",
+                error=f"Git 操作超过 {timeout_seconds} 秒",
+            )
             raise WorkspaceError(
                 f"Git 操作超过 {timeout_seconds} 秒，请检查网络和 SSH 认证"
             )
@@ -151,7 +233,7 @@ def _run_git(
             )
             break
         except subprocess.TimeoutExpired:
-            elapsed_seconds = int(time.monotonic() - started_at)
+            elapsed_seconds = int(time.monotonic() - monotonic_started_at)
             if elapsed_seconds - last_progress_at >= 10:
                 last_progress_at = elapsed_seconds
                 report("progress")
@@ -161,7 +243,14 @@ def _run_git(
         stdout,
         stderr,
     )
-    report("completed" if result.returncode == 0 else "failed")
+    if result.returncode == 0:
+        report("completed", exit_code=result.returncode)
+    else:
+        report(
+            "failed",
+            exit_code=result.returncode,
+            error="Git 命令返回非零退出码",
+        )
     if check and result.returncode != 0:
         raise WorkspaceError("Git 操作失败，请检查仓库地址、网络和 SSH/HTTPS 权限")
     return result
@@ -172,6 +261,7 @@ def ensure_repository_workspace(
     repository: RepositoryConfig,
     *,
     timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
 ) -> Path:
@@ -188,7 +278,7 @@ def ensure_repository_workspace(
             checkout = Path(temporary_root) / "repository"
             _run_git(
                 ["clone", "--origin", "origin", "--", clone_url, str(checkout)],
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=initialization_timeout_seconds,
                 operation="克隆基础仓库",
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
@@ -241,6 +331,7 @@ def initialize_repository_workspace(
     repository: RepositoryConfig,
     *,
     timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
 ) -> tuple[Path, str]:
@@ -251,6 +342,7 @@ def initialize_repository_workspace(
         provider,
         repository,
         timeout_seconds=timeout_seconds,
+        initialization_timeout_seconds=initialization_timeout_seconds,
         cancel_check=cancel_check,
         progress_callback=progress_callback,
     )
@@ -616,6 +708,7 @@ def prepare_change_request_workspace(
     snapshot: ChangeRequestSnapshot,
     *,
     timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
 ) -> str:
@@ -625,6 +718,7 @@ def prepare_change_request_workspace(
         provider,
         repository,
         timeout_seconds=timeout_seconds,
+        initialization_timeout_seconds=initialization_timeout_seconds,
         cancel_check=cancel_check,
         progress_callback=progress_callback,
     )

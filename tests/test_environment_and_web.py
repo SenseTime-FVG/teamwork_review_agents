@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from teamwork_review_agents.config import load_config
-from teamwork_review_agents.config_manager import ConfigManager
+from teamwork_review_agents.config_manager import ConfigManager, ConfigRevisionConflict
 from teamwork_review_agents.environment import (
     MASK,
     SecretRedactor,
@@ -187,6 +188,158 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     assert "provider-secret" not in manager.store.get_config_version(versions[0]["revision"])["content"]
 
 
+def test_config_manager_saves_one_agent_and_updates_references(tmp_path) -> None:
+    """单 Agent 保存应保护版本，并原子维护全部名称引用。"""
+
+    config_path = write_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["agents"]["helper"] = {
+        "prompt": "协助审核。",
+        "sandbox": "read-only",
+        "allowed_sub_agents": ["reviewer"],
+    }
+    raw["rules"][0]["agents"].append("helper")
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(config_path)
+    revision = manager.config.revision
+    reviewer = manager.document()["agents"]["reviewer"]
+    reviewer["prompt"] = "执行独立审核。"
+
+    updated = manager.save_agent(
+        expected_revision=revision,
+        original_name="reviewer",
+        name="primary-reviewer",
+        agent=reviewer,
+    )
+    document = manager.document(mask_secrets=False)
+    assert "reviewer" not in document["agents"]
+    assert document["agents"]["primary-reviewer"]["prompt"] == "执行独立审核。"
+    assert document["agents"]["helper"]["allowed_sub_agents"] == [
+        "primary-reviewer"
+    ]
+    assert document["rules"][0]["agents"] == ["primary-reviewer", "helper"]
+
+    with pytest.raises(ConfigRevisionConflict):
+        manager.delete_agent(expected_revision=revision, name="helper")
+
+    deleted = manager.delete_agent(
+        expected_revision=updated.revision,
+        name="helper",
+    )
+    document = manager.document(mask_secrets=False)
+    assert "helper" not in deleted.agents
+    assert document["rules"][0]["agents"] == ["primary-reviewer"]
+
+
+def test_config_manager_saves_one_rule_without_changing_order(tmp_path) -> None:
+    """单规则保存应保护版本，并在重命名时保持原匹配位置。"""
+
+    config_path = write_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["rules"].append(
+        {
+            "name": "secondary",
+            "events": ["change_request.updated"],
+            "agents": ["reviewer"],
+            "enabled": True,
+        }
+    )
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(config_path)
+    revision = manager.config.revision
+    rule = manager.document()["rules"][0]
+    rule["events"] = ["change_request.opened"]
+    rule["enabled"] = False
+
+    updated = manager.save_rule(
+        expected_revision=revision,
+        original_name="review",
+        name="primary-review",
+        rule=rule,
+    )
+    document = manager.document(mask_secrets=False)
+    assert [item["name"] for item in document["rules"]] == [
+        "primary-review",
+        "secondary",
+    ]
+    assert document["rules"][0]["events"] == ["change_request.opened"]
+    assert document["rules"][0]["enabled"] is False
+
+    with pytest.raises(ConfigRevisionConflict):
+        manager.delete_rule(expected_revision=revision, name="secondary")
+
+    manager.delete_rule(
+        expected_revision=updated.revision,
+        name="secondary",
+    )
+    assert [item["name"] for item in manager.document()["rules"]] == [
+        "primary-review"
+    ]
+
+
+def test_config_manager_saves_and_safely_deletes_one_repository(tmp_path) -> None:
+    """单仓库保存应保持身份和顺序，并阻止删除规则引用。"""
+
+    config_path = write_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["rules"][0]["repositories"] = ["first"]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(config_path)
+    revision = manager.config.revision
+    repository = manager.document()["repositories"][0]
+    repository["enabled"] = False
+
+    updated = manager.save_repository(
+        expected_revision=revision,
+        original_id="first",
+        repository_id="first",
+        repository=repository,
+    )
+    document = manager.document(mask_secrets=False)
+    assert [item["id"] for item in document["repositories"]] == [
+        "first",
+        "second",
+    ]
+    assert document["repositories"][0]["enabled"] is False
+
+    with pytest.raises(ValueError, match="ID 不允许修改"):
+        manager.save_repository(
+            expected_revision=updated.revision,
+            original_id="first",
+            repository_id="renamed",
+            repository=repository,
+        )
+
+    with pytest.raises(ValueError, match="仍被触发规则引用"):
+        manager.delete_repository(
+            expected_revision=updated.revision,
+            repository_id="first",
+        )
+
+    with pytest.raises(ConfigRevisionConflict):
+        manager.delete_repository(
+            expected_revision=revision,
+            repository_id="second",
+        )
+
+    manager.delete_repository(
+        expected_revision=updated.revision,
+        repository_id="second",
+    )
+    assert [item["id"] for item in manager.document()["repositories"]] == [
+        "first"
+    ]
+
+
 def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypatch) -> None:
     """Provider Token 应按全局固定值、全局宿主机引用、直接宿主机依次解析。"""
 
@@ -215,6 +368,212 @@ def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypa
     )
     config = load_config(config_path)
     assert resolve_provider_token(config, config.providers["provider-main"]) == "host-fallback-token"
+
+
+def test_web_api_saves_agents_independently_with_revision_guard(tmp_path) -> None:
+    """Agent 管理 API 应支持创建、重命名、删除和版本冲突。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/agents",
+            json={
+                "revision": current["revision"],
+                "name": "helper",
+                "agent": {
+                    "prompt": "协助审核。",
+                    "sandbox": "read-only",
+                    "allowed_sub_agents": ["reviewer"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert "helper" in created_body["document"]["agents"]
+
+        renamed = client.put(
+            "/api/config/agents/helper",
+            json={
+                "revision": created_body["revision"],
+                "name": "assistant",
+                "agent": created_body["document"]["agents"]["helper"],
+            },
+        )
+        assert renamed.status_code == 200
+        renamed_body = renamed.json()
+        assert "helper" not in renamed_body["document"]["agents"]
+        assert "assistant" in renamed_body["document"]["agents"]
+
+        conflict = client.request(
+            "DELETE",
+            "/api/config/agents/assistant",
+            json={"revision": current["revision"]},
+        )
+        assert conflict.status_code == 409
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/agents/assistant",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert "assistant" not in deleted.json()["document"]["agents"]
+
+
+def test_web_api_saves_rules_independently_with_revision_guard(tmp_path) -> None:
+    """触发规则管理 API 应支持创建、重命名、删除和版本冲突。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/rules",
+            json={
+                "revision": current["revision"],
+                "name": "secondary",
+                "rule": {
+                    "name": "secondary",
+                    "events": ["change_request.updated"],
+                    "agents": ["reviewer"],
+                    "enabled": True,
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert [item["name"] for item in created_body["document"]["rules"]] == [
+            "review",
+            "secondary",
+        ]
+
+        rule = created_body["document"]["rules"][1]
+        rule["enabled"] = False
+        renamed = client.put(
+            "/api/config/rules/secondary",
+            json={
+                "revision": created_body["revision"],
+                "name": "manual-review",
+                "rule": rule,
+            },
+        )
+        assert renamed.status_code == 200
+        renamed_body = renamed.json()
+        assert [item["name"] for item in renamed_body["document"]["rules"]] == [
+            "review",
+            "manual-review",
+        ]
+        assert renamed_body["document"]["rules"][1]["enabled"] is False
+
+        conflict = client.request(
+            "DELETE",
+            "/api/config/rules/manual-review",
+            json={"revision": current["revision"]},
+        )
+        assert conflict.status_code == 409
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/rules/manual-review",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert [item["name"] for item in deleted.json()["document"]["rules"]] == [
+            "review"
+        ]
+
+
+def test_web_api_saves_repositories_independently_and_blocks_references(
+    tmp_path,
+) -> None:
+    """仓库管理 API 应独立保存，并保护身份、版本和规则引用。"""
+
+    config_path = write_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["rules"][0]["repositories"] = ["first"]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/repositories",
+            json={
+                "revision": current["revision"],
+                "repository_id": "third",
+                "repository": {
+                    "id": "third",
+                    "provider": "provider-main",
+                    "project": "owner/third",
+                    "workspace": "./workspaces/third",
+                    "enabled": False,
+                    "environment": {},
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert [item["id"] for item in created_body["document"]["repositories"]] == [
+            "first",
+            "second",
+            "third",
+        ]
+
+        repository = created_body["document"]["repositories"][2]
+        repository["project"] = "owner/third-updated"
+        updated = client.put(
+            "/api/config/repositories/third",
+            json={
+                "revision": created_body["revision"],
+                "repository_id": "third",
+                "repository": repository,
+            },
+        )
+        assert updated.status_code == 200
+        updated_body = updated.json()
+        assert updated_body["document"]["repositories"][2]["project"] == (
+            "owner/third-updated"
+        )
+
+        renamed = client.put(
+            "/api/config/repositories/third",
+            json={
+                "revision": updated_body["revision"],
+                "repository_id": "renamed",
+                "repository": {**repository, "id": "renamed"},
+            },
+        )
+        assert renamed.status_code == 422
+
+        referenced = client.request(
+            "DELETE",
+            "/api/config/repositories/first",
+            json={"revision": updated_body["revision"]},
+        )
+        assert referenced.status_code == 422
+        assert "review" in referenced.json()["detail"]
+
+        conflict = client.request(
+            "DELETE",
+            "/api/config/repositories/third",
+            json={"revision": current["revision"]},
+        )
+        assert conflict.status_code == 409
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/repositories/third",
+            json={"revision": updated_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert [item["id"] for item in deleted.json()["document"]["repositories"]] == [
+            "first",
+            "second",
+        ]
 
 
 def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -> None:
