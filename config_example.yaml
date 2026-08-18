@@ -24,8 +24,10 @@ database:
 
 # 可选：Codex Agent、sub-agent、重试和写资源锁参数。
 # runtime:
-#   # 同一进程最多并行运行多少个 Codex CLI Agent。
-#   max_concurrent_agents: 4
+#   # 服务级根 Agent 全局并发上限；管理入口位于“全局环境”，默认 5。
+#   max_concurrent_agents: 5
+#   # 当前 Agent 调度执行额度；管理入口位于“运行时配置”，与全局上限取较小值。
+#   agent_concurrency_limit: 5
 #   # 等待 MR/PR 或工作目录写锁的最长秒数。
 #   lock_timeout_seconds: 300
 #   # 写锁租约有效秒数；运行期间会自动续租。
@@ -213,6 +215,8 @@ agents:
     timeout_seconds: 1200
     # 可选：覆盖 runtime.agent_idle_timeout_seconds；连续无进展时提前结束。
     # idle_timeout_seconds: 300
+    # 可选：限制此名称的根 Agent 与 sub-agent 并发；省略表示不额外限制。
+    # max_concurrent_runs: 2
     # 写操作声明用于申请串行锁，不等同于平台账号授权。
     # workspace：修改代码、提交或推送；change_request：评论、标签或合并 MR/PR。
     write_scopes:

@@ -105,6 +105,92 @@ def test_connection_context_closes_on_success_and_failure(tmp_path) -> None:
         failed_connection.execute("SELECT 1")
 
 
+def test_agent_run_capacity_combines_global_and_per_agent_limits(tmp_path) -> None:
+    """根任务使用全局额度，同名根任务与 sub-agent 共用 Agent 额度。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+
+    def reserve(run_id: str, agent_name: str, parent_run_id: str | None = None) -> None:
+        reservation = store.begin_agent_run(
+            proposed_run_id=run_id,
+            root_run_id="root-one" if parent_run_id else None,
+            parent_run_id=parent_run_id,
+            idempotency_key=f"key-{run_id}",
+            event_id=None,
+            rule_name=None,
+            agent_name=agent_name,
+            resource_key=f"resource-{run_id}",
+            prompt="",
+            max_attempts=1,
+        )
+        assert reservation is not None
+
+    reserve("root-one", "reviewer")
+    reserve("root-two", "writer")
+    reserve("root-three", "publisher")
+    reserve("child-one", "security", parent_run_id="root-one")
+    reserve("child-two", "security", parent_run_id="root-one")
+
+    assert store.try_acquire_agent_run_capacity(
+        "root-one",
+        global_limit=1,
+        runtime_limit=5,
+        agent_limit=None,
+        acquire_global=True,
+    ) == (True, None)
+    assert store.try_acquire_agent_run_capacity(
+        "root-two",
+        global_limit=1,
+        runtime_limit=5,
+        agent_limit=None,
+        acquire_global=True,
+    ) == (False, "global_concurrency")
+    assert store.try_acquire_agent_run_capacity(
+        "root-three",
+        global_limit=5,
+        runtime_limit=1,
+        agent_limit=None,
+        acquire_global=True,
+    ) == (False, "runtime_concurrency")
+
+    assert store.try_acquire_agent_run_capacity(
+        "child-one",
+        global_limit=1,
+        runtime_limit=1,
+        agent_limit=1,
+        acquire_global=False,
+    ) == (True, None)
+    assert store.try_acquire_agent_run_capacity(
+        "child-two",
+        global_limit=1,
+        runtime_limit=1,
+        agent_limit=1,
+        acquire_global=False,
+    ) == (False, "agent_concurrency")
+
+    queued = {item["run_id"]: item for item in store.list_runs()}
+    assert queued["root-two"]["queue_reason"] == "global_concurrency"
+    assert queued["root-three"]["queue_reason"] == "runtime_concurrency"
+    assert queued["child-two"]["queue_reason"] == "agent_concurrency"
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id="root-one",
+            root_run_id="root-one",
+            agent_name="reviewer",
+            status="completed",
+        )
+    )
+    assert store.try_acquire_agent_run_capacity(
+        "root-two",
+        global_limit=1,
+        runtime_limit=5,
+        agent_limit=None,
+        acquire_global=True,
+    ) == (True, None)
+
+
 def test_snapshot_and_events_are_idempotent(tmp_path, snapshot_factory) -> None:
     store = StateStore(tmp_path / "state.db")
     store.initialize()

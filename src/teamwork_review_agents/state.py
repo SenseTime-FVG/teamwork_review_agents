@@ -88,6 +88,7 @@ class StateStore:
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
+                    queue_reason TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -145,6 +146,8 @@ class StateStore:
                     workspace_reason TEXT,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     cancel_source TEXT,
+                    concurrency_acquired INTEGER NOT NULL DEFAULT 0,
+                    queue_reason TEXT,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -250,6 +253,14 @@ class StateStore:
                 "cancel_requested",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "concurrency_acquired",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(connection, "agent_runs", "queue_reason", "TEXT")
+            self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             cancel_source_added = self._ensure_column(
                 connection,
                 "agent_runs",
@@ -351,15 +362,23 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE event_inbox
-                SET status = 'pending', error = '服务异常退出，事件已重新入队', updated_at = ?
+                SET status = 'pending', error = '服务异常退出，事件已重新入队',
+                    queue_reason = NULL, updated_at = ?
                 WHERE status IN ('processing', 'triggered')
                 """,
                 (now,),
             )
             connection.execute(
                 """
+                UPDATE event_inbox SET queue_reason = NULL
+                WHERE status = 'pending' AND queue_reason IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
                 UPDATE agent_runs
                 SET status = 'failed', error = '服务异常退出，运行未正常结束',
+                    concurrency_acquired = 0, queue_reason = NULL,
                     workspace_status = CASE
                         WHEN workspace_status = 'active' THEN 'retained'
                         ELSE workspace_status
@@ -758,6 +777,75 @@ class StateStore:
             ).fetchall()
         return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
 
+    def pending_event_resources(
+        self,
+        max_attempts: int,
+        limit: int = 100,
+    ) -> list[tuple[str, int]]:
+        """按最早事件顺序返回存在待处理工作的变更请求。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT repository_id, number, MIN(created_at) AS first_created_at
+                FROM event_inbox
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND attempts < ?)
+                GROUP BY repository_id, number
+                ORDER BY first_created_at ASC, repository_id ASC, number ASC
+                LIMIT ?
+                """,
+                (max_attempts, limit),
+            ).fetchall()
+        return [(str(row["repository_id"]), int(row["number"])) for row in rows]
+
+    def pending_events_for_resource(
+        self,
+        repository_id: str,
+        number: int,
+        *,
+        max_attempts: int,
+        limit: int = 100,
+    ) -> list[ChangeEvent]:
+        """读取单个 PR / MR 尚未处理的事件。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM event_inbox
+                WHERE repository_id = ? AND number = ?
+                  AND (
+                      status = 'pending'
+                      OR (status = 'failed' AND attempts < ?)
+                  )
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT ?
+                """,
+                (repository_id, number, max_attempts, limit),
+            ).fetchall()
+        return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
+
+    def set_event_queue_reason(
+        self,
+        event_ids: Iterable[str],
+        reason: str | None,
+    ) -> None:
+        """记录待处理事件尚未被领取的结构化原因。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE event_inbox
+                SET queue_reason = ?, updated_at = ?
+                WHERE event_id IN ({placeholders}) AND status = 'pending'
+                """,
+                (reason, time.time(), *ids),
+            )
+
     def claim_event(self, event_id: str, max_attempts: int) -> bool:
         """原子领取一个事件，并限制总尝试次数。"""
 
@@ -779,7 +867,7 @@ class StateStore:
                 """
                 UPDATE event_inbox
                 SET status = 'processing', attempts = attempts + 1,
-                    error = NULL, updated_at = ?
+                    error = NULL, queue_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                 """,
                 (now, event_id),
@@ -812,7 +900,7 @@ class StateStore:
                 connection.execute(
                     """
                     UPDATE event_inbox
-                    SET status = ?, error = NULL, updated_at = ?
+                    SET status = ?, error = NULL, queue_reason = NULL, updated_at = ?
                     WHERE event_id = ?
                     """,
                     (
@@ -838,7 +926,7 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE event_inbox
-                SET status = ?, error = ?, updated_at = ?
+                SET status = ?, error = ?, queue_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                 """,
                 (final_status, error, time.time(), event_id),
@@ -853,7 +941,8 @@ class StateStore:
                 UPDATE event_inbox
                 SET status = 'pending',
                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
-                    error = '服务停止中断，事件已重新入队', updated_at = ?
+                    error = '服务停止中断，事件已重新入队',
+                    queue_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                   AND status IN ('processing', 'triggered', 'failed')
                 """,
@@ -1110,7 +1199,8 @@ class StateStore:
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
-                    cancel_source = NULL,
+                    cancel_source = NULL, concurrency_acquired = 0,
+                    queue_reason = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
@@ -1131,6 +1221,105 @@ class StateStore:
                 attempts,
             )
 
+    def try_acquire_agent_run_capacity(
+        self,
+        run_id: str,
+        *,
+        global_limit: int,
+        runtime_limit: int,
+        agent_limit: int | None,
+        acquire_global: bool,
+    ) -> tuple[bool, str | None]:
+        """原子申请根任务总额度和同名 Agent 额度。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT agent_name, status, cancel_requested,
+                       concurrency_acquired
+                FROM agent_runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] not in {"queued", "preparing", "running"}
+                or row["cancel_requested"]
+            ):
+                connection.rollback()
+                return False, None
+            if row["concurrency_acquired"]:
+                connection.rollback()
+                return True, None
+
+            reason: str | None = None
+            if acquire_global:
+                global_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM agent_runs
+                    WHERE concurrency_acquired = 1
+                      AND parent_run_id IS NULL
+                      AND status IN ('queued', 'preparing', 'running')
+                    """
+                ).fetchone()
+                active_roots = int(global_count["count"])
+                if active_roots >= global_limit:
+                    reason = "global_concurrency"
+                elif active_roots >= runtime_limit:
+                    reason = "runtime_concurrency"
+            if reason is None and agent_limit is not None:
+                agent_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM agent_runs
+                    WHERE concurrency_acquired = 1
+                      AND agent_name = ?
+                      AND status IN ('queued', 'preparing', 'running')
+                    """,
+                    (row["agent_name"],),
+                ).fetchone()
+                if int(agent_count["count"]) >= agent_limit:
+                    reason = "agent_concurrency"
+
+            if reason is not None:
+                connection.execute(
+                    """
+                    UPDATE agent_runs SET queue_reason = ?
+                    WHERE run_id = ? AND status = 'queued'
+                    """,
+                    (reason, run_id),
+                )
+                connection.commit()
+                return False, reason
+
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET concurrency_acquired = 1, queue_reason = NULL
+                WHERE run_id = ? AND status = 'queued'
+                  AND cancel_requested = 0
+                """,
+                (run_id,),
+            )
+            connection.commit()
+        return cursor.rowcount == 1, None
+
+    def set_agent_run_queue_reason(
+        self,
+        run_id: str,
+        reason: str | None,
+    ) -> None:
+        """更新仍在排队运行的结构化等待原因。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs SET queue_reason = ?
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (reason, run_id),
+            )
+
     def agent_run_status(self, idempotency_key: str) -> str | None:
         """查询一个幂等运行当前状态。"""
 
@@ -1148,7 +1337,7 @@ class StateStore:
             cursor = connection.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'running'
+                SET status = 'running', queue_reason = NULL
                 WHERE run_id = ? AND status IN ('queued', 'preparing')
                     AND cancel_requested = 0
                 """,
@@ -1163,7 +1352,7 @@ class StateStore:
             cursor = connection.execute(
                 """
                 UPDATE agent_runs
-                SET status = 'preparing'
+                SET status = 'preparing', queue_reason = NULL
                 WHERE run_id = ? AND status = 'queued' AND cancel_requested = 0
                 """,
                 (run_id,),
@@ -1272,6 +1461,14 @@ class StateStore:
                         finished_at = CASE
                             WHEN status = 'queued' THEN ?
                             ELSE finished_at
+                        END,
+                        concurrency_acquired = CASE
+                            WHEN status = 'queued' THEN 0
+                            ELSE concurrency_acquired
+                        END,
+                        queue_reason = CASE
+                            WHEN status = 'queued' THEN NULL
+                            ELSE queue_reason
                         END
                     WHERE run_id IN ({placeholders})
                     """,
@@ -1312,6 +1509,14 @@ class StateStore:
                         finished_at = CASE
                             WHEN status = 'queued' THEN ?
                             ELSE finished_at
+                        END,
+                        concurrency_acquired = CASE
+                            WHEN status = 'queued' THEN 0
+                            ELSE concurrency_acquired
+                        END,
+                        queue_reason = CASE
+                            WHEN status = 'queued' THEN NULL
+                            ELSE queue_reason
                         END
                     WHERE run_id IN ({placeholders})
                     """,
@@ -1373,7 +1578,8 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = ?, final_message = ?, thread_id = ?, usage = ?,
-                    events = ?, error = ?, finished_at = ?
+                    events = ?, error = ?, concurrency_acquired = 0,
+                    queue_reason = NULL, finished_at = ?
                 WHERE run_id = ?
                 """,
                 (
@@ -1570,7 +1776,8 @@ class StateStore:
             children = connection.execute(
                 """
                 SELECT run_id, agent_name, status, started_at, finished_at,
-                       workspace_path, workspace_status, workspace_reason
+                       queue_reason, workspace_path, workspace_status,
+                       workspace_reason
                 FROM agent_runs WHERE parent_run_id = ? ORDER BY started_at ASC
                 """,
                 (run_id,),
@@ -1645,6 +1852,7 @@ class StateStore:
                        agent_runs.rule_name, agent_runs.agent_name,
                        agent_runs.resource_key, agent_runs.status,
                        agent_runs.attempts, agent_runs.error,
+                       agent_runs.queue_reason,
                        agent_runs.cancel_requested, agent_runs.cancel_source,
                        agent_runs.workspace_path, agent_runs.workspace_status,
                        agent_runs.workspace_reason, agent_runs.started_at,
@@ -1714,7 +1922,8 @@ class StateStore:
                 SELECT event_inbox.event_id, event_inbox.event_type,
                        event_inbox.repository_id, event_inbox.number,
                        event_inbox.status, event_inbox.attempts,
-                       event_inbox.error, event_inbox.created_at,
+                       event_inbox.error, event_inbox.queue_reason,
+                       event_inbox.created_at,
                        event_inbox.updated_at,
                        json_extract(event_inbox.payload, '$.occurred_at')
                            AS occurred_at,

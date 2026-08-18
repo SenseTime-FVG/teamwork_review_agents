@@ -19,6 +19,7 @@ from teamwork_review_agents.config import (
     AgentConfig,
     CodexRuntimeConfig,
     RepositoryConfig,
+    RuntimeConfig,
     ScannerConfig,
     load_config,
     parse_config_data,
@@ -38,6 +39,17 @@ from teamwork_review_agents.process_manager import (
 def test_cli_uses_root_config_by_default() -> None:
     args = build_parser().parse_args(["validate"])
     assert args.config == Path("config.yaml")
+
+
+def test_concurrency_defaults_and_optional_agent_limit() -> None:
+    """两项总额度默认均为 5，Agent 留空时不增加限制。"""
+
+    runtime = RuntimeConfig()
+    agent = AgentConfig(prompt="测试")
+
+    assert runtime.max_concurrent_agents == 5
+    assert runtime.agent_concurrency_limit == 5
+    assert agent.max_concurrent_runs is None
 
 
 def test_cli_configures_utf8_output_for_redirected_windows_streams() -> None:

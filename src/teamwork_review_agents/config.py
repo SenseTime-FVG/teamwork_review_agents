@@ -136,7 +136,8 @@ class CodexRuntimeConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
-    max_concurrent_agents: PositiveInt = 4
+    max_concurrent_agents: PositiveInt = 5
+    agent_concurrency_limit: PositiveInt = 5
     lock_timeout_seconds: PositiveInt = 300
     lock_ttl_seconds: PositiveInt = 120
     max_sub_agent_depth: int = Field(default=2, ge=0)
@@ -319,6 +320,7 @@ class AgentConfig(BaseModel):
     network_domains: list[str] = Field(default_factory=list)
     timeout_seconds: PositiveInt = 1200
     idle_timeout_seconds: PositiveInt | None = None
+    max_concurrent_runs: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     allowed_sub_agents: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)

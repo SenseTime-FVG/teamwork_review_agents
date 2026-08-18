@@ -91,6 +91,7 @@ export type Agent = {
   network_domains?: string[];
   timeout_seconds?: number;
   idle_timeout_seconds?: number;
+  max_concurrent_runs?: number;
   write_scopes?: Array<"change_request" | "workspace">;
   allowed_sub_agents?: string[];
   skills?: string[];
@@ -119,6 +120,8 @@ export type CodexInheritedSetting = {
 };
 
 export type RuntimeConfig = Record<string, unknown> & {
+  max_concurrent_agents?: number;
+  agent_concurrency_limit?: number;
   codex_binary?: string;
   codex_home?: string;
   expected_codex_version?: string;
@@ -342,6 +345,7 @@ export type RunSummary = {
   change_request_title?: string | null;
   change_request_url?: string | null;
   status: string;
+  queue_reason?: string | null;
   attempts: number;
   error?: string | null;
   workspace_path?: string | null;
@@ -378,6 +382,7 @@ export type EventRecord = {
   status: string;
   attempts: number;
   error?: string | null;
+  queue_reason?: string | null;
   trigger_count: number;
   agent_queued_count: number;
   agent_preparing_count: number;

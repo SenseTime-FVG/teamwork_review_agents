@@ -119,6 +119,32 @@ class AgentExecutor:
             run_id
         )
 
+    async def _wait_for_run_capacity(
+        self,
+        run_id: str,
+        *,
+        agent_name: str,
+        depth: int,
+    ) -> bool:
+        """等待全局根任务额度和同名 Agent 额度。"""
+
+        agent_limit = self.config.agents[agent_name].max_concurrent_runs
+        while not self._cancel_requested(run_id):
+            acquired, reason = await asyncio.to_thread(
+                self.store.try_acquire_agent_run_capacity,
+                run_id,
+                global_limit=self.config.runtime.max_concurrent_agents,
+                runtime_limit=self.config.runtime.agent_concurrency_limit,
+                agent_limit=agent_limit,
+                acquire_global=depth == 0,
+            )
+            if acquired:
+                return True
+            if reason is None:
+                return False
+            await asyncio.sleep(0.2)
+        return False
+
     def run_workspace_path(
         self,
         repository: RepositoryConfig,
@@ -301,7 +327,19 @@ class AgentExecutor:
                 source=CANCEL_SOURCE_SERVICE_SHUTDOWN,
             )
 
+        await self._wait_for_run_capacity(
+            reservation.run_id,
+            agent_name=agent_name,
+            depth=depth,
+        )
+
         keys = self.lock_keys(agent_name, event, configured_repository)
+        if keys:
+            await asyncio.to_thread(
+                self.store.set_agent_run_queue_reason,
+                reservation.run_id,
+                "resource_lock",
+            )
         lease = ResourceLease(
             self.store,
             keys,
@@ -336,6 +374,14 @@ class AgentExecutor:
         try:
             async with lease:
                 if task is not None and inherit_workspace:
+                    preparing = await asyncio.to_thread(
+                        self.store.mark_agent_run_preparing,
+                        reservation.run_id,
+                    )
+                    if not preparing:
+                        raise WorkspaceCancelled(
+                            "运行在继承父工作区前被管理员取消"
+                        )
                     if parent_workspace is None:
                         raise AgentExecutionError(
                             "工作区继承已开启，但父 Agent 工作目录缺失"
@@ -357,6 +403,11 @@ class AgentExecutor:
                     active_workspace = self.run_workspace_path(
                         configured_repository,
                         reservation.run_id,
+                    )
+                    await asyncio.to_thread(
+                        self.store.set_agent_run_queue_reason,
+                        reservation.run_id,
+                        "repository_lock",
                     )
                     git_admin_lease = ResourceLease(
                         self.store,

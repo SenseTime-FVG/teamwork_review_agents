@@ -147,7 +147,8 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       ...scannerInput,
     },
     runtime: {
-      max_concurrent_agents: 4,
+      max_concurrent_agents: 5,
+      agent_concurrency_limit: 5,
       lock_timeout_seconds: 300,
       lock_ttl_seconds: 120,
       max_sub_agent_depth: 2,
@@ -1287,7 +1288,7 @@ function GlobalEnvironment(props: {
           <Field label="每个仓库每轮最多扫描 MR / PR" type="number" value={Number(props.document.scanner.max_items_per_repository ?? 100)} onChange={(value) => patchSection("scanner", "max_items_per_repository", Number(value))} help="默认 100 条；后台自动分页，并在到达上次成功扫描时间后提前停止" />
           <Field label="配置检测（秒）" type="number" value={Number(props.document.web.config_poll_seconds)} onChange={(value) => patchSection("web", "config_poll_seconds", Number(value))} />
           <Field label="日志保留（天）" type="number" value={Number(props.document.web.log_retention_days)} onChange={(value) => patchSection("web", "log_retention_days", Number(value))} />
-          <Field label="最大并行 Agent" type="number" value={Number(props.document.runtime.max_concurrent_agents)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} />
+          <Field label="全局并发上限" type="number" value={Number(props.document.runtime.max_concurrent_agents ?? 5)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} help="默认 5；与运行时 Agent 并发数取较小值" />
           <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
@@ -1547,6 +1548,13 @@ function CodexRuntimeEditor(props: {
             value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)}
             onChange={(value) => patchRuntime({ agent_idle_timeout_seconds: Number(value) })}
             help="只由 stdout / JSONL 续期，重复 stderr 不会延长"
+          />
+          <Field
+            label="Agent 运行并发数"
+            type="number"
+            value={Number(props.document.runtime.agent_concurrency_limit ?? 5)}
+            onChange={(value) => patchRuntime({ agent_concurrency_limit: Number(value) })}
+            help={`默认 5；与全局并发上限 ${String(props.document.runtime.max_concurrent_agents ?? 5)} 取较小值`}
           />
           <ModelField
             id="runtime-codex-models"
@@ -3319,6 +3327,7 @@ function AgentsEditor(props: {
                 <label className="field"><span>HOME 目录</span><select value={agent.home_mode ?? "inherit"} disabled={agent.sandbox === "read-only"} onChange={(event) => update(name, { home_mode: event.target.value as Agent["home_mode"] })}><option value="inherit">继承系统 HOME</option><option value="temporary">每次运行使用临时 HOME</option></select><small>{agent.sandbox === "read-only" ? "只读沙箱不能提供可写的临时 HOME" : agent.home_mode === "temporary" ? "缓存与用户级配置写入本次运行目录，结束后清理" : "命令继续直接使用启动服务用户的 HOME"}</small></label>
                 <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
+                <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>
               {props.showOverview === false && (
@@ -4313,6 +4322,19 @@ function StatusPill({ value }: { value: string }) {
   return <span className={`status-pill status-${value}`}>{statusLabel(value)}</span>;
 }
 
+function queueReasonLabel(reason?: string | null): string | null {
+  if (!reason) return null;
+  const labels: Record<string, string> = {
+    global_concurrency: "等待全局并发槽",
+    runtime_concurrency: "等待运行时 Agent 并发槽",
+    agent_concurrency: "等待此 Agent 并发槽",
+    change_request_order: "等待同一 PR / MR 前序批次",
+    resource_lock: "等待变更请求或分支资源锁",
+    repository_lock: "等待基础仓库管理锁",
+  };
+  return labels[reason] ?? reason;
+}
+
 function EventStatusPill({ event }: { event: EventRecord }) {
   const labels: Record<string, string> = {
     pending: "待处理",
@@ -4326,6 +4348,9 @@ function EventStatusPill({ event }: { event: EventRecord }) {
   return (
     <span className={`status-pill status-${event.status}`}>
       {labels[event.status] ?? event.status}
+      {event.status === "pending" && queueReasonLabel(event.queue_reason)
+        ? ` · ${queueReasonLabel(event.queue_reason)}`
+        : ""}
     </span>
   );
 }
@@ -4538,7 +4563,11 @@ function RunsView(props: {
                   <small>{run.change_request_title ?? run.resource_key}</small>
                 </span>
                 <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
-                <span><StatusPill value={run.status} />{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
+                <span className="run-status-cell">
+                  <StatusPill value={run.status} />
+                  {run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}
+                  {run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}
+                </span>
                 <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
                 <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
                 <span className="run-row-arrow" aria-hidden="true">›</span>
@@ -4598,6 +4627,7 @@ function RunsView(props: {
                     <dl className="run-metadata">
                       <div><dt>运行 ID</dt><dd>{detail.run_id}</dd></div>
                       <div><dt>触发规则</dt><dd>{detail.rule_name ?? "Sub-agent 调用"}</dd></div>
+                      <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
                       <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                       <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
                       <div><dt>Codex 会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>

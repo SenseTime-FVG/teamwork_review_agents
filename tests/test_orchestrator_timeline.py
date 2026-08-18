@@ -1,9 +1,11 @@
 """Timeline 活动与扫描编排集成测试。"""
 
+import asyncio
+
 from datetime import UTC, datetime, timedelta
 
 from teamwork_review_agents.config import RuleConfig
-from teamwork_review_agents.events import detect_target_branch_event
+from teamwork_review_agents.events import detect_events, detect_target_branch_event
 from teamwork_review_agents.models import (
     AgentResult,
     ChangeRequestActivity,
@@ -739,3 +741,144 @@ async def test_administrator_cancel_keeps_event_terminal(
     assert records["change_request.updated"]["status"] == "unmatched"
     assert orchestrator.store.pending_events() == []
     assert summary.errors == []
+
+
+async def test_different_change_requests_run_concurrently_and_fill_new_capacity(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """长任务运行期间，新入队的其他 PR 应立即使用空闲额度。"""
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="state-review",
+            events=["change_request.closed"],
+            agents=["code-reviewer"],
+        )
+    ]
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    first_old = snapshot_factory(number=41)
+    first_new = snapshot_factory(
+        number=41,
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    first_event = detect_events(first_old, first_new, batch_id="first-batch")[0]
+    orchestrator.store.save_snapshot_and_events(first_new, [first_event])
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_execute(**kwargs):
+        """让第一个 PR 持续运行，并记录第二个 PR 是否及时启动。"""
+
+        event = kwargs["event"]
+        if event.number == 41:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return AgentResult(
+            run_id=f"run-{event.number}",
+            root_run_id=f"run-{event.number}",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    summary = CycleSummary()
+    dispatch = asyncio.create_task(orchestrator.process_events(summary))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    second_old = snapshot_factory(number=42)
+    second_new = snapshot_factory(
+        number=42,
+        state="closed",
+        updated_at="2026-08-17T08:06:00Z",
+    )
+    second_event = detect_events(second_old, second_new, batch_id="second-batch")[0]
+    orchestrator.store.save_snapshot_and_events(second_new, [second_event])
+
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    release_first.set()
+    await asyncio.wait_for(dispatch, timeout=1)
+
+    assert summary.agent_runs == 2
+    assert {item["status"] for item in orchestrator.store.list_events()} == {
+        "completed"
+    }
+
+
+async def test_batches_for_same_change_request_keep_event_order(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """同一 PR 的后续批次必须等待前序 Agent 完成。"""
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="state-review",
+            events=["change_request.closed", "change_request.reopened"],
+            agents=["code-reviewer"],
+        )
+    ]
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    opened = snapshot_factory(number=43)
+    closed = snapshot_factory(
+        number=43,
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    reopened = snapshot_factory(
+        number=43,
+        state="opened",
+        updated_at="2026-08-17T08:06:00Z",
+    )
+    closed_event = detect_events(opened, closed, batch_id="close-batch")[0]
+    reopened_event = detect_events(closed, reopened, batch_id="reopen-batch")[0]
+    orchestrator.store.save_snapshot_and_events(closed, [closed_event])
+    orchestrator.store.save_snapshot_and_events(reopened, [reopened_event])
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    actions: list[str] = []
+
+    async def fake_execute(**kwargs):
+        """阻塞关闭事件，确保重新打开事件不会越过它。"""
+
+        action = kwargs["actions"][0]
+        actions.append(action)
+        if action == "change_request.closed":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return AgentResult(
+            run_id=f"run-{len(actions)}",
+            root_run_id=f"run-{len(actions)}",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    dispatch = asyncio.create_task(orchestrator.process_events(CycleSummary()))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.sleep(0.1)
+    assert not second_started.is_set()
+    waiting = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert waiting["change_request.reopened"]["queue_reason"] == (
+        "change_request_order"
+    )
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    await asyncio.wait_for(dispatch, timeout=1)
+    assert actions == ["change_request.closed", "change_request.reopened"]

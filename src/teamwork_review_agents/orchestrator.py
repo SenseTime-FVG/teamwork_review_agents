@@ -111,7 +111,6 @@ class Orchestrator:
             self.store.recover_interrupted_work()
         self.executor = AgentExecutor(config, self.store)
         self.preflight = PreflightExecutor(config, self.store)
-        self.agent_semaphore = asyncio.Semaphore(config.runtime.max_concurrent_agents)
         self._shutdown_requested = False
 
     async def request_shutdown(self) -> list[str]:
@@ -452,23 +451,31 @@ class Orchestrator:
         self,
         invocation: RuleInvocation,
     ) -> AgentResult | None:
-        """在全局并发额度内执行一条规则产生的 Agent 任务。"""
+        """执行一条规则产生的 Agent 任务，额度由执行器持久化申请。"""
 
         event = invocation.events[0]
-        async with self.agent_semaphore:
-            return await self.executor.execute(
-                agent_name=invocation.agent_name,
-                event=event,
-                actions=invocation.actions,
-                rule_name=invocation.rule.name,
-                inherit_workspace=invocation.rule.inherit_workspace,
-                idempotency_key=invocation.idempotency_key,
-            )
+        return await self.executor.execute(
+            agent_name=invocation.agent_name,
+            event=event,
+            actions=invocation.actions,
+            rule_name=invocation.rule.name,
+            inherit_workspace=invocation.rule.inherit_workspace,
+            idempotency_key=invocation.idempotency_key,
+        )
 
-    async def process_events(self, summary: CycleSummary) -> None:
-        """领取事件、匹配规则并等待所有目标 Agent 完成。"""
+    async def _process_resource_events(
+        self,
+        summary: CycleSummary,
+        resource: tuple[str, int],
+    ) -> str | None:
+        """按批次顺序处理单个 PR / MR 当前已经入队的事件。"""
 
-        events = await asyncio.to_thread(self.store.pending_events)
+        events = await asyncio.to_thread(
+            self.store.pending_events_for_resource,
+            resource[0],
+            resource[1],
+            max_attempts=self.config.runtime.event_retry_count + 1,
+        )
         max_attempts = self.config.runtime.event_retry_count + 1
         batches: dict[tuple[str, int, str], list[ChangeEvent]] = {}
         for event in events:
@@ -479,7 +486,21 @@ class Orchestrator:
             )
             batches.setdefault(batch_key, []).append(event)
 
-        for batch_events in batches.values():
+        ordered_batches = list(batches.values())
+        if len(ordered_batches) > 1:
+            await asyncio.to_thread(
+                self.store.set_event_queue_reason,
+                (
+                    event.id
+                    for batch_events in ordered_batches[1:]
+                    for event in batch_events
+                ),
+                "change_request_order",
+            )
+
+        for batch_events in ordered_batches:
+            service_interrupted = False
+            retry_deferred = False
             claimed_events: list[ChangeEvent] = []
             for event in batch_events:
                 claimed = await asyncio.to_thread(
@@ -668,6 +689,7 @@ class Orchestrator:
                         self.store.release_event_after_service_shutdown,
                         event.id,
                     )
+                    service_interrupted = True
                     continue
                 if event.id in administrator_cancelled_event_ids:
                     await asyncio.to_thread(
@@ -688,6 +710,7 @@ class Orchestrator:
                     continue
                 if error:
                     summary.errors.append(f"处理事件 {event.id} 失败：{error}")
+                    retry_deferred = True
                 await asyncio.to_thread(self.store.finish_event, event.id, error=error)
                 if error is None:
                     await asyncio.to_thread(
@@ -695,6 +718,74 @@ class Orchestrator:
                         event.id,
                     )
                 summary.processed_events += 1
+            if service_interrupted:
+                return "service_shutdown"
+            if retry_deferred:
+                return "retry"
+        return None
+
+    async def process_events(self, summary: CycleSummary) -> None:
+        """并发处理不同 PR / MR，并在活动期间持续补充新事件。"""
+
+        active: dict[tuple[str, int], asyncio.Task[str | None]] = {}
+        max_attempts = self.config.runtime.event_retry_count + 1
+        stop_scheduling = False
+        deferred_resources: set[tuple[str, int]] = set()
+        while not self._shutdown_requested:
+            resources = []
+            if not stop_scheduling:
+                resources = await asyncio.to_thread(
+                    self.store.pending_event_resources,
+                    max_attempts,
+                )
+            for resource in resources:
+                if resource in deferred_resources:
+                    continue
+                if resource in active:
+                    waiting_events = await asyncio.to_thread(
+                        self.store.pending_events_for_resource,
+                        resource[0],
+                        resource[1],
+                        max_attempts=max_attempts,
+                    )
+                    await asyncio.to_thread(
+                        self.store.set_event_queue_reason,
+                        (event.id for event in waiting_events),
+                        "change_request_order",
+                    )
+                    continue
+                active[resource] = asyncio.create_task(
+                    self._process_resource_events(summary, resource),
+                    name=f"event-dispatch-{resource[0]}-{resource[1]}",
+                )
+
+            if not active:
+                return
+            done, _ = await asyncio.wait(
+                tuple(active.values()),
+                timeout=0.25,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for resource, task in tuple(active.items()):
+                if task not in done:
+                    continue
+                active.pop(resource, None)
+                try:
+                    outcome = await task
+                    if outcome == "service_shutdown":
+                        stop_scheduling = True
+                    elif outcome == "retry":
+                        deferred_resources.add(resource)
+                except Exception as exc:
+                    deferred_resources.add(resource)
+                    summary.errors.append(
+                        f"处理 {resource[0]} #{resource[1]} 的事件队列失败：{exc}"
+                    )
+            if stop_scheduling and not active:
+                return
+
+        if active:
+            await asyncio.gather(*active.values(), return_exceptions=True)
 
     async def run_once(self, *, dry_run: bool = False) -> CycleSummary:
         """执行一次完整扫描；dry-run 时保留事件但不启动 Agent。"""
