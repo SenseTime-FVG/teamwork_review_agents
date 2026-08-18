@@ -267,3 +267,15 @@
 - 扩展运行摘要 API 与前端类型，补充仓库 ID 和 MR / PR 编号，并更新 README、后端测试和静态构建产物。
 
 验收：运行页默认只显示易扫描的全宽列表；点击任意运行后详情从右侧滑入且可完整关闭；Agent 回复按 Markdown 消息显示，命令与工具细节默认折叠，错误醒目且重复项合并；实时日志不会在用户查看历史时强制滚动；原始事件、Prompt、环境和工作区信息仍可查看且敏感值保持脱敏。
+
+## 阶段二十七：分离 Agent 文件权限与命令联网权限
+
+- 为 Agent 增加 `network_access` 和 `network_domains`，默认禁止命令联网，并对域名、沙箱组合和重复项进行配置校验。
+- 将 `workspace-write` 联网状态转换为 `sandbox_workspace_write.network_access`；白名单为空时关闭网络代理，非空时启用 `features.network_proxy` 并生成域名允许映射。
+- 将联网参数纳入应用托管配置，禁止运行时高级配置覆盖命令联网和网络代理安全边界。
+- 在 Agent 页面把“本地文件权限”与“命令联网权限”分区展示，按 `read-only`、`workspace-write` 和 `danger-full-access` 说明能力差异，并提供可选域名白名单编辑。
+- 保持 Provider Token 从 Codex 子进程环境移除，同时保留 `HOME`，让 `gh` / `glab` 仅使用各自的系统钥匙串或 CLI 登录态。
+- 将内置通用审核 Agent 默认设置为允许命令联网且白名单为空，不为其施加域名限制。
+- 更新完整配置示例、README、前后端类型、回归测试和静态构建产物。
+
+验收：`workspace-write` 默认不能联网；开启且无白名单时 `gh` 可通过自身登录态访问公开网络；配置白名单时非允许域名由 Codex 网络代理阻止；`read-only` 不能误开启联网，`danger-full-access` 不把白名单显示为有效隔离；Provider Token 在所有组合下都不会进入 Codex 环境；内置审核 Agent 默认联网且不受域名白名单约束。

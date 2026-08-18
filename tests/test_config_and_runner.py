@@ -8,6 +8,7 @@ import pytest
 from teamwork_review_agents.codex_runner import CodexRunner
 from teamwork_review_agents.cli import _server_settings, build_parser
 from teamwork_review_agents.config import (
+    AgentConfig,
     CodexRuntimeConfig,
     RepositoryConfig,
     ScannerConfig,
@@ -127,6 +128,9 @@ def test_example_config_is_valid() -> None:
     assert config.scanner.api_page_size == 50
     assert config.runtime.worktree_retention_days == 7
     assert config.runtime.codex.fast_mode == "inherit"
+    assert config.agents["general-reviewer"].network_access is True
+    assert config.agents["general-reviewer"].network_domains == []
+    assert config.agents["incremental-doc-updater"].network_access is False
 
 
 def test_scanner_migrates_legacy_pagination_settings() -> None:
@@ -164,6 +168,7 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     monkeypatch.setenv("GITHUB_TOKEN", "不应进入 Codex")
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
     monkeypatch.setenv("CODEX_API_KEY", "Codex 自身凭据")
+    monkeypatch.setenv("HOME", "/tmp/gh-keychain-home")
     environment = CodexRunner(config).child_environment(
         {
             "GITHUB_TOKEN": "Agent 环境也不能重新注入",
@@ -173,7 +178,122 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     assert "GITHUB_TOKEN" not in environment
     assert "GITLAB_TOKEN" not in environment
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
+    assert environment["HOME"] == "/tmp/gh-keychain-home"
     assert environment["VISIBLE_AGENT_VALUE"] == "允许进入 Codex"
+
+
+def test_agent_network_domains_are_normalized_and_validated() -> None:
+    """域名白名单应去重规范化，并拒绝无法安全转换的值。"""
+
+    agent = AgentConfig.model_validate(
+        {
+            "prompt": "测试",
+            "sandbox": "workspace-write",
+            "network_access": True,
+            "network_domains": ["API.GitHub.com", "api.github.com", "*.GitHub.com"],
+        }
+    )
+    assert agent.network_domains == ["api.github.com", "*.github.com"]
+
+    invalid_domains = (
+        "https://api.github.com",
+        "api.github.com:443",
+        "*",
+        "github.com/path",
+    )
+    for domain in invalid_domains:
+        with pytest.raises(ValueError, match="命令联网域名"):
+            AgentConfig.model_validate(
+                {
+                    "prompt": "测试",
+                    "sandbox": "workspace-write",
+                    "network_access": True,
+                    "network_domains": [domain],
+                }
+            )
+
+
+def test_agent_network_access_rejects_unsupported_sandbox_combinations() -> None:
+    """只读模式不能开放命令联网，完全访问也不能伪装成域名隔离。"""
+
+    with pytest.raises(ValueError, match="read-only"):
+        AgentConfig.model_validate(
+            {"prompt": "测试", "sandbox": "read-only", "network_access": True}
+        )
+    with pytest.raises(ValueError, match="danger-full-access"):
+        AgentConfig.model_validate(
+            {
+                "prompt": "测试",
+                "sandbox": "danger-full-access",
+                "network_access": True,
+                "network_domains": ["api.github.com"],
+            }
+        )
+    danger = AgentConfig.model_validate(
+        {"prompt": "测试", "sandbox": "danger-full-access"}
+    )
+    assert danger.network_access is True
+
+
+def test_runner_builds_agent_network_overrides(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """Runner 应把命令联网和可选域名白名单转换为应用托管覆盖。"""
+
+    config = configured_app_factory()
+    agent = config.agents["code-reviewer"]
+    agent.sandbox = "workspace-write"
+    agent.network_access = True
+    agent.network_domains = ["api.github.com", "*.github.com"]
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-network",
+        root_run_id="run-network",
+        event=event,
+    )
+    command = CodexRunner(config).build_command(agent, repository, context)
+    overrides = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+
+    assert "sandbox_workspace_write.network_access=true" in overrides
+    assert "features.network_proxy.enabled=true" in overrides
+    assert (
+        'features.network_proxy.domains={ "api.github.com" = "allow", '
+        '"*.github.com" = "allow" }'
+    ) in overrides
+
+    agent.network_domains = []
+    command = CodexRunner(config).build_command(agent, repository, context)
+    overrides = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+    assert "sandbox_workspace_write.network_access=true" in overrides
+    assert "features.network_proxy.enabled=false" in overrides
+
+    agent.network_access = False
+    command = CodexRunner(config).build_command(agent, repository, context)
+    overrides = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+    assert "sandbox_workspace_write.network_access=false" in overrides
+    assert "features.network_proxy.enabled=false" in overrides
 
 
 def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_factory) -> None:
@@ -321,6 +441,9 @@ def test_codex_advanced_config_protects_managed_keys() -> None:
         "approval_policy",
         "model_provider",
         "mcp_servers.untrusted.command",
+        "sandbox_workspace_write",
+        "features.network_proxy",
+        "features.network_proxy.enabled",
         "shell_environment_policy.include_only",
         "skills.config",
     ):

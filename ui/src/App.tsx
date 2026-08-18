@@ -241,19 +241,53 @@ function CommitField(props: {
   );
 }
 
-function Toggle(props: { label: string; checked: boolean; onChange: (value: boolean) => void }) {
+function Toggle(props: { label: string; checked: boolean; disabled?: boolean; onChange: (value: boolean) => void }) {
   return (
-    <label className="toggle-row">
+    <label className={`toggle-row ${props.disabled ? "disabled" : ""}`}>
       <button
         type="button"
         role="switch"
         aria-checked={props.checked}
+        disabled={props.disabled}
         className={`toggle ${props.checked ? "active" : ""}`}
         onClick={() => props.onChange(!props.checked)}
       >
         <span />
       </button>
       {props.label}
+    </label>
+  );
+}
+
+function NetworkDomainsField(props: {
+  value: string[];
+  onChange: (value: string[]) => void;
+}) {
+  const serialized = props.value.join("\n");
+  const [draft, setDraft] = useState(serialized);
+  useEffect(() => setDraft(serialized), [serialized]);
+  function apply() {
+    const domains = Array.from(new Set(
+      draft
+        .split(/[\n,]/)
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
+    ));
+    props.onChange(domains);
+    setDraft(domains.join("\n"));
+  }
+  return (
+    <label className="field network-domain-field">
+      <span>可选域名白名单</span>
+      <textarea
+        className="mono"
+        rows={4}
+        value={draft}
+        placeholder={"api.github.com\n*.github.com\n**.example.com"}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={apply}
+      />
+      <small>每行或逗号分隔一个域名；留空表示不限制目标域名。</small>
     </label>
   );
 }
@@ -1457,7 +1491,7 @@ function AgentsEditor(props: {
           let index = names.length + 1;
           let name = `agent-${index}`;
           while (props.document.agents[name]) name = `agent-${++index}`;
-          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { prompt: "请处理当前 MR / PR。", sandbox: "read-only", timeout_seconds: 1200, write_scopes: [], allowed_sub_agents: [], skills: [], environment: {} } } });
+          props.onChange({ ...props.document, agents: { ...props.document.agents, [name]: { prompt: "请处理当前 MR / PR。", sandbox: "read-only", network_access: false, network_domains: [], timeout_seconds: 1200, write_scopes: [], allowed_sub_agents: [], skills: [], environment: {} } } });
         }}>+ 添加 Agent</button>
       </div>
       <div className="agent-workspace-note">
@@ -1517,7 +1551,16 @@ function AgentsEditor(props: {
                   const nextScopes = sandbox === "read-only"
                     ? writeScopes.filter((scope) => scope !== "workspace")
                     : Array.from(new Set([...writeScopes, "workspace"]));
-                  update(name, { sandbox, write_scopes: nextScopes as Agent["write_scopes"] });
+                  update(name, {
+                    sandbox,
+                    write_scopes: nextScopes as Agent["write_scopes"],
+                    network_access: sandbox === "danger-full-access"
+                      ? true
+                      : sandbox === "read-only" || agent.sandbox === "danger-full-access"
+                        ? false
+                        : agent.network_access ?? false,
+                    network_domains: sandbox === "workspace-write" ? agent.network_domains ?? [] : [],
+                  });
                 }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件</option><option value="danger-full-access">完全访问：高风险</option></select><small>切换为可写模式时会自动启用“本地仓库写操作”</small></label>
                 <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
@@ -1581,6 +1624,40 @@ function AgentsEditor(props: {
                   ]}
                 />
               </div>
+              <section className="network-permission-section">
+                <div className="network-permission-head">
+                  <div>
+                    <strong>命令联网权限</strong>
+                    <p>控制 shell、gh、glab 等命令访问网络，与上面的联网搜索设置相互独立。</p>
+                  </div>
+                  <Toggle
+                    label={agent.sandbox === "danger-full-access" ? "网络不受沙箱限制" : "允许命令联网"}
+                    checked={agent.sandbox === "danger-full-access" || (agent.network_access ?? false)}
+                    disabled={agent.sandbox !== "workspace-write"}
+                    onChange={(network_access) => update(name, {
+                      network_access,
+                      network_domains: network_access ? agent.network_domains ?? [] : [],
+                    })}
+                  />
+                </div>
+                {agent.sandbox === "workspace-write" && agent.network_access ? (
+                  <NetworkDomainsField
+                    value={agent.network_domains ?? []}
+                    onChange={(network_domains) => update(name, { network_domains })}
+                  />
+                ) : (
+                  <p className="network-permission-state">
+                    {agent.sandbox === "read-only"
+                      ? "只读沙箱不支持通过本配置开放命令联网。"
+                      : agent.sandbox === "danger-full-access"
+                        ? "完全访问模式本身允许联网，域名白名单无法形成可靠隔离。"
+                        : "命令联网已关闭。"}
+                  </p>
+                )}
+                <p className="network-credential-note">
+                  Provider Token 始终不会进入 Codex；gh / glab 只使用当前系统钥匙串或各自 CLI 登录态。
+                </p>
+              </section>
               <div className="permissions-grid">
                 <ChoiceCards
                   title="写操作声明"
@@ -1597,6 +1674,8 @@ function AgentsEditor(props: {
                       sandbox: hasWorkspace
                         ? agent.sandbox === "danger-full-access" ? "danger-full-access" : "workspace-write"
                         : "read-only",
+                      network_access: hasWorkspace ? agent.network_access ?? false : false,
+                      network_domains: hasWorkspace ? agent.network_domains ?? [] : [],
                     });
                   }}
                 />

@@ -181,6 +181,10 @@ agents:
     # read-only：本地只读；workspace-write：工作区可写；
     # danger-full-access：完全访问。
     sandbox: workspace-write
+    # 命令联网与本地文件权限分开控制。审核 Agent 默认允许联网，便于 gh 使用
+    # 自己的系统钥匙串登录态；空白名单表示不限制目标域名。
+    network_access: true
+    network_domains: []
     # 单次 Codex CLI 运行最长秒数。
     timeout_seconds: 1200
     # 可选：覆盖 runtime.agent_idle_timeout_seconds；连续无进展时提前结束。
@@ -200,6 +204,8 @@ agents:
   incremental-doc-update-runner:
     prompt_file: ./prompts/增量文档更新入口.md
     sandbox: workspace-write
+    network_access: false
+    network_domains: []
     timeout_seconds: 1200
     write_scopes:
       - workspace
@@ -218,6 +224,8 @@ agents:
   incremental-doc-updater:
     prompt_file: ./prompts/增量文档更新.md
     sandbox: workspace-write
+    network_access: false
+    network_domains: []
     timeout_seconds: 1200
     write_scopes:
       - workspace

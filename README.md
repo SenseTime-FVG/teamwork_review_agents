@@ -208,6 +208,26 @@ runtime:
 
 实际合并顺序是 Codex 用户/仓库配置 → Teamwork 运行时默认 → 当前 Agent 显式覆盖 → 应用托管的 Sandbox、MCP 网关和 Skill 参数。后面的值覆盖前面的值。Agent 页的对应字段全部可留空；sub-agent 使用目标 Agent 自己的配置，不继承父 Agent 的模型或推理参数。
 
+### Agent 命令联网权限
+
+Agent 页把“本地文件权限”和“命令联网权限”分开配置。`sandbox` 决定本地文件能否修改；`network_access` 决定 `workspace-write` 沙箱里的 shell、`gh`、`glab` 等命令能否联网，它与 `web_search` 联网搜索不是同一个能力：
+
+```yaml
+agents:
+  reviewer:
+    prompt_file: ./prompts/general-review.md
+    sandbox: workspace-write
+    network_access: true
+    # 留空表示不限制目标域名；非空时通过 Codex 网络代理执行白名单。
+    network_domains:
+      - api.github.com
+      - "*.github.com"
+```
+
+`workspace-write` 默认禁止命令联网。开启联网且 `network_domains` 为空时允许直接访问公开网络；配置白名单后只允许精确域名、`*.example.com` 或 `**.example.com`。`read-only` 不能通过该开关开放网络；`danger-full-access` 本身不隔离网络，因此域名白名单不能作为有效保护。Teamwork 会显式覆盖这些参数，并禁止 `runtime.codex.extra_config` 绕过它们。该行为对应 [OpenAI 对 Codex 命令网络访问和网络代理的说明](https://learn.chatgpt.com/docs/agent-approvals-security#network-access)。
+
+开启联网不会把 Provider Token 交给 Agent。所有 Provider `token_env` 仍会在创建 Codex 子进程前强制移除；子进程只继承宿主机 `HOME` 等基础环境，因此 `gh` / `glab` 使用各自已经建立的系统钥匙串或 CLI 登录态。可以先在运行服务的同一用户下执行 `gh auth status` 或 `glab auth status` 核验登录，不需要也不应把 Provider Token 重新配置到 Agent 环境变量中。内置 `general-reviewer` 默认开启命令联网并保持域名白名单为空；其他内置 Agent 默认关闭。
+
 后台运行默认把用户配置中的 MCP Server 逐个设为禁用，只保留 Teamwork 自己的 `invoke_agent` 网关和 `allowed_user_mcp_servers` 明确列出的服务。这样不会因为用户桌面环境中配置了浏览器、Computer Use 或应用内工具，就让无人值守 Agent 卡在等待交互的工具调用上。如果确实需要继承全部用户 MCP，可以显式设置 `inherit_user_mcp_servers: true`，但这会重新引入无人值守运行风险。
 
 `codex_home` 留空时继续使用服务进程当前的 `CODEX_HOME` 或 `~/.codex`。配置独立目录可以隔离 `config.toml`、登录状态与 `models_cache.json`，但首次使用前必须先为该目录完成 Codex 登录。`expected_codex_version` 用来固定后台实际执行的 CLI 版本；服务会在启动 Agent 前调用 `codex --version`，不匹配时立即失败并显示实际路径、实际版本和缓存版本诊断，而不是让多个版本反复覆盖同一个模型缓存。
@@ -218,7 +238,7 @@ Agent 的 `timeout_seconds` 是单次运行总时长上限；`runtime.agent_idle
 
 模型候选来自服务端当前 `codex_binary` 的本机模型目录。读取失败时仍可手工填写模型 ID。Agent 模型留空时，界面会优先显示具体的 Teamwork 运行时模型，其次显示 `~/.codex/config.toml` 中可读取的模型；如果两处都没有固定模型，则明确显示“由 Codex CLI / 账号默认决定”，不会猜测一个可能变化的模型。不同仓库里的 `.codex/config.toml` 仍可能影响没有被更高层覆盖的运行。
 
-`extra_config` 的键使用 Codex `config.toml` 点号格式，值支持字符串、数字、布尔值和简单数组。模型结构化字段请使用上方专门配置；Sandbox、审批策略、MCP、Skill 和其他应用托管边界禁止通过高级配置覆盖。“快速模式”会把 Codex `service_tier` 设为 `fast`，“标准模式”设为 `default`；快速档位是否可用以及相应的用量倍率由当前模型和账号决定。
+`extra_config` 的键使用 Codex `config.toml` 点号格式，值支持字符串、数字、布尔值和简单数组。模型结构化字段请使用上方专门配置；Sandbox、命令联网、网络代理、审批策略、MCP、Skill 和其他应用托管边界禁止通过高级配置覆盖。“快速模式”会把 Codex `service_tier` 设为 `fast`，“标准模式”设为 `default`；快速档位是否可用以及相应的用量倍率由当前模型和账号决定。
 
 ## Agent 与 sub-agent
 

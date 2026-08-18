@@ -28,6 +28,8 @@ export type Agent = {
   personality?: "none" | "friendly" | "pragmatic";
   web_search?: "disabled" | "cached" | "live";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  network_access?: boolean;
+  network_domains?: string[];
   timeout_seconds?: number;
   idle_timeout_seconds?: number;
   write_scopes?: Array<"change_request" | "workspace">;

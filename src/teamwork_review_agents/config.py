@@ -35,7 +35,9 @@ CODEX_MANAGED_CONFIG_KEYS = {
     "openai_base_url",
     "profile",
     "sandbox_mode",
+    "sandbox_workspace_write",
     "shell_environment_policy",
+    "features.network_proxy",
 }
 CODEX_MANAGED_CONFIG_PREFIXES = (
     "agents.",
@@ -46,6 +48,7 @@ CODEX_MANAGED_CONFIG_PREFIXES = (
     "profiles.",
     "model_providers.",
     "otel.",
+    "features.network_proxy.",
     "sandbox_workspace_write.",
     "shell_environment_policy.",
 )
@@ -272,6 +275,8 @@ class AgentConfig(BaseModel):
     personality: Literal["none", "friendly", "pragmatic"] | None = None
     web_search: Literal["disabled", "cached", "live"] | None = None
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
+    network_access: bool = False
+    network_domains: list[str] = Field(default_factory=list)
     timeout_seconds: PositiveInt = 1200
     idle_timeout_seconds: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
@@ -282,12 +287,55 @@ class AgentConfig(BaseModel):
     extra_codex_args: list[str] = Field(default_factory=list)
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
 
+    @field_validator("network_domains")
+    @classmethod
+    def validate_network_domains(cls, value: list[str]) -> list[str]:
+        """规范化命令联网域名，并拒绝 URL、端口和过宽通配符。"""
+
+        domains: list[str] = []
+        seen: set[str] = set()
+        domain_pattern = re.compile(
+            r"(?:(?:\*\*|\*)\.)?"
+            r"(?=.{1,253}$)"
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        )
+        for raw_domain in value:
+            domain = raw_domain.strip().lower()
+            if not domain or domain_pattern.fullmatch(domain) is None:
+                raise ValueError(
+                    "命令联网域名必须是主机名、*.example.com 或 **.example.com，"
+                    f"不能包含协议、端口或路径：{raw_domain!r}"
+                )
+            if domain not in seen:
+                seen.add(domain)
+                domains.append(domain)
+        return domains
+
     @model_validator(mode="after")
     def validate_prompt_source(self) -> "AgentConfig":
         """要求 Agent 恰好配置一种 Prompt 来源。"""
 
         if bool(self.prompt_file) == bool(self.prompt):
             raise ValueError("Agent 必须且只能配置 prompt_file 或 prompt")
+        return self
+
+    @model_validator(mode="after")
+    def validate_network_access(self) -> "AgentConfig":
+        """校验命令联网与本地沙箱之间可实际执行的组合。"""
+
+        if self.network_domains and not self.network_access:
+            raise ValueError("配置命令联网域名白名单前必须先允许命令联网")
+        if self.sandbox == "read-only" and self.network_access:
+            raise ValueError("read-only 沙箱不能通过 Agent 配置允许命令联网")
+        if self.sandbox == "danger-full-access":
+            if self.network_domains:
+                raise ValueError(
+                    "danger-full-access 的网络不受域名白名单保护，"
+                    "不能配置 network_domains"
+                )
+            # 完全访问沙箱本身不隔离网络，统一记录为真实的有效状态。
+            self.network_access = True
         return self
 
 

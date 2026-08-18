@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .codex_settings import (
+    agent_network_overrides,
     agent_overrides,
     codex_home,
     read_user_mcp_servers,
@@ -157,6 +158,7 @@ class CodexRunner:
         overrides = [
             *runtime_overrides(self.config.runtime.codex),
             *agent_overrides(agent),
+            *agent_network_overrides(agent),
             f"mcp_servers.{server_name}.command={_toml_string(sys.executable)}",
             f"mcp_servers.{server_name}.args={json.dumps(mcp_args)}",
             f"mcp_servers.{server_name}.required=true",

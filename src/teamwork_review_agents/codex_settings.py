@@ -67,6 +67,31 @@ def agent_overrides(settings: AgentConfig) -> list[str]:
     return _common_overrides(settings)
 
 
+def agent_network_overrides(settings: AgentConfig) -> list[str]:
+    """生成 workspace-write 沙箱的命令联网与域名代理覆盖。"""
+
+    if settings.sandbox != "workspace-write":
+        return []
+    overrides = [
+        "sandbox_workspace_write.network_access="
+        f"{toml_value(settings.network_access)}",
+    ]
+    if not settings.network_access or not settings.network_domains:
+        overrides.append("features.network_proxy.enabled=false")
+        return overrides
+    domains = ", ".join(
+        f"{toml_value(domain)} = \"allow\""
+        for domain in settings.network_domains
+    )
+    overrides.extend(
+        [
+            "features.network_proxy.enabled=true",
+            f"features.network_proxy.domains={{ {domains} }}",
+        ]
+    )
+    return overrides
+
+
 def codex_home(configured: Path | None = None) -> Path:
     """返回后台运行实际使用的 Codex 配置目录。"""
 
