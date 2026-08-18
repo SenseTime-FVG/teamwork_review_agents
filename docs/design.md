@@ -461,7 +461,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 单实例锁使用跨平台文件锁库，不在模块导入阶段依赖 Windows 不存在的 `fcntl`。进程身份、启动时间、存活状态和托管进程发现统一使用跨平台进程库读取，不调用 `ps` 或解析平台相关命令行文本；PID 文件继续同时记录 PID 与启动时间，防止 PID 复用导致误停止。升级前生成的旧 PID 记录如果无法匹配新格式，进程发现仍应根据完整 Python 模块命令和配置绝对路径找回实例。
 
-所有需要携带后代进程的命令统一通过进程控制模块创建。POSIX 保持新会话和进程组语义，温和终止使用 `SIGTERM`，强制终止使用 `SIGKILL`；Windows 使用新的进程组，后台服务额外使用脱离终端标志，并通过进程树枚举终止服务、Codex、Git、SSH、`index-pack`、App Server 和 Preflight 后代。Windows 没有与 POSIX 完全等价且适用于脱离终端进程的 `SIGTERM`，因此停止阶段使用系统终止进程树并继续等待真实退出；状态恢复和工作区安全保留不得依赖信号名称。
+所有需要携带后代进程的命令统一通过进程控制模块创建。POSIX 保持新会话和进程组语义，温和终止使用 `SIGTERM`，强制终止使用 `SIGKILL`；Windows 使用新的进程组，后台服务额外使用脱离终端标志，并通过系统父 PID 关系递归枚举服务、Codex、Git、SSH、`index-pack`、App Server 和 Preflight 后代，即使直接父进程刚刚退出也继续回收仍存活的后代。Windows 没有与 POSIX 完全等价且适用于脱离终端进程的 `SIGTERM`，因此停止阶段使用系统终止进程树并继续等待真实退出；状态恢复和工作区安全保留不得依赖信号名称。Git、Codex 诊断和 CLI 捕获的文本统一按 UTF-8 解码并安全替换非法字节；Preflight 为 Python 子命令显式设置 UTF-8 环境，避免 Windows 本地代码页把中文输出误判为命令失败。
 
 Windows CI 至少安装项目并在真实 Windows runner 上执行 CLI 导入、配置校验、后台启动、重复启动、停止、重启、进程发现和进程树终止测试。Linux/macOS 的现有全量测试继续验证 POSIX 行为。systemd 与 launchd 模板仍只适用于各自平台；Windows 长期部署可让 Windows 服务管理器或任务计划程序执行前台 `teamwork-review-agents run`，项目内置的 `start` 适用于本机后台运行。
 

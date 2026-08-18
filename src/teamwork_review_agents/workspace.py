@@ -199,6 +199,8 @@ def _run_git(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             **process_group_options(),
         )
     except OSError as exc:

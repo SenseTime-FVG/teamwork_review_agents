@@ -83,6 +83,42 @@ def iter_process_commands() -> list[tuple[int, list[str], str]]:
     return processes
 
 
+def _windows_process_targets(pid: int, *, tree: bool) -> list[psutil.Process]:
+    """返回 Windows 目标进程，并找回直接父进程已退出的后代。"""
+
+    try:
+        root = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        root = None
+    if not tree:
+        return [root] if root is not None else []
+
+    children_by_parent: dict[int, list[psutil.Process]] = {}
+    for process in psutil.process_iter(["pid", "ppid"]):
+        try:
+            parent_pid = int(process.info["ppid"])
+        except (KeyError, TypeError, ValueError, psutil.Error):
+            continue
+        children_by_parent.setdefault(parent_pid, []).append(process)
+
+    descendants: list[psutil.Process] = []
+    pending = [pid]
+    seen = {pid}
+    while pending:
+        parent_pid = pending.pop()
+        for child in children_by_parent.get(parent_pid, []):
+            if child.pid in seen:
+                continue
+            seen.add(child.pid)
+            descendants.append(child)
+            pending.append(child.pid)
+
+    targets = list(reversed(descendants))
+    if root is not None:
+        targets.append(root)
+    return targets
+
+
 def terminate_process(
     pid: int,
     *,
@@ -101,15 +137,7 @@ def terminate_process(
             os.kill(pid, target_signal)
         return
 
-    try:
-        root = psutil.Process(pid)
-        descendants = root.children(recursive=True) if tree else []
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return
-    except psutil.AccessDenied as exc:
-        raise PermissionError(f"无权读取进程 PID {pid}") from exc
-
-    targets = [*reversed(descendants), root]
+    targets = _windows_process_targets(pid, tree=tree)
     denied: list[int] = []
     for process in targets:
         try:

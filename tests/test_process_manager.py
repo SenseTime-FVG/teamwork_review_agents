@@ -202,6 +202,8 @@ def test_restart_replaces_process_after_runtime_files_are_moved(tmp_path) -> Non
             cwd=tmp_path,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=30,
         )

@@ -77,3 +77,34 @@ def test_terminate_process_reclaims_descendant_tree(tmp_path) -> None:
             parent.wait(timeout=5)
         if child_pid and pid_exists(child_pid):
             terminate_process(child_pid, force=True, tree=False)
+
+
+def test_terminate_process_finds_descendant_after_parent_exits(tmp_path) -> None:
+    """直接父进程退出后仍应按原父 PID 找回并结束后代。"""
+
+    child_pid_file = tmp_path / "orphan-child.pid"
+    parent_code = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
+        "open(sys.argv[1],'w',encoding='utf-8').write(str(child.pid))"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code, str(child_pid_file)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **process_group_options(),
+    )
+    child_pid = 0
+    try:
+        parent.wait(timeout=5)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+
+        terminate_process(parent.pid, force=True, tree=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and pid_exists(child_pid):
+            time.sleep(0.05)
+        assert not pid_exists(child_pid)
+    finally:
+        if child_pid and pid_exists(child_pid):
+            terminate_process(child_pid, force=True, tree=False)

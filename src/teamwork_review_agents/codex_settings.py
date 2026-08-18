@@ -271,6 +271,8 @@ def inspect_codex_binary(
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             env=_codex_environment(home),
         )
@@ -339,6 +341,8 @@ def read_bundled_models(
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=8,
             env=_codex_environment(home),
         )

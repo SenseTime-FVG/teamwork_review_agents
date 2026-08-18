@@ -196,6 +196,8 @@ def test_preflight_environment_excludes_host_credentials(monkeypatch, tmp_path) 
 
     assert environment["PATH"] == "/safe/bin"
     assert environment["HOME"] == str(tmp_path)
+    assert environment["PYTHONUTF8"] == "1"
+    assert environment["PYTHONIOENCODING"] == "utf-8"
     assert "GITHUB_TOKEN" not in environment
     assert "CODEX_API_KEY" not in environment
     assert "OPENAI_API_KEY" not in environment

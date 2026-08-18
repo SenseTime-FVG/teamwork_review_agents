@@ -481,6 +481,8 @@
 - 改造后台服务、Codex Runner、Codex App Server、Git 工作区和 Preflight，使启动、取消、超时与停止在 Windows 上不调用 `os.killpg`、`SIGKILL` 或 `start_new_session`。
 - README 增加 PowerShell 快速开始和 Windows 运行说明，运维文档区分 POSIX 信号与 Windows 进程树终止，并说明 Bash 脚本和 systemd/launchd 的平台边界。
 - CLI 入口统一配置 UTF-8 标准流，避免 Windows 重定向输出使用本地代码页时因中文消息启动失败。
+- 捕获 Git 与 Codex 诊断输出时显式使用 UTF-8 并安全替换非法字节；Preflight 为 Python 子命令固定 UTF-8 环境。
+- Windows 终止逻辑按系统父 PID 关系补充枚举已经失去直接父进程的后代，避免继承管道或后台子命令残留。
 - 新增 Windows GitHub Actions，真实执行安装、导入、配置校验、后台启停重启、进程发现和进程树回收测试；保留 POSIX 全量回归。
 
 验收：原生 Windows 安装后导入 CLI 不依赖 `fcntl` 或 `ps`；PowerShell 中可以复制示例配置并完成 `validate`、`start`、`restart` 和 `stop`；终止服务、Codex、Git 或 Preflight 时不遗留可识别后代进程；Linux/macOS 原有文件锁、进程组与信号行为不回归；文档不再把 POSIX 命令误称为跨平台用法。

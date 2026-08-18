@@ -68,6 +68,8 @@ def build_preflight_environment(*, home: Path | None = None) -> dict[str, str]:
             "CI": "true",
             "TEAMWORK_PREFLIGHT": "1",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
     )
     if home is not None:
@@ -97,12 +99,15 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
 async def _read_bounded_stream(
     stream: asyncio.StreamReader,
     limit: int,
+    latest: list[str] | None = None,
 ) -> str:
     """持续排空子进程输出，但内存中只保留最新的有界内容。"""
 
     output = ""
     while chunk := await stream.read(65536):
         output = _append_bounded_output(output, chunk, limit)
+        if latest is not None:
+            latest[:] = [output]
     return output
 
 
@@ -151,8 +156,13 @@ async def execute_preflight_steps(
             )
 
         assert process.stdout is not None
+        latest_step_output = [""]
         output_reader = asyncio.create_task(
-            _read_bounded_stream(process.stdout, config.max_output_bytes)
+            _read_bounded_stream(
+                process.stdout,
+                config.max_output_bytes,
+                latest_step_output,
+            )
         )
         process_waiter = asyncio.create_task(process.wait())
         completed, pending = await asyncio.wait(
@@ -168,7 +178,9 @@ async def execute_preflight_steps(
                 return_when=asyncio.ALL_COMPLETED,
             )
             step_output = (
-                output_reader.result() if output_reader in cleanup_done else ""
+                output_reader.result()
+                if output_reader in cleanup_done
+                else latest_step_output[0]
             )
             if cleanup_pending:
                 stdout_transport = getattr(process.stdout, "_transport", None)
