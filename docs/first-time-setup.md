@@ -14,7 +14,9 @@
 
 Provider Token 只供后台扫描器访问平台 API，不会传给 Codex，也不能代替 `gh` / `glab` 登录态。具体登录与验证命令见[配置 `gh` / `glab`](platform-cli-auth.md)。
 
-首次启动前，从示例生成本地配置：
+首次启动前，从示例生成本地配置。
+
+Linux、macOS 或 WSL2：
 
 ```bash
 python -m pip install -e .
@@ -22,6 +24,17 @@ cp config_example.yaml config.yaml
 teamwork-review-agents validate
 teamwork-review-agents start
 ```
+
+Windows PowerShell：
+
+```powershell
+python -m pip install -e .
+Copy-Item config_example.yaml config.yaml
+teamwork-review-agents validate
+teamwork-review-agents start
+```
+
+原生 Windows 可以直接使用 `run`、`start`、`stop`、`restart` 和 `scan-once`。`codex`、`gh`、`glab` 的登录与状态检查命令也可以直接在 PowerShell 中执行；必须使用启动 Teamwork 服务的同一系统用户完成登录。
 
 `config.yaml` 已被 Git 忽略，不要把真实 Token 或部署环境配置提交到仓库。
 
@@ -63,6 +76,8 @@ teamwork-review-agents start
 - 进程：关闭
 
 Provider 凭据会被系统强制视为 Secret，并禁止进入 Prompt 和 Codex 子进程。如果是在服务启动后才设置宿主机环境变量，需要由你手动重启服务，让新进程继承该变量。
+
+在 Windows 中，`$env:GITHUB_TOKEN` 或 `$env:GITLAB_TOKEN` 只属于当前 PowerShell 会话及其后代进程。使用这种方式时，必须从同一个 PowerShell 会话启动 Teamwork；如果改为用户级环境变量或由 Windows 服务管理器、任务计划程序注入，也只有之后创建的服务进程能够读取。不要在文档、截图或 Git 仓库中填写真实 Token。
 
 ## 4. 检查 Agent
 

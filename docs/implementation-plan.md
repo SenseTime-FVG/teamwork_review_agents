@@ -548,3 +548,13 @@
 - 补充上下文载荷与双平台 Prompt 回归测试，并执行配置与 Runner 相关测试。
 
 验收：GitHub 合并 PR 触发入口 Agent 时不再因“必须是 GitLab MR”停止；根 Agent 只使用上下文声明的平台适配器；GitHub 文档 PR 只在精确 Head 的必要 Checks、Review、可合并状态和分支保护全部通过后合并；GitLab 原有 MR / Pipeline / Approval 路径不回归；sub-agent 继续只处理 Git 与文档更新。
+
+## 阶段五十一：首次配置指南 Windows 快速开始
+
+- 将首次配置图文指南的安装、复制配置、校验和启动命令拆分为 Linux/macOS/WSL2 与 Windows PowerShell 两段。
+- 原生 Windows 使用 `Copy-Item`，不再展示无法直接执行的 `cp`。
+- 明确 `codex`、`gh`、`glab` 校验命令可以直接在 PowerShell 中执行，并要求使用启动 Teamwork 的同一系统用户。
+- 补充 PowerShell 当前会话、用户环境和服务进程之间的 Provider Token 继承边界；服务启动后设置 Token 仍需手动重启。
+- 核对 README、首次配置指南和平台 CLI 登录文档的相互链接与命令一致性。
+
+验收：Windows 用户从 README 进入首次配置图文指南后，可以只使用 PowerShell 命令完成安装、生成配置、校验和后台启动；文档不再把 POSIX 命令显示为 Windows 通用命令；Token 和 CLI 登录态的进程继承要求清晰且不要求在文档中填写真实凭据。

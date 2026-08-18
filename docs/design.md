@@ -512,3 +512,9 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 入口 Prompt 统一使用“变更请求”表达业务流程：GitHub 上是 Pull Request（PR），通过已登录的 `gh` 或 GitHub API 核验原始 PR、创建文档 PR、查询精确文档提交的 Check Runs / Status Checks、Review 和分支保护或 Ruleset，最后在不绕过保护的前提下合并并删除源分支；GitLab 上是 Merge Request（MR），通过已登录的 `glab` 或 GitLab API 执行等价的 MR、Pipeline / Job、Approval、保护分支与合并流程。未知、冲突或不可认证的平台必须安全停止，不得混用另一平台的状态和命令。
 
 文档更新 sub-agent 仍只负责 Git 差异、文档候选、索引、验证、唯一提交与普通推送，不调用 GitHub 或 GitLab 的变更请求 API。为了兼容现有入口与结构化状态，`MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA` 及“MR 目标分支”等字段名继续保留，但 Prompt 必须明确这些是平台无关的历史协议名，对 GitHub PR 与 GitLab MR 含义完全一致。Provider Token 仍不进入 Agent，平台操作依赖启动 Teamwork 的同一系统用户已建立的 `gh` / `glab` 登录态。
+
+## 54. 首次配置文档的跨平台一致性
+
+README 与首次配置图文指南必须同时提供 POSIX shell 和 Windows PowerShell 的可复制启动命令。Linux、macOS 和 WSL2 使用 `cp`，原生 Windows 使用 `Copy-Item`；不能让 README 声明支持 Windows 后，又在其直接链接的首次配置流程中只展示 POSIX 命令。
+
+`codex`、`gh`、`glab` 和 Teamwork CLI 的登录与校验命令在两个终端中保持一致。Provider Token 的说明必须强调环境变量属于启动服务的进程环境：PowerShell 当前会话变量只会被从该会话启动的服务继承，用户级或服务管理器环境变更只对之后创建的进程生效，已经运行的 Teamwork 服务仍需由用户手动重启。
