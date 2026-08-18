@@ -3827,6 +3827,7 @@ function RulesView(props: {
   const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
   const [draftName, setDraftName] = useState("");
   const [saving, setSaving] = useState(false);
+  const [togglingRuleName, setTogglingRuleName] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<
     { kind: "discard"; nextName: string | null } | { kind: "delete" } | null
   >(null);
@@ -3970,6 +3971,32 @@ function RulesView(props: {
     }
   }
 
+  async function toggleRule(rule: Rule) {
+    if (togglingRuleName !== null) return;
+    const enabled = rule.enabled === false;
+    setTogglingRuleName(rule.name);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/rules/${encodeURIComponent(rule.name)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            revision: props.revision,
+            name: rule.name,
+            rule: { ...rule, enabled },
+          }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`规则 ${rule.name} 已${enabled ? "启用" : "停用"}并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "更新规则启用状态失败");
+    } finally {
+      setTogglingRuleName(null);
+    }
+  }
+
   const confirmation = useMemo<AgentActionConfirmation | null>(() => {
     if (!pendingAction) return null;
     if (pendingAction.kind === "discard") {
@@ -4026,7 +4053,7 @@ function RulesView(props: {
         <div className="section-title-row agent-list-title">
           <div>
             <h2>MR / PR 触发规则</h2>
-            <p>点击一行查看完整配置；每条规则在详情页独立编辑和保存。</p>
+            <p>可直接切换启用状态；点击一行查看完整配置并独立编辑和保存。</p>
           </div>
           <button type="button" className="button primary" onClick={beginCreate}>+ 添加规则</button>
         </div>
@@ -4048,16 +4075,33 @@ function RulesView(props: {
                 rule.deduplicate_per_scan ? "单轮去重" : "逐事件触发",
                 rule.inherit_workspace ? "继承工作区" : "独立工作区",
               ];
+              const enabled = rule.enabled !== false;
+              const toggling = togglingRuleName === rule.name;
               return (
-                <button type="button" className="rule-config-row" key={rule.name} onClick={() => requestDetail(rule.name)}>
+                <div className="rule-config-row" key={rule.name} onClick={() => requestDetail(rule.name)}>
                   <span className="agent-config-identity"><span className="rule-config-avatar" aria-hidden="true">R</span><span><strong>{rule.name}</strong><small>{conditionCount > 0 ? `${conditionCount} 项条件` : "无附加条件"}</small></span></span>
-                  <span><strong className={rule.enabled !== false ? "success-text" : "muted-text"}>{rule.enabled !== false ? "已启用" : "已停用"}</strong></span>
+                  <span className={`rule-config-status ${enabled ? "enabled" : ""}`} onClick={(event) => event.stopPropagation()}>
+                    <Toggle
+                      label={toggling ? "保存中…" : enabled ? "已启用" : "已停用"}
+                      checked={enabled}
+                      disabled={togglingRuleName !== null}
+                      onChange={() => { void toggleRule(rule); }}
+                    />
+                  </span>
                   <span className="agent-config-summary"><strong>{rule.events.length} 个</strong><small>{rule.events[0] ?? "未选择事件"}</small></span>
                   <span className="agent-config-summary"><strong>{rule.agents.length} 个</strong><small>{rule.agents.join("、") || "未选择 Agent"}</small></span>
                   <span className="agent-config-summary"><strong>{rule.repositories?.length ? `${rule.repositories.length} 个` : "全部仓库"}</strong><small>{rule.repositories?.join("、") || "不限制仓库"}</small></span>
                   <span className="agent-config-summary"><strong>{optionLabels[0]}</strong><small>{optionLabels[1]}</small></span>
-                  <span className="agent-config-arrow" aria-hidden="true">›</span>
-                </button>
+                  <button
+                    type="button"
+                    className="agent-config-arrow rule-config-detail-button"
+                    aria-label={`查看规则 ${rule.name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      requestDetail(rule.name);
+                    }}
+                  >›</button>
+                </div>
               );
             })}
             {visibleRules.length === 0 && <div className="empty tall">{rules.length === 0 ? "尚未配置触发规则" : "没有匹配的触发规则"}</div>}

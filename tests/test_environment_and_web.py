@@ -424,7 +424,7 @@ def test_web_api_saves_agents_independently_with_revision_guard(tmp_path) -> Non
 
 
 def test_web_api_saves_rules_independently_with_revision_guard(tmp_path) -> None:
-    """触发规则管理 API 应支持创建、重命名、删除和版本冲突。"""
+    """触发规则管理 API 应支持启停、创建、重命名、删除和版本冲突。"""
 
     config_path = write_config(tmp_path)
     app = create_app(config_path, start_scheduler=False)
@@ -452,10 +452,25 @@ def test_web_api_saves_rules_independently_with_revision_guard(tmp_path) -> None
 
         rule = created_body["document"]["rules"][1]
         rule["enabled"] = False
-        renamed = client.put(
+        toggled = client.put(
             "/api/config/rules/secondary",
             json={
                 "revision": created_body["revision"],
+                "name": "secondary",
+                "rule": rule,
+            },
+        )
+        assert toggled.status_code == 200
+        toggled_body = toggled.json()
+        assert toggled_body["document"]["rules"][0] == created_body["document"][
+            "rules"
+        ][0]
+        assert toggled_body["document"]["rules"][1]["enabled"] is False
+
+        renamed = client.put(
+            "/api/config/rules/secondary",
+            json={
+                "revision": toggled_body["revision"],
                 "name": "manual-review",
                 "rule": rule,
             },
