@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .events import activity_event_type
 from .models import (
@@ -34,15 +35,20 @@ class StateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def connect(self) -> sqlite3.Connection:
-        """创建启用 WAL 与字典行访问的数据库连接。"""
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """创建启用 WAL 的连接，并在事务结束后确定关闭。"""
 
         connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=30000")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         """创建数据库目录和全部基础表。"""

@@ -1,8 +1,31 @@
 """SQLite 幂等与资源租约测试。"""
 
+import sqlite3
+
+import pytest
+
 from teamwork_review_agents.events import create_manual_activity_event, detect_events
 from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
 from teamwork_review_agents.state import StateStore
+
+
+def test_connection_context_closes_on_success_and_failure(tmp_path) -> None:
+    """状态存储连接在正常返回和异常回滚后都必须立即关闭。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+
+    with store.connect() as successful_connection:
+        successful_connection.execute("SELECT 1").fetchone()
+    with pytest.raises(sqlite3.ProgrammingError):
+        successful_connection.execute("SELECT 1")
+
+    with pytest.raises(RuntimeError):
+        with store.connect() as failed_connection:
+            failed_connection.execute("SELECT 1").fetchone()
+            raise RuntimeError("模拟事务失败")
+    with pytest.raises(sqlite3.ProgrammingError):
+        failed_connection.execute("SELECT 1")
 
 
 def test_snapshot_and_events_are_idempotent(tmp_path, snapshot_factory) -> None:

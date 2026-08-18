@@ -1,5 +1,8 @@
 """配置解析和 Codex 命令边界测试。"""
 
+import asyncio
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -744,3 +747,248 @@ time.sleep(30)
 
     assert result.status == expected_status
     assert expected_error in (result.error or "")
+
+
+async def test_runner_parses_jsonl_larger_than_asyncio_default_limit(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """包含大体积命令输出的单条 JSONL 不应被默认 64 KiB 限制截断。"""
+
+    config = configured_app_factory()
+    workspace = tmp_path / "workspace-large-jsonl"
+    workspace.mkdir()
+    fake_codex = tmp_path / "fake-codex-large-jsonl"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+sys.stdin.read()
+message = "长" * (128 * 1024)
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": message}}}}, ensure_ascii=False), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config.runtime.codex_binary = str(fake_codex)
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    agent = config.agents["code-reviewer"]
+    agent.skip_git_repo_check = True
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-large-jsonl",
+        root_run_id="run-large-jsonl",
+        event=event,
+    )
+
+    result = await CodexRunner(config).run(
+        run_id="run-large-jsonl",
+        root_run_id="run-large-jsonl",
+        parent_run_id=None,
+        agent_name="code-reviewer",
+        agent=agent,
+        repository=repository,
+        context=context,
+        prompt="执行超长 JSONL 测试",
+    )
+
+    assert result.status == "completed"
+    assert result.final_message == "长" * (128 * 1024)
+
+
+async def test_runner_reports_stream_failure_and_terminates_process(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+    monkeypatch,
+) -> None:
+    """流读取越界必须明确失败，并结束仍在写入的 Codex 进程。"""
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_runner._CODEX_STREAM_LIMIT_BYTES",
+        1024,
+    )
+    config = configured_app_factory()
+    workspace = tmp_path / "workspace-stream-failure"
+    workspace.mkdir()
+    fake_codex = tmp_path / "fake-codex-stream-failure"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import sys
+import time
+sys.stdin.read()
+print("x" * 4096, flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config.runtime.codex_binary = str(fake_codex)
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    agent = config.agents["code-reviewer"]
+    agent.skip_git_repo_check = True
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-stream-failure",
+        root_run_id="run-stream-failure",
+        event=event,
+    )
+    emitted: list[tuple[str, str]] = []
+
+    async def capture_log(
+        stream: str,
+        event_type: str,
+        payload: str | dict[str, object],
+    ) -> None:
+        """只记录流和事件类型，避免测试保存大体积输出。"""
+
+        del payload
+        emitted.append((stream, event_type))
+
+    result = await asyncio.wait_for(
+        CodexRunner(config).run(
+            run_id="run-stream-failure",
+            root_run_id="run-stream-failure",
+            parent_run_id=None,
+            agent_name="code-reviewer",
+            agent=agent,
+            repository=repository,
+            context=context,
+            prompt="执行流异常测试",
+            log_callback=capture_log,
+        ),
+        timeout=5,
+    )
+
+    assert result.status == "failed"
+    assert "读取 Codex stdout 失败" in (result.error or "")
+    assert ("system", "run.stream_failed") in emitted
+
+
+async def test_runner_does_not_wait_forever_for_inherited_stream_pipe(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+    monkeypatch,
+) -> None:
+    """脱离进程组的后代持有管道时，超时运行仍必须有界结束。"""
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_runner._STREAM_DRAIN_TIMEOUT_SECONDS",
+        0.2,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_runner._PROCESS_TERMINATE_GRACE_SECONDS",
+        0.2,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_runner._PROCESS_KILL_GRACE_SECONDS",
+        0.2,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_runner._STREAM_CANCEL_TIMEOUT_SECONDS",
+        0.2,
+    )
+    config = configured_app_factory()
+    workspace = tmp_path / "workspace-inherited-pipe"
+    workspace.mkdir()
+    descendant_pid_file = tmp_path / "descendant.pid"
+    fake_codex = tmp_path / "fake-codex-inherited-pipe"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+sys.stdin.read()
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+    start_new_session=True,
+)
+Path({str(descendant_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
+print(json.dumps({{"type": "thread.started", "thread_id": "thread-pipe"}}), flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config.runtime.codex_binary = str(fake_codex)
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    agent = config.agents["code-reviewer"]
+    agent.skip_git_repo_check = True
+    agent.idle_timeout_seconds = 1
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-inherited-pipe",
+        root_run_id="run-inherited-pipe",
+        event=event,
+    )
+    emitted: list[str] = []
+
+    async def capture_log(
+        stream: str,
+        event_type: str,
+        payload: str | dict[str, object],
+    ) -> None:
+        """记录收尾诊断事件。"""
+
+        del stream, payload
+        emitted.append(event_type)
+
+    try:
+        result = await asyncio.wait_for(
+            CodexRunner(config).run(
+                run_id="run-inherited-pipe",
+                root_run_id="run-inherited-pipe",
+                parent_run_id=None,
+                agent_name="code-reviewer",
+                agent=agent,
+                repository=repository,
+                context=context,
+                prompt="执行继承管道测试",
+                log_callback=capture_log,
+            ),
+            timeout=5,
+        )
+    finally:
+        if descendant_pid_file.exists():
+            descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert result.status == "timed_out"
+    assert "没有 stdout / JSONL 进展" in (result.error or "")
+    assert "run.stream_drain_timed_out" in emitted

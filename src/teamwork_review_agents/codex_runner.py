@@ -30,6 +30,13 @@ from .skill_files import SkillProjection
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
 CancelCheck = Callable[[], Awaitable[bool]]
 
+_CODEX_STREAM_LIMIT_BYTES = 16 * 1024 * 1024
+_PROCESS_TERMINATE_GRACE_SECONDS = 5.0
+_PROCESS_KILL_GRACE_SECONDS = 1.0
+_STREAM_DRAIN_TIMEOUT_SECONDS = 5.0
+_STREAM_CANCEL_TIMEOUT_SECONDS = 1.0
+_STREAM_ERROR_DETAIL_LIMIT = 500
+
 BASE_ENVIRONMENT_NAMES = {
     "PATH",
     "HOME",
@@ -342,6 +349,7 @@ class CodexRunner:
             cwd=repository.workspace,
             env=child_environment,
             start_new_session=True,
+            limit=_CODEX_STREAM_LIMIT_BYTES,
         )
         assert process.stdin is not None
         assert process.stdout is not None
@@ -364,44 +372,80 @@ class CodexRunner:
         stream_error: str | None = None
         started_at = time.monotonic()
         last_progress_at = started_at
+        stream_failure_event = asyncio.Event()
+
+        async def record_stream_failure(stream: str, error: Exception) -> None:
+            """记录安全的流读取错误，并通知主循环尽快终止子进程。"""
+
+            nonlocal stream_error
+            detail = active_redactor.text(str(error)).strip()
+            if len(detail) > _STREAM_ERROR_DETAIL_LIMIT:
+                detail = f"{detail[:_STREAM_ERROR_DETAIL_LIMIT]}…"
+            message = f"读取 Codex {stream} 失败：{type(error).__name__}"
+            if detail:
+                message = f"{message}: {detail}"
+            if stream_error is None:
+                stream_error = message
+            stream_failure_event.set()
+            await emit(
+                "system",
+                "run.stream_failed",
+                {
+                    "stream": stream,
+                    "error_type": type(error).__name__,
+                    "message": message,
+                },
+            )
 
         async def read_stdout() -> None:
             """逐行解析并持久化 Codex JSONL。"""
 
             nonlocal final_message, thread_id, usage, stream_error, last_progress_at
-            while raw_line := await process.stdout.readline():
-                # 只有 stdout / JSONL 代表 Agent 有实际语义进展；重复诊断 stderr 不续期。
-                last_progress_at = time.monotonic()
-                text_line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                try:
-                    parsed = json.loads(text_line)
-                except json.JSONDecodeError:
-                    redacted_text = active_redactor.text(text_line)
-                    await emit("stdout", "text", redacted_text)
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                event = active_redactor.data(parsed)
-                events.append(event)
-                event_type = str(event.get("type") or "jsonl")
-                await emit("stdout", event_type, event)
-                if event_type == "thread.started":
-                    thread_id = str(event.get("thread_id") or "") or None
-                if event_type == "item.completed":
-                    item = event.get("item") or {}
-                    if isinstance(item, dict) and item.get("type") == "agent_message":
-                        final_message = str(item.get("text") or "")
-                if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
-                    usage = event["usage"]
-                if event_type in {"turn.failed", "error"}:
-                    stream_error = json.dumps(event, ensure_ascii=False)
+            try:
+                while raw_line := await process.stdout.readline():
+                    # 只有 stdout / JSONL 代表 Agent 有实际语义进展；重复诊断 stderr 不续期。
+                    last_progress_at = time.monotonic()
+                    text_line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    try:
+                        parsed = json.loads(text_line)
+                    except json.JSONDecodeError:
+                        redacted_text = active_redactor.text(text_line)
+                        await emit("stdout", "text", redacted_text)
+                        continue
+                    if not isinstance(parsed, dict):
+                        continue
+                    event = active_redactor.data(parsed)
+                    events.append(event)
+                    event_type = str(event.get("type") or "jsonl")
+                    await emit("stdout", event_type, event)
+                    if event_type == "thread.started":
+                        thread_id = str(event.get("thread_id") or "") or None
+                    if event_type == "item.completed":
+                        item = event.get("item") or {}
+                        if isinstance(item, dict) and item.get("type") == "agent_message":
+                            final_message = str(item.get("text") or "")
+                    if event_type == "turn.completed" and isinstance(
+                        event.get("usage"), dict
+                    ):
+                        usage = event["usage"]
+                    if event_type in {"turn.failed", "error"}:
+                        stream_error = json.dumps(event, ensure_ascii=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await record_stream_failure("stdout", error)
 
         async def read_stderr() -> None:
             """逐行保存 Codex 进度与诊断输出。"""
 
-            while raw_line := await process.stderr.readline():
-                text_line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                await emit("stderr", "text", active_redactor.text(text_line))
+            try:
+                while raw_line := await process.stderr.readline():
+                    text_line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    await emit("stderr", "text", active_redactor.text(text_line))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await record_stream_failure("stderr", error)
 
         stdout_task = asyncio.create_task(read_stdout())
         stderr_task = asyncio.create_task(read_stderr())
@@ -418,11 +462,31 @@ class CodexRunner:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=_PROCESS_TERMINATE_GRACE_SECONDS,
+                )
             except TimeoutError:
-                with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                await wait_task
+                # asyncio 的 wait() 可能等待继承管道的后代关闭；已有退出码就不再误判主进程存活。
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task),
+                            timeout=_PROCESS_KILL_GRACE_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+            if not wait_task.done():
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+            if process.returncode is None:
+                await emit(
+                    "system",
+                    "run.process_termination_incomplete",
+                    "Codex 进程组已收到强制终止信号，但主进程退出状态仍不可用",
+                )
 
         while not wait_task.done():
             try:
@@ -431,6 +495,8 @@ class CodexRunner:
             except TimeoutError:
                 pass
             now = time.monotonic()
+            if stream_failure_event.is_set():
+                stop_reason = "stream_error"
             if cancel_check is not None:
                 try:
                     if await cancel_check():
@@ -445,7 +511,42 @@ class CodexRunner:
             if stop_reason is not None:
                 await terminate_process_group()
                 break
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        stream_tasks = {stdout_task, stderr_task}
+        _, pending_stream_tasks = await asyncio.wait(
+            stream_tasks,
+            timeout=_STREAM_DRAIN_TIMEOUT_SECONDS,
+        )
+        if pending_stream_tasks:
+            for task in pending_stream_tasks:
+                task.cancel()
+            _, still_pending = await asyncio.wait(
+                pending_stream_tasks,
+                timeout=_STREAM_CANCEL_TIMEOUT_SECONDS,
+            )
+            message = (
+                "Codex 子进程结束后，stdout/stderr 未在宽限期内关闭；"
+                "已停止等待剩余输出"
+            )
+            if stream_error is None:
+                stream_error = message
+            await emit(
+                "system",
+                "run.stream_drain_timed_out",
+                {
+                    "message": message,
+                    "pending_streams": len(pending_stream_tasks),
+                    "still_pending_streams": len(still_pending),
+                },
+            )
+
+        # 所有已结束任务都必须取出异常，避免 asyncio 产生未读取异常警告。
+        for task in stream_tasks:
+            if not task.done() or task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                await record_stream_failure("unknown", error)
 
         if stop_reason == "cancelled":
             error = "运行已由管理员取消"
