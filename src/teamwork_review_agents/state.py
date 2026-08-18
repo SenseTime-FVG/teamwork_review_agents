@@ -111,6 +111,7 @@ class StateStore:
                     workspace_path TEXT,
                     workspace_status TEXT,
                     workspace_reason TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -169,6 +170,12 @@ class StateStore:
             self._ensure_column(connection, "agent_runs", "workspace_path", "TEXT")
             self._ensure_column(connection, "agent_runs", "workspace_status", "TEXT")
             self._ensure_column(connection, "agent_runs", "workspace_reason", "TEXT")
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "cancel_requested",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
 
     @staticmethod
     def _ensure_column(
@@ -626,7 +633,7 @@ class StateStore:
                     config_revision = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
-                    workspace_reason = NULL,
+                    workspace_reason = NULL, cancel_requested = 0,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
@@ -657,18 +664,87 @@ class StateStore:
             ).fetchone()
         return None if row is None else str(row["status"])
 
-    def mark_agent_run_running(self, run_id: str) -> None:
+    def mark_agent_run_running(self, run_id: str) -> bool:
         """在 Codex CLI 即将启动时把 Agent 从排队切换为执行中。"""
 
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE agent_runs
                 SET status = 'running'
-                WHERE run_id = ? AND status = 'queued'
+                WHERE run_id = ? AND status = 'queued' AND cancel_requested = 0
                 """,
                 (run_id,),
             )
+        return cursor.rowcount == 1
+
+    def agent_run_cancel_requested(self, run_id: str) -> bool:
+        """返回某次运行是否已收到持久化取消请求。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_requested FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def request_cancel_run(self, run_id: str) -> list[str] | None:
+        """取消指定运行及全部后代，并立即结束仍在排队的运行。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if exists is None:
+                connection.rollback()
+                return None
+            rows = connection.execute(
+                """
+                WITH RECURSIVE descendants(run_id) AS (
+                    SELECT run_id FROM agent_runs WHERE run_id = ?
+                    UNION ALL
+                    SELECT child.run_id
+                    FROM agent_runs AS child
+                    JOIN descendants AS parent
+                        ON child.parent_run_id = parent.run_id
+                )
+                SELECT run_id, status FROM agent_runs
+                WHERE run_id IN (SELECT run_id FROM descendants)
+                """,
+                (run_id,),
+            ).fetchall()
+            active_ids = [
+                str(row["run_id"])
+                for row in rows
+                if row["status"] in {"queued", "running"}
+            ]
+            if active_ids:
+                placeholders = ", ".join("?" for _ in active_ids)
+                connection.execute(
+                    f"""
+                    UPDATE agent_runs
+                    SET cancel_requested = 1,
+                        status = CASE
+                            WHEN status = 'queued' THEN 'cancelled'
+                            ELSE status
+                        END,
+                        error = CASE
+                            WHEN status = 'queued' THEN '运行已由管理员取消'
+                            ELSE error
+                        END,
+                        finished_at = CASE
+                            WHEN status = 'queued' THEN ?
+                            ELSE finished_at
+                        END
+                    WHERE run_id IN ({placeholders})
+                    """,
+                    (now, *active_ids),
+                )
+            connection.commit()
+        return active_ids
 
     def update_agent_run_inputs(
         self,
@@ -954,6 +1030,7 @@ class StateStore:
                 f"""
                 SELECT run_id, root_run_id, parent_run_id, event_id, rule_name,
                        agent_name, resource_key, status, attempts, error,
+                       cancel_requested,
                        workspace_path, workspace_status, workspace_reason,
                        started_at, finished_at
                 FROM agent_runs {where} ORDER BY started_at DESC LIMIT ?
@@ -1014,7 +1091,9 @@ class StateStore:
                        COALESCE(dispatch_stats.agent_failed_count, 0)
                            AS agent_failed_count,
                        COALESCE(dispatch_stats.agent_timed_out_count, 0)
-                           AS agent_timed_out_count
+                           AS agent_timed_out_count,
+                       COALESCE(dispatch_stats.agent_cancelled_count, 0)
+                           AS agent_cancelled_count
                 FROM event_inbox
                 LEFT JOIN (
                     SELECT dispatch.event_id,
@@ -1032,7 +1111,9 @@ class StateStore:
                            SUM(CASE WHEN run.status = 'failed' THEN 1 ELSE 0 END)
                                AS agent_failed_count,
                            SUM(CASE WHEN run.status = 'timed_out' THEN 1 ELSE 0 END)
-                               AS agent_timed_out_count
+                               AS agent_timed_out_count,
+                           SUM(CASE WHEN run.status = 'cancelled' THEN 1 ELSE 0 END)
+                               AS agent_cancelled_count
                     FROM event_agent_dispatches AS dispatch
                     LEFT JOIN agent_runs AS run
                         ON run.idempotency_key = dispatch.idempotency_key

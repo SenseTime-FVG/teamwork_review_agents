@@ -8,18 +8,26 @@ import json
 import os
 import signal
 import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from .config import AgentConfig, AppConfig, RepositoryConfig
-from .codex_settings import agent_overrides, runtime_overrides
+from .codex_settings import (
+    agent_overrides,
+    codex_home,
+    read_user_mcp_servers,
+    runtime_overrides,
+    validate_codex_version,
+)
 from .environment import SecretRedactor
 from .models import AgentResult, InvocationContext
 from .skill_files import SkillProjection
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
+CancelCheck = Callable[[], Awaitable[bool]]
 
 BASE_ENVIRONMENT_NAMES = {
     "PATH",
@@ -100,6 +108,17 @@ def _add_git_excludes_file(environment: dict[str, str], path: Path) -> None:
     environment[f"GIT_CONFIG_VALUE_{count}"] = str(path)
 
 
+def _toml_key_segment(value: str) -> str:
+    """为 TOML 点号键安全编码一个 MCP Server 名称。"""
+
+    if value and all(
+        character.isascii() and (character.isalnum() or character in "_-")
+        for character in value
+    ):
+        return value
+    return _toml_string(value)
+
+
 class CodexRunner:
     """启动 `codex exec` 并提取最终消息、线程和用量。"""
 
@@ -141,6 +160,7 @@ class CodexRunner:
             f"mcp_servers.{server_name}.command={_toml_string(sys.executable)}",
             f"mcp_servers.{server_name}.args={json.dumps(mcp_args)}",
             f"mcp_servers.{server_name}.required=true",
+            f"mcp_servers.{server_name}.enabled=true",
             (
                 f"mcp_servers.{server_name}.startup_timeout_sec="
                 f"{self.config.runtime.mcp_startup_timeout_seconds}"
@@ -160,6 +180,17 @@ class CodexRunner:
                 f"{_toml_string(context_value)}"
             ),
         ]
+        if not self.config.runtime.inherit_user_mcp_servers:
+            allowed = set(self.config.runtime.allowed_user_mcp_servers)
+            user_servers, _ = read_user_mcp_servers(
+                codex_home(self.config.runtime.codex_home),
+            )
+            disabled_overrides = [
+                f"mcp_servers.{_toml_key_segment(name)}.enabled=false"
+                for name in user_servers
+                if name != server_name and name not in allowed
+            ]
+            overrides = [*disabled_overrides, *overrides]
         if skill_files:
             overrides.append(_skills_config_override(skill_files, agent.skills))
         for override in overrides:
@@ -180,6 +211,8 @@ class CodexRunner:
             if name in BASE_ENVIRONMENT_NAMES
         }
         environment.update(agent_environment or {})
+        if self.config.runtime.codex_home is not None:
+            environment["CODEX_HOME"] = str(self.config.runtime.codex_home)
         # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
         for provider in self.config.providers.values():
             environment.pop(provider.token_env, None)
@@ -200,6 +233,7 @@ class CodexRunner:
         process_environment: dict[str, str] | None = None,
         redactor: SecretRedactor | None = None,
         log_callback: LogCallback | None = None,
+        cancel_check: CancelCheck | None = None,
     ) -> AgentResult:
         """准备当前工作区的 Skill 投影，并保证 Codex 退出后立即清理。"""
 
@@ -224,6 +258,7 @@ class CodexRunner:
                 process_environment=process_environment,
                 redactor=redactor,
                 log_callback=log_callback,
+                cancel_check=cancel_check,
                 skill_files=projection.skill_files,
                 git_excludes_file=projection.marker if self.config.skills else None,
             )
@@ -244,6 +279,7 @@ class CodexRunner:
         process_environment: dict[str, str] | None = None,
         redactor: SecretRedactor | None = None,
         log_callback: LogCallback | None = None,
+        cancel_check: CancelCheck | None = None,
         skill_files: Mapping[str, Path],
         git_excludes_file: Path | None,
     ) -> AgentResult:
@@ -269,6 +305,33 @@ class CodexRunner:
         child_environment = self.child_environment(process_environment)
         if git_excludes_file is not None:
             _add_git_excludes_file(child_environment, git_excludes_file)
+        version_error = await asyncio.to_thread(
+            validate_codex_version,
+            self.config.runtime.codex_binary,
+            self.config.runtime.expected_codex_version,
+            self.config.runtime.codex_home,
+        )
+        if version_error:
+            await emit("system", "run.version_mismatch", version_error)
+            return AgentResult(
+                run_id=run_id,
+                root_run_id=root_run_id,
+                parent_run_id=parent_run_id,
+                agent_name=agent_name,
+                status="failed",
+                error=version_error,
+            )
+        if cancel_check is not None and await cancel_check():
+            error = "运行在 Codex CLI 启动前被管理员取消"
+            await emit("system", "run.cancelled", error)
+            return AgentResult(
+                run_id=run_id,
+                root_run_id=root_run_id,
+                parent_run_id=parent_run_id,
+                agent_name=agent_name,
+                status="cancelled",
+                error=error,
+            )
         process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
@@ -297,12 +360,16 @@ class CodexRunner:
         thread_id: str | None = None
         usage: dict[str, Any] = {}
         stream_error: str | None = None
+        started_at = time.monotonic()
+        last_progress_at = started_at
 
         async def read_stdout() -> None:
             """逐行解析并持久化 Codex JSONL。"""
 
-            nonlocal final_message, thread_id, usage, stream_error
+            nonlocal final_message, thread_id, usage, stream_error, last_progress_at
             while raw_line := await process.stdout.readline():
+                # 只有 stdout / JSONL 代表 Agent 有实际语义进展；重复诊断 stderr 不续期。
+                last_progress_at = time.monotonic()
                 text_line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 try:
                     parsed = json.loads(text_line)
@@ -336,24 +403,75 @@ class CodexRunner:
 
         stdout_task = asyncio.create_task(read_stdout())
         stderr_task = asyncio.create_task(read_stderr())
-        timed_out = False
-        try:
-            await asyncio.wait_for(process.wait(), timeout=agent.timeout_seconds)
-        except TimeoutError:
-            timed_out = True
+        wait_task = asyncio.create_task(process.wait())
+        stop_reason: str | None = None
+        idle_timeout = (
+            agent.idle_timeout_seconds
+            or self.config.runtime.agent_idle_timeout_seconds
+        )
+
+        async def terminate_process_group() -> None:
+            """先温和、再强制结束当前 Codex 及同进程组子进程。"""
+
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(process.wait(), timeout=5)
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
             except TimeoutError:
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+                await wait_task
+
+        while not wait_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.5)
+                break
+            except TimeoutError:
+                pass
+            now = time.monotonic()
+            if cancel_check is not None:
+                try:
+                    if await cancel_check():
+                        stop_reason = "cancelled"
+                except Exception:
+                    # 取消检查短暂失败不能误杀正常运行，下一轮会继续检查。
+                    pass
+            if stop_reason is None and now - started_at >= agent.timeout_seconds:
+                stop_reason = "total_timeout"
+            if stop_reason is None and now - last_progress_at >= idle_timeout:
+                stop_reason = "idle_timeout"
+            if stop_reason is not None:
+                await terminate_process_group()
+                break
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
-        if timed_out:
+        if stop_reason == "cancelled":
+            error = "运行已由管理员取消"
+            await emit("system", "run.cancelled", error)
+            return AgentResult(
+                run_id=run_id,
+                root_run_id=root_run_id,
+                parent_run_id=parent_run_id,
+                agent_name=agent_name,
+                status="cancelled",
+                events=events[-self.config.runtime.max_jsonl_events :],
+                error=error,
+            )
+        if stop_reason == "total_timeout":
             error = f"Codex CLI 运行超过 {agent.timeout_seconds} 秒"
             await emit("system", "run.timed_out", error)
+            return AgentResult(
+                run_id=run_id,
+                root_run_id=root_run_id,
+                parent_run_id=parent_run_id,
+                agent_name=agent_name,
+                status="timed_out",
+                events=events[-self.config.runtime.max_jsonl_events :],
+                error=error,
+            )
+        if stop_reason == "idle_timeout":
+            error = f"Codex CLI 连续 {idle_timeout} 秒没有 stdout / JSONL 进展"
+            await emit("system", "run.idle_timed_out", error)
             return AgentResult(
                 run_id=run_id,
                 root_run_id=root_run_id,

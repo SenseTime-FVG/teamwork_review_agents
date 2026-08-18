@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -65,29 +67,136 @@ def agent_overrides(settings: AgentConfig) -> list[str]:
     return _common_overrides(settings)
 
 
-def codex_home() -> Path:
-    """返回当前服务进程使用的 Codex 配置目录。"""
+def codex_home(configured: Path | None = None) -> Path:
+    """返回后台运行实际使用的 Codex 配置目录。"""
 
+    if configured is not None:
+        return configured.expanduser().resolve()
     configured = os.getenv("CODEX_HOME")
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
-def read_user_model() -> tuple[str | None, str | None, str]:
-    """读取用户 Codex 配置中的顶层模型，并把失败作为展示信息返回。"""
+def _read_user_config(home: Path) -> tuple[dict[str, Any], str | None, str]:
+    """读取 Codex 用户配置，失败时返回空配置和可展示错误。"""
 
-    path = codex_home() / "config.toml"
+    path = home / "config.toml"
     if not path.is_file():
-        return None, None, str(path)
+        return {}, None, str(path)
     try:
         with path.open("rb") as file:
             document = tomllib.load(file)
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        return None, str(exc), str(path)
+        return {}, str(exc), str(path)
+    return document, None, str(path)
+
+
+def read_user_model(home: Path | None = None) -> tuple[str | None, str | None, str]:
+    """读取用户 Codex 配置中的顶层模型，并把失败作为展示信息返回。"""
+
+    document, error, path = _read_user_config(home or codex_home())
+    if error:
+        return None, error, path
     model = document.get("model")
-    return (str(model) if isinstance(model, str) and model.strip() else None), None, str(path)
+    return (str(model) if isinstance(model, str) and model.strip() else None), None, path
 
 
-def read_bundled_models(codex_binary: str) -> tuple[list[dict[str, Any]], str | None]:
+def read_user_mcp_servers(home: Path | None = None) -> tuple[list[str], str | None]:
+    """返回 Codex 用户配置中声明的 MCP Server 名称。"""
+
+    document, error, _ = _read_user_config(home or codex_home())
+    if error:
+        return [], error
+    servers = document.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        return [], None
+    return sorted(str(name) for name in servers), None
+
+
+def _codex_environment(home: Path | None) -> dict[str, str]:
+    """为诊断命令构造与后台 Agent 一致的 Codex Home 环境。"""
+
+    environment = dict(os.environ)
+    if home is not None:
+        environment["CODEX_HOME"] = str(home)
+    return environment
+
+
+def inspect_codex_binary(
+    codex_binary: str,
+    home: Path | None = None,
+) -> dict[str, str | None]:
+    """解析 Codex CLI 路径和版本，不执行任何 Agent 任务。"""
+
+    resolved = shutil.which(codex_binary)
+    if resolved is None and Path(codex_binary).expanduser().is_file():
+        resolved = str(Path(codex_binary).expanduser().resolve())
+    command = resolved or codex_binary
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_codex_environment(home),
+        )
+        output = (result.stdout or result.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "resolved_path": resolved,
+            "version": None,
+            "version_output": None,
+            "error": str(exc),
+        }
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)", output)
+    return {
+        "resolved_path": resolved,
+        "version": match.group(1) if match else None,
+        "version_output": output,
+        "error": None,
+    }
+
+
+def validate_codex_version(
+    codex_binary: str,
+    expected_version: str | None,
+    home: Path | None = None,
+) -> str | None:
+    """验证后台实际 Codex CLI 版本，返回阻断执行的错误。"""
+
+    if not expected_version:
+        return None
+    inspection = inspect_codex_binary(codex_binary, home)
+    if inspection["error"]:
+        return f"无法检查 Codex CLI 版本：{inspection['error']}"
+    actual = inspection["version"]
+    if actual != expected_version:
+        return f"Codex CLI 版本不匹配：期望 {expected_version}，实际 {actual or '无法识别'}"
+    return None
+
+
+def inspect_model_cache(home: Path) -> dict[str, Any]:
+    """读取模型缓存记录的客户端版本，仅用于诊断版本竞争。"""
+
+    path = home / "models_cache.json"
+    if not path.is_file():
+        return {"path": str(path), "client_version": None, "error": None}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"path": str(path), "client_version": None, "error": str(exc)}
+    version = document.get("client_version") if isinstance(document, dict) else None
+    return {
+        "path": str(path),
+        "client_version": str(version) if version else None,
+        "error": None,
+    }
+
+
+def read_bundled_models(
+    codex_binary: str,
+    home: Path | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """从本机 Codex CLI 读取模型目录；失败时保留手工填写能力。"""
 
     try:
@@ -97,6 +206,7 @@ def read_bundled_models(codex_binary: str) -> tuple[list[dict[str, Any]], str | 
             capture_output=True,
             text=True,
             timeout=8,
+            env=_codex_environment(home),
         )
         document = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -138,11 +248,30 @@ def read_bundled_models(codex_binary: str) -> tuple[list[dict[str, Any]], str | 
 def inspect_runtime_options(
     settings: CodexRuntimeConfig,
     codex_binary: str,
+    configured_home: Path | None = None,
+    expected_version: str | None = None,
 ) -> dict[str, Any]:
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
-    models, catalog_error = read_bundled_models(codex_binary)
-    user_model, user_error, user_config_path = read_user_model()
+    home = codex_home(configured_home)
+    models, catalog_error = read_bundled_models(codex_binary, home)
+    user_model, user_error, user_config_path = read_user_model(home)
+    binary = inspect_codex_binary(codex_binary, home)
+    cache = inspect_model_cache(home)
+    user_mcp_servers, user_mcp_error = read_user_mcp_servers(home)
+    version_warning: str | None = None
+    actual_version = binary.get("version")
+    cache_version = cache.get("client_version")
+    if actual_version and cache_version and actual_version != cache_version:
+        version_warning = (
+            f"当前 CLI {actual_version} 与模型缓存客户端 {cache_version} 不一致；"
+            "建议为后台配置独立 CODEX_HOME，或固定所有调用方使用同一 Codex 版本"
+        )
+    if expected_version and actual_version != expected_version:
+        version_warning = (
+            f"当前 CLI {actual_version or '无法识别'} 与配置期望版本 "
+            f"{expected_version} 不一致"
+        )
     if settings.model:
         inherited_model = {
             "value": settings.model,
@@ -168,4 +297,11 @@ def inspect_runtime_options(
         "user_config_path": user_config_path,
         "catalog_error": catalog_error,
         "user_config_error": user_error,
+        "codex_home": str(home),
+        "binary": binary,
+        "model_cache": cache,
+        "expected_version": expected_version,
+        "version_warning": version_warning,
+        "user_mcp_servers": user_mcp_servers,
+        "user_mcp_error": user_mcp_error,
     }

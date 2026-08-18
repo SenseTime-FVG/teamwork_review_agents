@@ -98,7 +98,7 @@ class AgentResult(BaseModel):
     root_run_id: str
     parent_run_id: str | None = None
     agent_name: str
-    status: Literal["completed", "failed", "timed_out"]
+    status: Literal["completed", "failed", "timed_out", "cancelled"]
     final_message: str = ""
     thread_id: str | None = None
     usage: dict[str, Any] = Field(default_factory=dict)

@@ -201,6 +201,59 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
     assert command[-1] == "-"
 
 
+def test_runner_disables_unapproved_user_mcp_servers(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """后台默认应禁用用户 MCP，只保留显式白名单和 Teamwork 网关。"""
+
+    config = configured_app_factory()
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        """
+[mcp_servers.node_repl]
+command = "node"
+
+[mcp_servers.internal_api]
+command = "internal-api"
+""".strip(),
+        encoding="utf-8",
+    )
+    config.runtime.codex_home = home
+    config.runtime.allowed_user_mcp_servers = ["internal_api"]
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-mcp-isolation",
+        root_run_id="run-mcp-isolation",
+        event=event,
+    )
+    command = CodexRunner(config).build_command(
+        config.agents["code-reviewer"],
+        repository,
+        context,
+    )
+    overrides = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+
+    assert "mcp_servers.node_repl.enabled=false" in overrides
+    assert "mcp_servers.internal_api.enabled=false" not in overrides
+    assert "mcp_servers.teamwork_agent_gateway.enabled=true" in overrides
+
+
 def test_runner_merges_runtime_and_agent_codex_options(
     snapshot_factory,
     configured_app_factory,
@@ -484,3 +537,81 @@ for item in items:
     assert result.thread_id == "thread-test"
     assert result.final_message == "执行完成"
     assert result.usage == {"input_tokens": 10, "output_tokens": 2}
+
+
+@pytest.mark.parametrize(
+    ("cancel_after_checks", "expected_status", "expected_error"),
+    [
+        (None, "timed_out", "没有 stdout / JSONL 进展"),
+        (2, "cancelled", "管理员取消"),
+    ],
+)
+async def test_runner_stops_idle_or_cancelled_process_group(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+    cancel_after_checks,
+    expected_status,
+    expected_error,
+) -> None:
+    """无进展超时和人工取消都必须结束仍在运行的 Codex 进程。"""
+
+    config = configured_app_factory()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+import time
+sys.stdin.read()
+print(json.dumps({{"type": "thread.started", "thread_id": "thread-wait"}}), flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config.runtime.codex_binary = str(fake_codex)
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    agent = config.agents["code-reviewer"]
+    agent.skip_git_repo_check = True
+    agent.idle_timeout_seconds = 1
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-stop",
+        root_run_id="run-stop",
+        event=event,
+    )
+    checks = 0
+
+    async def cancellation_requested() -> bool:
+        """在指定轮次模拟另一个进程写入 SQLite 的取消请求。"""
+
+        nonlocal checks
+        checks += 1
+        return cancel_after_checks is not None and checks >= cancel_after_checks
+
+    result = await CodexRunner(config).run(
+        run_id="run-stop",
+        root_run_id="run-stop",
+        parent_run_id=None,
+        agent_name="code-reviewer",
+        agent=agent,
+        repository=repository,
+        context=context,
+        prompt="执行等待测试",
+        cancel_check=cancellation_requested,
+    )
+
+    assert result.status == expected_status
+    assert expected_error in (result.error or "")

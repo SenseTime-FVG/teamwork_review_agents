@@ -277,3 +277,13 @@ Agent 运行使用独立状态。运行记录创建后先为 `queued`，表示�
 GitHub 在首次建立单个 PR 的 Timeline 游标时，从最新页向前读取到回看窗口边界，只转换平台能够提供发生时间且位于窗口内的关闭、重新打开、合并、提交、强制推送、Draft 和标签动作，然后把游标推进到当前最新项。后续扫描继续使用稳定 Timeline 项 ID 增量读取，因此首次窗口事件不会重复。若首次快照包含多个窗口内活动，事件检测会从当前快照反向还原窗口开始时的必要状态，再按 Timeline 顺序生成每个具体事件及配套 `updated`；规则去重仍只影响 Agent 调度，不影响事件完整记录。
 
 不支持活动流的 Provider 仍可依据创建时间产生窗口内的 `opened`，其余首次周期动作只能等待该 Provider 增加可定位时间和稳定 ID 的活动接口。活动没有可靠发生时间时不重放，避免把历史事件错误归入当前周期。
+
+## 27. 后台 Codex 运行隔离、无进展超时与人工取消
+
+Teamwork 启动的后台 Codex CLI 默认不继承用户 `config.toml` 中配置的 MCP Server。服务在启动命令中逐项关闭已发现的用户 MCP，只保留应用托管的 `teamwork_agent_gateway`；管理员可以通过 `runtime.allowed_user_mcp_servers` 显式放行确有需要的服务，也可以用 `runtime.inherit_user_mcp_servers` 恢复完整继承。GitHub / GitLab 管理 Agent 应优先使用本次 MR / PR 输入、平台 API、`gh` / `glab` 和本地工作区，不因用户桌面环境存在浏览器、Computer Use 或 REPL MCP 就自动获得这些能力。
+
+运行时可以通过 `runtime.codex_home` 为后台服务指定独立 `CODEX_HOME`。独立目录隔离 `config.toml`、模型目录缓存和其他 Codex 状态，但凭据也属于该目录，部署者需要在该目录下单独完成 Codex 登录。留空时继续使用服务进程继承的 `CODEX_HOME` 或 `~/.codex`。`runtime.codex_binary` 仍决定实际二进制，`runtime.expected_codex_version` 可锁定期望版本；启动单次 Agent 前若实际版本不匹配，则直接失败而不执行任务。管理 UI 展示二进制解析路径、实际版本、当前 Codex Home、模型缓存记录的客户端版本和冲突警告，避免多个 Codex 版本共用缓存时只能从重复 stderr 猜测原因。
+
+总运行超时与无进展超时分离。`Agent.timeout_seconds` 继续限制完整执行时间；`runtime.agent_idle_timeout_seconds` 是默认无进展窗口，Agent 可通过 `idle_timeout_seconds` 单独覆盖。只有 Codex stdout/JSONL 新事件表示语义进展，重复 stderr 诊断不会续期；连续超过窗口后服务终止整个 Codex 进程组并记录明确的 `run.idle_timed_out`。这样卡在某个 MCP/tool item 的运行无需等待完整二十分钟，同时正常持续输出的长任务仍可继续。
+
+运行记录增加持久化取消请求。管理 API 取消某个运行时，会同时标记它的全部后代：仍在排队的运行直接进入 `cancelled`，已经执行的根 Agent 或跨 MCP 进程 sub-agent 通过 SQLite 短轮询感知请求，先发送 `SIGTERM`，宽限期后发送 `SIGKILL`。Runner 返回 `cancelled`，工作区继续走既有安全清理策略；脏工作区或未推送提交仍会保留。UI 只对 `queued`、`running` 展示“取消运行”，并把已取消数量独立纳入事件关联 Agent 的终态统计。

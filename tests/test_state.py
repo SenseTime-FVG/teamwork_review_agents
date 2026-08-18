@@ -206,6 +206,51 @@ def test_agent_run_exposes_workspace_cleanup_status(tmp_path) -> None:
     assert detail["workspace_reason"] == "工作区存在未提交文件"
 
 
+def test_cancel_request_persists_and_cascades_to_descendants(tmp_path) -> None:
+    """取消根运行时，排队后代应立即取消，执行中运行应收到持久化请求。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    root = store.begin_agent_run(
+        proposed_run_id="run-root",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="cancel-root",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:7",
+        prompt="",
+        max_attempts=1,
+    )
+    child = store.begin_agent_run(
+        proposed_run_id="run-child",
+        root_run_id="run-root",
+        parent_run_id="run-root",
+        idempotency_key="cancel-child",
+        event_id=None,
+        rule_name=None,
+        agent_name="helper",
+        resource_key="github:demo:7",
+        prompt="",
+        max_attempts=1,
+    )
+    assert root is not None
+    assert child is not None
+    assert store.mark_agent_run_running(root.run_id)
+
+    cancelled = store.request_cancel_run(root.run_id)
+
+    assert set(cancelled or []) == {root.run_id, child.run_id}
+    assert store.agent_run_cancel_requested(root.run_id)
+    assert store.agent_run_cancel_requested(child.run_id)
+    assert store.get_run(root.run_id)["status"] == "running"
+    child_detail = store.get_run(child.run_id)
+    assert child_detail["status"] == "cancelled"
+    assert child_detail["finished_at"] is not None
+    assert not store.mark_agent_run_running(child.run_id)
+
+
 def test_activity_cursor_is_saved_with_snapshot_and_events(
     tmp_path,
     snapshot_factory,

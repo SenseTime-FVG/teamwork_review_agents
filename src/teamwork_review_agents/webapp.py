@@ -193,6 +193,8 @@ def create_app(
             inspect_runtime_options,
             manager.config.runtime.codex,
             manager.config.runtime.codex_binary,
+            manager.config.runtime.codex_home,
+            manager.config.runtime.expected_codex_version,
         )
 
     @app.post("/api/prompts/preview")
@@ -308,6 +310,29 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="运行记录不存在")
         return run
+
+    @app.post("/api/runs/{run_id}/cancel")
+    async def cancel_run(run_id: str) -> dict[str, Any]:
+        """持久化取消指定运行及其全部后代。"""
+
+        run_ids = await asyncio.to_thread(manager.store.request_cancel_run, run_id)
+        if run_ids is None:
+            raise HTTPException(status_code=404, detail="运行记录不存在")
+        if not run_ids:
+            return {"accepted": False, "run_ids": [], "reason": "运行已经结束"}
+        for active_run_id in run_ids:
+            await asyncio.to_thread(
+                manager.store.append_run_log,
+                active_run_id,
+                stream="system",
+                event_type="run.cancel_requested",
+                payload="管理员已请求取消运行",
+            )
+        return {
+            "accepted": True,
+            "run_ids": run_ids,
+            "reason": f"已请求取消 {len(run_ids)} 个运行",
+        }
 
     @app.get("/api/runs/{run_id}/logs")
     async def run_logs(

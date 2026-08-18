@@ -98,6 +98,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .button.primary:hover:not(:disabled) { background: #79e2aa; box-shadow: 0 5px 18px rgba(96, 211, 148, .16); }
 .button.secondary { background: #151e2a; color: #b8c4d3; border-color: #2a3544; }
 .button.secondary:hover:not(:disabled) { border-color: #435166; color: var(--bright); }
+.button.danger { color: #ff9191; background: #291419; border-color: #623439; }
+.button.danger:hover:not(:disabled) { color: #ffc0c0; background: #35181e; border-color: #875057; }
 .button.compact { padding: 7px 10px; font-size: 9px; white-space: nowrap; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 7px; background: #111925; cursor: pointer; color: var(--muted); font-size: 18px; }
 .icon-button.danger:hover { color: var(--red); border-color: #623439; background: #211419; }
@@ -245,6 +247,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-completed { color: #7de5ad; border-color: #28553c; background: #10271b; }
 .status-running, .status-processing, .status-triggered { color: #8eb8ff; border-color: #294f75; background: #101f33; }
 .status-failed, .status-timed_out { color: #ff9191; border-color: #623439; background: #291419; }
+.status-cancelled { color: #f4bb7f; border-color: #664a2d; background: #2a1e12; }
 .status-pending, .status-queued { color: #f4bb7f; border-color: #664a2d; background: #2a1e12; }
 .status-unmatched { color: #a8b2c0; border-color: #3c4756; background: #171e27; }
 .status-opened { color: #7de5ad; border-color: #28553c; background: #10271b; }
@@ -266,6 +269,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-status-dot[data-status="completed"] { background: var(--accent); }
 .run-status-dot[data-status="running"] { background: var(--blue); box-shadow: 0 0 0 4px rgba(114, 165, 255, .08); }
 .run-status-dot[data-status="failed"], .run-status-dot[data-status="timed_out"] { background: var(--red); }
+.run-status-dot[data-status="cancelled"] { background: var(--orange); }
 .run-detail-head { padding-bottom: 15px; border-bottom: 1px solid var(--line); }
 .run-detail-head h2 { margin-top: 5px; }
 .run-detail-head p { font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; }

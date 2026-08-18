@@ -29,6 +29,7 @@ export type Agent = {
   web_search?: "disabled" | "cached" | "live";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   timeout_seconds?: number;
+  idle_timeout_seconds?: number;
   write_scopes?: Array<"change_request" | "workspace">;
   allowed_sub_agents?: string[];
   skills?: string[];
@@ -51,6 +52,12 @@ export type CodexRuntimeConfig = {
 };
 
 export type RuntimeConfig = Record<string, unknown> & {
+  codex_binary?: string;
+  codex_home?: string;
+  expected_codex_version?: string;
+  inherit_user_mcp_servers?: boolean;
+  allowed_user_mcp_servers?: string[];
+  agent_idle_timeout_seconds?: number;
   codex?: CodexRuntimeConfig;
 };
 
@@ -71,6 +78,22 @@ export type CodexRuntimeOptions = {
   user_config_path: string;
   catalog_error?: string | null;
   user_config_error?: string | null;
+  codex_home: string;
+  binary: {
+    resolved_path?: string | null;
+    version?: string | null;
+    version_output?: string | null;
+    error?: string | null;
+  };
+  model_cache: {
+    path: string;
+    client_version?: string | null;
+    error?: string | null;
+  };
+  expected_version?: string | null;
+  version_warning?: string | null;
+  user_mcp_servers: string[];
+  user_mcp_error?: string | null;
 };
 
 export type Skill = {
@@ -189,6 +212,7 @@ export type EventRecord = {
   agent_completed_count: number;
   agent_failed_count: number;
   agent_timed_out_count: number;
+  agent_cancelled_count: number;
   created_at: number;
   updated_at: number;
 };

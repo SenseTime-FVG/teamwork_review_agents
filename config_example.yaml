@@ -40,6 +40,18 @@ database:
 #   worktree_retention_days: 7
 #   # Codex CLI 命令名，也可以配置为绝对路径。
 #   codex_binary: codex
+#   # 可选：为后台 Agent 使用独立的 Codex 配置目录，避免和桌面版或其他 CLI
+#   # 共用模型缓存及 MCP 配置。首次使用前需要在该目录对应的环境中完成登录。
+#   # codex_home: ./data/codex-home
+#   # 可选：要求实际 Codex CLI 版本完全匹配；不匹配时运行会立即失败并给出诊断。
+#   # expected_codex_version: 0.146.0
+#   # 默认不继承 ~/.codex/config.toml 中的用户 MCP，避免后台 Agent 调起浏览器、
+#   # Computer Use 或桌面应用工具后长期等待。改为 true 表示继承全部用户 MCP。
+#   inherit_user_mcp_servers: false
+#   # 在保持隔离时，可按 ~/.codex/config.toml 中的 MCP 名称显式放行所需服务。
+#   allowed_user_mcp_servers: []
+#   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
+#   agent_idle_timeout_seconds: 300
 #   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
 #   codex:
 #     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
@@ -171,6 +183,8 @@ agents:
     sandbox: workspace-write
     # 单次 Codex CLI 运行最长秒数。
     timeout_seconds: 1200
+    # 可选：覆盖 runtime.agent_idle_timeout_seconds；连续无进展时提前结束。
+    # idle_timeout_seconds: 300
     # 写操作声明用于申请串行锁，不等同于平台账号授权。
     # workspace：修改代码、提交或推送；change_request：评论、标签或合并 MR/PR。
     write_scopes:

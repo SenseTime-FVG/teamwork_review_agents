@@ -140,6 +140,11 @@ class RuntimeConfig(BaseModel):
     event_retry_count: int = Field(default=2, ge=0)
     worktree_retention_days: PositiveInt = 7
     codex_binary: str = "codex"
+    codex_home: Path | None = None
+    expected_codex_version: str | None = None
+    inherit_user_mcp_servers: bool = False
+    allowed_user_mcp_servers: list[str] = Field(default_factory=list)
+    agent_idle_timeout_seconds: PositiveInt = 300
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
     mcp_tool_timeout_seconds: PositiveInt = 1800
@@ -268,6 +273,7 @@ class AgentConfig(BaseModel):
     web_search: Literal["disabled", "cached", "live"] | None = None
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
     timeout_seconds: PositiveInt = 1200
+    idle_timeout_seconds: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     allowed_sub_agents: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
@@ -501,6 +507,13 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
     data["database"] = dict(data.get("database", {}))
     if "path" in data["database"]:
         data["database"]["path"] = _resolve_path(base_dir, data["database"]["path"])
+
+    data["runtime"] = dict(data.get("runtime", {}))
+    if data["runtime"].get("codex_home"):
+        data["runtime"]["codex_home"] = _resolve_path(
+            base_dir,
+            data["runtime"]["codex_home"],
+        )
 
     repositories: list[dict[str, Any]] = []
     for item in data.get("repositories", []):

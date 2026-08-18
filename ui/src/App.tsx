@@ -44,6 +44,10 @@ const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   },
   user_model: null,
   user_config_path: "~/.codex/config.toml",
+  codex_home: "~/.codex",
+  binary: {},
+  model_cache: { path: "~/.codex/models_cache.json" },
+  user_mcp_servers: [],
 };
 
 const REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -77,6 +81,9 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       event_retry_count: 2,
       worktree_retention_days: 7,
       codex_binary: "codex",
+      inherit_user_mcp_servers: false,
+      allowed_user_mcp_servers: [],
+      agent_idle_timeout_seconds: 300,
       ...runtimeInput,
       codex: {
         fast_mode: "inherit",
@@ -808,12 +815,42 @@ function CodexRuntimeEditor(props: {
           <strong>当前模型来源</strong>
           <span>{inherited.label}。Agent 可以单独覆盖；仓库中的 `.codex/config.toml` 仅在没有更高优先级覆盖时参与 Codex 原生合并。</span>
         </div>
+        <div className="agent-workspace-note">
+          <strong>实际后台 CLI</strong>
+          <span>
+            {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
+            {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
+            {` · CODEX_HOME ${props.options.codex_home}`}
+          </span>
+        </div>
+        {props.options.version_warning && <div className="alert error">{props.options.version_warning}</div>}
         <div className="form-grid three runtime-config-grid">
           <Field
             label="Codex CLI 命令"
             value={String(props.document.runtime.codex_binary ?? "codex")}
             onChange={(codex_binary) => patchRuntime({ codex_binary: codex_binary || "codex" })}
             help="可以填写命令名或服务端绝对路径"
+          />
+          <Field
+            label="后台 Codex Home（可选）"
+            value={String(props.document.runtime.codex_home ?? "")}
+            placeholder="留空继承 CODEX_HOME 或 ~/.codex"
+            onChange={(codex_home) => patchRuntime({ codex_home: codex_home || undefined })}
+            help="配置独立目录可隔离模型缓存；需要在该目录下单独完成 Codex 登录"
+          />
+          <Field
+            label="期望 CLI 版本（可选）"
+            value={String(props.document.runtime.expected_codex_version ?? "")}
+            placeholder={props.options.binary.version ?? "例如 0.146.0"}
+            onChange={(expected_codex_version) => patchRuntime({ expected_codex_version: expected_codex_version || undefined })}
+            help="填写后版本不一致会阻止 Agent 启动"
+          />
+          <Field
+            label="默认无进展超时（秒）"
+            type="number"
+            value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)}
+            onChange={(value) => patchRuntime({ agent_idle_timeout_seconds: Number(value) })}
+            help="只由 stdout / JSONL 续期，重复 stderr 不会延长"
           />
           <ModelField
             id="runtime-codex-models"
@@ -879,6 +916,30 @@ function CodexRuntimeEditor(props: {
             ]}
           />
         </div>
+      </section>
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>后台 MCP 能力隔离</h2>
+            <p>默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。</p>
+          </div>
+        </div>
+        <div className="toggle-grid">
+          <Toggle
+            label="继承全部用户 MCP（高风险）"
+            checked={Boolean(props.document.runtime.inherit_user_mcp_servers)}
+            onChange={(inherit_user_mcp_servers) => patchRuntime({ inherit_user_mcp_servers })}
+          />
+          <small>开启后，浏览器、Computer Use、REPL 等用户 MCP 也可能被后台 Agent 调用。</small>
+        </div>
+        {!props.document.runtime.inherit_user_mcp_servers && (
+          <MultiSelect
+            label="允许继承的用户 MCP"
+            values={props.document.runtime.allowed_user_mcp_servers ?? []}
+            options={props.options.user_mcp_servers}
+            onChange={(allowed_user_mcp_servers) => patchRuntime({ allowed_user_mcp_servers })}
+          />
+        )}
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -1457,7 +1518,8 @@ function AgentsEditor(props: {
                     : Array.from(new Set([...writeScopes, "workspace"]));
                   update(name, { sandbox, write_scopes: nextScopes as Agent["write_scopes"] });
                 }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件</option><option value="danger-full-access">完全访问：高风险</option></select><small>切换为可写模式时会自动启用“本地仓库写操作”</small></label>
-                <Field label="超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
+                <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
+                <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>
               <div className="form-grid three agent-runtime-overrides">
@@ -1690,7 +1752,8 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   }
   const settled = event.agent_completed_count
     + event.agent_failed_count
-    + event.agent_timed_out_count;
+    + event.agent_timed_out_count
+    + event.agent_cancelled_count;
   if (event.agent_running_count > 0) {
     return (
       <span className="event-agent-progress running">
@@ -1705,7 +1768,9 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
       </span>
     );
   }
-  const failed = event.agent_failed_count + event.agent_timed_out_count;
+  const failed = event.agent_failed_count
+    + event.agent_timed_out_count
+    + event.agent_cancelled_count;
   if (failed > 0) {
     return (
       <span className="event-agent-progress failed">
@@ -1725,6 +1790,26 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+
+  async function cancelSelectedRun() {
+    if (!selectedId || !detail || !window.confirm(`确定取消 ${detail.agent_name} 的本次运行吗？\n\n它的全部 sub-agent 也会收到取消请求。`)) return;
+    setCancelling(true);
+    setError("");
+    try {
+      const result = await api<{ accepted: boolean; reason: string }>(
+        `/api/runs/${encodeURIComponent(selectedId)}/cancel`,
+        { method: "POST" },
+      );
+      if (!result.accepted) setError(result.reason);
+      setDetail(await api<RunDetail>(`/api/runs/${encodeURIComponent(selectedId)}`));
+      props.onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消运行失败");
+    } finally {
+      setCancelling(false);
+    }
+  }
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1779,7 +1864,14 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
           <>
             <div className="run-detail-head">
               <div><span className="eyebrow">{detail.run_id}</span><h2>{detail.agent_name}</h2><p>{detail.rule_name ?? "sub-agent 调用"} · 配置 {shortRevision(detail.config_revision)}</p></div>
-              <StatusPill value={detail.status} />
+              <div className="button-group">
+                {(detail.status === "queued" || detail.status === "running") && (
+                  <button className="button danger" disabled={cancelling} onClick={() => { void cancelSelectedRun(); }}>
+                    {cancelling ? "取消中…" : "取消运行"}
+                  </button>
+                )}
+                <StatusPill value={detail.status} />
+              </div>
             </div>
             <div className="detail-tabs">
               <details open><summary>实时日志 <span>{logs.length}</span></summary><div className="terminal">{logs.map((log) => <div key={log.id} className={`log-line stream-${log.stream}`}><time>{new Date(log.created_at * 1000).toLocaleTimeString("zh-CN")}</time><b>{log.event_type}</b><pre>{log.payload}</pre></div>)}{logs.length === 0 && <span className="terminal-empty">等待 Codex 输出…</span>}</div></details>

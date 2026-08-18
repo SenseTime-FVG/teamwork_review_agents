@@ -380,45 +380,59 @@ class AgentExecutor:
                         "reason": workspace_reason,
                     },
                 )
-                await asyncio.to_thread(
+                started = await asyncio.to_thread(
                     self.store.mark_agent_run_running,
                     reservation.run_id,
                 )
-                await persist_log(
-                    "system",
-                    "run.started",
-                    {
-                        "agent_name": agent_name,
-                        "config_revision": self.config.revision,
-                        "environment": resolved_environment.audit_values,
-                        "workspace_mode": workspace_mode,
-                        "workspace": str(active_workspace),
-                    },
-                )
-                context = InvocationContext(
-                    config_path=str(self.config.config_path),
-                    current_agent=agent_name,
-                    run_id=reservation.run_id,
-                    root_run_id=reservation.root_run_id,
-                    depth=depth,
-                    call_chain=(*call_chain, agent_name),
-                    inherit_workspace=inherit_workspace,
-                    active_workspace=str(active_workspace),
-                    event=event,
-                )
-                result = await self.runner.run(
-                    run_id=reservation.run_id,
-                    root_run_id=reservation.root_run_id,
-                    parent_run_id=reservation.parent_run_id,
-                    agent_name=agent_name,
-                    agent=agent,
-                    repository=repository,
-                    context=context,
-                    prompt=prompt,
-                    process_environment=resolved_environment.process_values,
-                    redactor=redactor,
-                    log_callback=persist_log,
-                )
+                if not started:
+                    result = AgentResult(
+                        run_id=reservation.run_id,
+                        root_run_id=reservation.root_run_id,
+                        parent_run_id=reservation.parent_run_id,
+                        agent_name=agent_name,
+                        status="cancelled",
+                        error="运行在 Codex CLI 启动前被管理员取消",
+                    )
+                else:
+                    await persist_log(
+                        "system",
+                        "run.started",
+                        {
+                            "agent_name": agent_name,
+                            "config_revision": self.config.revision,
+                            "environment": resolved_environment.audit_values,
+                            "workspace_mode": workspace_mode,
+                            "workspace": str(active_workspace),
+                        },
+                    )
+                    context = InvocationContext(
+                        config_path=str(self.config.config_path),
+                        current_agent=agent_name,
+                        run_id=reservation.run_id,
+                        root_run_id=reservation.root_run_id,
+                        depth=depth,
+                        call_chain=(*call_chain, agent_name),
+                        inherit_workspace=inherit_workspace,
+                        active_workspace=str(active_workspace),
+                        event=event,
+                    )
+                    result = await self.runner.run(
+                        run_id=reservation.run_id,
+                        root_run_id=reservation.root_run_id,
+                        parent_run_id=reservation.parent_run_id,
+                        agent_name=agent_name,
+                        agent=agent,
+                        repository=repository,
+                        context=context,
+                        prompt=prompt,
+                        process_environment=resolved_environment.process_values,
+                        redactor=redactor,
+                        log_callback=persist_log,
+                        cancel_check=lambda: asyncio.to_thread(
+                            self.store.agent_run_cancel_requested,
+                            reservation.run_id,
+                        ),
+                    )
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"

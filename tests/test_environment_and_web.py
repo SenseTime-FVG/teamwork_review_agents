@@ -338,6 +338,27 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         assert "event: item.completed" in stream.text
         assert "event: end" in stream.text
 
+        cancellable = store.begin_agent_run(
+            proposed_run_id="run-web-cancel",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key="web-cancel-test",
+            event_id=None,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key="github:first:12",
+            prompt="等待执行",
+            max_attempts=1,
+        )
+        assert cancellable is not None
+        cancelled = client.post("/api/runs/run-web-cancel/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["accepted"] is True
+        assert client.get("/api/runs/run-web-cancel").json()["status"] == "cancelled"
+        cancel_logs = client.get("/api/runs/run-web-cancel/logs").json()
+        assert cancel_logs[-1]["event_type"] == "run.cancel_requested"
+        assert client.post("/api/runs/unknown/cancel").status_code == 404
+
         static = client.get("/")
         assert static.status_code == 200
         assert "Teamwork Review Agents" in static.text

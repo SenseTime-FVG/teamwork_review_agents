@@ -173,7 +173,7 @@ GitHub 候选 PR 会额外增量读取 Issue Timeline。PR 详情负责提供当
 
 规则可配置 `deduplicate_per_scan: true`。开启后，同一轮扫描中同一个 MR/PR 的多个已选事件匹配同一规则时，每个目标 Agent 只运行一次，并把动作合并到 `mr.action`；关闭时仍按每个事件分别运行。GitHub Timeline 可以恢复轮询间的离散动作，快照仍用于保存当前真值并补充审批、流水线和可合并状态等变化；需要更低延迟时可进一步接入 Webhook，并保留扫描器作为对账兜底。
 
-运行概览会分开展示事件状态和 Agent 进度。事件没有匹配规则时会立即显示“未触发”；匹配规则后显示“已触发”，相关任务结束后显示“已处理”或“处理失败”。Agent 独立使用“排队中”“执行中”“已完成”“失败”“超时”等状态，因此同批次中未被规则选择的 `change_request.updated` 不会再因为其他事件正在执行 Agent 而显示为“处理中”。历史版本已经完成但没有调度关联记录的事件会显示“历史已处理”。
+运行概览会分开展示事件状态和 Agent 进度。事件没有匹配规则时会立即显示“未触发”；匹配规则后显示“已触发”，相关任务结束后显示“已处理”或“处理失败”。Agent 独立使用“排队中”“执行中”“已完成”“失败”“超时”“已取消”等状态，因此同批次中未被规则选择的 `change_request.updated` 不会再因为其他事件正在执行 Agent 而显示为“处理中”。历史版本已经完成但没有调度关联记录的事件会显示“历史已处理”。
 
 ## Codex CLI 运行时配置
 
@@ -182,6 +182,15 @@ GitHub 候选 PR 会额外增量读取 Issue Timeline。PR 详情负责提供当
 ```yaml
 runtime:
   codex_binary: codex
+  # 可选：让后台服务使用独立的 Codex 配置和缓存目录。
+  codex_home: ./data/codex-home
+  # 可选：不匹配时拒绝启动 Agent，避免多个 Codex 版本争用模型缓存。
+  expected_codex_version: 0.146.0
+  # 默认隔离 ~/.codex/config.toml 中的用户 MCP；可按名称显式放行。
+  inherit_user_mcp_servers: false
+  allowed_user_mcp_servers: []
+  # 连续 5 分钟没有新的 Codex JSONL 进度时提前终止。
+  agent_idle_timeout_seconds: 300
   codex:
     model: gpt-5.6-sol
     model_reasoning_effort: high
@@ -194,6 +203,12 @@ runtime:
 ```
 
 实际合并顺序是 Codex 用户/仓库配置 → Teamwork 运行时默认 → 当前 Agent 显式覆盖 → 应用托管的 Sandbox、MCP 网关和 Skill 参数。后面的值覆盖前面的值。Agent 页的对应字段全部可留空；sub-agent 使用目标 Agent 自己的配置，不继承父 Agent 的模型或推理参数。
+
+后台运行默认把用户配置中的 MCP Server 逐个设为禁用，只保留 Teamwork 自己的 `invoke_agent` 网关和 `allowed_user_mcp_servers` 明确列出的服务。这样不会因为用户桌面环境中配置了浏览器、Computer Use 或应用内工具，就让无人值守 Agent 卡在等待交互的工具调用上。如果确实需要继承全部用户 MCP，可以显式设置 `inherit_user_mcp_servers: true`，但这会重新引入无人值守运行风险。
+
+`codex_home` 留空时继续使用服务进程当前的 `CODEX_HOME` 或 `~/.codex`。配置独立目录可以隔离 `config.toml`、登录状态与 `models_cache.json`，但首次使用前必须先为该目录完成 Codex 登录。`expected_codex_version` 用来固定后台实际执行的 CLI 版本；服务会在启动 Agent 前调用 `codex --version`，不匹配时立即失败并显示实际路径、实际版本和缓存版本诊断，而不是让多个版本反复覆盖同一个模型缓存。
+
+Agent 的 `timeout_seconds` 是单次运行总时长上限；`runtime.agent_idle_timeout_seconds` 是连续没有新 JSONL 进度的上限，两者任意一个先到都会终止整个 Codex 进程组。Agent 还可以用 `idle_timeout_seconds` 单独覆盖默认值。在“运行与日志”中可以对“排队中”或“执行中”的任务点击“取消运行”：排队任务会直接取消，执行中任务会先请求正常终止，短暂等待后再强制结束整个进程组，取消状态会持久化到 SQLite，因此后台服务与 UI 不在同一进程时仍然有效。
 
 模型候选来自服务端当前 `codex_binary` 的本机模型目录。读取失败时仍可手工填写模型 ID。Agent 模型留空时，界面会优先显示具体的 Teamwork 运行时模型，其次显示 `~/.codex/config.toml` 中可读取的模型；如果两处都没有固定模型，则明确显示“由 Codex CLI / 账号默认决定”，不会猜测一个可能变化的模型。不同仓库里的 `.codex/config.toml` 仍可能影响没有被更高层覆盖的运行。
 
