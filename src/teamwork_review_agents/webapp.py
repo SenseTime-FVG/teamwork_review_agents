@@ -85,6 +85,19 @@ class RepositoryDeleteRequest(BaseModel):
     revision: str
 
 
+class ManualLatestEventTarget(BaseModel):
+    """批量手动触发中的单个 MR / PR 目标。"""
+
+    repository_id: str = Field(min_length=1)
+    number: int = Field(ge=1)
+
+
+class ManualLatestEventBatchRequest(BaseModel):
+    """批量手动触发最新事件请求。"""
+
+    targets: list[ManualLatestEventTarget] = Field(min_length=1, max_length=100)
+
+
 class PromptPreviewRequest(BaseModel):
     """Prompt 模板的纯文本预览请求。"""
 
@@ -851,12 +864,8 @@ def create_app(
             "reason": "首次发现事件已补发" if inserted else "首次发现事件已经存在",
         }
 
-    @app.post(
-        "/api/change-requests/{repository_id}/{number}/trigger-latest-event"
-    )
-    async def trigger_latest_event(repository_id: str, number: int):
-        """把已缓存的最新 Provider 活动作为新的手动事件送入规则引擎。"""
-
+    async def create_latest_manual_event(repository_id: str, number: int):
+        """校验目标并创建尚未写入数据库的最新手动事件。"""
         snapshot = await asyncio.to_thread(
             manager.store.load_snapshot,
             f"{repository_id}:{number}",
@@ -878,6 +887,15 @@ def create_app(
                 detail="尚未取得可触发的最新 Provider 事件，请先完成一次扫描",
             )
         event = create_manual_activity_event(snapshot, activity)
+        return event, activity
+
+    @app.post(
+        "/api/change-requests/{repository_id}/{number}/trigger-latest-event"
+    )
+    async def trigger_latest_event(repository_id: str, number: int):
+        """把已缓存的最新 Provider 活动作为新的手动事件送入规则引擎。"""
+
+        event, activity = await create_latest_manual_event(repository_id, number)
         inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
         if not inserted:
             raise HTTPException(status_code=409, detail="手动事件未能写入，请重新操作")
@@ -893,6 +911,79 @@ def create_app(
                 else None
             ),
             "reason": f"已手动发送 {event.type}",
+        }
+
+    @app.post("/api/change-requests/trigger-latest-events")
+    async def trigger_latest_events(request: ManualLatestEventBatchRequest):
+        """逐项创建最新手动事件，并让单项失败不阻塞其他目标。"""
+
+        results: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        created_count = 0
+        for target in request.targets:
+            key = (target.repository_id, target.number)
+            if key in seen:
+                results.append(
+                    {
+                        "repository_id": target.repository_id,
+                        "number": target.number,
+                        "created": False,
+                        "status_code": 409,
+                        "reason": "批量请求中存在重复目标",
+                    }
+                )
+                continue
+            seen.add(key)
+            try:
+                event, activity = await create_latest_manual_event(*key)
+                inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
+                if not inserted:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="手动事件未能写入，请重新操作",
+                    )
+            except HTTPException as exc:
+                results.append(
+                    {
+                        "repository_id": target.repository_id,
+                        "number": target.number,
+                        "created": False,
+                        "status_code": exc.status_code,
+                        "reason": str(exc.detail),
+                    }
+                )
+                continue
+
+            created_count += 1
+            results.append(
+                {
+                    "repository_id": target.repository_id,
+                    "number": target.number,
+                    "created": True,
+                    "status_code": 200,
+                    "event_id": event.id,
+                    "event_type": event.type,
+                    "source_activity_id": activity.id,
+                    "source_occurred_at": (
+                        activity.occurred_at.isoformat()
+                        if activity.occurred_at is not None
+                        else None
+                    ),
+                    "reason": f"已手动发送 {event.type}",
+                }
+            )
+
+        if created_count:
+            runtime.dispatch_events_now()
+        failed_count = len(results) - created_count
+        return {
+            "requested": len(request.targets),
+            "created": created_count,
+            "failed": failed_count,
+            "results": results,
+            "reason": (
+                f"批量手动触发完成：成功 {created_count} 项，失败 {failed_count} 项"
+            ),
         }
 
     static_directory = Path(__file__).parent / "web" / "dist"

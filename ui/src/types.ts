@@ -287,6 +287,26 @@ export type ChangeRequestRecord = {
   } | null;
 };
 
+export type ManualLatestEventBatchResult = {
+  repository_id: string;
+  number: number;
+  created: boolean;
+  status_code: number;
+  event_id?: string;
+  event_type?: string;
+  source_activity_id?: string;
+  source_occurred_at?: string | null;
+  reason: string;
+};
+
+export type ManualLatestEventBatchResponse = {
+  requested: number;
+  created: number;
+  failed: number;
+  results: ManualLatestEventBatchResult[];
+  reason: string;
+};
+
 export type RunSummary = {
   run_id: string;
   root_run_id: string;

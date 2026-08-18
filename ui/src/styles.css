@@ -116,6 +116,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .section-title-row { margin-bottom: 19px; }
 .section-title-row h2, .run-detail-head h2 { margin: 0 0 5px; color: var(--bright); font-size: 16px; letter-spacing: -.015em; }
 .section-title-row p, .sub-card-head p, .run-detail-head p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.overview-section-tools { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; }
+.overview-selection-actions { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .overview-list-controls { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .overview-list-controls label { min-width: 118px; display: flex; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
 .overview-list-controls label:first-child { min-width: 190px; }
@@ -385,6 +387,10 @@ table { width: 100%; border-collapse: collapse; font-size: 11px; }
 th { padding: 9px 10px; color: #647287; text-align: left; font-size: 9px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
 td { padding: 11px 10px; color: #aab6c5; border-bottom: 1px solid var(--line-soft); }
 tbody tr:last-child td { border-bottom: 0; }
+.overview-selection-column { width: 46px; min-width: 46px; text-align: center; }
+.overview-selection-column input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.overview-selection-column input:disabled { cursor: not-allowed; opacity: .38; }
+.overview-row-selected td { background: rgba(53, 141, 91, .08); }
 .change-request-link { display: flex; min-width: 220px; max-width: 440px; flex-direction: column; gap: 4px; color: var(--bright); text-decoration: none; }
 .change-request-link:hover strong { color: var(--accent); }
 .change-request-link strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -675,6 +681,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .agent-detail-form, .rule-detail-form { padding: 16px; }
   .repository-detail-form { padding: 16px; }
   .repository-reference-warning { flex-direction: column; gap: 6px; }
+  .overview-section-tools { width: 100%; flex-direction: column; align-items: stretch; }
+  .overview-selection-actions { width: 100%; }
   .overview-list-controls { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
   .overview-list-controls label, .overview-list-controls label:first-child, .overview-list-controls .overview-custom-limit { min-width: 0; }
   .overview-confirmation-layer { align-items: end; padding: 10px; }

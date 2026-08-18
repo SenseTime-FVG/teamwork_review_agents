@@ -720,6 +720,57 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
             "/api/change-requests/first/13/trigger-latest-event"
         ).status_code == 409
 
+        committed_snapshot = snapshot_factory(
+            provider="provider-main",
+            repository_id="second",
+            number=14,
+        )
+        store.save_snapshot_and_events(committed_snapshot, [])
+        committed_activity = ChangeRequestActivity(
+            id="timeline-committed",
+            type="committed",
+            occurred_at="2026-08-18T09:00:00Z",
+        )
+        store.save_activity_cursor(
+            committed_snapshot.provider,
+            committed_snapshot.repository_id,
+            committed_snapshot.number,
+            {
+                "item_id": committed_activity.id,
+                "latest_activity_checked": True,
+                "latest_activity": committed_activity.model_dump(mode="json"),
+            },
+        )
+        dispatch_calls: list[bool] = []
+        app.state.runtime.dispatch_events_now = lambda: dispatch_calls.append(True)
+        batch_manual = client.post(
+            "/api/change-requests/trigger-latest-events",
+            json={
+                "targets": [
+                    {"repository_id": "first", "number": 12},
+                    {"repository_id": "second", "number": 14},
+                    {"repository_id": "first", "number": 12},
+                    {"repository_id": "first", "number": 13},
+                ]
+            },
+        )
+        assert batch_manual.status_code == 200
+        batch_body = batch_manual.json()
+        assert batch_body["requested"] == 4
+        assert batch_body["created"] == 2
+        assert batch_body["failed"] == 2
+        assert [item["event_type"] for item in batch_body["results"] if item["created"]] == [
+            "change_request.merged",
+            "change_request.commits_changed",
+        ]
+        assert batch_body["results"][2]["reason"] == "批量请求中存在重复目标"
+        assert batch_body["results"][3]["status_code"] == 409
+        assert dispatch_calls == [True]
+        assert client.post(
+            "/api/change-requests/trigger-latest-events",
+            json={"targets": []},
+        ).status_code == 422
+
         reservation = store.begin_agent_run(
             proposed_run_id="run-web",
             root_run_id=None,
