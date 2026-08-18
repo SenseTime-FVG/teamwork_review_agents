@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from .models import (
@@ -21,6 +22,74 @@ FIELD_EVENTS = {
     "pipeline_status": "change_request.pipeline_changed",
     "merge_status": "change_request.merge_status_changed",
 }
+
+ACTIVITY_EVENT_TYPES = {
+    "closed": "change_request.closed",
+    "reopened": "change_request.reopened",
+    "merged": "change_request.merged",
+    "committed": "change_request.commits_changed",
+    "head_ref_force_pushed": "change_request.commits_changed",
+    "convert_to_draft": "change_request.draft_changed",
+    "ready_for_review": "change_request.draft_changed",
+    "labeled": "change_request.labels_changed",
+    "unlabeled": "change_request.labels_changed",
+}
+
+ACTIVITY_CHANGED_FIELDS = {
+    "closed": ("state",),
+    "reopened": ("state",),
+    "merged": ("state",),
+    "committed": ("head_sha",),
+    "head_ref_force_pushed": ("head_sha",),
+    "convert_to_draft": ("draft",),
+    "ready_for_review": ("draft",),
+    "labeled": ("labels",),
+    "unlabeled": ("labels",),
+}
+
+
+def activity_event_type(activity_type: str) -> str | None:
+    """把 Provider 活动类型转换为系统规则事件类型。"""
+
+    return ACTIVITY_EVENT_TYPES.get(activity_type)
+
+
+def create_manual_activity_event(
+    snapshot: ChangeRequestSnapshot,
+    activity: ChangeRequestActivity,
+) -> ChangeEvent:
+    """使用当前快照重放一条 Provider 活动，并保留原始活动审计引用。"""
+
+    event_type = activity_event_type(activity.type)
+    if event_type is None:
+        raise ValueError(f"不支持手动触发 Provider 活动：{activity.type}")
+    request_id = uuid.uuid4().hex
+    occurred_at = datetime.now(UTC)
+    return ChangeEvent(
+        id=stable_hash(
+            snapshot.provider,
+            snapshot.repository_id,
+            snapshot.number,
+            "manual",
+            request_id,
+            activity.id,
+            event_type,
+        ),
+        type=event_type,
+        provider=snapshot.provider,
+        repository_id=snapshot.repository_id,
+        number=snapshot.number,
+        old=snapshot,
+        new=snapshot,
+        current=snapshot,
+        batch_id=f"manual:{request_id}",
+        changed_fields=ACTIVITY_CHANGED_FIELDS[activity.type],
+        occurred_at=occurred_at,
+        origin="manual",
+        source_activity_id=activity.id,
+        source_activity_type=activity.type,
+        source_occurred_at=activity.occurred_at,
+    )
 
 
 def _event_id(

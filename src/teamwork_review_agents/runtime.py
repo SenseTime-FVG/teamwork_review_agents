@@ -19,6 +19,7 @@ class BackgroundRuntime:
         self.store.recover_interrupted_work()
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
+        self._dispatch_requested = False
         self._task: asyncio.Task[None] | None = None
         self._orchestrator = Orchestrator(
             manager.config,
@@ -55,6 +56,12 @@ class BackgroundRuntime:
     def scan_now(self) -> None:
         """请求尽快执行一次扫描，不与正在运行的周期重叠。"""
 
+        self._wake_event.set()
+
+    def dispatch_events_now(self) -> None:
+        """请求尽快只处理待处理事件，不额外访问 Provider。"""
+
+        self._dispatch_requested = True
         self._wake_event.set()
 
     def pause(self) -> None:
@@ -115,12 +122,42 @@ class BackgroundRuntime:
             "stats": stats,
         }
 
+    async def _run_cycle(self, *, dispatch_only: bool) -> None:
+        """串行执行完整扫描周期或仅执行事件调度。"""
+
+        self.running_cycle = True
+        self.last_started_at = time.time()
+        self.last_error = None
+        self._persist_status()
+        try:
+            if dispatch_only:
+                summary = CycleSummary()
+                await self._orchestrator.process_events(summary)
+            else:
+                summary = await self._orchestrator.run_once()
+            self.last_summary = summary.to_dict()
+            if summary.errors:
+                self.last_error = "; ".join(summary.errors)
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.last_summary = None
+        finally:
+            self.running_cycle = False
+            self.last_finished_at = time.time()
+            self._persist_status()
+        cutoff = time.time() - self.manager.config.web.log_retention_days * 86400
+        await asyncio.to_thread(self.store.prune_run_logs, cutoff)
+
     async def _loop(self) -> None:
         """串行执行周期，并独立按较短间隔检测配置文件变化。"""
 
         next_scan_at = 0.0
         while not self._stop_event.is_set():
             self._reload_config()
+            if self._dispatch_requested:
+                self._dispatch_requested = False
+                await self._run_cycle(dispatch_only=True)
+                continue
             if self.paused:
                 self._persist_status()
                 try:
@@ -143,26 +180,10 @@ class BackgroundRuntime:
                 except TimeoutError:
                     pass
                 if self._wake_event.is_set():
-                    # 配置保存和手动扫描都要求尽快执行下一周期。
-                    next_scan_at = 0.0
+                    if not self._dispatch_requested:
+                        # 配置保存和手动扫描都要求尽快执行下一周期。
+                        next_scan_at = 0.0
                 self._wake_event.clear()
                 continue
-            self.running_cycle = True
-            self.last_started_at = time.time()
-            self.last_error = None
-            self._persist_status()
-            try:
-                summary: CycleSummary = await self._orchestrator.run_once()
-                self.last_summary = summary.to_dict()
-                if summary.errors:
-                    self.last_error = "; ".join(summary.errors)
-            except Exception as exc:
-                self.last_error = str(exc)
-                self.last_summary = None
-            finally:
-                self.running_cycle = False
-                self.last_finished_at = time.time()
-                self._persist_status()
-            cutoff = time.time() - self.manager.config.web.log_retention_days * 86400
-            await asyncio.to_thread(self.store.prune_run_logs, cutoff)
+            await self._run_cycle(dispatch_only=False)
             next_scan_at = time.monotonic() + self.manager.config.scanner.interval_seconds

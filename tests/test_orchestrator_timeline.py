@@ -34,7 +34,11 @@ async def test_scan_recovers_transient_state_changes_from_timeline(
     orchestrator.store.save_snapshot_and_events(
         old,
         [],
-        activity_cursor={"page": 1, "item_id": "before-close"},
+        activity_cursor={
+            "page": 1,
+            "item_id": "before-close",
+            "latest_activity_checked": True,
+        },
     )
 
     class FakeProvider:
@@ -56,7 +60,16 @@ async def test_scan_recovers_transient_state_changes_from_timeline(
             *_: object,
             cursor: dict[str, object] | None = None,
         ) -> ChangeRequestActivityBatch:
-            assert cursor == {"page": 1, "item_id": "before-close"}
+            assert cursor == {
+                "page": 1,
+                "item_id": "before-close",
+                "latest_activity_checked": True,
+            }
+            latest = ChangeRequestActivity(
+                id="reopened-1",
+                type="reopened",
+                occurred_at="2026-08-17T08:02:00Z",
+            )
             return ChangeRequestActivityBatch(
                 activities=(
                     ChangeRequestActivity(
@@ -70,6 +83,7 @@ async def test_scan_recovers_transient_state_changes_from_timeline(
                         occurred_at="2026-08-17T08:02:00Z",
                     ),
                 ),
+                latest_activity=latest,
                 cursor={"page": 1, "item_id": "reopened-1"},
             )
 
@@ -87,11 +101,16 @@ async def test_scan_recovers_transient_state_changes_from_timeline(
         "change_request.reopened",
         "change_request.updated",
     ]
-    assert orchestrator.store.load_activity_cursor(
+    cursor = orchestrator.store.load_activity_cursor(
         repository.provider,
         repository.id,
         current.number,
-    ) == {"page": 1, "item_id": "reopened-1"}
+    )
+    assert cursor is not None
+    assert cursor["page"] == 1
+    assert cursor["item_id"] == "reopened-1"
+    assert cursor["latest_activity_checked"] is True
+    assert cursor["latest_activity"]["type"] == "reopened"
 
 
 async def test_scan_initializes_existing_snapshot_before_candidate_filtering(
@@ -132,6 +151,11 @@ async def test_scan_initializes_existing_snapshot_before_candidate_filtering(
             assert cursor is None
             return ChangeRequestActivityBatch(
                 cursor={"page": 4, "item_id": "baseline-last"},
+                latest_activity=ChangeRequestActivity(
+                    id="baseline-merged",
+                    type="merged",
+                    occurred_at="2026-08-16T08:00:00Z",
+                ),
                 baseline=True,
             )
 
@@ -144,11 +168,20 @@ async def test_scan_initializes_existing_snapshot_before_candidate_filtering(
 
     assert summary.snapshots == 0
     assert summary.new_events == 0
-    assert orchestrator.store.load_activity_cursor(
+    cursor = orchestrator.store.load_activity_cursor(
         repository.provider,
         repository.id,
         snapshot.number,
-    ) == {"page": 4, "item_id": "baseline-last"}
+    )
+    assert cursor is not None
+    assert cursor["page"] == 4
+    assert cursor["item_id"] == "baseline-last"
+    assert cursor["latest_activity_checked"] is True
+    assert cursor["latest_activity"]["type"] == "merged"
+    assert orchestrator.store.pending_events() == []
+    latest_event = orchestrator.store.list_snapshots()[0]["latest_event"]
+    assert latest_event["event_type"] == "change_request.merged"
+    assert latest_event["provider_event_id"] == "baseline-merged"
 
 
 async def test_first_scan_replays_one_cycle_then_uses_saved_cursor(
@@ -192,9 +225,17 @@ async def test_first_scan_replays_one_cycle_then_uses_saved_cursor(
             since: datetime | None = None,
         ) -> ChangeRequestActivityBatch:
             if cursor is not None:
-                assert cursor == {"page": 1, "item_id": "first-reopen"}
+                assert cursor["page"] == 1
+                assert cursor["item_id"] == "first-reopen"
+                assert cursor["latest_activity_checked"] is True
+                assert cursor["latest_activity"]["id"] == "first-reopen"
                 assert since is None
-                return ChangeRequestActivityBatch(cursor=cursor)
+                return ChangeRequestActivityBatch(
+                    cursor={"page": 1, "item_id": "first-reopen"},
+                    latest_activity=ChangeRequestActivity.model_validate(
+                        cursor["latest_activity"]
+                    ),
+                )
             assert since is not None
             seen_since.append(since)
             return ChangeRequestActivityBatch(
@@ -209,6 +250,11 @@ async def test_first_scan_replays_one_cycle_then_uses_saved_cursor(
                         type="reopened",
                         occurred_at=now - timedelta(minutes=2),
                     ),
+                ),
+                latest_activity=ChangeRequestActivity(
+                    id="first-reopen",
+                    type="reopened",
+                    occurred_at=now - timedelta(minutes=2),
                 ),
                 cursor={"page": 1, "item_id": "first-reopen"},
             )

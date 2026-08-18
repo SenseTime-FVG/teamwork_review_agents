@@ -13,7 +13,7 @@ from .config import AppConfig, RepositoryConfig, RuleConfig
 from .environment import resolve_provider_token
 from .events import detect_activity_events, detect_events, detect_first_seen_events
 from .executor import AgentExecutor
-from .models import AgentResult, ChangeEvent, stable_hash
+from .models import AgentResult, ChangeEvent, ChangeRequestActivityBatch, stable_hash
 from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
 from .state import StateStore
@@ -99,6 +99,16 @@ class Orchestrator:
 
         return f"repository_scan:{repository_id}"
 
+    @staticmethod
+    def _activity_cursor(batch: ChangeRequestActivityBatch) -> dict[str, Any]:
+        """把最新 Provider 活动与增量位置一起写入持久化游标。"""
+
+        cursor = dict(batch.cursor)
+        cursor["latest_activity_checked"] = True
+        if batch.latest_activity is not None:
+            cursor["latest_activity"] = batch.latest_activity.model_dump(mode="json")
+        return cursor
+
     def _last_scan_completed_at(self, repository_id: str) -> datetime | None:
         """读取仓库上一次成功完成扫描的精确时间。"""
 
@@ -183,7 +193,7 @@ class Orchestrator:
                     snapshot.provider,
                     snapshot.repository_id,
                     snapshot.number,
-                    activity_batch.cursor,
+                    self._activity_cursor(activity_batch),
                 )
             if len(snapshots) < self.config.scanner.max_items_per_repository:
                 return
@@ -296,7 +306,7 @@ class Orchestrator:
                                     snapshot,
                                     events,
                                     activity_cursor=(
-                                        activity_batch.cursor
+                                        self._activity_cursor(activity_batch)
                                         if activity_batch is not None
                                         else None
                                     ),

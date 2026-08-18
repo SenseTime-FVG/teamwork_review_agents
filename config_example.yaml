@@ -244,6 +244,7 @@ rules:
     events:
       - change_request.opened
       - change_request.reopened
+      - change_request.commits_changed
     agents:
       - general-reviewer
     # 留空表示不限制仓库，也不附加快照字段条件。

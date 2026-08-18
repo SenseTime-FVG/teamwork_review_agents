@@ -17,7 +17,7 @@ from teamwork_review_agents.environment import (
     resolve_provider_token,
 )
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import AgentResult
+from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
 from teamwork_review_agents.webapp import create_app
 
 
@@ -281,6 +281,8 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         change_requests = client.get("/api/change-requests").json()
         assert change_requests[0]["number"] == 12
         assert change_requests[0]["discovered_event_emitted"] is False
+        assert change_requests[0]["latest_event_supported"] is True
+        assert change_requests[0]["latest_event_checked"] is False
         assert client.get("/api/status").json()["stats"]["change_requests"] == {
             "total": 1,
             "opened": 1,
@@ -305,6 +307,58 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         assert client.post(
             "/api/change-requests/first/999/emit-discovered"
         ).status_code == 404
+
+        latest_activity = ChangeRequestActivity(
+            id="timeline-merged",
+            type="merged",
+            occurred_at="2026-08-17T08:00:00Z",
+        )
+        store.save_activity_cursor(
+            snapshot.provider,
+            snapshot.repository_id,
+            snapshot.number,
+            {
+                "page": 3,
+                "item_id": latest_activity.id,
+                "latest_activity_checked": True,
+                "latest_activity": latest_activity.model_dump(mode="json"),
+            },
+        )
+        latest_event = client.get("/api/change-requests").json()[0]["latest_event"]
+        assert latest_event["event_type"] == "change_request.merged"
+        assert latest_event["provider_event_id"] == "timeline-merged"
+        assert client.get("/api/change-requests").json()[0][
+            "latest_event_checked"
+        ] is True
+
+        first_manual = client.post(
+            "/api/change-requests/first/12/trigger-latest-event"
+        )
+        second_manual = client.post(
+            "/api/change-requests/first/12/trigger-latest-event"
+        )
+        assert first_manual.status_code == 200
+        assert second_manual.status_code == 200
+        assert first_manual.json()["event_type"] == "change_request.merged"
+        assert first_manual.json()["event_id"] != second_manual.json()["event_id"]
+        manual_records = [
+            item for item in client.get("/api/events").json()
+            if item["origin"] == "manual"
+        ]
+        assert len(manual_records) == 2
+        assert {item["source_activity_id"] for item in manual_records} == {
+            "timeline-merged"
+        }
+
+        no_latest_snapshot = snapshot_factory(
+            provider="provider-main",
+            repository_id="first",
+            number=13,
+        )
+        store.save_snapshot_and_events(no_latest_snapshot, [])
+        assert client.post(
+            "/api/change-requests/first/13/trigger-latest-event"
+        ).status_code == 409
 
         reservation = store.begin_agent_run(
             proposed_run_id="run-web",
@@ -366,6 +420,64 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         static = client.get("/")
         assert static.status_code == 200
         assert "Teamwork Review Agents" in static.text
+
+
+def test_overview_api_filters_status_repository_and_limit(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """概览 API 应组合过滤条件并支持自定义数量与全部模式。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        store = app.state.config_manager.store
+        first = snapshot_factory(
+            provider="provider-main",
+            repository_id="first",
+            number=1,
+            state="opened",
+            updated_at="2026-08-18T10:00:00Z",
+        )
+        second = snapshot_factory(
+            provider="provider-main",
+            repository_id="second",
+            number=2,
+            state="closed",
+            updated_at="2026-08-18T09:00:00Z",
+        )
+        first_event = detect_events(None, first, emit_initial=True)[0]
+        second_event = detect_events(None, second, emit_initial=True)[0]
+        store.save_snapshot_and_events(first, [first_event])
+        store.save_snapshot_and_events(second, [second_event])
+        assert store.claim_event(second_event.id, 2)
+        store.record_event_dispatches([second_event.id], [])
+
+        assert len(client.get("/api/change-requests?limit=1").json()) == 1
+        all_snapshots = client.get(
+            "/api/change-requests?all_records=true"
+        ).json()
+        assert [item["snapshot_key"] for item in all_snapshots] == [
+            first.key,
+            second.key,
+        ]
+        filtered_snapshots = client.get(
+            "/api/change-requests?repository_id=second&status=closed&limit=10"
+        ).json()
+        assert [item["snapshot_key"] for item in filtered_snapshots] == [second.key]
+
+        assert len(client.get("/api/events?limit=1").json()) == 1
+        all_events = client.get("/api/events?all_records=true").json()
+        assert [item["event_id"] for item in all_events] == [
+            first_event.id,
+            second_event.id,
+        ]
+        filtered_events = client.get(
+            "/api/events?repository_id=second&status=unmatched&limit=10"
+        ).json()
+        assert [item["event_id"] for item in filtered_events] == [second_event.id]
+        assert client.get("/api/events?status=unknown").status_code == 422
+        assert client.get("/api/change-requests?status=unknown").status_code == 422
 
 
 def test_codex_runtime_options_report_catalog_and_user_model(

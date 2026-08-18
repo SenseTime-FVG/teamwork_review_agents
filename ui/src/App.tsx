@@ -31,6 +31,35 @@ import type {
 
 type Tab = "overview" | "repositories" | "environment" | "skills" | "agents" | "rules" | "runtime" | "runs";
 
+type OverviewLimit = number | null;
+
+type OverviewFilter = {
+  repositoryId: string;
+  status: string;
+  limit: OverviewLimit;
+};
+
+const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
+  repositoryId: "",
+  status: "",
+  limit: 10,
+};
+
+const CHANGE_REQUEST_STATUS_OPTIONS = [
+  { value: "opened", label: "打开" },
+  { value: "closed", label: "已关闭" },
+  { value: "merged", label: "已合并" },
+];
+
+const EVENT_STATUS_OPTIONS = [
+  { value: "pending", label: "待处理" },
+  { value: "processing", label: "规则匹配中" },
+  { value: "unmatched", label: "未触发" },
+  { value: "triggered", label: "已触发" },
+  { value: "completed", label: "已处理" },
+  { value: "failed", label: "处理失败" },
+];
+
 const EMPTY_STATUS: RuntimeStatus = {
   paused: false,
   running_cycle: false,
@@ -116,6 +145,18 @@ function timeText(timestamp?: number | null): string {
 
 function dateTimeText(value?: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
+}
+
+function overviewQuery(filter: OverviewFilter): string {
+  const parameters = new URLSearchParams();
+  if (filter.limit === null) {
+    parameters.set("all_records", "true");
+  } else {
+    parameters.set("limit", String(filter.limit));
+  }
+  if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
+  if (filter.status) parameters.set("status", filter.status);
+  return parameters.toString();
 }
 
 function shortRevision(revision?: string): string {
@@ -639,13 +680,133 @@ function EnvironmentEditor(props: {
   );
 }
 
+function OverviewListControls(props: {
+  repositories: Repository[];
+  filter: OverviewFilter;
+  statuses: Array<{ value: string; label: string }>;
+  onChange: (filter: OverviewFilter) => void;
+}) {
+  const predefinedLimits = [10, 20, 50];
+  const limitMode = props.filter.limit === null
+    ? "all"
+    : predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "custom";
+  const [customLimit, setCustomLimit] = useState(
+    props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "100",
+  );
+
+  useEffect(() => {
+    if (props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)) {
+      setCustomLimit(String(props.filter.limit));
+    }
+  }, [props.filter.limit]);
+
+  function applyCustomLimit() {
+    const parsed = Number(customLimit);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      props.onChange({ ...props.filter, limit: parsed });
+      return;
+    }
+    const fallback = props.filter.limit !== null && props.filter.limit > 0
+      ? props.filter.limit
+      : 100;
+    setCustomLimit(String(fallback));
+  }
+
+  return (
+    <div className="overview-list-controls">
+      <label>
+        <span>仓库</span>
+        <select
+          value={props.filter.repositoryId}
+          onChange={(event) => props.onChange({ ...props.filter, repositoryId: event.target.value })}
+        >
+          <option value="">全部仓库</option>
+          {props.repositories.map((repository) => (
+            <option key={repository.id} value={repository.id}>
+              {repository.id} · {repository.project}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>状态</span>
+        <select
+          value={props.filter.status}
+          onChange={(event) => props.onChange({ ...props.filter, status: event.target.value })}
+        >
+          <option value="">全部状态</option>
+          {props.statuses.map((status) => (
+            <option key={status.value} value={status.value}>{status.label}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>展示</span>
+        <select
+          value={limitMode}
+          onChange={(event) => {
+            if (event.target.value === "all") {
+              props.onChange({ ...props.filter, limit: null });
+            } else if (event.target.value === "custom") {
+              const parsed = Number(customLimit);
+              props.onChange({
+                ...props.filter,
+                limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
+              });
+            } else {
+              props.onChange({ ...props.filter, limit: Number(event.target.value) });
+            }
+          }}
+        >
+          <option value="10">10 条</option>
+          <option value="20">20 条</option>
+          <option value="50">50 条</option>
+          <option value="all">全部</option>
+          <option value="custom">自定义</option>
+        </select>
+      </label>
+      {limitMode === "custom" && (
+        <label className="overview-custom-limit">
+          <span>自定义条数</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            inputMode="numeric"
+            value={customLimit}
+            onChange={(event) => setCustomLimit(event.target.value)}
+            onBlur={applyCustomLimit}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                applyCustomLimit();
+                event.currentTarget.blur();
+              }
+            }}
+          />
+        </label>
+      )}
+    </div>
+  );
+}
+
 function Overview(props: {
   status: RuntimeStatus;
   events: EventRecord[];
   changeRequests: ChangeRequestRecord[];
+  repositories: Repository[];
+  changeRequestFilter: OverviewFilter;
+  eventFilter: OverviewFilter;
   emittingKey: string;
+  triggeringKey: string;
   onAction: (action: "scan" | "pause" | "resume") => void;
   onEmitDiscovered: (item: ChangeRequestRecord) => void;
+  onTriggerLatestEvent: (item: ChangeRequestRecord) => void;
+  onChangeRequestFilterChange: (filter: OverviewFilter) => void;
+  onEventFilterChange: (filter: OverviewFilter) => void;
 }) {
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
@@ -681,10 +842,16 @@ function Overview(props: {
       <section className="section-card">
         <div className="section-title-row">
           <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；这里的数量与变化事件分开统计。</p></div>
+          <OverviewListControls
+            repositories={props.repositories}
+            filter={props.changeRequestFilter}
+            statuses={CHANGE_REQUEST_STATUS_OPTIONS}
+            onChange={props.onChangeRequestFilterChange}
+          />
         </div>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th></tr></thead>
+            <thead><tr><th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th><th>最新事件</th><th>操作</th></tr></thead>
             <tbody>
               {props.changeRequests.map((item) => (
                 <tr key={item.snapshot_key}>
@@ -711,32 +878,83 @@ function Overview(props: {
                       </button>
                     )}
                   </td>
+                  <td>
+                    {item.latest_event ? (
+                      <span className="latest-event-reference">
+                        <strong>{item.latest_event.event_type}</strong>
+                        <small>{dateTimeText(item.latest_event.occurred_at)}</small>
+                      </span>
+                    ) : (
+                      <span className="latest-event-empty">
+                        {item.latest_event_supported === false
+                          ? "当前 Provider 不支持"
+                          : item.latest_event_checked
+                            ? "暂无可识别事件"
+                            : "等待扫描获取"}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    <button
+                      className="button secondary compact"
+                      disabled={!item.latest_event || props.triggeringKey === item.snapshot_key}
+                      title={item.latest_event ? `手动发送 ${item.latest_event.event_type}` : "尚无可触发的最新事件"}
+                      onClick={() => props.onTriggerLatestEvent(item)}
+                    >
+                      {props.triggeringKey === item.snapshot_key ? "发送中…" : "手动触发"}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {props.changeRequests.length === 0 && <div className="empty">尚未扫描到 MR / PR，请确认仓库已启用并执行扫描。</div>}
+          {props.changeRequests.length === 0 && (
+            <div className="empty">
+              {props.changeRequestFilter.repositoryId || props.changeRequestFilter.status
+                ? "当前筛选条件下没有 MR / PR。"
+                : "尚未扫描到 MR / PR，请确认仓库已启用并执行扫描。"}
+            </div>
+          )}
         </div>
       </section>
       <section className="section-card">
-        <div className="section-title-row"><div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div></div>
+        <div className="section-title-row">
+          <div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div>
+          <OverviewListControls
+            repositories={props.repositories}
+            filter={props.eventFilter}
+            statuses={EVENT_STATUS_OPTIONS}
+            onChange={props.onEventFilterChange}
+          />
+        </div>
         <div className="table-wrap">
           <table>
             <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th></tr></thead>
             <tbody>
               {props.events.map((event) => (
                 <tr key={event.event_id}>
-                  <td className="mono">{event.event_type}</td>
+                  <td className="mono">
+                    <span className="event-type-with-origin">
+                      {event.event_type}
+                      {event.origin === "manual" && <small>手动</small>}
+                    </span>
+                  </td>
                   <td>{event.repository_id}</td>
                   <td>#{event.number}</td>
                   <td><EventStatusPill event={event} /></td>
                   <td><EventAgentProgress event={event} /></td>
-                  <td>{timeText(event.created_at)}</td>
+                  <td>{dateTimeText(event.occurred_at)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {props.events.length === 0 && <div className="empty">尚未产生事件</div>}
+          {props.events.length === 0 && (
+            <div className="empty">
+              {props.eventFilter.repositoryId || props.eventFilter.status
+                ? "当前筛选条件下没有变化事件。"
+                : "尚未产生事件"}
+            </div>
+          )}
         </div>
       </section>
     </div>
@@ -2278,7 +2496,14 @@ export default function App() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
+  const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
+    DEFAULT_OVERVIEW_FILTER,
+  );
+  const [eventFilter, setEventFilter] = useState<OverviewFilter>(
+    DEFAULT_OVERVIEW_FILTER,
+  );
   const [emittingKey, setEmittingKey] = useState("");
+  const [triggeringKey, setTriggeringKey] = useState("");
   const [eventOptions, setEventOptions] = useState<string[]>([]);
   const [codexOptions, setCodexOptions] = useState<CodexRuntimeOptions>(EMPTY_CODEX_OPTIONS);
   const [revision, setRevision] = useState("");
@@ -2291,17 +2516,22 @@ export default function App() {
   const [token, setToken] = useState(getToken());
 
   const refreshOperationalData = useCallback(async () => {
-    const [nextStatus, nextRuns, nextEvents, nextChangeRequests] = await Promise.all([
+    const [nextStatus, nextRuns] = await Promise.all([
       api<RuntimeStatus>("/api/status"),
       api<RunSummary[]>("/api/runs?limit=100"),
-      api<EventRecord[]>("/api/events?limit=50"),
-      api<ChangeRequestRecord[]>("/api/change-requests?limit=100"),
     ]);
     setStatus(nextStatus);
     setRuns(nextRuns);
+  }, []);
+
+  const refreshOverviewData = useCallback(async () => {
+    const [nextEvents, nextChangeRequests] = await Promise.all([
+      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter)}`),
+      api<ChangeRequestRecord[]>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
+    ]);
     setEvents(nextEvents);
     setChangeRequests(nextChangeRequests);
-  }, []);
+  }, [changeRequestFilter, eventFilter]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2334,6 +2564,13 @@ export default function App() {
     const timer = window.setInterval(() => { void refreshOperationalData().catch(() => undefined); }, 3000);
     return () => window.clearInterval(timer);
   }, [refreshOperationalData]);
+  useEffect(() => {
+    void refreshOverviewData().catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "概览列表加载失败");
+    });
+    const timer = window.setInterval(() => { void refreshOverviewData().catch(() => undefined); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [refreshOverviewData]);
 
   function changeDocument(next: ConfigDocument) {
     if (!editing) return;
@@ -2412,7 +2649,7 @@ export default function App() {
         `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/emit-discovered`,
         { method: "POST" },
       );
-      await refreshOperationalData();
+      await Promise.all([refreshOperationalData(), refreshOverviewData()]);
       setNotice(result.reason);
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
@@ -2421,6 +2658,61 @@ export default function App() {
       setEmittingKey("");
     }
   }
+
+  async function triggerLatestEvent(item: ChangeRequestRecord) {
+    const latestEvent = item.latest_event;
+    if (!latestEvent) return;
+    const hasCandidateRule = Boolean(document?.rules.some((rule) => (
+      rule.enabled !== false
+      && rule.events.includes(latestEvent.event_type)
+      && (!rule.repositories || rule.repositories.includes(item.repository_id))
+    )));
+    const ruleImpact = hasCandidateRule
+      ? "当前存在事件和仓库范围可能匹配的启用规则；最终仍需满足规则条件。"
+      : "当前没有事件和仓库范围匹配的启用规则，本次事件预计会记录为未触发。";
+    const confirmed = window.confirm(
+      `确定为 ${item.repository_id} #${item.number} 手动发送 ${latestEvent.event_type} 吗？\n\n`
+      + `平台原事件时间：${dateTimeText(latestEvent.occurred_at)}\n`
+      + `${ruleImpact}\n\n此操作不会修改远端 PR。`,
+    );
+    if (!confirmed) return;
+
+    setTriggeringKey(item.snapshot_key);
+    setError("");
+    try {
+      const result = await api<{ created: boolean; reason: string }>(
+        `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/trigger-latest-event`,
+        { method: "POST" },
+      );
+      await Promise.all([refreshOperationalData(), refreshOverviewData()]);
+      setNotice(result.reason);
+      window.setTimeout(() => setNotice(""), 3500);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "手动触发最新事件失败");
+    } finally {
+      setTriggeringKey("");
+    }
+  }
+
+  const enabledRepositories = useMemo(
+    () => (savedDocument?.repositories ?? document?.repositories ?? [])
+      .filter((repository) => repository.enabled !== false),
+    [document?.repositories, savedDocument?.repositories],
+  );
+
+  useEffect(() => {
+    const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
+    setChangeRequestFilter((current) => (
+      current.repositoryId && !enabledIds.has(current.repositoryId)
+        ? { ...current, repositoryId: "" }
+        : current
+    ));
+    setEventFilter((current) => (
+      current.repositoryId && !enabledIds.has(current.repositoryId)
+        ? { ...current, repositoryId: "" }
+        : current
+    ));
+  }, [enabledRepositories]);
 
   const tabs = useMemo<Array<{ id: Tab; label: string; mark: string }>>(() => [
     { id: "overview", label: "运行概览", mark: "01" },
@@ -2469,9 +2761,16 @@ export default function App() {
                   status={status}
                   events={events}
                   changeRequests={changeRequests}
+                  repositories={enabledRepositories}
+                  changeRequestFilter={changeRequestFilter}
+                  eventFilter={eventFilter}
                   emittingKey={emittingKey}
+                  triggeringKey={triggeringKey}
                   onAction={control}
                   onEmitDiscovered={(item) => { void emitDiscovered(item); }}
+                  onTriggerLatestEvent={(item) => { void triggerLatestEvent(item); }}
+                  onChangeRequestFilterChange={setChangeRequestFilter}
+                  onEventFilterChange={setEventFilter}
                 />
               )}
               {configurableTab && (

@@ -1,7 +1,7 @@
 """SQLite 幂等与资源租约测试。"""
 
-from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import AgentResult
+from teamwork_review_agents.events import create_manual_activity_event, detect_events
+from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
 from teamwork_review_agents.state import StateStore
 
 
@@ -41,6 +41,104 @@ def test_lists_snapshot_stats_and_enqueues_discovered_event(
     assert store.has_event_type("demo", 9, "change_request.discovered")
     assert store.load_snapshot(snapshot.key) == snapshot
     assert store.list_snapshots()[0]["discovered_event_emitted"] is True
+
+
+def test_latest_activity_reference_and_manual_events_are_independent(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """最新活动只作参考，同一活动可多次生成不同的手动事件。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(repository_id="demo", number=9, state="merged")
+    activity = ChangeRequestActivity(
+        id="timeline-merged",
+        type="merged",
+        occurred_at="2026-08-17T08:00:00Z",
+    )
+    store.save_snapshot_and_events(
+        snapshot,
+        [],
+        activity_cursor={
+            "page": 3,
+            "item_id": activity.id,
+            "latest_activity_checked": True,
+            "latest_activity": activity.model_dump(mode="json"),
+        },
+    )
+
+    assert store.pending_events() == []
+    latest = store.list_snapshots()[0]["latest_event"]
+    assert latest["event_type"] == "change_request.merged"
+    assert latest["provider_event_id"] == activity.id
+
+    first = create_manual_activity_event(snapshot, activity)
+    second = create_manual_activity_event(snapshot, activity)
+    assert first.id != second.id
+    assert first.batch_id != second.batch_id
+    assert store.enqueue_events([first, second]) == 2
+    assert len(store.pending_events()) == 2
+    records = store.list_events()
+    assert {item["origin"] for item in records} == {"manual"}
+    assert {item["source_activity_id"] for item in records} == {activity.id}
+    assert {item["source_activity_type"] for item in records} == {"merged"}
+
+
+def test_overview_lists_filter_sort_and_apply_optional_limits(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """概览查询应先过滤，再按业务时间倒序并支持全部记录。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    newest = snapshot_factory(
+        repository_id="first",
+        number=1,
+        state="opened",
+        updated_at="2026-08-18T10:00:00Z",
+    )
+    older = snapshot_factory(
+        repository_id="second",
+        number=2,
+        state="closed",
+        updated_at="2026-08-18T09:00:00Z",
+    )
+    newest_event = detect_events(None, newest, emit_initial=True)[0]
+    older_event = detect_events(None, older, emit_initial=True)[0]
+
+    # 故意让业务时间较旧的记录后入库，验证排序不依赖扫描或入库时间。
+    store.save_snapshot_and_events(newest, [newest_event])
+    store.save_snapshot_and_events(older, [older_event])
+    assert store.claim_event(older_event.id, 2)
+    store.record_event_dispatches([older_event.id], [])
+
+    assert [item["snapshot_key"] for item in store.list_snapshots(None)] == [
+        newest.key,
+        older.key,
+    ]
+    assert [item["snapshot_key"] for item in store.list_snapshots(1)] == [
+        newest.key,
+    ]
+    assert [
+        item["snapshot_key"]
+        for item in store.list_snapshots(None, repository_id="second")
+    ] == [older.key]
+    assert [
+        item["snapshot_key"]
+        for item in store.list_snapshots(None, status="opened")
+    ] == [newest.key]
+
+    assert [item["event_id"] for item in store.list_events(None)] == [
+        newest_event.id,
+        older_event.id,
+    ]
+    assert store.list_events(1)[0]["event_id"] == newest_event.id
+    assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
+    assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id
+    assert store.list_events(None, status="pending")[0]["event_id"] == newest_event.id
+    assert store.list_events(None)[0]["occurred_at"].startswith("2026-08-18T10:00:00")
 
 
 def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:

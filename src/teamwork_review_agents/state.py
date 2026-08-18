@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import AgentResult, ChangeEvent, ChangeRequestSnapshot
+from .events import activity_event_type
+from .models import (
+    AgentResult,
+    ChangeEvent,
+    ChangeRequestActivity,
+    ChangeRequestSnapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -268,7 +274,7 @@ class StateStore:
         *,
         limit: int = 100,
     ) -> list[ChangeRequestSnapshot]:
-        """返回已有快照中尚未建立 Provider 活动基线的项目。"""
+        """返回尚无活动游标或最新活动缓存的已有快照。"""
 
         with self.connect() as connection:
             rows = connection.execute(
@@ -281,7 +287,15 @@ class StateStore:
                  AND activity.number = json_extract(snapshot.payload, '$.number')
                 WHERE json_extract(snapshot.payload, '$.provider') = ?
                   AND json_extract(snapshot.payload, '$.repository_id') = ?
-                  AND activity.provider IS NULL
+                  AND (
+                      activity.provider IS NULL
+                      OR COALESCE(
+                          json_extract(
+                              activity.cursor, '$.latest_activity_checked'
+                          ),
+                          0
+                      ) != 1
+                  )
                 ORDER BY snapshot.updated_at ASC
                 LIMIT ?
                 """,
@@ -291,6 +305,30 @@ class StateStore:
             ChangeRequestSnapshot.model_validate_json(row["payload"])
             for row in rows
         ]
+
+    @staticmethod
+    def _latest_activity_from_cursor(
+        cursor: dict[str, Any] | None,
+    ) -> ChangeRequestActivity | None:
+        """从兼容游标中读取最新 Provider 活动。"""
+
+        if not cursor or not isinstance(cursor.get("latest_activity"), dict):
+            return None
+        try:
+            return ChangeRequestActivity.model_validate(cursor["latest_activity"])
+        except (TypeError, ValueError):
+            return None
+
+    def load_latest_activity(
+        self,
+        provider: str,
+        repository_id: str,
+        number: int,
+    ) -> ChangeRequestActivity | None:
+        """读取指定 MR/PR 已缓存的最新可触发 Provider 活动。"""
+
+        cursor = self.load_activity_cursor(provider, repository_id, number)
+        return self._latest_activity_from_cursor(cursor)
 
     def save_activity_cursor(
         self,
@@ -381,28 +419,55 @@ class StateStore:
 
     def list_snapshots(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         *,
         repository_id: str | None = None,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
 
-        where = "WHERE json_extract(payload, '$.repository_id') = ?" if repository_id else ""
-        parameters: list[Any] = [repository_id] if repository_id else []
-        parameters.append(limit)
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if repository_id:
+            conditions.append(
+                "json_extract(snapshots.payload, '$.repository_id') = ?"
+            )
+            parameters.append(repository_id)
+        if status:
+            conditions.append("json_extract(snapshots.payload, '$.state') = ?")
+            parameters.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT snapshot_key, payload, updated_at,
+                SELECT snapshots.snapshot_key, snapshots.payload,
+                       snapshots.updated_at, activity.cursor AS activity_cursor,
                        EXISTS(
                            SELECT 1 FROM event_inbox event
                            WHERE event.repository_id = json_extract(snapshots.payload, '$.repository_id')
                              AND event.number = json_extract(snapshots.payload, '$.number')
                              AND event.event_type = 'change_request.discovered'
                        ) AS discovered_event_emitted
-                FROM snapshots {where}
-                ORDER BY updated_at DESC
-                LIMIT ?
+                FROM snapshots
+                LEFT JOIN provider_activity_cursors AS activity
+                  ON activity.provider = json_extract(snapshots.payload, '$.provider')
+                 AND activity.repository_id = json_extract(
+                         snapshots.payload, '$.repository_id'
+                     )
+                 AND activity.number = json_extract(snapshots.payload, '$.number')
+                {where}
+                ORDER BY julianday(
+                             json_extract(snapshots.payload, '$.updated_at')
+                         ) DESC,
+                         json_extract(snapshots.payload, '$.repository_id') ASC,
+                         CAST(
+                             json_extract(snapshots.payload, '$.number') AS INTEGER
+                         ) DESC
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()
@@ -410,12 +475,41 @@ class StateStore:
         results: list[dict[str, Any]] = []
         for row in rows:
             snapshot = ChangeRequestSnapshot.model_validate_json(row["payload"])
+            activity_cursor = (
+                json.loads(row["activity_cursor"])
+                if row["activity_cursor"]
+                else None
+            )
+            latest_activity = self._latest_activity_from_cursor(activity_cursor)
+            latest_event_type = (
+                activity_event_type(latest_activity.type)
+                if latest_activity is not None
+                else None
+            )
             summary = snapshot.model_dump(mode="json", exclude={"raw"})
             summary.update(
                 {
                     "snapshot_key": row["snapshot_key"],
                     "scanned_at": row["updated_at"],
                     "discovered_event_emitted": bool(row["discovered_event_emitted"]),
+                    "latest_event_checked": bool(
+                        activity_cursor
+                        and activity_cursor.get("latest_activity_checked") is True
+                    ),
+                    "latest_event": (
+                        {
+                            "event_type": latest_event_type,
+                            "provider_event_type": latest_activity.type,
+                            "provider_event_id": latest_activity.id,
+                            "occurred_at": (
+                                latest_activity.occurred_at.isoformat()
+                                if latest_activity.occurred_at is not None
+                                else None
+                            ),
+                        }
+                        if latest_activity is not None and latest_event_type is not None
+                        else None
+                    ),
                 }
             )
             results.append(summary)
@@ -1095,15 +1189,26 @@ class StateStore:
 
     def list_events(
         self,
-        limit: int = 50,
+        limit: int | None = 50,
         *,
         status: str | None = None,
+        repository_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
 
-        where = "WHERE event_inbox.status = ?" if status else ""
-        parameters: list[Any] = [status] if status else []
-        parameters.append(limit)
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if status:
+            conditions.append("event_inbox.status = ?")
+            parameters.append(status)
+        if repository_id:
+            conditions.append("event_inbox.repository_id = ?")
+            parameters.append(repository_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -1112,6 +1217,18 @@ class StateStore:
                        event_inbox.status, event_inbox.attempts,
                        event_inbox.error, event_inbox.created_at,
                        event_inbox.updated_at,
+                       json_extract(event_inbox.payload, '$.occurred_at')
+                           AS occurred_at,
+                       COALESCE(
+                           json_extract(event_inbox.payload, '$.origin'),
+                           'scanner'
+                       ) AS origin,
+                       json_extract(event_inbox.payload, '$.source_activity_id')
+                           AS source_activity_id,
+                       json_extract(event_inbox.payload, '$.source_activity_type')
+                           AS source_activity_type,
+                       json_extract(event_inbox.payload, '$.source_occurred_at')
+                           AS source_occurred_at,
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
@@ -1151,7 +1268,13 @@ class StateStore:
                     GROUP BY dispatch.event_id
                 ) AS dispatch_stats
                     ON dispatch_stats.event_id = event_inbox.event_id
-                {where} ORDER BY event_inbox.created_at DESC LIMIT ?
+                {where}
+                ORDER BY julianday(
+                             json_extract(event_inbox.payload, '$.occurred_at')
+                         ) DESC,
+                         event_inbox.created_at DESC,
+                         event_inbox.event_id DESC
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()

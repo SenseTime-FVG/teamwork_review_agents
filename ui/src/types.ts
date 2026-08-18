@@ -215,6 +215,14 @@ export type ChangeRequestRecord = {
   web_url: string;
   scanned_at: number;
   discovered_event_emitted: boolean;
+  latest_event_checked?: boolean;
+  latest_event_supported?: boolean;
+  latest_event?: {
+    event_type: string;
+    provider_event_type: string;
+    provider_event_id: string;
+    occurred_at?: string | null;
+  } | null;
 };
 
 export type RunSummary = {
@@ -273,6 +281,11 @@ export type EventRecord = {
   agent_failed_count: number;
   agent_timed_out_count: number;
   agent_cancelled_count: number;
+  occurred_at: string;
+  origin: "scanner" | "manual";
+  source_activity_id?: string | null;
+  source_activity_type?: string | null;
+  source_occurred_at?: string | null;
   created_at: number;
   updated_at: number;
 };

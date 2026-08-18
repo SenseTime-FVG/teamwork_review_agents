@@ -7,7 +7,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -22,7 +22,7 @@ from .codex_account import (
 from .config_manager import ConfigManager
 from .codex_settings import inspect_runtime_options
 from .environment import render_prompt
-from .events import FIELD_EVENTS, detect_events
+from .events import FIELD_EVENTS, create_manual_activity_event, detect_events
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
 from .runtime import BackgroundRuntime
 from .skill_files import (
@@ -463,27 +463,48 @@ def create_app(
 
     @app.get("/api/events")
     async def events(
-        limit: int = Query(default=50, ge=1, le=500),
-        status: str | None = None,
+        limit: int = Query(default=50, ge=1),
+        all_records: bool = False,
+        repository_id: str | None = None,
+        status: Literal[
+            "pending",
+            "processing",
+            "unmatched",
+            "triggered",
+            "completed",
+            "failed",
+        ]
+        | None = None,
     ):
         return await asyncio.to_thread(
             manager.store.list_events,
-            limit,
+            None if all_records else limit,
             status=status,
+            repository_id=repository_id,
         )
 
     @app.get("/api/change-requests")
     async def change_requests(
-        limit: int = Query(default=100, ge=1, le=500),
+        limit: int = Query(default=100, ge=1),
+        all_records: bool = False,
         repository_id: str | None = None,
+        status: Literal["opened", "closed", "merged"] | None = None,
     ):
         """返回扫描器已经建立基线的 MR/PR 最新快照。"""
 
-        return await asyncio.to_thread(
+        records = await asyncio.to_thread(
             manager.store.list_snapshots,
-            limit,
+            None if all_records else limit,
             repository_id=repository_id,
+            status=status,
         )
+        provider_map = manager.config.providers
+        for record in records:
+            provider = provider_map.get(str(record.get("provider") or ""))
+            record["latest_event_supported"] = bool(
+                provider is not None and provider.kind == "github"
+            )
+        return records
 
     @app.post("/api/change-requests/{repository_id}/{number}/emit-discovered")
     async def emit_discovered(repository_id: str, number: int):
@@ -509,11 +530,55 @@ def create_app(
         event = detect_events(None, snapshot, emit_initial=True)[0]
         inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
         if inserted:
-            runtime.scan_now()
+            runtime.dispatch_events_now()
         return {
             "created": bool(inserted),
             "event_id": event.id,
             "reason": "首次发现事件已补发" if inserted else "首次发现事件已经存在",
+        }
+
+    @app.post(
+        "/api/change-requests/{repository_id}/{number}/trigger-latest-event"
+    )
+    async def trigger_latest_event(repository_id: str, number: int):
+        """把已缓存的最新 Provider 活动作为新的手动事件送入规则引擎。"""
+
+        snapshot = await asyncio.to_thread(
+            manager.store.load_snapshot,
+            f"{repository_id}:{number}",
+        )
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="MR / PR 快照不存在，请先执行扫描")
+        repository = manager.config.repository_map().get(repository_id)
+        if repository is None or not repository.enabled:
+            raise HTTPException(status_code=409, detail="仓库未启用，不能手动触发事件")
+        activity = await asyncio.to_thread(
+            manager.store.load_latest_activity,
+            snapshot.provider,
+            repository_id,
+            number,
+        )
+        if activity is None:
+            raise HTTPException(
+                status_code=409,
+                detail="尚未取得可触发的最新 Provider 事件，请先完成一次扫描",
+            )
+        event = create_manual_activity_event(snapshot, activity)
+        inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
+        if not inserted:
+            raise HTTPException(status_code=409, detail="手动事件未能写入，请重新操作")
+        runtime.dispatch_events_now()
+        return {
+            "created": True,
+            "event_id": event.id,
+            "event_type": event.type,
+            "source_activity_id": activity.id,
+            "source_occurred_at": (
+                activity.occurred_at.isoformat()
+                if activity.occurred_at is not None
+                else None
+            ),
+            "reason": f"已手动发送 {event.type}",
         }
 
     static_directory = Path(__file__).parent / "web" / "dist"

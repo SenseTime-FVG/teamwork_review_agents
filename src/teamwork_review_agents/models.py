@@ -59,6 +59,7 @@ class ChangeRequestActivityBatch(BaseModel):
     """一次活动流增量读取结果及下一次使用的不透明游标。"""
 
     activities: tuple[ChangeRequestActivity, ...] = ()
+    latest_activity: ChangeRequestActivity | None = None
     cursor: dict[str, Any] = Field(default_factory=dict)
     baseline: bool = False
 
@@ -77,6 +78,10 @@ class ChangeEvent(BaseModel):
     batch_id: str = ""
     changed_fields: tuple[str, ...] = ()
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    origin: Literal["scanner", "manual"] = "scanner"
+    source_activity_id: str | None = None
+    source_activity_type: str | None = None
+    source_occurred_at: datetime | None = None
 
     @property
     def resource_key(self) -> str:

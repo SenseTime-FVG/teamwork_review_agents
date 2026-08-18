@@ -142,10 +142,16 @@ async def test_github_timeline_builds_baseline_then_returns_new_activities() -> 
     )
     timeline: list[dict[str, object]] = [
         {
+            "event": "closed",
+            "id": 100,
+            "created_at": "2026-08-17T08:00:00Z",
+        },
+        {
             "event": "committed",
             "node_id": "commit-initial",
             "sha": "a" * 40,
-            "author": {"date": "2026-08-17T08:00:00Z"},
+            # Commit 作者时间可能早于它进入 PR 的时间，最新项必须按 Timeline 顺序取。
+            "author": {"date": "2026-08-17T07:00:00Z"},
         }
     ]
 
@@ -158,6 +164,9 @@ async def test_github_timeline_builds_baseline_then_returns_new_activities() -> 
         assert baseline.baseline is True
         assert baseline.activities == ()
         assert baseline.cursor == {"page": 1, "item_id": "commit-initial"}
+        assert baseline.latest_activity is not None
+        assert baseline.latest_activity.id == "commit-initial"
+        assert baseline.latest_activity.type == "committed"
 
         timeline.extend(
             [
@@ -191,6 +200,8 @@ async def test_github_timeline_builds_baseline_then_returns_new_activities() -> 
             "committed",
         ]
         assert incremental.activities[-1].data["sha"] == "b" * 40
+        assert incremental.latest_activity is not None
+        assert incremental.latest_activity.id == "commit-next"
 
         repeated = await provider.list_change_request_activities(
             repository,
@@ -318,6 +329,8 @@ async def test_github_timeline_first_scan_only_replays_requested_window() -> Non
 
     assert result.baseline is False
     assert [item.type for item in result.activities] == ["reopened", "labeled"]
+    assert result.latest_activity is not None
+    assert result.latest_activity.type == "labeled"
     assert result.cursor == {"page": 1, "item_id": "102"}
 
 

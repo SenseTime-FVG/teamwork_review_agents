@@ -159,6 +159,34 @@ class GitHubProvider(BaseProvider):
             },
         )
 
+    @classmethod
+    def _latest_supported_activity(
+        cls,
+        items: list[object],
+    ) -> ChangeRequestActivity | None:
+        """按 Timeline 原始顺序返回最后一条可转换活动。"""
+
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            activity = cls._timeline_activity(item)
+            if activity is not None:
+                return activity
+        return None
+
+    @staticmethod
+    def _cursor_latest_activity(
+        cursor: dict[str, object] | None,
+    ) -> ChangeRequestActivity | None:
+        """兼容读取游标中缓存的最新 Provider 活动。"""
+
+        if not cursor or not isinstance(cursor.get("latest_activity"), dict):
+            return None
+        try:
+            return ChangeRequestActivity.model_validate(cursor["latest_activity"])
+        except (TypeError, ValueError):
+            return None
+
     async def list_change_request_activities(
         self,
         repository: RepositoryConfig,
@@ -219,6 +247,38 @@ class GitHubProvider(BaseProvider):
                             f"{self.MAX_TIMELINE_PAGES_PER_SCAN} 页"
                         )
                     page += 1
+            latest_activity: ChangeRequestActivity | None = None
+            latest_activity_page = last_page
+            latest_activity_pages_read = 0
+            while latest_activity_page >= 1:
+                payload = page_cache.get(latest_activity_page)
+                if payload is None:
+                    payload = await self.get_json(
+                        path,
+                        params={
+                            "per_page": self.TIMELINE_PAGE_SIZE,
+                            "page": latest_activity_page,
+                        },
+                    )
+                    if not isinstance(payload, list):
+                        raise ProviderError(
+                            f"GitHub PR #{number} Timeline 返回格式异常"
+                        )
+                    page_cache[latest_activity_page] = payload
+                latest_activity_pages_read += 1
+                latest_activity = self._latest_supported_activity(payload)
+                if latest_activity is not None:
+                    break
+                if (
+                    latest_activity_pages_read
+                    >= self.MAX_TIMELINE_PAGES_PER_SCAN
+                    and latest_activity_page > 1
+                ):
+                    raise ProviderError(
+                        f"GitHub PR #{number} Timeline 最新事件回看超过 "
+                        f"{self.MAX_TIMELINE_PAGES_PER_SCAN} 页"
+                    )
+                latest_activity_page -= 1
             latest_id = (
                 self._timeline_item_id(last_payload[-1])
                 if last_payload and isinstance(last_payload[-1], dict)
@@ -228,6 +288,7 @@ class GitHubProvider(BaseProvider):
             if since is None:
                 return ChangeRequestActivityBatch(
                     cursor=next_cursor,
+                    latest_activity=latest_activity,
                     baseline=True,
                 )
 
@@ -282,9 +343,11 @@ class GitHubProvider(BaseProvider):
             )
             return ChangeRequestActivityBatch(
                 activities=activities,
+                latest_activity=latest_activity,
                 cursor=next_cursor,
             )
 
+        previous_latest_activity = self._cursor_latest_activity(cursor)
         try:
             cursor_page = max(1, int(cursor.get("page") or 1))
         except (TypeError, ValueError):
@@ -356,6 +419,7 @@ class GitHubProvider(BaseProvider):
         if not entries:
             return ChangeRequestActivityBatch(
                 cursor={"page": 1, "item_id": ""},
+                latest_activity=previous_latest_activity,
                 baseline=bool(cursor_item_id),
             )
 
@@ -366,7 +430,14 @@ class GitHubProvider(BaseProvider):
         }
         if cursor_item_id and marker_index is None:
             # 游标对应的 Timeline 项可能被删除；重建基线比重放历史更安全。
-            return ChangeRequestActivityBatch(cursor=next_cursor, baseline=True)
+            latest_activity = self._latest_supported_activity(
+                [item for _, item in entries]
+            )
+            return ChangeRequestActivityBatch(
+                cursor=next_cursor,
+                latest_activity=latest_activity or previous_latest_activity,
+                baseline=True,
+            )
 
         new_entries = entries[(marker_index + 1) if marker_index is not None else 0 :]
         activities = tuple(
@@ -374,8 +445,10 @@ class GitHubProvider(BaseProvider):
             for _, item in new_entries
             if (activity := self._timeline_activity(item)) is not None
         )
+        latest_activity = activities[-1] if activities else previous_latest_activity
         return ChangeRequestActivityBatch(
             activities=activities,
+            latest_activity=latest_activity,
             cursor=next_cursor,
         )
 
