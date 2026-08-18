@@ -10,6 +10,7 @@ import httpx
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig, ScannerConfig
 from teamwork_review_agents.providers.github import GitHubProvider
+from teamwork_review_agents.providers.gitlab import GitLabProvider
 
 
 async def test_github_provider_auto_pages_and_honors_item_limit(snapshot_factory) -> None:
@@ -122,6 +123,65 @@ async def test_github_provider_stops_at_previous_scan_watermark(snapshot_factory
 
     assert [snapshot.number for snapshot in snapshots] == [1]
     assert call_count == 1
+
+
+async def test_providers_read_real_target_branch_heads() -> None:
+    """GitHub 与 GitLab 必须通过分支 API 返回目标分支真实提交。"""
+
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    github = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    github_paths: list[str] = []
+
+    async def github_get_json(path: str, **_: object) -> object:
+        github_paths.append(path)
+        return {"object": {"sha": "a" * 40}}
+
+    setattr(github, "get_json", github_get_json)
+    try:
+        assert await github.get_branch_head(repository, "release/v2") == "a" * 40
+    finally:
+        await github.close()
+
+    gitlab = GitLabProvider(
+        "gitlab-main",
+        ProviderConfig(
+            kind="gitlab",
+            base_url="https://gitlab.example.com/api/v4",
+            token_env="GITLAB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    gitlab_paths: list[str] = []
+
+    async def gitlab_get_json(path: str, **_: object) -> object:
+        gitlab_paths.append(path)
+        return {"commit": {"id": "b" * 40}}
+
+    setattr(gitlab, "get_json", gitlab_get_json)
+    try:
+        assert await gitlab.get_branch_head(repository, "release/v2") == "b" * 40
+    finally:
+        await gitlab.close()
+
+    assert github_paths == ["repos/owner/demo/git/ref/heads/release%2Fv2"]
+    assert gitlab_paths == [
+        "projects/owner%2Fdemo/repository/branches/release%2Fv2"
+    ]
 
 
 async def test_github_timeline_builds_baseline_then_returns_new_activities() -> None:

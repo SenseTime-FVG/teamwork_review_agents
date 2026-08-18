@@ -152,6 +152,15 @@ class BaseProvider(ABC):
 
         return None
 
+    async def get_branch_head(
+        self,
+        repository: RepositoryConfig,
+        branch: str,
+    ) -> str:
+        """读取仓库分支真实 Head；具体平台必须显式实现。"""
+
+        raise ProviderError(f"Provider {self.name} 不支持读取分支 Head")
+
 
 def parse_datetime(value: str | None) -> datetime:
     """解析平台 ISO 时间；缺失时使用当前 UTC 时间。"""

@@ -25,6 +25,7 @@ class ChangeRequestSnapshot(BaseModel):
     source_branch: str
     target_branch: str
     head_sha: str
+    target_head_sha: str = ""
     labels: tuple[str, ...] = ()
     approvals: int = 0
     pipeline_status: str = "unknown"

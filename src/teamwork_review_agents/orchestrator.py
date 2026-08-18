@@ -11,9 +11,20 @@ from typing import Any
 
 from .config import AppConfig, RepositoryConfig, RuleConfig
 from .environment import resolve_provider_token
-from .events import detect_activity_events, detect_events, detect_first_seen_events
+from .events import (
+    detect_activity_events,
+    detect_events,
+    detect_first_seen_events,
+    detect_target_branch_event,
+)
 from .executor import AgentExecutor
-from .models import AgentResult, ChangeEvent, ChangeRequestActivityBatch, stable_hash
+from .models import (
+    AgentResult,
+    ChangeEvent,
+    ChangeRequestActivityBatch,
+    ChangeRequestSnapshot,
+    stable_hash,
+)
 from .preflight import PreflightExecutor
 from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
@@ -203,6 +214,30 @@ class Orchestrator:
             if len(snapshots) < self.config.scanner.max_items_per_repository:
                 return
 
+    @staticmethod
+    async def _target_branch_heads(
+        provider: BaseProvider,
+        repository: RepositoryConfig,
+        snapshots: list[ChangeRequestSnapshot],
+    ) -> dict[str, str]:
+        """一次扫描只读取每个打开目标分支的一份真实 Head。"""
+
+        resolver = getattr(provider, "get_branch_head", None)
+        if not callable(resolver):
+            # 兼容不实现新接口的测试替身与外部 Provider。
+            return {}
+        branches = sorted(
+            {
+                snapshot.target_branch
+                for snapshot in snapshots
+                if snapshot.state == "opened" and snapshot.target_branch
+            }
+        )
+        heads = await asyncio.gather(
+            *(resolver(repository, branch) for branch in branches)
+        )
+        return dict(zip(branches, heads, strict=True))
+
     async def scan(self, summary: CycleSummary) -> None:
         """按 Provider 分组扫描所有启用仓库。"""
 
@@ -245,11 +280,40 @@ class Orchestrator:
                                 repository,
                                 updated_since=updated_since,
                             )
+                            stored_snapshots = await asyncio.to_thread(
+                                self.store.repository_snapshots,
+                                provider.name,
+                                repository.id,
+                            )
+                            stored_by_key = {
+                                item.key: item for item in stored_snapshots
+                            }
+                            target_heads = await self._target_branch_heads(
+                                provider,
+                                repository,
+                                [*stored_snapshots, *snapshots],
+                            )
+                            normalized_snapshots: list[ChangeRequestSnapshot] = []
                             for snapshot in snapshots:
-                                old = await asyncio.to_thread(
-                                    self.store.load_snapshot,
-                                    snapshot.key,
+                                old = stored_by_key.get(snapshot.key)
+                                target_head_sha = target_heads.get(
+                                    snapshot.target_branch
                                 )
+                                if target_head_sha:
+                                    snapshot = snapshot.model_copy(
+                                        update={"target_head_sha": target_head_sha}
+                                    )
+                                elif old is not None and old.target_head_sha:
+                                    snapshot = snapshot.model_copy(
+                                        update={
+                                            "target_head_sha": old.target_head_sha
+                                        }
+                                    )
+                                normalized_snapshots.append(snapshot)
+                            snapshots = normalized_snapshots
+                            candidate_keys = {item.key for item in snapshots}
+                            for snapshot in snapshots:
+                                old = stored_by_key.get(snapshot.key)
                                 activity_cursor = await asyncio.to_thread(
                                     self.store.load_activity_cursor,
                                     snapshot.provider,
@@ -307,6 +371,14 @@ class Orchestrator:
                                         emit_initial=self.config.scanner.emit_initial_events,
                                         batch_id=scan_batch_id,
                                     )
+                                events.extend(
+                                    detect_target_branch_event(
+                                        old,
+                                        snapshot,
+                                        batch_id=scan_batch_id,
+                                        occurred_at=scan_started_at,
+                                    )
+                                )
                                 inserted = await asyncio.to_thread(
                                     self.store.save_snapshot_and_events,
                                     snapshot,
@@ -316,6 +388,28 @@ class Orchestrator:
                                         if activity_batch is not None
                                         else None
                                     ),
+                                )
+                                summary.snapshots += 1
+                                summary.new_events += inserted
+                            for old in stored_snapshots:
+                                if old.state != "opened" or old.key in candidate_keys:
+                                    continue
+                                target_head_sha = target_heads.get(old.target_branch)
+                                if not target_head_sha or target_head_sha == old.target_head_sha:
+                                    continue
+                                current = old.model_copy(
+                                    update={"target_head_sha": target_head_sha}
+                                )
+                                events = detect_target_branch_event(
+                                    old,
+                                    current,
+                                    batch_id=scan_batch_id,
+                                    occurred_at=scan_started_at,
+                                )
+                                inserted = await asyncio.to_thread(
+                                    self.store.save_snapshot_and_events,
+                                    current,
+                                    events,
                                 )
                                 summary.snapshots += 1
                                 summary.new_events += inserted
@@ -380,6 +474,10 @@ class Orchestrator:
                         self.store.finish_event,
                         event.id,
                         status="unmatched",
+                    )
+                    await asyncio.to_thread(
+                        self.store.cleanup_terminal_transient_event,
+                        event.id,
                     )
                     summary.processed_events += 1
                 continue
@@ -517,11 +615,20 @@ class Orchestrator:
             for event in claimed_events:
                 error = "; ".join(errors_by_event[event.id]) or None
                 if event.id not in matched_event_ids and error is None:
+                    await asyncio.to_thread(
+                        self.store.cleanup_terminal_transient_event,
+                        event.id,
+                    )
                     summary.processed_events += 1
                     continue
                 if error:
                     summary.errors.append(f"处理事件 {event.id} 失败：{error}")
                 await asyncio.to_thread(self.store.finish_event, event.id, error=error)
+                if error is None:
+                    await asyncio.to_thread(
+                        self.store.cleanup_terminal_transient_event,
+                        event.id,
+                    )
                 summary.processed_events += 1
 
     async def run_once(self, *, dry_run: bool = False) -> CycleSummary:

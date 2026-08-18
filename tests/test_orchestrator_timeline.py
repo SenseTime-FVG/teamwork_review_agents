@@ -3,12 +3,153 @@
 from datetime import UTC, datetime, timedelta
 
 from teamwork_review_agents.config import RuleConfig
+from teamwork_review_agents.events import detect_target_branch_event
 from teamwork_review_agents.models import (
     AgentResult,
     ChangeRequestActivity,
     ChangeRequestActivityBatch,
 )
 from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
+
+
+async def test_scan_detects_target_head_for_pr_outside_updated_candidates(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """目标分支变化必须覆盖未进入 Provider 更新时间候选的打开 PR。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    old = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+        target_head_sha="a" * 40,
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(old, [])
+    branch_calls: list[str] = []
+
+    class FakeProvider:
+        """模拟 PR 本身未更新、目标分支已经推进的 Provider。"""
+
+        name = repository.provider
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def list_change_requests(self, *_: object, **__: object):
+            return []
+
+        async def list_change_request_activities(self, *_: object, **__: object):
+            return None
+
+        async def get_branch_head(
+            self,
+            _repository,
+            branch: str,
+        ) -> str:
+            branch_calls.append(branch)
+            return "b" * 40
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    summary = CycleSummary()
+    await orchestrator.scan(summary)
+
+    assert branch_calls == ["main"]
+    assert summary.new_events == 1
+    assert [event.type for event in orchestrator.store.pending_events()] == [
+        "change_request.target_commits_changed"
+    ]
+    saved = orchestrator.store.load_snapshot(old.key)
+    assert saved is not None
+    assert saved.target_head_sha == "b" * 40
+
+    repeated_summary = CycleSummary()
+    await orchestrator.scan(repeated_summary)
+    assert repeated_summary.new_events == 0
+    assert len(orchestrator.store.pending_events()) == 1
+
+
+async def test_first_target_head_only_builds_baseline(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """旧快照没有目标 Head 时，升级后的首次扫描不能补发历史变化。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    old = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(old, [])
+
+    class FakeProvider:
+        """只提供目标分支基线。"""
+
+        name = repository.provider
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def list_change_requests(self, *_: object, **__: object):
+            return []
+
+        async def list_change_request_activities(self, *_: object, **__: object):
+            return None
+
+        async def get_branch_head(self, *_: object) -> str:
+            return "b" * 40
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    summary = CycleSummary()
+    await orchestrator.scan(summary)
+
+    assert summary.new_events == 0
+    assert orchestrator.store.pending_events() == []
+    saved = orchestrator.store.load_snapshot(old.key)
+    assert saved is not None
+    assert saved.target_head_sha == "b" * 40
+
+
+async def test_unmatched_target_event_is_removed(
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """没有规则匹配的目标变化事件处理后不进入长期历史。"""
+
+    config = configured_app_factory()
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    old = snapshot_factory(target_head_sha="a" * 40)
+    current = snapshot_factory(target_head_sha="b" * 40)
+    event = detect_target_branch_event(
+        old,
+        current,
+        batch_id="scan-one",
+        occurred_at=current.updated_at,
+    )[0]
+    orchestrator.store.save_snapshot_and_events(current, [event])
+
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    assert summary.processed_events == 1
+    assert orchestrator.store.list_events(None) == []
 
 
 async def test_scan_recovers_transient_state_changes_from_timeline(

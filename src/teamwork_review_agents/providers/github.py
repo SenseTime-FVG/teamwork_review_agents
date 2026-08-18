@@ -6,6 +6,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import quote
 
 from ..config import RepositoryConfig
 from ..models import (
@@ -61,6 +62,23 @@ class GitHubProvider(BaseProvider):
                 "description": description[:140],
             },
         )
+
+    async def get_branch_head(
+        self,
+        repository: RepositoryConfig,
+        branch: str,
+    ) -> str:
+        """通过 Git Ref API 读取 GitHub 分支当前提交。"""
+
+        payload = await self.get_json(
+            f"repos/{repository.project}/git/ref/heads/{quote(branch, safe='')}"
+        )
+        if not isinstance(payload, dict):
+            raise ProviderError(f"GitHub 分支 {branch} 返回格式异常")
+        target = payload.get("object") or {}
+        if not isinstance(target, dict) or not target.get("sha"):
+            raise ProviderError(f"GitHub 分支 {branch} 缺少 Head SHA")
+        return str(target["sha"])
 
     async def list_change_requests(
         self,

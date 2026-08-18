@@ -6,6 +6,7 @@ from teamwork_review_agents.events import (
     detect_activity_events,
     detect_events,
     detect_first_seen_events,
+    detect_target_branch_event,
 )
 from teamwork_review_agents.models import ChangeRequestActivity
 
@@ -50,6 +51,77 @@ def test_ignores_only_updated_timestamp(snapshot_factory) -> None:
     old = snapshot_factory()
     new = snapshot_factory(updated_at="2026-08-17T09:00:00Z")
     assert detect_events(old, new) == []
+
+
+def test_target_branch_change_is_one_batch_scoped_event(snapshot_factory) -> None:
+    """目标分支 Head 变化应独立成事件，并允许未来同值往返再次触发。"""
+
+    old = snapshot_factory(target_head_sha="a" * 40)
+    new = snapshot_factory(target_head_sha="b" * 40)
+    occurred_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+
+    events = detect_target_branch_event(
+        old,
+        new,
+        batch_id="scan-one",
+        occurred_at=occurred_at,
+    )
+    repeated = detect_target_branch_event(
+        old,
+        new,
+        batch_id="scan-one",
+        occurred_at=occurred_at,
+    )
+    later = detect_target_branch_event(
+        old,
+        new,
+        batch_id="scan-two",
+        occurred_at=occurred_at,
+    )
+
+    assert [event.type for event in events] == [
+        "change_request.target_commits_changed"
+    ]
+    assert events[0].changed_fields == ("target_head_sha",)
+    assert events[0].occurred_at == occurred_at
+    assert repeated[0].id == events[0].id
+    assert later[0].id != events[0].id
+    assert detect_events(old, new) == []
+
+
+def test_target_branch_change_requires_existing_open_baseline(snapshot_factory) -> None:
+    """首次建立目标 Head 基线及已结束 PR 都不应补发目标变化事件。"""
+
+    current = snapshot_factory(target_head_sha="b" * 40)
+    assert (
+        detect_target_branch_event(
+            None,
+            current,
+            batch_id="scan-one",
+            occurred_at=current.updated_at,
+        )
+        == []
+    )
+    empty_baseline = snapshot_factory(target_head_sha="")
+    assert (
+        detect_target_branch_event(
+            empty_baseline,
+            current,
+            batch_id="scan-one",
+            occurred_at=current.updated_at,
+        )
+        == []
+    )
+    merged = current.model_copy(update={"state": "merged"})
+    assert (
+        detect_target_branch_event(
+            snapshot_factory(target_head_sha="a" * 40),
+            merged,
+            batch_id="scan-one",
+            occurred_at=current.updated_at,
+        )
+        == []
+    )
 
 
 def test_repeated_state_transition_uses_occurrence_time_in_event_id(

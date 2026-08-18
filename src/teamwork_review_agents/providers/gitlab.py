@@ -22,6 +22,25 @@ class GitLabProvider(BaseProvider):
             "User-Agent": "teamwork-review-agents",
         }
 
+    async def get_branch_head(
+        self,
+        repository: RepositoryConfig,
+        branch: str,
+    ) -> str:
+        """通过 Repository Branch API 读取 GitLab 分支当前提交。"""
+
+        project = quote(repository.project, safe="")
+        encoded_branch = quote(branch, safe="")
+        payload = await self.get_json(
+            f"projects/{project}/repository/branches/{encoded_branch}"
+        )
+        if not isinstance(payload, dict):
+            raise ProviderError(f"GitLab 分支 {branch} 返回格式异常")
+        commit = payload.get("commit") or {}
+        if not isinstance(commit, dict) or not commit.get("id"):
+            raise ProviderError(f"GitLab 分支 {branch} 缺少 Head SHA")
+        return str(commit["id"])
+
     async def list_change_requests(
         self,
         repository: RepositoryConfig,

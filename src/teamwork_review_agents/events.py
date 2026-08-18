@@ -23,6 +23,8 @@ FIELD_EVENTS = {
     "merge_status": "change_request.merge_status_changed",
 }
 
+TARGET_COMMITS_CHANGED_EVENT = "change_request.target_commits_changed"
+
 ACTIVITY_EVENT_TYPES = {
     "closed": "change_request.closed",
     "reopened": "change_request.reopened",
@@ -453,7 +455,13 @@ def detect_events(
 
     old_payload = old.normalized_payload()
     new_payload = new.normalized_payload()
-    ignored_fields = {"created_at", "updated_at", "title", "web_url"}
+    ignored_fields = {
+        "created_at",
+        "updated_at",
+        "title",
+        "web_url",
+        "target_head_sha",
+    }
     changed_fields = tuple(
         sorted(
             field
@@ -526,3 +534,45 @@ def detect_events(
         )
     )
     return events
+
+
+def detect_target_branch_event(
+    old: ChangeRequestSnapshot | None,
+    new: ChangeRequestSnapshot,
+    *,
+    batch_id: str,
+    occurred_at: datetime,
+) -> list[ChangeEvent]:
+    """在已有目标 Head 基线变化时生成单条临时规则事件。"""
+
+    if (
+        old is None
+        or new.state != "opened"
+        or not old.target_head_sha
+        or not new.target_head_sha
+        or old.target_head_sha == new.target_head_sha
+    ):
+        return []
+    event_id = stable_hash(
+        new.provider,
+        new.repository_id,
+        new.number,
+        TARGET_COMMITS_CHANGED_EVENT,
+        old.target_head_sha,
+        new.target_head_sha,
+        batch_id,
+    )
+    return [
+        _create_event(
+            TARGET_COMMITS_CHANGED_EVENT,
+            old,
+            new,
+            ("target_head_sha",),
+            old.target_head_sha,
+            new.target_head_sha,
+            batch_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+            current=new,
+        )
+    ]

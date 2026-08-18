@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .events import activity_event_type
+from .events import TARGET_COMMITS_CHANGED_EVENT, activity_event_type
 from .models import (
     AgentResult,
     ChangeEvent,
@@ -119,6 +119,10 @@ class StateStore:
                     rule_name TEXT,
                     agent_name TEXT NOT NULL,
                     resource_key TEXT NOT NULL,
+                    repository_id TEXT,
+                    change_request_number INTEGER,
+                    change_request_title TEXT,
+                    change_request_url TEXT,
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 1,
                     prompt TEXT NOT NULL,
@@ -213,6 +217,25 @@ class StateStore:
             self._ensure_column(connection, "agent_runs", "workspace_path", "TEXT")
             self._ensure_column(connection, "agent_runs", "workspace_status", "TEXT")
             self._ensure_column(connection, "agent_runs", "workspace_reason", "TEXT")
+            self._ensure_column(connection, "agent_runs", "repository_id", "TEXT")
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "change_request_number",
+                "INTEGER",
+            )
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "change_request_title",
+                "TEXT",
+            )
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "change_request_url",
+                "TEXT",
+            )
             self._ensure_column(
                 connection,
                 "agent_runs",
@@ -358,6 +381,28 @@ class StateStore:
             for row in rows
         ]
 
+    def repository_snapshots(
+        self,
+        provider: str,
+        repository_id: str,
+    ) -> list[ChangeRequestSnapshot]:
+        """返回指定仓库已经保存的全部 MR/PR 快照。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM snapshots
+                WHERE json_extract(payload, '$.provider') = ?
+                  AND json_extract(payload, '$.repository_id') = ?
+                ORDER BY updated_at ASC
+                """,
+                (provider, repository_id),
+            ).fetchall()
+        return [
+            ChangeRequestSnapshot.model_validate_json(row["payload"])
+            for row in rows
+        ]
+
     @staticmethod
     def _latest_activity_from_cursor(
         cursor: dict[str, Any] | None,
@@ -420,6 +465,16 @@ class StateStore:
 
         inserted = 0
         for event in events:
+            if event.type == TARGET_COMMITS_CHANGED_EVENT:
+                payload = event.model_dump_json(
+                    exclude={
+                        "old": {"raw"},
+                        "new": {"raw"},
+                        "current": {"raw"},
+                    }
+                )
+            else:
+                payload = event.model_dump_json()
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO event_inbox (
@@ -432,7 +487,7 @@ class StateStore:
                     event.type,
                     event.repository_id,
                     event.number,
-                    event.model_dump_json(),
+                    payload,
                     now,
                     now,
                 ),
@@ -711,6 +766,48 @@ class StateStore:
                 """,
                 (final_status, error, time.time(), event_id),
             )
+
+    def cleanup_terminal_transient_event(self, event_id: str) -> bool:
+        """固化运行上下文并删除已经成功结束的临时事件。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT payload FROM event_inbox
+                WHERE event_id = ? AND event_type = ?
+                  AND status IN ('completed', 'unmatched')
+                """,
+                (event_id, TARGET_COMMITS_CHANGED_EVENT),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            event = ChangeEvent.model_validate_json(row["payload"])
+            snapshot = event.current_snapshot
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET repository_id = COALESCE(repository_id, ?),
+                    change_request_number = COALESCE(change_request_number, ?),
+                    change_request_title = COALESCE(change_request_title, ?),
+                    change_request_url = COALESCE(change_request_url, ?)
+                WHERE event_id = ?
+                """,
+                (
+                    event.repository_id,
+                    event.number,
+                    snapshot.title,
+                    snapshot.web_url,
+                    event_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM event_inbox WHERE event_id = ?",
+                (event_id,),
+            )
+            connection.commit()
+        return True
 
     def begin_preflight_run(
         self,
@@ -1268,8 +1365,9 @@ class StateStore:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT agent_runs.*, event_inbox.repository_id,
-                       event_inbox.number AS change_request_number,
+                SELECT agent_runs.*,
+                       event_inbox.repository_id AS event_repository_id,
+                       event_inbox.number AS event_change_request_number,
                        event_inbox.payload AS event_payload
                 FROM agent_runs
                 LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
@@ -1299,6 +1397,18 @@ class StateStore:
     def _decorate_run_record(record: dict[str, Any]) -> dict[str, Any]:
         """从关联事件中提取运行列表需要的 MR/PR 摘要。"""
 
+        event_repository_id = record.pop("event_repository_id", None)
+        event_change_request_number = record.pop(
+            "event_change_request_number",
+            None,
+        )
+        if not record.get("repository_id") and event_repository_id:
+            record["repository_id"] = event_repository_id
+        if (
+            record.get("change_request_number") is None
+            and event_change_request_number is not None
+        ):
+            record["change_request_number"] = event_change_request_number
         event_payload = record.pop("event_payload", None)
         if not event_payload:
             return record
@@ -1307,8 +1417,10 @@ class StateStore:
         except (TypeError, json.JSONDecodeError):
             return record
         snapshot = event.get("current") or event.get("new") or {}
-        record["change_request_title"] = snapshot.get("title")
-        record["change_request_url"] = snapshot.get("web_url")
+        if not record.get("change_request_title"):
+            record["change_request_title"] = snapshot.get("title")
+        if not record.get("change_request_url"):
+            record["change_request_url"] = snapshot.get("web_url")
         return record
 
     def list_runs(
@@ -1346,8 +1458,12 @@ class StateStore:
                        agent_runs.cancel_requested,
                        agent_runs.workspace_path, agent_runs.workspace_status,
                        agent_runs.workspace_reason, agent_runs.started_at,
-                       agent_runs.finished_at, event_inbox.repository_id,
-                       event_inbox.number AS change_request_number,
+                       agent_runs.finished_at, agent_runs.repository_id,
+                       agent_runs.change_request_number,
+                       agent_runs.change_request_title,
+                       agent_runs.change_request_url,
+                       event_inbox.repository_id AS event_repository_id,
+                       event_inbox.number AS event_change_request_number,
                        event_inbox.payload AS event_payload
                 FROM agent_runs
                 LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id

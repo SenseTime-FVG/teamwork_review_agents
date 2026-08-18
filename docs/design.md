@@ -59,6 +59,7 @@ flowchart LR
 - `change_request.closed`
 - `change_request.merged`
 - `change_request.commits_changed`
+- `change_request.target_commits_changed`
 - `change_request.draft_changed`
 - `change_request.labels_changed`
 - `change_request.approvals_changed`
@@ -66,7 +67,7 @@ flowchart LR
 - `change_request.merge_status_changed`
 - `change_request.updated`
 
-事件 ID 由仓库、变更请求编号、事件类型、旧值和新值生成。同一变化重复扫描不会产生第二个事件。
+普通事件 ID 由仓库、变更请求编号、事件类型、旧值和新值生成。同一变化重复扫描不会产生第二个事件。目标分支变化事件还包含扫描批次，以便目标分支往返到旧提交时仍能再次触发，同时保持单轮幂等。
 
 ## 6. 规则条件
 
@@ -455,3 +456,13 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 同一 PR 批次可能同时匹配要求 CI 和不要求 CI 的规则。编排器先记录并启动不要求 CI 的 Agent，使其不等待 Preflight；要求 CI 的规则共享同一仓库、PR、Head SHA 和配置版本对应的幂等结果。CI 成功后再启动这些规则的 Agent；代码失败或超时只阻断要求 CI 的规则；基础设施错误只让要求 CI 的事件路径进入重试，不撤销已经启动或完成的不要求 CI 的 Agent。事件与 Agent 调度关系只记录实际启动的调用，不能把被 CI 阻断的规则伪装成已触发。
 
 仓库管理页使用结构化步骤编辑器维护本地 CI。每个步骤包含名称、执行程序、参数数组和可选单步超时；命令继续直接以参数数组启动，不隐式经过 shell。复杂 CI 可以由目标仓库维护脚本，并把 `bash ci/preflight.sh` 表达为执行程序 `bash` 加参数 `ci/preflight.sh`。规则详情和规则列表同时显示是否使用仓库 CI，避免“仓库已启用”被误解为所有审核规则都会固定执行。
+
+## 48. 目标分支提交变化与临时可靠事件
+
+统一快照增加 `target_head_sha`，表示扫描时从目标分支真实 Git ref 读取到的当前提交。Provider 必须通过 GitHub Git Ref API 或 GitLab Repository Branch API 获取该值，不能使用 PR / MR 详情中的历史差异基准字段。一次仓库扫描对相同目标分支只请求一次，并把结果复用于全部指向该分支的打开状态 PR / MR；已经关闭或合并的记录不持续跟踪目标分支。
+
+扫描器每轮同时检查 Provider 本轮返回的候选快照和 SQLite 中尚未被候选更新时间命中的已打开快照。第一次得到 `target_head_sha` 只建立基线，不产生事件；已有非空基线发生变化时，每个 PR / MR 在同一扫描批次最多产生一条 `change_request.target_commits_changed`。该事件只表达目标分支提交变化，不额外产生通用 `change_request.updated`，源分支 Head 变化继续使用 `change_request.commits_changed`。
+
+目标分支变化事件属于临时可靠事件。为避免“快照已推进但规则尚未触发”造成永久漏触发，它仍先写入 SQLite 可靠队列，但事件载荷排除 Provider 原始响应，只保存规则匹配、重试和 Agent 上下文需要的数据。服务异常退出时沿用现有事件恢复与幂等调度；处理失败时保留到既有重试流程结束。事件成功处理、被规则判定为未匹配，或因仓库已禁用而结束后立即删除事件及临时调度关系，不进入长期事件历史。
+
+删除临时事件前，服务把仓库、PR / MR 编号、标题和地址固化到已经创建的 Agent 运行记录，确保“运行与日志”不依赖已删除事件仍可展示上下文。Agent 运行、最终结果和运行日志继续遵循各自的持久化与保留策略；删除临时事件不能删除或隐藏已经创建的运行。

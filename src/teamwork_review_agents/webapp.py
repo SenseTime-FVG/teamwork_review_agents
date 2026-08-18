@@ -23,7 +23,12 @@ from .codex_account import (
 from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import codex_home, inspect_runtime_options
 from .environment import render_prompt
-from .events import FIELD_EVENTS, create_manual_activity_event, detect_events
+from .events import (
+    FIELD_EVENTS,
+    TARGET_COMMITS_CHANGED_EVENT,
+    create_manual_activity_event,
+    detect_events,
+)
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
@@ -445,7 +450,9 @@ def create_app(
                 "change_request.reopened",
                 "change_request.closed",
                 "change_request.merged",
-                *sorted(set(FIELD_EVENTS.values())),
+                *sorted(
+                    set(FIELD_EVENTS.values()) | {TARGET_COMMITS_CHANGED_EVENT}
+                ),
                 "change_request.updated",
             ],
             "operators": [

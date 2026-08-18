@@ -258,14 +258,17 @@ agents:
 
 # 内置 MR/PR 触发规则模板。全部默认关闭，管理员检查后再从 UI 主动启用。
 # 支持 discovered、opened、reopened、closed、merged、commits_changed、
-# draft_changed、labels_changed、approvals_changed、pipeline_changed、
-# merge_status_changed 和 updated，完整名称以 change_request. 开头。
+# target_commits_changed、draft_changed、labels_changed、approvals_changed、
+# pipeline_changed、merge_status_changed 和 updated，完整名称以
+# change_request. 开头。commits_changed 表示源分支 Head 变化；
+# target_commits_changed 表示打开状态 PR/MR 的目标分支 Head 变化。
 rules:
   - name: general-review
     events:
       - change_request.opened
       - change_request.reopened
       - change_request.commits_changed
+      - change_request.target_commits_changed
     agents:
       - general-reviewer
     # 留空表示不限制仓库，也不附加快照字段条件。

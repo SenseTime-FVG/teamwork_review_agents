@@ -4,13 +4,81 @@ import sqlite3
 
 import pytest
 
-from teamwork_review_agents.events import create_manual_activity_event, detect_events
+from teamwork_review_agents.events import (
+    create_manual_activity_event,
+    detect_events,
+    detect_target_branch_event,
+)
 from teamwork_review_agents.models import (
     AgentResult,
     ChangeRequestActivity,
     PreflightResult,
 )
 from teamwork_review_agents.state import StateStore
+
+
+def test_terminal_target_event_is_lightweight_and_removed_without_losing_run(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """临时目标事件结束后应删除，关联运行仍保留完整 MR/PR 摘要。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    old = snapshot_factory(
+        target_head_sha="a" * 40,
+        raw={"large-provider-value": "不应写入临时事件"},
+    )
+    current = snapshot_factory(
+        target_head_sha="b" * 40,
+        raw={"large-provider-value": "不应写入临时事件"},
+    )
+    event = detect_target_branch_event(
+        old,
+        current,
+        batch_id="scan-one",
+        occurred_at=current.updated_at,
+    )[0]
+    store.save_snapshot_and_events(current, [event])
+
+    with store.connect() as connection:
+        payload = connection.execute(
+            "SELECT payload FROM event_inbox WHERE event_id = ?",
+            (event.id,),
+        ).fetchone()["payload"]
+    assert "large-provider-value" not in payload
+
+    reservation = store.begin_agent_run(
+        proposed_run_id="target-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="target-run-key",
+        event_id=event.id,
+        rule_name="target-review",
+        agent_name="reviewer",
+        resource_key=event.resource_key,
+        prompt="目标分支变化审核",
+        max_attempts=2,
+    )
+    assert reservation is not None
+    store.finish_agent_run(
+        AgentResult(
+            run_id="target-run",
+            root_run_id="target-run",
+            agent_name="reviewer",
+            status="completed",
+        )
+    )
+    store.finish_event(event.id)
+
+    assert store.cleanup_terminal_transient_event(event.id) is True
+    assert store.list_events(None) == []
+    detail = store.get_run("target-run")
+    assert detail is not None
+    assert detail["repository_id"] == current.repository_id
+    assert detail["change_request_number"] == current.number
+    assert detail["change_request_title"] == current.title
+    assert detail["change_request_url"] == current.web_url
 
 
 def test_connection_context_closes_on_success_and_failure(tmp_path) -> None:
