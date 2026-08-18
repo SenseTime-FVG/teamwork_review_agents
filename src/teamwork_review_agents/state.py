@@ -20,6 +20,13 @@ from .models import (
 )
 
 
+CANCEL_SOURCE_ADMINISTRATOR = "administrator"
+CANCEL_SOURCE_SERVICE_SHUTDOWN = "service_shutdown"
+LEGACY_CANCELLED_RETRY_ERROR = (
+    "幂等任务已经达到重试上限，当前状态：cancelled"
+)
+
+
 @dataclass(frozen=True)
 class RunReservation:
     """一次新建或重试的 Agent 运行占位。"""
@@ -137,6 +144,7 @@ class StateStore:
                     workspace_status TEXT,
                     workspace_reason TEXT,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    cancel_source TEXT,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -242,12 +250,20 @@ class StateStore:
                 "cancel_requested",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            cancel_source_added = self._ensure_column(
+                connection,
+                "agent_runs",
+                "cancel_source",
+                "TEXT",
+            )
             self._ensure_column(
                 connection,
                 "preflight_runs",
                 "status_published",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            if cancel_source_added:
+                self._recover_legacy_shutdown_cancellations(connection)
 
     @staticmethod
     def _ensure_column(
@@ -255,7 +271,7 @@ class StateStore:
         table: str,
         column: str,
         definition: str,
-    ) -> None:
+    ) -> bool:
         """为已有 SQLite 数据库执行轻量兼容迁移。"""
 
         columns = {
@@ -264,6 +280,67 @@ class StateStore:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            return True
+        return False
+
+    @staticmethod
+    def _recover_legacy_shutdown_cancellations(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """一次性恢复旧版本中被服务重启耗尽重试的取消事件。"""
+
+        candidates = connection.execute(
+            """
+            SELECT event_inbox.event_id
+            FROM event_inbox
+            JOIN event_agent_dispatches AS dispatch
+                ON dispatch.event_id = event_inbox.event_id
+            JOIN agent_runs AS run
+                ON run.idempotency_key = dispatch.idempotency_key
+            WHERE event_inbox.status = 'failed'
+              AND event_inbox.error = ?
+            GROUP BY event_inbox.event_id
+            HAVING COUNT(*) > 0
+               AND SUM(
+                   CASE
+                       WHEN run.status = 'cancelled'
+                        AND run.attempts = 1
+                        AND run.cancel_source IS NULL
+                       THEN 0 ELSE 1
+                   END
+               ) = 0
+            """,
+            (LEGACY_CANCELLED_RETRY_ERROR,),
+        ).fetchall()
+        event_ids = [str(row["event_id"]) for row in candidates]
+        if not event_ids:
+            return
+        placeholders = ", ".join("?" for _ in event_ids)
+        now = time.time()
+        connection.execute(
+            f"""
+            UPDATE event_inbox
+            SET status = 'pending', attempts = 0,
+                error = '旧版本服务重启中断，事件已重新入队', updated_at = ?
+            WHERE event_id IN ({placeholders})
+            """,
+            (now, *event_ids),
+        )
+        connection.execute(
+            f"""
+            UPDATE agent_runs
+            SET cancel_source = ?
+            WHERE idempotency_key IN (
+                SELECT idempotency_key
+                FROM event_agent_dispatches
+                WHERE event_id IN ({placeholders})
+            )
+              AND status = 'cancelled'
+              AND attempts = 1
+              AND cancel_source IS NULL
+            """,
+            (CANCEL_SOURCE_SERVICE_SHUTDOWN, *event_ids),
+        )
 
     def recover_interrupted_work(self) -> None:
         """单实例服务启动时恢复上次异常退出遗留的未完成状态。"""
@@ -755,7 +832,7 @@ class StateStore:
     ) -> None:
         """将事件标记为指定的终态，默认根据错误选择完成或失败。"""
 
-        final_status = "failed" if error else status or "completed"
+        final_status = status or ("failed" if error else "completed")
 
         with self.connect() as connection:
             connection.execute(
@@ -766,6 +843,23 @@ class StateStore:
                 """,
                 (final_status, error, time.time(), event_id),
             )
+
+    def release_event_after_service_shutdown(self, event_id: str) -> bool:
+        """服务停止时退回事件，并抵消本轮领取增加的尝试次数。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE event_inbox
+                SET status = 'pending',
+                    attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                    error = '服务停止中断，事件已重新入队', updated_at = ?
+                WHERE event_id = ?
+                  AND status IN ('processing', 'triggered', 'failed')
+                """,
+                (time.time(), event_id),
+            )
+        return cursor.rowcount == 1
 
     def cleanup_terminal_transient_event(self, event_id: str) -> bool:
         """固化运行上下文并删除已经成功结束的临时事件。"""
@@ -959,7 +1053,8 @@ class StateStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT run_id, root_run_id, parent_run_id, status, attempts
+                SELECT run_id, root_run_id, parent_run_id, status, attempts,
+                       cancel_source
                 FROM agent_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -991,10 +1086,22 @@ class StateStore:
                 connection.commit()
                 return RunReservation(proposed_run_id, root, parent_run_id, 1)
 
-            if row["status"] not in {"failed", "timed_out"} or row["attempts"] >= max_attempts:
+            service_interrupted = (
+                row["status"] == "cancelled"
+                and row["cancel_source"] == CANCEL_SOURCE_SERVICE_SHUTDOWN
+            )
+            retryable_failure = (
+                row["status"] in {"failed", "timed_out"}
+                and row["attempts"] < max_attempts
+            )
+            if not service_interrupted and not retryable_failure:
                 connection.rollback()
                 return None
-            attempts = int(row["attempts"]) + 1
+            attempts = (
+                int(row["attempts"])
+                if service_interrupted
+                else int(row["attempts"]) + 1
+            )
             connection.execute(
                 """
                 UPDATE agent_runs
@@ -1003,6 +1110,7 @@ class StateStore:
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
+                    cancel_source = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
@@ -1072,9 +1180,51 @@ class StateStore:
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def request_cancel_run(self, run_id: str) -> list[str] | None:
+    def agent_run_cancel_source(self, run_id: str) -> str | None:
+        """返回某次运行最近一次取消请求的来源。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_source FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return None if row is None or row["cancel_source"] is None else str(
+            row["cancel_source"]
+        )
+
+    def agent_run_cancel_source_by_idempotency(
+        self,
+        idempotency_key: str,
+    ) -> str | None:
+        """按幂等键返回运行最近一次取消请求的来源。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_source FROM agent_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return None if row is None or row["cancel_source"] is None else str(
+            row["cancel_source"]
+        )
+
+    def request_cancel_run(
+        self,
+        run_id: str,
+        *,
+        source: str = CANCEL_SOURCE_ADMINISTRATOR,
+    ) -> list[str] | None:
         """取消指定运行及全部后代，并立即结束仍在排队的运行。"""
 
+        if source not in {
+            CANCEL_SOURCE_ADMINISTRATOR,
+            CANCEL_SOURCE_SERVICE_SHUTDOWN,
+        }:
+            raise ValueError(f"不支持的取消来源：{source}")
+        queued_error = (
+            "服务正在停止，运行已取消"
+            if source == CANCEL_SOURCE_SERVICE_SHUTDOWN
+            else "运行已由管理员取消"
+        )
         now = time.time()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1110,13 +1260,13 @@ class StateStore:
                 connection.execute(
                     f"""
                     UPDATE agent_runs
-                    SET cancel_requested = 1,
+                    SET cancel_requested = 1, cancel_source = ?,
                         status = CASE
                             WHEN status = 'queued' THEN 'cancelled'
                             ELSE status
                         END,
                         error = CASE
-                            WHEN status = 'queued' THEN '运行已由管理员取消'
+                            WHEN status = 'queued' THEN ?
                             ELSE error
                         END,
                         finished_at = CASE
@@ -1125,7 +1275,7 @@ class StateStore:
                         END
                     WHERE run_id IN ({placeholders})
                     """,
-                    (now, *active_ids),
+                    (source, queued_error, now, *active_ids),
                 )
             connection.commit()
         return active_ids
@@ -1150,7 +1300,7 @@ class StateStore:
                 connection.execute(
                     f"""
                     UPDATE agent_runs
-                    SET cancel_requested = 1,
+                    SET cancel_requested = 1, cancel_source = ?,
                         status = CASE
                             WHEN status = 'queued' THEN 'cancelled'
                             ELSE status
@@ -1165,7 +1315,7 @@ class StateStore:
                         END
                     WHERE run_id IN ({placeholders})
                     """,
-                    (now, *active_ids),
+                    (CANCEL_SOURCE_SERVICE_SHUTDOWN, now, *active_ids),
                 )
             connection.commit()
         return active_ids
@@ -1495,7 +1645,7 @@ class StateStore:
                        agent_runs.rule_name, agent_runs.agent_name,
                        agent_runs.resource_key, agent_runs.status,
                        agent_runs.attempts, agent_runs.error,
-                       agent_runs.cancel_requested,
+                       agent_runs.cancel_requested, agent_runs.cancel_source,
                        agent_runs.workspace_path, agent_runs.workspace_status,
                        agent_runs.workspace_reason, agent_runs.started_at,
                        agent_runs.finished_at, agent_runs.repository_id,

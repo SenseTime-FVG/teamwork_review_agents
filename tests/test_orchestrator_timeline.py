@@ -10,6 +10,10 @@ from teamwork_review_agents.models import (
     ChangeRequestActivityBatch,
 )
 from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
+from teamwork_review_agents.state import (
+    CANCEL_SOURCE_ADMINISTRATOR,
+    CANCEL_SOURCE_SERVICE_SHUTDOWN,
+)
 
 
 async def test_scan_detects_target_head_for_pr_outside_updated_candidates(
@@ -552,3 +556,186 @@ async def test_failed_agent_marks_matching_event_as_failed(
     assert records["change_request.closed"]["status"] == "failed"
     assert records["change_request.closed"]["error"] == "审核失败"
     assert records["change_request.updated"]["status"] == "unmatched"
+
+
+async def test_service_shutdown_requeues_event_and_resumes_same_run(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """服务停止中断后应复用原运行，并且不消耗事件或 Agent 重试次数。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    config.runtime.event_retry_count = 0
+    config.rules = [
+        RuleConfig(
+            name="close-review",
+            events=["change_request.closed"],
+            agents=["code-reviewer"],
+        )
+    ]
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+    original_run_id = "service-interrupted-run"
+
+    async def fake_interrupted_execute(**kwargs):
+        """模拟服务停止时排队运行被持久化取消。"""
+
+        reservation = orchestrator.store.begin_agent_run(
+            proposed_run_id=original_run_id,
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key=kwargs["idempotency_key"],
+            event_id=kwargs["event"].id,
+            rule_name=kwargs["rule_name"],
+            agent_name=kwargs["agent_name"],
+            resource_key=kwargs["event"].resource_key,
+            prompt="",
+            max_attempts=1,
+        )
+        assert reservation is not None
+        orchestrator.store.request_cancel_run(
+            reservation.run_id,
+            source=CANCEL_SOURCE_SERVICE_SHUTDOWN,
+        )
+        return AgentResult(
+            run_id=reservation.run_id,
+            root_run_id=reservation.root_run_id,
+            agent_name=kwargs["agent_name"],
+            status="cancelled",
+            error="服务停止时中断运行",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_interrupted_execute)
+    first_summary = CycleSummary()
+    await orchestrator.process_events(first_summary)
+
+    first_records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert first_records["change_request.closed"]["status"] == "pending"
+    assert first_records["change_request.closed"]["attempts"] == 0
+    assert first_summary.processed_events == 1
+    assert first_summary.errors == []
+
+    async def fake_resumed_execute(**kwargs):
+        """模拟新服务使用同一幂等记录完成恢复执行。"""
+
+        reservation = orchestrator.store.begin_agent_run(
+            proposed_run_id="unused-run-id",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key=kwargs["idempotency_key"],
+            event_id=kwargs["event"].id,
+            rule_name=kwargs["rule_name"],
+            agent_name=kwargs["agent_name"],
+            resource_key=kwargs["event"].resource_key,
+            prompt="",
+            max_attempts=1,
+        )
+        assert reservation is not None
+        assert reservation.run_id == original_run_id
+        assert reservation.attempts == 1
+        result = AgentResult(
+            run_id=reservation.run_id,
+            root_run_id=reservation.root_run_id,
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+        orchestrator.store.finish_agent_run(result)
+        return result
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_resumed_execute)
+    second_summary = CycleSummary()
+    await orchestrator.process_events(second_summary)
+
+    second_records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert second_records["change_request.closed"]["status"] == "completed"
+    assert second_records["change_request.closed"]["attempts"] == 1
+    assert second_summary.errors == []
+    run = orchestrator.store.get_run(original_run_id)
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["attempts"] == 1
+
+
+async def test_administrator_cancel_keeps_event_terminal(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """管理员主动取消后，事件应保持已取消终态且不再自动领取。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="close-review",
+            events=["change_request.closed"],
+            agents=["code-reviewer"],
+        )
+    ]
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+
+    async def fake_cancelled_execute(**kwargs):
+        """模拟管理员在运行排队阶段主动取消。"""
+
+        reservation = orchestrator.store.begin_agent_run(
+            proposed_run_id="administrator-cancelled-run",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key=kwargs["idempotency_key"],
+            event_id=kwargs["event"].id,
+            rule_name=kwargs["rule_name"],
+            agent_name=kwargs["agent_name"],
+            resource_key=kwargs["event"].resource_key,
+            prompt="",
+            max_attempts=3,
+        )
+        assert reservation is not None
+        orchestrator.store.request_cancel_run(
+            reservation.run_id,
+            source=CANCEL_SOURCE_ADMINISTRATOR,
+        )
+        return AgentResult(
+            run_id=reservation.run_id,
+            root_run_id=reservation.root_run_id,
+            agent_name=kwargs["agent_name"],
+            status="cancelled",
+            error="运行已由管理员取消",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_cancelled_execute)
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert records["change_request.closed"]["status"] == "cancelled"
+    assert records["change_request.closed"]["error"] == "关联 Agent 运行已由管理员取消"
+    assert records["change_request.updated"]["status"] == "unmatched"
+    assert orchestrator.store.pending_events() == []
+    assert summary.errors == []

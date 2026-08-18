@@ -878,6 +878,11 @@ def test_overview_api_filters_status_repository_and_limit(
         store.save_snapshot_and_events(second, [second_event])
         assert store.claim_event(second_event.id, 2)
         store.record_event_dispatches([second_event.id], [])
+        store.finish_event(
+            second_event.id,
+            status="cancelled",
+            error="关联 Agent 运行已由管理员取消",
+        )
 
         assert len(client.get("/api/change-requests?limit=1").json()) == 1
         all_snapshots = client.get(
@@ -899,7 +904,7 @@ def test_overview_api_filters_status_repository_and_limit(
             second_event.id,
         ]
         filtered_events = client.get(
-            "/api/events?repository_id=second&status=unmatched&limit=10"
+            "/api/events?repository_id=second&status=cancelled&limit=10"
         ).json()
         assert [item["event_id"] for item in filtered_events] == [second_event.id]
         assert client.get("/api/events?status=unknown").status_code == 422

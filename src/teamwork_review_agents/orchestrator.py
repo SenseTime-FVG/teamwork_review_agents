@@ -28,7 +28,11 @@ from .models import (
 from .preflight import PreflightExecutor
 from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
-from .state import StateStore
+from .state import (
+    CANCEL_SOURCE_ADMINISTRATOR,
+    CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    StateStore,
+)
 
 
 @dataclass
@@ -108,10 +112,12 @@ class Orchestrator:
         self.executor = AgentExecutor(config, self.store)
         self.preflight = PreflightExecutor(config, self.store)
         self.agent_semaphore = asyncio.Semaphore(config.runtime.max_concurrent_agents)
+        self._shutdown_requested = False
 
     async def request_shutdown(self) -> list[str]:
         """停止创建新 Agent，并持久化取消当前服务的全部活动运行。"""
 
+        self._shutdown_requested = True
         self.executor.begin_shutdown()
         run_ids = await asyncio.to_thread(self.store.request_cancel_active_runs)
         for run_id in run_ids:
@@ -504,6 +510,8 @@ class Orchestrator:
             errors_by_event: dict[str, list[str]] = {
                 event.id: [] for event in claimed_events
             }
+            service_interrupted_event_ids: set[str] = set()
+            administrator_cancelled_event_ids: set[str] = set()
             matched_event_ids: set[str] = set()
             task_items: list[
                 tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
@@ -622,6 +630,29 @@ class Orchestrator:
                     isinstance(result, AgentResult) for result in results
                 )
                 for (invocation, _), result in zip(task_items, results, strict=True):
+                    run_id = result.run_id if isinstance(result, AgentResult) else None
+                    if run_id is not None:
+                        cancel_source = await asyncio.to_thread(
+                            self.store.agent_run_cancel_source,
+                            run_id,
+                        )
+                    else:
+                        cancel_source = await asyncio.to_thread(
+                            self.store.agent_run_cancel_source_by_idempotency,
+                            invocation.idempotency_key,
+                        )
+                    if cancel_source is None and self._shutdown_requested:
+                        cancel_source = CANCEL_SOURCE_SERVICE_SHUTDOWN
+                    if cancel_source == CANCEL_SOURCE_SERVICE_SHUTDOWN:
+                        service_interrupted_event_ids.update(
+                            event.id for event in invocation.events
+                        )
+                        continue
+                    if cancel_source == CANCEL_SOURCE_ADMINISTRATOR:
+                        administrator_cancelled_event_ids.update(
+                            event.id for event in invocation.events
+                        )
+                        continue
                     if isinstance(result, BaseException):
                         error = str(result)
                     elif isinstance(result, AgentResult) and result.status != "completed":
@@ -632,6 +663,21 @@ class Orchestrator:
                         errors_by_event[event.id].append(error)
 
             for event in claimed_events:
+                if event.id in service_interrupted_event_ids:
+                    await asyncio.to_thread(
+                        self.store.release_event_after_service_shutdown,
+                        event.id,
+                    )
+                    continue
+                if event.id in administrator_cancelled_event_ids:
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="cancelled",
+                        error="关联 Agent 运行已由管理员取消",
+                    )
+                    summary.processed_events += 1
+                    continue
                 error = "; ".join(errors_by_event[event.id]) or None
                 if event.id not in matched_event_ids and error is None:
                     await asyncio.to_thread(

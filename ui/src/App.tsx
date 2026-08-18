@@ -89,6 +89,7 @@ const EVENT_STATUS_OPTIONS = [
   { value: "triggered", label: "已触发" },
   { value: "completed", label: "已处理" },
   { value: "failed", label: "处理失败" },
+  { value: "cancelled", label: "已取消" },
 ];
 
 const EMPTY_STATUS: RuntimeStatus = {
@@ -4320,6 +4321,7 @@ function EventStatusPill({ event }: { event: EventRecord }) {
     triggered: "已触发",
     completed: event.trigger_count > 0 ? "已处理" : "历史已处理",
     failed: "处理失败",
+    cancelled: "已取消",
   };
   return (
     <span className={`status-pill status-${event.status}`}>

@@ -14,7 +14,11 @@ from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import SecretRedactor, render_prompt, resolve_environment
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
-from .state import StateStore
+from .state import (
+    CANCEL_SOURCE_ADMINISTRATOR,
+    CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    StateStore,
+)
 from .workspace import (
     GitProgressEvent,
     change_request_ref,
@@ -276,10 +280,25 @@ class AgentExecutor:
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
             )
+
+        async def cancellation_source() -> str | None:
+            """读取持久化来源，并兜住停止请求与数据库写入之间的竞态。"""
+
+            source = await asyncio.to_thread(
+                self.store.agent_run_cancel_source,
+                reservation.run_id,
+            )
+            if source is not None:
+                return source
+            if self._shutdown_requested.is_set():
+                return CANCEL_SOURCE_SERVICE_SHUTDOWN
+            return None
+
         if self._shutdown_requested.is_set():
             await asyncio.to_thread(
                 self.store.request_cancel_run,
                 reservation.run_id,
+                source=CANCEL_SOURCE_SERVICE_SHUTDOWN,
             )
 
         keys = self.lock_keys(agent_name, event, configured_repository)
@@ -509,13 +528,18 @@ class AgentExecutor:
                     reservation.run_id,
                 )
                 if not started:
+                    source = await cancellation_source()
                     result = AgentResult(
                         run_id=reservation.run_id,
                         root_run_id=reservation.root_run_id,
                         parent_run_id=reservation.parent_run_id,
                         agent_name=agent_name,
                         status="cancelled",
-                        error="运行在 Codex CLI 启动前被管理员取消",
+                        error=(
+                            "服务停止时在 Codex CLI 启动前中断运行"
+                            if source == CANCEL_SOURCE_SERVICE_SHUTDOWN
+                            else "运行在 Codex CLI 启动前被管理员取消"
+                        ),
                     )
                 else:
                     await persist_log(
@@ -561,21 +585,29 @@ class AgentExecutor:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
         except WorkspaceCancelled as exc:
+            source = await cancellation_source()
             result = AgentResult(
                 run_id=reservation.run_id,
                 root_run_id=reservation.root_run_id,
                 parent_run_id=reservation.parent_run_id,
                 agent_name=agent_name,
                 status="cancelled",
-                error=redactor.text(str(exc)),
+                error=(
+                    "服务停止时中断 Git 工作区准备"
+                    if source == CANCEL_SOURCE_SERVICE_SHUTDOWN
+                    else redactor.text(str(exc))
+                ),
             )
         except Exception as exc:
             cancelled = await asyncio.to_thread(
                 self._cancel_requested,
                 reservation.run_id,
             )
+            source = await cancellation_source() if cancelled else None
             error = (
-                "运行已由管理员取消"
+                "服务停止时中断运行"
+                if source == CANCEL_SOURCE_SERVICE_SHUTDOWN
+                else "运行已由管理员取消"
                 if cancelled
                 else redactor.text(str(exc))
             )
@@ -587,6 +619,13 @@ class AgentExecutor:
                 status="cancelled" if cancelled else "failed",
                 error=error,
             )
+
+        if result.status == "cancelled":
+            source = await cancellation_source()
+            if source == CANCEL_SOURCE_SERVICE_SHUTDOWN:
+                result.error = result.error or "服务停止时中断运行"
+            elif source == CANCEL_SOURCE_ADMINISTRATOR:
+                result.error = result.error or "运行已由管理员取消"
 
         if owned_workspace and active_workspace is not None:
             try:

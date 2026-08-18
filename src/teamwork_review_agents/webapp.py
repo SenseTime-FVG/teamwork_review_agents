@@ -807,6 +807,7 @@ def create_app(
             "triggered",
             "completed",
             "failed",
+            "cancelled",
         ]
         | None = None,
     ):

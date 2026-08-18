@@ -14,7 +14,12 @@ from teamwork_review_agents.models import (
     ChangeRequestActivity,
     PreflightResult,
 )
-from teamwork_review_agents.state import StateStore
+from teamwork_review_agents.state import (
+    CANCEL_SOURCE_ADMINISTRATOR,
+    CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    LEGACY_CANCELLED_RETRY_ERROR,
+    StateStore,
+)
 
 
 def test_terminal_target_event_is_lightweight_and_removed_without_losing_run(
@@ -246,6 +251,49 @@ def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
     assert store.claim_event(event.id, 2)
     store.finish_event(event.id, error="第二次失败")
     assert not store.claim_event(event.id, 2)
+
+
+def test_service_shutdown_release_does_not_consume_event_attempt(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """服务停止退回事件时应抵消领取次数，并允许按原次数再次领取。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    event = detect_events(None, snapshot_factory(), emit_initial=True)[0]
+    store.save_snapshot_and_events(event.new, [event])
+    assert store.claim_event(event.id, 1)
+    store.record_event_dispatches(
+        [event.id],
+        [(event.id, "shutdown-event", "review", "reviewer")],
+    )
+
+    assert store.release_event_after_service_shutdown(event.id)
+    record = store.list_events(None)[0]
+    assert record["status"] == "pending"
+    assert record["attempts"] == 0
+    assert store.claim_event(event.id, 1)
+
+
+def test_explicit_cancelled_event_status_is_terminal(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """带错误说明的管理员取消事件也必须保留 cancelled 终态。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    event = detect_events(None, snapshot_factory(), emit_initial=True)[0]
+    store.save_snapshot_and_events(event.new, [event])
+    assert store.claim_event(event.id, 2)
+
+    store.finish_event(event.id, status="cancelled", error="管理员取消")
+
+    record = store.list_events(None)[0]
+    assert record["status"] == "cancelled"
+    assert record["error"] == "管理员取消"
+    assert store.pending_events() == []
 
 
 def test_resource_lock_is_reentrant_and_exclusive(tmp_path) -> None:
@@ -537,7 +585,142 @@ def test_service_shutdown_requests_cancel_for_every_active_run(tmp_path) -> None
     assert store.get_run(running.run_id)["status"] == "running"
     assert store.get_run(child.run_id)["status"] == "preparing"
     assert all(store.agent_run_cancel_requested(run_id) for run_id in cancelled)
+    assert all(
+        store.agent_run_cancel_source(run_id)
+        == CANCEL_SOURCE_SERVICE_SHUTDOWN
+        for run_id in cancelled
+    )
     assert store.request_cancel_active_runs() == []
+
+
+def test_service_shutdown_cancelled_run_reuses_attempt_and_run_id(tmp_path) -> None:
+    """服务中断的幂等运行应原位恢复，且不增加业务失败尝试次数。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = store.begin_agent_run(
+        proposed_run_id="service-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="service-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:10",
+        prompt="首次执行",
+        max_attempts=1,
+    )
+    assert first is not None
+    assert store.request_cancel_run(
+        first.run_id,
+        source=CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    ) == [first.run_id]
+    assert store.agent_run_cancel_source(first.run_id) == CANCEL_SOURCE_SERVICE_SHUTDOWN
+
+    resumed = store.begin_agent_run(
+        proposed_run_id="unused-new-id",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="service-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:10",
+        prompt="恢复执行",
+        max_attempts=1,
+    )
+
+    assert resumed is not None
+    assert resumed.run_id == first.run_id
+    assert resumed.attempts == 1
+    detail = store.get_run(first.run_id)
+    assert detail is not None
+    assert detail["status"] == "queued"
+    assert detail["cancel_requested"] == 0
+    assert detail["cancel_source"] is None
+
+
+def test_manual_cancelled_run_is_not_automatically_reused(tmp_path) -> None:
+    """管理员取消保持终态，不能由幂等重试自动恢复。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = store.begin_agent_run(
+        proposed_run_id="manual-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="manual-cancel",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:11",
+        prompt="",
+        max_attempts=3,
+    )
+    assert first is not None
+    assert store.request_cancel_run(first.run_id) == [first.run_id]
+    assert store.agent_run_cancel_source(first.run_id) == CANCEL_SOURCE_ADMINISTRATOR
+
+    assert store.begin_agent_run(
+        proposed_run_id="manual-retry",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="manual-cancel",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:11",
+        prompt="",
+        max_attempts=3,
+    ) is None
+
+
+def test_initialize_recovers_narrow_legacy_restart_failure(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """新增取消来源字段时只恢复旧版重启形成的特征化失败记录。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    event = detect_events(None, snapshot_factory(), emit_initial=True)[0]
+    store.save_snapshot_and_events(event.new, [event])
+    assert store.claim_event(event.id, 3)
+    store.record_event_dispatches(
+        [event.id],
+        [(event.id, "legacy-cancel", "review", "reviewer")],
+    )
+    run = store.begin_agent_run(
+        proposed_run_id="legacy-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="legacy-cancel",
+        event_id=event.id,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key=event.resource_key,
+        prompt="",
+        max_attempts=3,
+    )
+    assert run is not None
+    store.request_cancel_run(run.run_id)
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE event_inbox
+            SET status = 'failed', attempts = 3, error = ?
+            WHERE event_id = ?
+            """,
+            (LEGACY_CANCELLED_RETRY_ERROR, event.id),
+        )
+        connection.execute("ALTER TABLE agent_runs DROP COLUMN cancel_source")
+
+    store.initialize()
+
+    record = store.list_events(None)[0]
+    assert record["status"] == "pending"
+    assert record["attempts"] == 0
+    assert store.agent_run_cancel_source(run.run_id) == CANCEL_SOURCE_SERVICE_SHUTDOWN
 
 
 def test_activity_cursor_is_saved_with_snapshot_and_events(
