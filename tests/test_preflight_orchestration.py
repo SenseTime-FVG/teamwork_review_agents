@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from teamwork_review_agents.config import parse_config_data
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import PreflightResult
+from teamwork_review_agents.models import (
+    AgentResult,
+    ChangeRequestActivityBatch,
+    PreflightResult,
+)
 from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
 
 
@@ -65,7 +69,12 @@ class FakeAgentExecutor:
 
     async def execute(self, *, agent_name, **_kwargs):
         self.calls.append(agent_name)
-        return object()
+        return AgentResult(
+            run_id=f"run-{agent_name}",
+            root_run_id=f"run-{agent_name}",
+            agent_name=agent_name,
+            status="completed",
+        )
 
 
 class FakePreflightExecutor:
@@ -170,6 +179,8 @@ async def test_preflight_repository_emits_initial_event_without_global_opt_in(
     )
 
     class FakeProvider:
+        name = "github-main"
+
         async def __aenter__(self):
             return self
 
@@ -179,14 +190,27 @@ async def test_preflight_repository_emits_initial_event_without_global_opt_in(
         async def list_change_requests(self, _repository, *, updated_since=None):
             return [snapshot]
 
+        async def list_change_request_activities(
+            self,
+            _repository,
+            _number,
+            *,
+            cursor=None,
+            since=None,
+        ):
+            return ChangeRequestActivityBatch(baseline=True)
+
     monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
     monkeypatch.setattr(
         "teamwork_review_agents.orchestrator.create_provider",
         lambda *_args, **_kwargs: FakeProvider(),
     )
     orchestrator = Orchestrator(config, recover_interrupted=False)
+    summary = CycleSummary()
 
-    await orchestrator.scan(CycleSummary())
+    await orchestrator.scan(summary)
 
     events = orchestrator.store.pending_events()
-    assert [event.type for event in events] == ["change_request.discovered"]
+    assert [event.type for event in events] == [
+        "change_request.discovered"
+    ], summary.errors
