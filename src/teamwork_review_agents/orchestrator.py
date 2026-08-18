@@ -11,7 +11,7 @@ from typing import Any
 
 from .config import AppConfig, RepositoryConfig, RuleConfig
 from .environment import resolve_provider_token
-from .events import detect_activity_events, detect_events
+from .events import detect_activity_events, detect_events, detect_first_seen_events
 from .executor import AgentExecutor
 from .models import AgentResult, ChangeEvent, stable_hash
 from .providers import BaseProvider, ProviderError, create_provider
@@ -99,8 +99,8 @@ class Orchestrator:
 
         return f"repository_scan:{repository_id}"
 
-    def _updated_since(self, repository_id: str) -> datetime | None:
-        """读取上次成功扫描时间，并保留两个扫描周期的重叠窗口。"""
+    def _last_scan_completed_at(self, repository_id: str) -> datetime | None:
+        """读取仓库上一次成功完成扫描的精确时间。"""
 
         state = self.store.get_service_state(self._scan_state_key(repository_id))
         if not state or not state.get("completed_at"):
@@ -111,15 +111,47 @@ class Orchestrator:
             return None
         if completed_at.tzinfo is None:
             completed_at = completed_at.replace(tzinfo=UTC)
+        return completed_at
+
+    def _updated_since(self, repository_id: str) -> datetime | None:
+        """读取上次成功扫描时间，并保留两个扫描周期的重叠窗口。"""
+
+        completed_at = self._last_scan_completed_at(repository_id)
+        if completed_at is None:
+            return None
         overlap_seconds = max(60, self.config.scanner.interval_seconds * 2)
         return completed_at - timedelta(seconds=overlap_seconds)
 
-    def _mark_scan_completed(self, repository_id: str) -> None:
+    def _last_successful_scan_started_at(self, repository_id: str) -> datetime | None:
+        """读取上一次成功轮次的开始时间，旧数据回退到完成时间。"""
+
+        state = self.store.get_service_state(self._scan_state_key(repository_id))
+        if not state:
+            return None
+        value = state.get("started_at") or state.get("completed_at")
+        if not value:
+            return None
+        try:
+            started_at = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        return started_at
+
+    def _mark_scan_completed(
+        self,
+        repository_id: str,
+        scan_started_at: datetime,
+    ) -> None:
         """只在仓库完整扫描成功后推进时间水位。"""
 
         self.store.set_service_state(
             self._scan_state_key(repository_id),
-            {"completed_at": datetime.now(UTC).isoformat()},
+            {
+                "started_at": scan_started_at.isoformat(),
+                "completed_at": datetime.now(UTC).isoformat(),
+            },
         )
 
     async def _initialize_activity_cursors(
@@ -177,6 +209,15 @@ class Orchestrator:
                     for repository in repositories:
                         summary.repositories += 1
                         try:
+                            scan_started_at = datetime.now(UTC)
+                            last_scan_started_at = await asyncio.to_thread(
+                                self._last_successful_scan_started_at,
+                                repository.id,
+                            )
+                            event_window_start = last_scan_started_at or (
+                                scan_started_at
+                                - timedelta(seconds=self.config.scanner.interval_seconds)
+                            )
                             await self._initialize_activity_cursors(
                                 provider,
                                 repository,
@@ -200,12 +241,39 @@ class Orchestrator:
                                     snapshot.repository_id,
                                     snapshot.number,
                                 )
-                                activity_batch = await provider.list_change_request_activities(
-                                    repository,
-                                    snapshot.number,
-                                    cursor=activity_cursor,
-                                )
-                                if (
+                                if old is None:
+                                    activity_batch = (
+                                        await provider.list_change_request_activities(
+                                            repository,
+                                            snapshot.number,
+                                            cursor=activity_cursor,
+                                            since=event_window_start,
+                                        )
+                                    )
+                                else:
+                                    activity_batch = (
+                                        await provider.list_change_request_activities(
+                                            repository,
+                                            snapshot.number,
+                                            cursor=activity_cursor,
+                                        )
+                                    )
+                                if old is None:
+                                    events = detect_first_seen_events(
+                                        snapshot,
+                                        (
+                                            activity_batch.activities
+                                            if activity_batch is not None
+                                            and not activity_batch.baseline
+                                            else ()
+                                        ),
+                                        event_window_start=event_window_start,
+                                        emit_discovered=(
+                                            self.config.scanner.emit_initial_events
+                                        ),
+                                        batch_id=scan_batch_id,
+                                    )
+                                elif (
                                     old is not None
                                     and activity_batch is not None
                                     and not activity_batch.baseline
@@ -238,6 +306,7 @@ class Orchestrator:
                             await asyncio.to_thread(
                                 self._mark_scan_completed,
                                 repository.id,
+                                scan_started_at,
                             )
                         except Exception as exc:
                             summary.errors.append(f"扫描仓库 {repository.id} 失败：{exc}")

@@ -125,6 +125,11 @@ class GitLabProvider(BaseProvider):
                 or detail.get("merge_status")
                 or "unknown"
             ),
+            created_at=(
+                parse_datetime(detail.get("created_at"))
+                if detail.get("created_at")
+                else None
+            ),
             updated_at=parse_datetime(detail.get("updated_at")),
             web_url=str(detail.get("web_url") or ""),
             raw={"merge_request": detail, "approvals": approvals},

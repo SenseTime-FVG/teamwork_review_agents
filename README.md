@@ -104,7 +104,7 @@ teamwork-review-agents scan-once --dry-run
 
 该模式仍会请求 Provider、保存最新快照并生成事件，但不会处理事件或启动 Agent。生成的事件会保留为待处理状态，之后执行普通 `scan-once` 或启动 `run` / `start` 时仍可能被处理。
 
-首次看到一个 MR/PR 时，系统默认只建立快照基线，不产生触发事件。将 `scanner.emit_initial_events` 改为 `true` 后，首次发现会生成 `change_request.discovered` 事件，并按照规则决定是否启动 Agent。
+首次扫描仓库时，系统会向前回看一个扫描周期：例如扫描间隔为 5 分钟，就会输出最近 5 分钟内新建 PR 的 `change_request.opened`，以及 GitHub Timeline 能确认发生时间的关闭、重开、提交、Draft 和标签等动作；更早的历史 PR 只建立快照，不会被误报为新建。后续窗口从该仓库上一次成功轮次的开始时间起算，并依靠稳定事件 ID 消除重叠读取。`scanner.emit_initial_events` 只控制是否额外生成 `change_request.discovered`，窗口内真实发生的事件不受它影响。
 
 管理界面的“已扫描 MR / PR”统计和列表来自已保存的最新快照；“变化事件”是新发现、提交、状态、标签等变化产生的事件，两者不会混为一个计数。对于已经建立基线但没有首次事件的 MR / PR，可以在列表中选择“补发首次事件”。补发不会删除快照或重新请求 Provider，只会幂等写入 `change_request.discovered`，并按当前规则调度；操作前请先确认规则与 Agent 权限。
 
@@ -130,7 +130,7 @@ teamwork-review-agents scan-once --dry-run
 
 扫描器会先按更新时间倒序读取 PR / MR 列表，并在上次成功扫描时间水位处提前停止。`scanner.max_items_per_repository` 是单个仓库每轮的安全上限，默认 100 条；它限制需要继续读取详情、活动、Review、流水线与合并状态的 MR/PR 数量，避免大型仓库单轮请求失控。`scanner.api_page_size` 只是高级分页参数，通常无需修改。
 
-GitHub 候选 PR 会额外增量读取 Issue Timeline。PR 详情负责提供当前快照，Timeline 的稳定 `id` / `node_id` 负责识别同一轮轮询间发生的 `closed`、`reopened`、`merged`、`committed`、Draft 和标签动作；因此即使扫描前后都为打开状态，中间的关闭和重新打开也能分别入库。升级或首次启用时，扫描器会先为数据库中的已有 PR 补齐 Timeline 基线，不自动重放历史动作，然后再开始候选筛选。GitLab 暂时继续使用快照差异。
+GitHub 候选 PR 会额外增量读取 Issue Timeline。PR 详情负责提供当前快照，Timeline 的稳定 `id` / `node_id` 负责识别同一轮轮询间发生的 `closed`、`reopened`、`merged`、`committed`、Draft 和标签动作；因此即使扫描前后都为打开状态，中间的关闭和重新打开也能分别入库。全新数据库第一次扫描某个 PR 时只回看上述扫描周期；升级后数据库里已经有快照但缺少 Timeline 游标的 PR 只补齐活动基线，不重放不确定的历史动作。GitLab 暂时继续使用快照差异。
 
 同一个 MR/PR 可以在不同时间重复产生 `closed`、`reopened` 等事件；事件 ID 包含远端更新时间，因此重复状态转换不会再被上一轮同名事件吞掉。同一远端快照被重复扫描时仍然保持幂等。
 

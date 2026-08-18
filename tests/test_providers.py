@@ -263,3 +263,121 @@ async def test_github_timeline_reads_across_page_boundary() -> None:
 
     assert [item.type for item in result.activities] == ["closed", "reopened"]
     assert result.cursor == {"page": 2, "item_id": "102"}
+
+
+async def test_github_timeline_first_scan_only_replays_requested_window() -> None:
+    """首次游标应保留最新位置，同时只返回回看时间窗内的活动。"""
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    timeline = [
+        {
+            "event": "closed",
+            "id": 100,
+            "created_at": "2026-08-17T07:59:00Z",
+        },
+        {
+            "event": "reopened",
+            "id": 101,
+            "created_at": "2026-08-17T08:01:00Z",
+        },
+        {
+            "event": "labeled",
+            "id": 102,
+            "created_at": "2026-08-17T08:02:00Z",
+            "label": {"name": "ready"},
+        },
+    ]
+
+    async def fake_get_json_response(_: str, **__: object):
+        return timeline, {}
+
+    setattr(provider, "get_json_response", fake_get_json_response)
+    try:
+        result = await provider.list_change_request_activities(
+            repository,
+            7,
+            since=datetime(2026, 8, 17, 8, tzinfo=UTC),
+        )
+    finally:
+        await provider.close()
+
+    assert result.baseline is False
+    assert [item.type for item in result.activities] == ["reopened", "labeled"]
+    assert result.cursor == {"page": 1, "item_id": "102"}
+
+
+async def test_github_timeline_first_window_reads_back_across_pages() -> None:
+    """首次窗口跨页时应从末页向前读到边界，再保持平台顺序。"""
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    provider.TIMELINE_PAGE_SIZE = 2
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    pages = {
+        1: [
+            {"event": "closed", "id": 1, "created_at": "2026-08-17T07:55:00Z"},
+            {"event": "reopened", "id": 2, "created_at": "2026-08-17T07:56:00Z"},
+        ],
+        2: [
+            {"event": "closed", "id": 3, "created_at": "2026-08-17T07:59:00Z"},
+            {"event": "reopened", "id": 4, "created_at": "2026-08-17T08:00:00Z"},
+        ],
+        3: [
+            {"event": "closed", "id": 5, "created_at": "2026-08-17T08:01:00Z"},
+            {"event": "reopened", "id": 6, "created_at": "2026-08-17T08:02:00Z"},
+        ],
+    }
+    fetched_pages: list[int] = []
+
+    async def fake_get_json_response(_: str, **__: object):
+        return pages[1], {"Link": '<https://api.github.com?page=3>; rel="last"'}
+
+    async def fake_get_json(_: str, **kwargs: object):
+        params = kwargs["params"]
+        assert isinstance(params, dict)
+        page = int(params["page"])
+        fetched_pages.append(page)
+        return pages[page]
+
+    setattr(provider, "get_json_response", fake_get_json_response)
+    setattr(provider, "get_json", fake_get_json)
+    try:
+        result = await provider.list_change_request_activities(
+            repository,
+            7,
+            since=datetime(2026, 8, 17, 8, tzinfo=UTC),
+        )
+    finally:
+        await provider.close()
+
+    assert fetched_pages == [3, 2]
+    assert [item.id for item in result.activities] == ["4", "5", "6"]
+    assert result.cursor == {"page": 3, "item_id": "6"}

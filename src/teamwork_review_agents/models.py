@@ -29,6 +29,7 @@ class ChangeRequestSnapshot(BaseModel):
     approvals: int = 0
     pipeline_status: str = "unknown"
     merge_status: str = "unknown"
+    created_at: datetime | None = None
     updated_at: datetime
     web_url: str
     raw: dict[str, Any] = Field(default_factory=dict)

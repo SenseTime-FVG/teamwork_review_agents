@@ -117,16 +117,10 @@ class GitHubProvider(BaseProvider):
                 return max(1, int(match.group(1)))
         return 1
 
-    @classmethod
-    def _timeline_activity(
-        cls,
-        item: dict[str, Any],
-    ) -> ChangeRequestActivity | None:
-        """将 GitHub Timeline 项收敛为事件检测需要的最小活动。"""
+    @staticmethod
+    def _timeline_item_occurred_at(item: dict[str, Any]) -> datetime | None:
+        """读取 Timeline 项中平台能够提供的活动时间。"""
 
-        event_type = str(item.get("event") or "")
-        if event_type not in cls.TIMELINE_EVENT_TYPES:
-            return None
         author = item.get("author") or {}
         committer = item.get("committer") or {}
         if not isinstance(author, dict):
@@ -139,13 +133,25 @@ class GitHubProvider(BaseProvider):
             or author.get("date")
             or committer.get("date")
         )
+        return parse_datetime(str(occurred_value)) if occurred_value else None
+
+    @classmethod
+    def _timeline_activity(
+        cls,
+        item: dict[str, Any],
+    ) -> ChangeRequestActivity | None:
+        """将 GitHub Timeline 项收敛为事件检测需要的最小活动。"""
+
+        event_type = str(item.get("event") or "")
+        if event_type not in cls.TIMELINE_EVENT_TYPES:
+            return None
         label = item.get("label") or {}
         if not isinstance(label, dict):
             label = {}
         return ChangeRequestActivity(
             id=cls._timeline_item_id(item),
             type=event_type,
-            occurred_at=parse_datetime(str(occurred_value)) if occurred_value else None,
+            occurred_at=cls._timeline_item_occurred_at(item),
             data={
                 "sha": str(item.get("sha") or ""),
                 "commit_id": str(item.get("commit_id") or ""),
@@ -159,8 +165,9 @@ class GitHubProvider(BaseProvider):
         number: int,
         *,
         cursor: dict[str, object] | None = None,
+        since: datetime | None = None,
     ) -> ChangeRequestActivityBatch:
-        """按不透明游标增量读取单个 PR 的 GitHub Timeline。"""
+        """按不透明游标增量读取，或首次回看限定时间内的 Timeline。"""
 
         path = f"repos/{repository.project}/issues/{number}/timeline"
         first_payload, headers = await self.get_json_response(
@@ -171,6 +178,7 @@ class GitHubProvider(BaseProvider):
             raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
 
         if cursor is None:
+            page_cache: dict[int, list[object]] = {1: first_payload}
             last_page = self._last_timeline_page(headers)
             last_payload = first_payload
             if last_page > 1:
@@ -183,6 +191,7 @@ class GitHubProvider(BaseProvider):
                 )
                 if not isinstance(last_payload, list):
                     raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+                page_cache[last_page] = last_payload
             elif len(first_payload) == self.TIMELINE_PAGE_SIZE:
                 # 非 GitHub 兼容服务可能省略 Link，首次基线需顺序找到真正末页。
                 page = 2
@@ -201,6 +210,7 @@ class GitHubProvider(BaseProvider):
                     if payload:
                         last_page = page
                         last_payload = payload
+                        page_cache[page] = payload
                     if len(payload) < self.TIMELINE_PAGE_SIZE:
                         break
                     if page >= self.MAX_TIMELINE_PAGES_PER_SCAN:
@@ -214,9 +224,65 @@ class GitHubProvider(BaseProvider):
                 if last_payload and isinstance(last_payload[-1], dict)
                 else ""
             )
+            next_cursor = {"page": last_page, "item_id": latest_id}
+            if since is None:
+                return ChangeRequestActivityBatch(
+                    cursor=next_cursor,
+                    baseline=True,
+                )
+
+            # 首次扫描只从末页向前回看到本扫描周期，
+            # 避免重放全部历史动作。
+            recent_pages: list[tuple[int, list[object]]] = []
+            page = last_page
+            pages_read = 0
+            while page >= 1:
+                payload = page_cache.get(page)
+                if payload is None:
+                    payload = await self.get_json(
+                        path,
+                        params={
+                            "per_page": self.TIMELINE_PAGE_SIZE,
+                            "page": page,
+                        },
+                    )
+                if not isinstance(payload, list):
+                    raise ProviderError(f"GitHub PR #{number} Timeline 返回格式异常")
+                recent_pages.append((page, payload))
+                pages_read += 1
+                occurred_times = [
+                    occurred_at
+                    for item in payload
+                    if isinstance(item, dict)
+                    and (occurred_at := self._timeline_item_occurred_at(item)) is not None
+                ]
+                if occurred_times and all(value < since for value in occurred_times):
+                    break
+                if page == 1:
+                    break
+                if pages_read >= self.MAX_TIMELINE_PAGES_PER_SCAN:
+                    raise ProviderError(
+                        f"GitHub PR #{number} Timeline 首次回看超过 "
+                        f"{self.MAX_TIMELINE_PAGES_PER_SCAN} 页"
+                    )
+                page -= 1
+
+            entries = [
+                item
+                for _, payload in reversed(recent_pages)
+                for item in payload
+                if isinstance(item, dict)
+            ]
+            activities = tuple(
+                activity
+                for item in entries
+                if (activity := self._timeline_activity(item)) is not None
+                and activity.occurred_at is not None
+                and activity.occurred_at >= since
+            )
             return ChangeRequestActivityBatch(
-                cursor={"page": last_page, "item_id": latest_id},
-                baseline=True,
+                activities=activities,
+                cursor=next_cursor,
             )
 
         try:
@@ -390,6 +456,11 @@ class GitHubProvider(BaseProvider):
             approvals=approvals,
             pipeline_status=str(status.get("state") or "unknown"),
             merge_status=merge_status,
+            created_at=(
+                parse_datetime(detail.get("created_at"))
+                if detail.get("created_at")
+                else None
+            ),
             updated_at=parse_datetime(detail.get("updated_at")),
             web_url=str(detail.get("html_url") or ""),
             raw={"pull_request": detail, "reviews": reviews, "status": status},

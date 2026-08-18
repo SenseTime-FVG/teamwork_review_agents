@@ -1,6 +1,12 @@
 """快照变化检测测试。"""
 
-from teamwork_review_agents.events import detect_activity_events, detect_events
+from datetime import UTC, datetime
+
+from teamwork_review_agents.events import (
+    detect_activity_events,
+    detect_events,
+    detect_first_seen_events,
+)
 from teamwork_review_agents.models import ChangeRequestActivity
 
 
@@ -143,3 +149,97 @@ def test_timeline_commits_and_snapshot_only_fields_are_combined(snapshot_factory
         "change_request.updated",
     ]
     assert events[-2].changed_fields == ("approvals",)
+
+
+def test_first_seen_recent_pr_emits_opened_and_window_activities(
+    snapshot_factory,
+) -> None:
+    """首次扫描应输出窗口内的新建、关闭与重开，而不是只建基线。"""
+
+    current = snapshot_factory(
+        created_at="2026-08-17T08:01:00Z",
+        updated_at="2026-08-17T08:04:00Z",
+    )
+    activities = (
+        ChangeRequestActivity(
+            id="first-close",
+            type="closed",
+            occurred_at="2026-08-17T08:02:00Z",
+        ),
+        ChangeRequestActivity(
+            id="first-reopen",
+            type="reopened",
+            occurred_at="2026-08-17T08:03:00Z",
+        ),
+    )
+
+    events = detect_first_seen_events(
+        current,
+        activities,
+        event_window_start=datetime(2026, 8, 17, 8, tzinfo=UTC),
+        emit_discovered=True,
+        batch_id="first-scan",
+    )
+
+    assert [event.type for event in events] == [
+        "change_request.discovered",
+        "change_request.opened",
+        "change_request.updated",
+        "change_request.closed",
+        "change_request.updated",
+        "change_request.reopened",
+        "change_request.updated",
+    ]
+    assert events[3].old is not None and events[3].old.state == "opened"
+    assert events[5].old is not None and events[5].old.state == "closed"
+    assert all(event.current_snapshot == current for event in events[1:])
+
+
+def test_first_seen_historical_pr_only_replays_recent_activities(
+    snapshot_factory,
+) -> None:
+    """历史 PR 不应补发 opened，但窗口内的真实动作仍需完整输出。"""
+
+    current = snapshot_factory(
+        created_at="2026-08-16T08:00:00Z",
+        updated_at="2026-08-17T08:04:00Z",
+    )
+    activities = (
+        ChangeRequestActivity(
+            id="old-outside-window",
+            type="closed",
+            occurred_at="2026-08-17T07:59:00Z",
+        ),
+        ChangeRequestActivity(
+            id="recent-close",
+            type="closed",
+            occurred_at="2026-08-17T08:02:00Z",
+        ),
+        ChangeRequestActivity(
+            id="recent-reopen",
+            type="reopened",
+            occurred_at="2026-08-17T08:03:00Z",
+        ),
+    )
+
+    events = detect_first_seen_events(
+        current,
+        activities,
+        event_window_start=datetime(2026, 8, 17, 8, tzinfo=UTC),
+    )
+
+    assert [event.type for event in events] == [
+        "change_request.closed",
+        "change_request.updated",
+        "change_request.reopened",
+        "change_request.updated",
+    ]
+
+
+def test_created_at_upgrade_does_not_create_snapshot_change(snapshot_factory) -> None:
+    """旧快照缺少创建时间时，补齐字段不应产生一次性 updated。"""
+
+    old = snapshot_factory(created_at=None)
+    current = snapshot_factory(created_at="2026-08-17T07:00:00Z")
+
+    assert detect_events(old, current) == []

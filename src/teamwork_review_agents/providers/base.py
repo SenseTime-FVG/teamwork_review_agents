@@ -118,8 +118,9 @@ class BaseProvider(ABC):
         number: int,
         *,
         cursor: dict[str, object] | None = None,
+        since: datetime | None = None,
     ) -> ChangeRequestActivityBatch | None:
-        """读取单个 MR/PR 的增量活动；不支持时返回空能力。"""
+        """读取单个 MR/PR 的增量或限定时间窗口活动；不支持时返回空能力。"""
 
         return None
 

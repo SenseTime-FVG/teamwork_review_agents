@@ -89,6 +89,22 @@ def _activity_event_id(
     )
 
 
+def _creation_event_id(
+    snapshot: ChangeRequestSnapshot,
+    event_type: str,
+) -> str:
+    """使用平台创建时间生成首次窗口事件的稳定 ID。"""
+
+    return stable_hash(
+        snapshot.provider,
+        snapshot.repository_id,
+        snapshot.number,
+        "provider-created",
+        snapshot.created_at,
+        event_type,
+    )
+
+
 def _apply_activity(
     before: ChangeRequestSnapshot,
     current: ChangeRequestSnapshot,
@@ -215,6 +231,125 @@ def detect_activity_events(
     return events
 
 
+def _rewind_first_seen_snapshot(
+    current: ChangeRequestSnapshot,
+    activities: tuple[ChangeRequestActivity, ...],
+    event_window_start: datetime,
+) -> ChangeRequestSnapshot:
+    """从当前真值反向还原首次回看窗口开始时的必要状态。"""
+
+    working = current
+    for activity in reversed(activities):
+        updates: dict[str, Any] = {}
+        if activity.type == "closed":
+            updates["state"] = "opened"
+        elif activity.type == "reopened":
+            updates["state"] = "closed"
+        elif activity.type == "merged":
+            updates["state"] = "opened"
+        elif activity.type in {"committed", "head_ref_force_pushed"}:
+            # Timeline 不提供动作前的 Head，使用空值表示未知初态。
+            updates["head_sha"] = ""
+        elif activity.type == "convert_to_draft":
+            updates["draft"] = False
+        elif activity.type == "ready_for_review":
+            updates["draft"] = True
+        elif activity.type in {"labeled", "unlabeled"}:
+            label = str(activity.data.get("label") or "")
+            if label:
+                labels = set(working.labels)
+                if activity.type == "labeled":
+                    labels.discard(label)
+                else:
+                    labels.add(label)
+                updates["labels"] = tuple(sorted(labels))
+        if updates:
+            working = working.model_copy(update=updates)
+    return working.model_copy(update={"updated_at": event_window_start})
+
+
+def detect_first_seen_events(
+    current: ChangeRequestSnapshot,
+    activities: tuple[ChangeRequestActivity, ...] | list[ChangeRequestActivity],
+    *,
+    event_window_start: datetime,
+    emit_discovered: bool = False,
+    batch_id: str | None = None,
+) -> list[ChangeEvent]:
+    """首次建立快照时只回放当前扫描窗口内可确认的真实事件。"""
+
+    effective_batch_id = batch_id or stable_hash(
+        "scan-batch",
+        current.provider,
+        current.repository_id,
+        current.number,
+        current.updated_at,
+    )
+    recent_activities = tuple(
+        activity
+        for activity in activities
+        if activity.occurred_at is not None
+        and activity.occurred_at >= event_window_start
+    )
+    baseline = _rewind_first_seen_snapshot(
+        current,
+        recent_activities,
+        event_window_start,
+    )
+    events = detect_events(
+        None,
+        current,
+        emit_initial=emit_discovered,
+        batch_id=effective_batch_id,
+    )
+
+    if current.created_at is not None and current.created_at >= event_window_start:
+        opened = baseline.model_copy(
+            update={
+                "state": "opened",
+                "updated_at": current.created_at,
+            }
+        )
+        events.append(
+            _create_event(
+                "change_request.opened",
+                None,
+                opened,
+                ("state",),
+                None,
+                "opened",
+                effective_batch_id,
+                event_id=_creation_event_id(current, "change_request.opened"),
+                occurred_at=current.created_at,
+                current=current,
+            )
+        )
+        events.append(
+            _create_event(
+                "change_request.updated",
+                None,
+                opened,
+                ("state",),
+                {"state": None},
+                {"state": "opened"},
+                effective_batch_id,
+                event_id=_creation_event_id(current, "change_request.updated"),
+                occurred_at=current.created_at,
+                current=current,
+            )
+        )
+
+    events.extend(
+        detect_activity_events(
+            baseline,
+            current,
+            recent_activities,
+            batch_id=effective_batch_id,
+        )
+    )
+    return events
+
+
 def detect_events(
     old: ChangeRequestSnapshot | None,
     new: ChangeRequestSnapshot,
@@ -249,7 +384,7 @@ def detect_events(
 
     old_payload = old.normalized_payload()
     new_payload = new.normalized_payload()
-    ignored_fields = {"updated_at", "title", "web_url"}
+    ignored_fields = {"created_at", "updated_at", "title", "web_url"}
     changed_fields = tuple(
         sorted(
             field

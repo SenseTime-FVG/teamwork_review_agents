@@ -1,5 +1,7 @@
 """Timeline 活动与扫描编排集成测试。"""
 
+from datetime import UTC, datetime, timedelta
+
 from teamwork_review_agents.config import RuleConfig
 from teamwork_review_agents.models import (
     AgentResult,
@@ -147,6 +149,92 @@ async def test_scan_initializes_existing_snapshot_before_candidate_filtering(
         repository.id,
         snapshot.number,
     ) == {"page": 4, "item_id": "baseline-last"}
+
+
+async def test_first_scan_replays_one_cycle_then_uses_saved_cursor(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """首次扫描回看一个周期，下一轮不得重复同一 Timeline 活动。"""
+
+    config = configured_app_factory()
+    config.scanner.emit_initial_events = True
+    repository = config.repositories[0]
+    now = datetime.now(UTC)
+    current = snapshot_factory(
+        provider=repository.provider,
+        repository_id=repository.id,
+        created_at=now - timedelta(minutes=4),
+        updated_at=now - timedelta(minutes=1),
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    seen_since: list[datetime] = []
+
+    class FakeProvider:
+        """首次返回窗口活动，后续根据已保存游标返回空增量。"""
+
+        name = repository.provider
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def list_change_requests(self, *_: object, **__: object):
+            return [current]
+
+        async def list_change_request_activities(
+            self,
+            *_: object,
+            cursor: dict[str, object] | None = None,
+            since: datetime | None = None,
+        ) -> ChangeRequestActivityBatch:
+            if cursor is not None:
+                assert cursor == {"page": 1, "item_id": "first-reopen"}
+                assert since is None
+                return ChangeRequestActivityBatch(cursor=cursor)
+            assert since is not None
+            seen_since.append(since)
+            return ChangeRequestActivityBatch(
+                activities=(
+                    ChangeRequestActivity(
+                        id="first-close",
+                        type="closed",
+                        occurred_at=now - timedelta(minutes=3),
+                    ),
+                    ChangeRequestActivity(
+                        id="first-reopen",
+                        type="reopened",
+                        occurred_at=now - timedelta(minutes=2),
+                    ),
+                ),
+                cursor={"page": 1, "item_id": "first-reopen"},
+            )
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    first_summary = CycleSummary()
+    await orchestrator.scan(first_summary)
+    second_summary = CycleSummary()
+    await orchestrator.scan(second_summary)
+
+    assert len(seen_since) == 1
+    assert now - timedelta(minutes=6) < seen_since[0] < now - timedelta(minutes=4)
+    assert first_summary.new_events == 7
+    assert second_summary.new_events == 0
+    assert [item.type for item in orchestrator.store.pending_events()] == [
+        "change_request.discovered",
+        "change_request.opened",
+        "change_request.updated",
+        "change_request.closed",
+        "change_request.updated",
+        "change_request.reopened",
+        "change_request.updated",
+    ]
 
 
 async def test_process_events_marks_events_without_matching_rules_as_unmatched(

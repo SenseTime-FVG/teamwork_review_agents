@@ -732,7 +732,8 @@ function GlobalEnvironment(props: {
           <Field label="管理员 Token 环境变量" value={String(props.document.web.admin_token_env ?? "")} onChange={(value) => patchSection("web", "admin_token_env", value || undefined)} help="非本机监听时必填" />
         </div>
         <div className="toggle-grid">
-          <Toggle label="首次发现 MR / PR 时触发事件" checked={Boolean(props.document.scanner.emit_initial_events)} onChange={(value) => patchSection("scanner", "emit_initial_events", value)} />
+          <Toggle label="首次建立快照时额外记录 discovered" checked={Boolean(props.document.scanner.emit_initial_events)} onChange={(value) => patchSection("scanner", "emit_initial_events", value)} />
+          <small>只控制 discovered；扫描周期内真实发生的 opened、closed、reopened 等事件始终会记录。</small>
         </div>
       </section>
     </div>
