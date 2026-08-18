@@ -262,12 +262,17 @@ export type ConfigDocument = {
 export type RuntimeStatus = {
   paused: boolean;
   running_cycle: boolean;
+  dispatching_events: boolean;
   config_revision: string;
   config_error?: string | null;
   last_started_at?: number | null;
   last_finished_at?: number | null;
   last_summary?: Record<string, unknown> | null;
   last_error?: string | null;
+  last_dispatch_started_at?: number | null;
+  last_dispatch_finished_at?: number | null;
+  last_dispatch_summary?: Record<string, unknown> | null;
+  last_dispatch_error?: string | null;
   stats: {
     runs: Record<string, number>;
     events: Record<string, number>;

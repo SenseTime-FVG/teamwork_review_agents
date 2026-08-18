@@ -94,6 +94,7 @@ const EVENT_STATUS_OPTIONS = [
 const EMPTY_STATUS: RuntimeStatus = {
   paused: false,
   running_cycle: false,
+  dispatching_events: false,
   config_revision: "",
   stats: { runs: {}, events: {}, change_requests: {} },
 };
@@ -1066,8 +1067,8 @@ function Overview(props: {
       <section className="hero-card">
         <div>
           <span className="eyebrow">后台调度器</span>
-          <h1>{props.status.paused ? "扫描已暂停" : props.status.running_cycle ? "正在扫描与调度" : "服务运行正常"}</h1>
-          <p>配置版本 {shortRevision(props.status.config_revision)} · 最近完成 {timeText(props.status.last_finished_at)}</p>
+          <h1>{props.status.paused ? "扫描已暂停" : props.status.running_cycle ? "正在扫描" : props.status.dispatching_events ? "Agent 调度进行中" : "服务运行正常"}</h1>
+          <p>配置版本 {shortRevision(props.status.config_revision)} · 最近扫描完成 {timeText(props.status.last_finished_at)}</p>
         </div>
         <div className="button-group">
           <button className="button primary" onClick={() => props.onAction("scan")}>立即扫描</button>
@@ -1079,14 +1080,14 @@ function Overview(props: {
           </button>
         </div>
       </section>
-      {(props.status.config_error || props.status.last_error) && (
-        <div className="alert error">{props.status.config_error ?? props.status.last_error}</div>
+      {(props.status.config_error || props.status.last_error || props.status.last_dispatch_error) && (
+        <div className="alert error">{props.status.config_error ?? props.status.last_error ?? props.status.last_dispatch_error}</div>
       )}
       <div className="metric-grid">
         <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{props.status.stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
         <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
         <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个执行中 · {props.status.stats.runs.preparing ?? 0} 个准备中 · {props.status.stats.runs.queued ?? 0} 个排队中</small></div>
-        <div className="metric-card"><span>最近周期</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
+        <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
       </div>
       <section className="section-card">
         <div className="section-title-row">
@@ -5065,7 +5066,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">TR</div><div><strong>Teamwork</strong><span>Review Agents</span></div></div>
         <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
-        <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
+        <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle || status.dispatching_events ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
       </aside>
       <main className="main">
         <header className="topbar">

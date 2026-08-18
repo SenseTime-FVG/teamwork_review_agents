@@ -18,9 +18,10 @@ class BackgroundRuntime:
         self.store = manager.store
         self.store.recover_interrupted_work()
         self._stop_event = asyncio.Event()
-        self._wake_event = asyncio.Event()
-        self._dispatch_requested = False
-        self._task: asyncio.Task[None] | None = None
+        self._scan_wake_event = asyncio.Event()
+        self._dispatch_event = asyncio.Event()
+        self._scan_task: asyncio.Task[None] | None = None
+        self._dispatch_task: asyncio.Task[None] | None = None
         self._orchestrator = Orchestrator(
             manager.config,
             recover_interrupted=False,
@@ -28,41 +29,60 @@ class BackgroundRuntime:
         self._revision = manager.config.revision
         self.paused = False
         self.running_cycle = False
+        self.dispatching_events = False
         self.last_started_at: float | None = None
         self.last_finished_at: float | None = None
         self.last_summary: dict[str, Any] | None = None
         self.last_error: str | None = None
+        self.last_dispatch_started_at: float | None = None
+        self.last_dispatch_finished_at: float | None = None
+        self.last_dispatch_summary: dict[str, Any] | None = None
+        self.last_dispatch_error: str | None = None
 
     async def start(self) -> None:
-        """启动唯一后台循环。"""
+        """启动扫描与事件执行两个后台循环。"""
 
-        if self._task is None:
-            self._task = asyncio.create_task(self._loop(), name="teamwork-background-runtime")
+        if self._scan_task is None:
+            self._scan_task = asyncio.create_task(
+                self._scan_loop(),
+                name="teamwork-background-scanner",
+            )
+        if self._dispatch_task is None:
+            self._dispatch_task = asyncio.create_task(
+                self._dispatch_loop(),
+                name="teamwork-background-dispatcher",
+            )
 
     async def stop(self) -> None:
-        """请求退出并等待当前扫描周期收尾。"""
+        """请求退出并等待当前扫描和事件执行安全收尾。"""
 
         self._stop_event.set()
-        self._wake_event.set()
-        if self._task:
-            await self._task
-            self._task = None
+        self._scan_wake_event.set()
+        self._dispatch_event.set()
+        tasks = tuple(
+            task
+            for task in (self._scan_task, self._dispatch_task)
+            if task is not None
+        )
+        if tasks:
+            await asyncio.gather(*tasks)
+        self._scan_task = None
+        self._dispatch_task = None
 
     def notify_config_changed(self) -> None:
         """唤醒后台，让下一周期应用最新配置。"""
 
-        self._wake_event.set()
+        self._scan_wake_event.set()
 
     def scan_now(self) -> None:
         """请求尽快执行一次扫描，不与正在运行的周期重叠。"""
 
-        self._wake_event.set()
+        self._scan_wake_event.set()
 
     def dispatch_events_now(self) -> None:
         """请求尽快只处理待处理事件，不额外访问 Provider。"""
 
-        self._dispatch_requested = True
-        self._wake_event.set()
+        self._dispatch_event.set()
 
     def pause(self) -> None:
         """暂停新扫描，不中断正在运行的 Agent。"""
@@ -74,7 +94,7 @@ class BackgroundRuntime:
         """恢复扫描并立即唤醒后台。"""
 
         self.paused = False
-        self._wake_event.set()
+        self._scan_wake_event.set()
         self._persist_status()
 
     def _reload_config(self) -> None:
@@ -97,12 +117,17 @@ class BackgroundRuntime:
             {
                 "paused": self.paused,
                 "running_cycle": self.running_cycle,
+                "dispatching_events": self.dispatching_events,
                 "config_revision": self._revision,
                 "config_error": self.manager.last_error,
                 "last_started_at": self.last_started_at,
                 "last_finished_at": self.last_finished_at,
                 "last_summary": self.last_summary,
                 "last_error": self.last_error,
+                "last_dispatch_started_at": self.last_dispatch_started_at,
+                "last_dispatch_finished_at": self.last_dispatch_finished_at,
+                "last_dispatch_summary": self.last_dispatch_summary,
+                "last_dispatch_error": self.last_dispatch_error,
             },
         )
 
@@ -113,28 +138,31 @@ class BackgroundRuntime:
         return {
             "paused": self.paused,
             "running_cycle": self.running_cycle,
+            "dispatching_events": self.dispatching_events,
             "config_revision": self._revision,
             "config_error": self.manager.last_error,
             "last_started_at": self.last_started_at,
             "last_finished_at": self.last_finished_at,
             "last_summary": self.last_summary,
             "last_error": self.last_error,
+            "last_dispatch_started_at": self.last_dispatch_started_at,
+            "last_dispatch_finished_at": self.last_dispatch_finished_at,
+            "last_dispatch_summary": self.last_dispatch_summary,
+            "last_dispatch_error": self.last_dispatch_error,
             "stats": stats,
         }
 
-    async def _run_cycle(self, *, dispatch_only: bool) -> None:
-        """串行执行完整扫描周期或仅执行事件调度。"""
+    async def _run_scan_cycle(self) -> None:
+        """执行一次扫描并持久化事件，不等待 Agent 执行。"""
 
         self.running_cycle = True
         self.last_started_at = time.time()
         self.last_error = None
         self._persist_status()
         try:
-            if dispatch_only:
-                summary = CycleSummary()
-                await self._orchestrator.process_events(summary)
-            else:
-                summary = await self._orchestrator.run_once()
+            summary = CycleSummary()
+            orchestrator = self._orchestrator
+            await orchestrator.scan(summary)
             self.last_summary = summary.to_dict()
             if summary.errors:
                 self.last_error = "; ".join(summary.errors)
@@ -145,29 +173,49 @@ class BackgroundRuntime:
             self.running_cycle = False
             self.last_finished_at = time.time()
             self._persist_status()
+            # 即使单个仓库失败，其他仓库本轮已产生的事件仍需及时调度。
+            self._dispatch_event.set()
+
+    async def _run_dispatch_cycle(self) -> None:
+        """独立领取并执行持久化事件，不占用扫描循环。"""
+
+        self.dispatching_events = True
+        self.last_dispatch_started_at = time.time()
+        self.last_dispatch_error = None
+        self._persist_status()
+        try:
+            summary = CycleSummary()
+            orchestrator = self._orchestrator
+            await orchestrator.process_events(summary)
+            self.last_dispatch_summary = summary.to_dict()
+            if summary.errors:
+                self.last_dispatch_error = "; ".join(summary.errors)
+        except Exception as exc:
+            self.last_dispatch_error = str(exc)
+            self.last_dispatch_summary = None
+        finally:
+            self.dispatching_events = False
+            self.last_dispatch_finished_at = time.time()
+            self._persist_status()
         cutoff = time.time() - self.manager.config.web.log_retention_days * 86400
         await asyncio.to_thread(self.store.prune_run_logs, cutoff)
 
-    async def _loop(self) -> None:
-        """串行执行周期，并独立按较短间隔检测配置文件变化。"""
+    async def _scan_loop(self) -> None:
+        """按固定间隔扫描 Provider，不等待事件执行循环。"""
 
         next_scan_at = 0.0
         while not self._stop_event.is_set():
             self._reload_config()
-            if self._dispatch_requested:
-                self._dispatch_requested = False
-                await self._run_cycle(dispatch_only=True)
-                continue
             if self.paused:
                 self._persist_status()
                 try:
                     await asyncio.wait_for(
-                        self._wake_event.wait(),
+                        self._scan_wake_event.wait(),
                         timeout=self.manager.config.web.config_poll_seconds,
                     )
                 except TimeoutError:
                     pass
-                self._wake_event.clear()
+                self._scan_wake_event.clear()
                 continue
             now = time.monotonic()
             if now < next_scan_at:
@@ -176,14 +224,26 @@ class BackgroundRuntime:
                     max(0.0, next_scan_at - now),
                 )
                 try:
-                    await asyncio.wait_for(self._wake_event.wait(), timeout=timeout)
+                    await asyncio.wait_for(
+                        self._scan_wake_event.wait(),
+                        timeout=timeout,
+                    )
                 except TimeoutError:
                     pass
-                if self._wake_event.is_set():
-                    if not self._dispatch_requested:
-                        # 配置保存和手动扫描都要求尽快执行下一周期。
-                        next_scan_at = 0.0
-                self._wake_event.clear()
+                if self._scan_wake_event.is_set():
+                    # 配置保存和手动扫描都要求尽快执行下一周期。
+                    next_scan_at = 0.0
+                self._scan_wake_event.clear()
                 continue
-            await self._run_cycle(dispatch_only=False)
+            await self._run_scan_cycle()
             next_scan_at = time.monotonic() + self.manager.config.scanner.interval_seconds
+
+    async def _dispatch_loop(self) -> None:
+        """收到持久化事件通知后串行执行调度批次。"""
+
+        while not self._stop_event.is_set():
+            await self._dispatch_event.wait()
+            self._dispatch_event.clear()
+            if self._stop_event.is_set():
+                break
+            await self._run_dispatch_cycle()
