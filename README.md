@@ -145,14 +145,25 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 ## GitHub 本地 CI 门禁
 
-通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。仓库启用 CI 只是声明具备该能力，只有同时选择“执行仓库 CI（如已启用）”的触发规则才会等待 Preflight。
+通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
 
-![本地 CI 与 Review Agent 完整流程](docs/assets/local-ci-review-agent-flow.png)
+![GitHub 本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
+
+配置分为以下三部分：
+
+| 位置 | 必需内容 | 作用 |
+| --- | --- | --- |
+| 接入仓库 | CI 脚本，例如 `ci/preflight.sh` | 安装依赖、编译、测试和构建；脚本随 PR Head 一起检出并执行 |
+| Teamwork 配置 | `repositories[].preflight`、Review Agent 和触发规则 | 指定扫描仓库、CI 命令、超时、状态名称以及成功后启动的 Agent |
+| GitHub 仓库设置 | Ruleset 中的 Required Status Check | 将与 `status_context` 同名的检查设为合并门禁 |
+
+下面是完整的最小配置。Prompt 可以继续放在本仓库，通过 `TEAMWORK_REVIEW_AGENTS_ROOT` 引用，不需要复制到接入仓库；启动服务前必须把该环境变量设置为本仓库的绝对路径：
 
 ```yaml
 scanner:
-  # Preflight 仓库会自动产生首次事件；显式开启后，其他仓库也会产生。
-  emit_initial_events: true
+  interval_seconds: 300
+  # 即使为 false，启用 Preflight 的仓库也会自动产生首次 discovered 事件。
+  emit_initial_events: false
 
 repositories:
   - id: example-github
@@ -168,12 +179,54 @@ repositories:
         - name: repository-ci
           command: [bash, ci/preflight.sh]
 
+agents:
+  general-reviewer:
+    prompt_file: "${TEAMWORK_REVIEW_AGENTS_ROOT}/prompts/general-review.md"
+    sandbox: read-only
+    timeout_seconds: 1800
+    write_scopes: []
+    allowed_sub_agents: []
+
 rules:
-  - name: review-with-local-ci
-    events: [change_request.opened, change_request.commits_changed]
+  - name: example-general-review
+    events:
+      - change_request.discovered
+      - change_request.commits_changed
+      - change_request.reopened
+      - change_request.draft_changed
     agents: [general-reviewer]
+    repositories: [example-github]
+    conditions:
+      state: opened
+      draft: false
     # 仓库未启用或未配置 CI 时不报错，直接运行 Agent。
     run_preflight: true
+    enabled: true
+```
+
+接入仓库中的 `ci/preflight.sh` 应当是可独立运行、首个错误即退出的确定性脚本，例如：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+uv sync --frozen --all-extras
+uv run python -m compileall -q your_package
+uv run pytest tests/ -q --tb=short
+uv build
+```
+
+完成配置后，在 GitHub Ruleset 中添加 Required Status Check `teamwork/local-ci`，其名称必须与 `status_context` 完全一致。然后校验配置并启动服务：
+
+```bash
+# 指向包含 prompts/general-review.md 的 Teamwork Review Agents 仓库。
+export TEAMWORK_REVIEW_AGENTS_ROOT=/path/to/teamwork_review_agents
+
+teamwork-review-agents validate -c /path/to/review.config.yaml
+teamwork-review-agents start -c /path/to/review.config.yaml
+
+# 调试时可以立即执行一轮，不等待扫描间隔。
+teamwork-review-agents scan-once -c /path/to/review.config.yaml
 ```
 
 Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
