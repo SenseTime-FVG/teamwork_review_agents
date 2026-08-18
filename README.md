@@ -143,7 +143,7 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 ## GitHub 本地 CI 门禁
 
-通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。启用后，只有 Preflight 成功才启动匹配的 Review Agent。
+通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。仓库启用 CI 只是声明具备该能力，只有同时选择“执行仓库 CI（如已启用）”的触发规则才会等待 Preflight。
 
 ![本地 CI 与 Review Agent 完整流程](docs/assets/local-ci-review-agent-flow.png)
 
@@ -165,9 +165,18 @@ repositories:
       steps:
         - name: repository-ci
           command: [bash, ci/preflight.sh]
+
+rules:
+  - name: review-with-local-ci
+    events: [change_request.opened, change_request.commits_changed]
+    agents: [general-reviewer]
+    # 仓库未启用或未配置 CI 时不报错，直接运行 Agent。
+    run_preflight: true
 ```
 
-Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次；代码失败或超时会阻断 Agent。Git、进程启动或首次状态发布等基础设施错误沿用事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
+
+每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
 Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 

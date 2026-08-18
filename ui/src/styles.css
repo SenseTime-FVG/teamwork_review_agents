@@ -260,6 +260,19 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .repository-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
 .repository-detail-form { padding: 22px; }
 .repository-detail-card { margin: 0; }
+.repository-preflight-section { margin-top: 18px; padding: 16px; border: 1px solid #294052; border-radius: 9px; background: #09131d; }
+.repository-preflight-head, .repository-preflight-steps-head, .repository-preflight-step-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.repository-preflight-head strong, .repository-preflight-steps-head strong { color: var(--bright); font-size: 12px; }
+.repository-preflight-head p, .repository-preflight-steps-head p { margin: 5px 0 0; color: #6e7d91; font-size: 10px; line-height: 1.55; }
+.repository-preflight-content { margin-top: 16px; padding-top: 16px; border-top: 1px solid #233446; }
+.repository-preflight-steps-head { margin-top: 17px; align-items: center; }
+.repository-preflight-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 11px; }
+.repository-preflight-step { padding: 13px 14px; border: 1px solid #263547; border-radius: 8px; background: #0b121d; }
+.repository-preflight-step-title { align-items: center; margin-bottom: 12px; }
+.repository-preflight-step-title > strong { color: #9fd4b6; font-size: 10px; }
+.repository-preflight-step-title .icon-button { width: 29px; height: 29px; }
+.repository-preflight-args { margin-top: 12px; }
+.repository-preflight-args textarea { resize: vertical; font: 400 11px/1.6 "SFMono-Regular", Consolas, monospace; }
 .repository-reference-warning { display: flex; align-items: flex-start; gap: 14px; padding: 12px 14px; border: 1px solid #6a4a2f; border-radius: 9px; background: #271b12; }
 .repository-reference-warning strong { flex: 0 0 auto; color: #f2b97d; font-size: 10px; }
 .repository-reference-warning span { color: #b68f69; font-size: 10px; line-height: 1.5; }
@@ -380,11 +393,11 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .managed-skill.invalid { border-color: #4a3034; }
 .json-field { margin-top: 16px; }
 .json-field textarea { font-size: 10px; line-height: 1.55; resize: vertical; }
-.rule-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.rule-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
 .rule-option { display: flex; align-items: flex-start; gap: 18px; padding: 13px 14px; border: 1px solid #263243; border-radius: 7px; background: #0b121d; }
 .rule-option .toggle-row { padding-top: 1px; }
 .rule-option p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
-@media (max-width: 900px) { .rule-options { grid-template-columns: 1fr; } }
+@media (max-width: 1200px) { .rule-options { grid-template-columns: 1fr; } }
 .error-text { color: var(--red) !important; }
 
 .table-wrap { overflow-x: auto; }

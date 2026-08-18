@@ -388,63 +388,131 @@ class Orchestrator:
                 event.id: [] for event in claimed_events
             }
             matched_event_ids: set[str] = set()
+            task_items: list[
+                tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
+            ] = []
             try:
                 invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                direct_invocations = [
+                    invocation
+                    for invocation in invocations
+                    if not invocation.rule.run_preflight
+                ]
+                preflight_invocations = [
+                    invocation
+                    for invocation in invocations
+                    if invocation.rule.run_preflight
+                ]
                 representative = claimed_events[0]
-                if (
-                    invocations
-                    and repository.preflight.enabled
-                    and representative.current_snapshot.state == "opened"
-                ):
-                    summary.preflight_runs += 1
-                    preflight_result = await self.preflight.ensure_passed(representative)
-                    if preflight_result.status in {"failure", "timed_out"}:
-                        summary.preflight_failures += 1
-                        for event in claimed_events:
-                            await asyncio.to_thread(self.store.finish_event, event.id)
-                            summary.processed_events += 1
-                        continue
-                    if preflight_result.status != "success":
-                        summary.preflight_errors += 1
-                        raise RuntimeError(
-                            preflight_result.error
-                            or f"Preflight 当前状态为 {preflight_result.status}"
-                        )
-
-                dispatches = [
+                direct_dispatches = [
                     (
                         event.id,
                         invocation.idempotency_key,
                         invocation.rule.name,
                         invocation.agent_name,
                     )
-                    for invocation in invocations
+                    for invocation in direct_invocations
                     for event in invocation.events
                 ]
-                matched_event_ids = {item[0] for item in dispatches}
+                matched_event_ids.update(item[0] for item in direct_dispatches)
                 await asyncio.to_thread(
                     self.store.record_event_dispatches,
                     tuple(event.id for event in claimed_events),
-                    dispatches,
+                    direct_dispatches,
                 )
-                tasks = [asyncio.create_task(self._run_agent(item)) for item in invocations]
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    summary.agent_runs += sum(
-                        isinstance(result, AgentResult) for result in results
+                task_items.extend(
+                    (invocation, asyncio.create_task(self._run_agent(invocation)))
+                    for invocation in direct_invocations
+                )
+
+                ready_preflight_invocations = preflight_invocations
+                if (
+                    preflight_invocations
+                    and repository.preflight.enabled
+                    and representative.current_snapshot.state == "opened"
+                ):
+                    summary.preflight_runs += 1
+                    try:
+                        preflight_result = await self.preflight.ensure_passed(representative)
+                    except Exception as exc:
+                        summary.preflight_errors += 1
+                        ready_preflight_invocations = []
+                        for invocation in preflight_invocations:
+                            for event in invocation.events:
+                                matched_event_ids.add(event.id)
+                                errors_by_event[event.id].append(str(exc))
+                    else:
+                        if preflight_result.status in {"failure", "timed_out"}:
+                            summary.preflight_failures += 1
+                            ready_preflight_invocations = []
+                            for invocation in preflight_invocations:
+                                matched_event_ids.update(
+                                    event.id for event in invocation.events
+                                )
+                        elif preflight_result.status != "success":
+                            summary.preflight_errors += 1
+                            ready_preflight_invocations = []
+                            error = (
+                                preflight_result.error
+                                or f"Preflight 当前状态为 {preflight_result.status}"
+                            )
+                            for invocation in preflight_invocations:
+                                for event in invocation.events:
+                                    matched_event_ids.add(event.id)
+                                    errors_by_event[event.id].append(error)
+
+                if ready_preflight_invocations:
+                    preflight_dispatches = [
+                        (
+                            event.id,
+                            invocation.idempotency_key,
+                            invocation.rule.name,
+                            invocation.agent_name,
+                        )
+                        for invocation in ready_preflight_invocations
+                        for event in invocation.events
+                    ]
+                    preflight_event_ids = tuple(
+                        dict.fromkeys(item[0] for item in preflight_dispatches)
                     )
-                    for invocation, result in zip(invocations, results, strict=True):
-                        if isinstance(result, BaseException):
-                            error = str(result)
-                        elif isinstance(result, AgentResult) and result.status != "completed":
-                            error = result.error or f"Agent 运行状态为 {result.status}"
-                        else:
-                            continue
-                        for event in invocation.events:
-                            errors_by_event[event.id].append(error)
+                    try:
+                        await asyncio.to_thread(
+                            self.store.record_event_dispatches,
+                            preflight_event_ids,
+                            preflight_dispatches,
+                        )
+                    except Exception as exc:
+                        for invocation in ready_preflight_invocations:
+                            for event in invocation.events:
+                                matched_event_ids.add(event.id)
+                                errors_by_event[event.id].append(str(exc))
+                    else:
+                        matched_event_ids.update(item[0] for item in preflight_dispatches)
+                        task_items.extend(
+                            (invocation, asyncio.create_task(self._run_agent(invocation)))
+                            for invocation in ready_preflight_invocations
+                        )
             except Exception as exc:
                 for event in claimed_events:
                     errors_by_event[event.id].append(str(exc))
+
+            if task_items:
+                results = await asyncio.gather(
+                    *(task for _, task in task_items),
+                    return_exceptions=True,
+                )
+                summary.agent_runs += sum(
+                    isinstance(result, AgentResult) for result in results
+                )
+                for (invocation, _), result in zip(task_items, results, strict=True):
+                    if isinstance(result, BaseException):
+                        error = str(result)
+                    elif isinstance(result, AgentResult) and result.status != "completed":
+                        error = result.error or f"Agent 运行状态为 {result.status}"
+                    else:
+                        continue
+                    for event in invocation.events:
+                        errors_by_event[event.id].append(error)
 
             for event in claimed_events:
                 error = "; ".join(errors_by_event[event.id]) or None

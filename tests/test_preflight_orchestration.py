@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from teamwork_review_agents.config import parse_config_data
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.models import (
@@ -43,6 +45,7 @@ def preflight_config(tmp_path):
                     "name": "review-new-pr",
                     "events": ["change_request.discovered"],
                     "agents": ["reviewer"],
+                    "run_preflight": True,
                 }
             ],
         },
@@ -50,13 +53,14 @@ def preflight_config(tmp_path):
     )
 
 
-def enqueue_discovered(orchestrator, snapshot_factory):
+def enqueue_discovered(orchestrator, snapshot_factory, *, state="opened"):
     """写入一条真实的首次发现事件并返回它。"""
 
     snapshot = snapshot_factory(
         provider="github-main",
         repository_id="demo",
         head_sha="b" * 40,
+        state=state,
     )
     event = detect_events(None, snapshot, emit_initial=True)[0]
     orchestrator.store.save_snapshot_and_events(snapshot, [event])
@@ -80,8 +84,10 @@ class FakeAgentExecutor:
 class FakePreflightExecutor:
     def __init__(self, result: PreflightResult) -> None:
         self.result = result
+        self.calls = 0
 
     async def ensure_passed(self, _event):
+        self.calls += 1
         return self.result
 
 
@@ -96,6 +102,47 @@ def result(status: str, *, error: str | None = None) -> PreflightResult:
         exit_code=1 if status == "failure" else None,
         error=error,
     )
+
+
+def test_rule_can_request_preflight_without_repository_ci_configuration(
+    tmp_path,
+) -> None:
+    """规则选择全部仓库时，不要求每个仓库都配置 CI。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            ],
+            "agents": {"reviewer": {"prompt": "审查代码。"}},
+            "rules": [
+                {
+                    "name": "all-repositories",
+                    "events": ["change_request.opened"],
+                    "agents": ["reviewer"],
+                    "run_preflight": True,
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+
+    assert config.rules[0].run_preflight is True
+    assert config.rules[0].repositories is None
+    assert config.repositories[0].preflight.enabled is False
 
 
 async def test_failed_preflight_completes_event_without_starting_review_agent(
@@ -137,6 +184,124 @@ async def test_successful_preflight_allows_matching_review_agents(
     assert agents.calls == ["reviewer"]
     assert orchestrator.store.pending_events() == []
     assert summary.preflight_failures == 0
+    assert summary.agent_runs == 1
+
+
+async def test_rule_without_preflight_does_not_wait_for_enabled_repository_ci(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """仓库启用 CI 时，未选择 CI 的规则仍须直接运行 Agent。"""
+
+    config = preflight_config(tmp_path)
+    config.rules[0].run_preflight = False
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    enqueue_discovered(orchestrator, snapshot_factory)
+    agents = FakeAgentExecutor()
+    preflight = FakePreflightExecutor(result("failure"))
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert agents.calls == ["reviewer"]
+    assert preflight.calls == 0
+    assert summary.preflight_runs == 0
+    assert summary.agent_runs == 1
+
+
+async def test_rule_preflight_is_bypassed_when_repository_ci_is_disabled(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """规则选择 CI 但仓库未启用时不得报错或阻断 Agent。"""
+
+    config = preflight_config(tmp_path)
+    config.repositories[0].preflight.enabled = False
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    enqueue_discovered(orchestrator, snapshot_factory)
+    agents = FakeAgentExecutor()
+    preflight = FakePreflightExecutor(result("failure"))
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert agents.calls == ["reviewer"]
+    assert preflight.calls == 0
+    assert summary.preflight_runs == 0
+    assert summary.errors == []
+
+
+async def test_rule_preflight_is_bypassed_for_non_open_change_request(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """已关闭或合并的变更请求不执行 Head CI，但仍运行匹配 Agent。"""
+
+    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
+    enqueue_discovered(orchestrator, snapshot_factory, state="merged")
+    agents = FakeAgentExecutor()
+    preflight = FakePreflightExecutor(result("failure"))
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert agents.calls == ["reviewer"]
+    assert preflight.calls == 0
+    assert summary.preflight_runs == 0
+
+
+async def test_failed_preflight_only_blocks_rules_that_requested_ci(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """混合规则中直接 Agent 不等待 CI，CI 失败只阻断门禁 Agent。"""
+
+    config = preflight_config(tmp_path)
+    config.agents["direct-reviewer"] = config.agents["reviewer"].model_copy()
+    config.rules.append(
+        config.rules[0].model_copy(
+            update={
+                "name": "direct-review",
+                "agents": ["direct-reviewer"],
+                "run_preflight": False,
+            }
+        )
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    enqueue_discovered(orchestrator, snapshot_factory)
+    direct_started = asyncio.Event()
+
+    class SignalingAgentExecutor(FakeAgentExecutor):
+        async def execute(self, *, agent_name, **kwargs):
+            if agent_name == "direct-reviewer":
+                direct_started.set()
+            return await super().execute(agent_name=agent_name, **kwargs)
+
+    class WaitingPreflightExecutor:
+        calls = 0
+
+        async def ensure_passed(self, _event):
+            self.calls += 1
+            await asyncio.wait_for(direct_started.wait(), timeout=1)
+            return result("failure")
+
+    agents = SignalingAgentExecutor()
+    preflight = WaitingPreflightExecutor()
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert agents.calls == ["direct-reviewer"]
+    assert preflight.calls == 1
+    assert summary.preflight_failures == 1
     assert summary.agent_runs == 1
 
 

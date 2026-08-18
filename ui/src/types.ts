@@ -8,6 +8,20 @@ export type EnvironmentVariable = {
 
 export type EnvironmentMap = Record<string, EnvironmentVariable | string | number | boolean | null>;
 
+export type RepositoryPreflightStep = {
+  name: string;
+  command: string[];
+  timeout_seconds?: number;
+};
+
+export type RepositoryPreflight = {
+  enabled?: boolean;
+  status_context?: string;
+  timeout_seconds?: number;
+  max_output_bytes?: number;
+  steps?: RepositoryPreflightStep[];
+};
+
 export type Repository = {
   id: string;
   provider: string;
@@ -16,6 +30,7 @@ export type Repository = {
   clone_url?: string;
   enabled?: boolean;
   environment?: EnvironmentMap;
+  preflight?: RepositoryPreflight;
 };
 
 export type RepositoryWorkspaceStatus = {
@@ -226,6 +241,7 @@ export type Rule = {
   conditions?: Record<string, unknown>;
   deduplicate_per_scan?: boolean;
   inherit_workspace?: boolean;
+  run_preflight?: boolean;
   enabled?: boolean;
 };
 

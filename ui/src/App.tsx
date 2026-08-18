@@ -24,6 +24,8 @@ import type {
   ManualLatestEventBatchResponse,
   Repository,
   RepositoryGitDetail,
+  RepositoryPreflight,
+  RepositoryPreflightStep,
   RepositoryWorkspaceStatus,
   Rule,
   RunDetail,
@@ -2353,6 +2355,16 @@ function RepositoryDetailEditor(props: {
   const protectedNames = providerCredentialNames(props.document);
   if (!repository) return <div className="empty tall">仓库配置不存在</div>;
 
+  const preflight: Required<Omit<RepositoryPreflight, "steps">> & {
+    steps: RepositoryPreflightStep[];
+  } = {
+    enabled: repository.preflight?.enabled ?? false,
+    status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
+    timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
+    max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
+    steps: repository.preflight?.steps ?? [],
+  };
+
   function update(patch: Partial<Repository>) {
     const repositories = [...props.document.repositories];
     repositories[props.repositoryIndex] = { ...repository, ...patch };
@@ -2368,6 +2380,33 @@ function RepositoryDetailEditor(props: {
         : repository.workspace,
     });
     props.onIdChange(repositoryId);
+  }
+
+  function updatePreflight(patch: Partial<RepositoryPreflight>) {
+    update({ preflight: { ...preflight, ...patch } });
+  }
+
+  function updatePreflightStep(index: number, patch: Partial<RepositoryPreflightStep>) {
+    const steps = [...preflight.steps];
+    steps[index] = { ...steps[index], ...patch };
+    updatePreflight({ steps });
+  }
+
+  function movePreflightStep(index: number, offset: number) {
+    const target = index + offset;
+    if (target < 0 || target >= preflight.steps.length) return;
+    const steps = [...preflight.steps];
+    [steps[index], steps[target]] = [steps[target], steps[index]];
+    updatePreflight({ steps });
+  }
+
+  function togglePreflight(enabled: boolean) {
+    updatePreflight({
+      enabled,
+      steps: enabled && preflight.steps.length === 0
+        ? [{ name: "repository-ci", command: ["bash", "ci/preflight.sh"] }]
+        : preflight.steps,
+    });
   }
 
   return (
@@ -2408,6 +2447,93 @@ function RepositoryDetailEditor(props: {
             help="只负责克隆、校验、fetch 和 worktree 管理；Codex 在每次运行独享的临时目录中工作"
           />
         </div>
+        <section className="repository-preflight-section">
+          <div className="repository-preflight-head">
+            <div>
+              <strong>本地 CI 门禁</strong>
+              <p>声明此仓库可执行的本地 CI，当前仅支持 GitHub。只有明确选择“执行仓库 CI”的触发规则才会使用；未配置时对应 Agent 仍会直接运行。</p>
+            </div>
+            <Toggle label={preflight.enabled ? "已启用" : "未启用"} checked={preflight.enabled} onChange={togglePreflight} />
+          </div>
+          {preflight.enabled && (
+            <div className="repository-preflight-content">
+              <div className="form-grid three">
+                <Field
+                  label="GitHub 状态名称"
+                  value={preflight.status_context}
+                  onChange={(status_context) => updatePreflight({ status_context })}
+                  help="建议同时配置为仓库 Ruleset 的 required status check"
+                />
+                <Field
+                  label="CI 总超时（秒）"
+                  type="number"
+                  value={preflight.timeout_seconds}
+                  onChange={(value) => updatePreflight({ timeout_seconds: Number(value) })}
+                />
+                <Field
+                  label="最大日志字节数"
+                  type="number"
+                  value={preflight.max_output_bytes}
+                  onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
+                />
+              </div>
+              <div className="repository-preflight-steps-head">
+                <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  onClick={() => updatePreflight({
+                    steps: [...preflight.steps, { name: `step-${preflight.steps.length + 1}`, command: ["bash", "ci/preflight.sh"] }],
+                  })}
+                >+ 添加步骤</button>
+              </div>
+              <div className="repository-preflight-steps">
+                {preflight.steps.map((step, index) => (
+                  <article className="repository-preflight-step" key={index}>
+                    <div className="repository-preflight-step-title">
+                      <strong>步骤 {index + 1}</strong>
+                      <div className="button-group">
+                        <button type="button" className="icon-button" disabled={index === 0} title="上移" onClick={() => movePreflightStep(index, -1)}>↑</button>
+                        <button type="button" className="icon-button" disabled={index === preflight.steps.length - 1} title="下移" onClick={() => movePreflightStep(index, 1)}>↓</button>
+                        <button type="button" className="icon-button danger" title="删除步骤" onClick={() => updatePreflight({ steps: preflight.steps.filter((_, itemIndex) => itemIndex !== index) })}>×</button>
+                      </div>
+                    </div>
+                    <div className="form-grid three">
+                      <Field label="步骤名称" value={step.name} onChange={(name) => updatePreflightStep(index, { name })} />
+                      <Field
+                        label="执行程序"
+                        value={step.command[0] ?? ""}
+                        placeholder="bash"
+                        onChange={(program) => updatePreflightStep(index, { command: [program, ...step.command.slice(1)] })}
+                        help="例如 bash、python、npm"
+                      />
+                      <Field
+                        label="单步超时（秒，可选）"
+                        type="number"
+                        value={step.timeout_seconds ?? ""}
+                        onChange={(value) => updatePreflightStep(index, { timeout_seconds: value ? Number(value) : undefined })}
+                      />
+                    </div>
+                    <label className="field repository-preflight-args">
+                      <span>参数（每行一个）</span>
+                      <textarea
+                        className="mono"
+                        rows={Math.min(8, Math.max(3, step.command.length))}
+                        value={step.command.slice(1).join("\n")}
+                        placeholder={"ci/preflight.sh\n--verbose"}
+                        onChange={(event) => updatePreflightStep(index, {
+                          command: [step.command[0] ?? "", ...event.target.value.split("\n").filter((value) => value !== "")],
+                        })}
+                      />
+                      <small>每一行作为一个独立参数；例如 bash + ci/preflight.sh 等价于执行仓库脚本。</small>
+                    </label>
+                  </article>
+                ))}
+                {preflight.steps.length === 0 && <div className="choice-empty">启用本地 CI 时至少需要添加一个命令步骤。</div>}
+              </div>
+            </div>
+          )}
+        </section>
         <EnvironmentEditor
           compact
           title="仓库环境变量"
@@ -3721,6 +3847,7 @@ function createEmptyRule(document: ConfigDocument, events: string[]): Rule {
     conditions: {},
     deduplicate_per_scan: false,
     inherit_workspace: false,
+    run_preflight: false,
     enabled: true,
   };
 }
@@ -3787,6 +3914,14 @@ function RulesEditor(props: {
               <MultiSelect label="限制仓库（留空为全部）" values={rule.repositories ?? []} options={repositoryNames} onChange={(repositories) => update(index, { repositories: repositories.length ? repositories : undefined })} />
             </div>
             <div className="rule-options">
+              <div className="rule-option">
+                <Toggle
+                  label="执行仓库 CI（如已启用）"
+                  checked={rule.run_preflight ?? false}
+                  onChange={(run_preflight) => update(index, { run_preflight })}
+                />
+                <p>仓库已配置本地 CI 且 PR 仍打开时先执行门禁；仓库未配置或 PR 已关闭、合并时直接运行 Agent，不报错。</p>
+              </div>
               <div className="rule-option">
                 <Toggle
                   label="单轮扫描同一 MR / PR 只触发一次"
@@ -4092,7 +4227,7 @@ function RulesView(props: {
                   <span className="agent-config-summary"><strong>{rule.events.length} 个</strong><small>{rule.events[0] ?? "未选择事件"}</small></span>
                   <span className="agent-config-summary"><strong>{rule.agents.length} 个</strong><small>{rule.agents.join("、") || "未选择 Agent"}</small></span>
                   <span className="agent-config-summary"><strong>{rule.repositories?.length ? `${rule.repositories.length} 个` : "全部仓库"}</strong><small>{rule.repositories?.join("、") || "不限制仓库"}</small></span>
-                  <span className="agent-config-summary"><strong>{optionLabels[0]}</strong><small>{optionLabels[1]}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.run_preflight ? "仓库 CI" : "跳过 CI"}</strong><small>{optionLabels.join(" · ")}</small></span>
                   <button
                     type="button"
                     className="agent-config-arrow rule-config-detail-button"

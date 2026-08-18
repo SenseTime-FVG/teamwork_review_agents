@@ -230,9 +230,18 @@ class PreflightStepConfig(BaseModel):
     command: list[str] = Field(min_length=1)
     timeout_seconds: PositiveInt | None = None
 
+    @field_validator("command")
+    @classmethod
+    def validate_command_program(cls, value: list[str]) -> list[str]:
+        """拒绝缺少执行程序的空命令，避免把配置错误推迟到运行期。"""
+
+        if not value[0].strip():
+            raise ValueError("Preflight 步骤的执行程序不能为空")
+        return value
+
 
 class PreflightConfig(BaseModel):
-    """仓库级 CI 前置门禁配置。"""
+    """仓库级 CI 能力与执行步骤配置。"""
 
     enabled: bool = False
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
@@ -378,6 +387,7 @@ class RuleConfig(BaseModel):
     conditions: dict[str, Any] = Field(default_factory=dict)
     deduplicate_per_scan: bool = False
     inherit_workspace: bool = False
+    run_preflight: bool = False
     enabled: bool = True
 
 

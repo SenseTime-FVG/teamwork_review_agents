@@ -160,8 +160,8 @@ web:
 #     # 可选：只覆盖当前仓库的环境变量。
 #     environment:
 #       REPOSITORY_TIER: production
-#     # 可选：在 Review Agent 之前执行的确定性本地 CI。通用引擎负责隔离执行，
-#     # 具体命令和 CI 脚本由目标仓库维护；当前仅支持 GitHub Commit Status。
+#     # 可选：声明此仓库具备确定性本地 CI 能力。只有同时在触发规则中选择
+#     # run_preflight 的 Agent 才会等待门禁；具体命令和 CI 脚本由目标仓库维护。
 #     preflight:
 #       enabled: true
 #       # 仅运行可信内部 PR；环境会过滤，但这不是容器或系统级安全沙箱。
@@ -272,6 +272,8 @@ rules:
     conditions: {}
     # 同轮多个匹配事件对每个目标 Agent 合并为一次运行。
     deduplicate_per_scan: true
+    # 仓库已启用本地 CI 且 PR 仍打开时先执行门禁；仓库未配置时直接运行 Agent。
+    run_preflight: true
     # 内置规则绝不自动启用。
     enabled: false
 
@@ -282,6 +284,8 @@ rules:
       - incremental-doc-update-runner
     conditions: {}
     deduplicate_per_scan: true
+    # 合并后文档更新不需要执行 PR Head 的本地 CI。
+    run_preflight: false
     # sub-agent 复用入口 Agent 的 worktree、分支、暂存区和未提交文件。
     inherit_workspace: true
     # 内置规则绝不自动启用。
