@@ -86,8 +86,8 @@
 
 # 三、建立不可变审核基准
 
-1. 将首次读取到的源分支最新提交 SHA 记为 `REVIEW_HEAD_SHA`。
-2. 将同一轮读取到的目标分支最新提交 SHA 记为 `REVIEW_TARGET_SHA`。
+1. 将运行上下文中的 `mr.head_sha` 记为 `REVIEW_HEAD_SHA`。工作区已经检出并校验该提交，不得改用平台返回的其他源 SHA 建立本轮基准。
+2. 将运行上下文中的 `mr.target_head_sha` 记为 `REVIEW_TARGET_SHA`。该值由服务在工作区 `fetch` 完成后从 `mr.target_ref` 对应的远端跟踪分支解析，是本轮启动时的权威目标分支 SHA。
 3. 后续所有 diff、代码上下文、设计与历史变更审核、拟合并结果、CI 和合并操作都必须明确对应这一对审核基准。
 4. 不得把其他提交、旧 Pipeline、旧 Check 或另一目标分支版本的合并结果当作当前审核基准的验证结果。
 5. 每次关键状态刷新，都必须在同一轮刷新中一并查询：
@@ -96,10 +96,11 @@
    - 当前可合并状态；
    - `REVIEW_HEAD_SHA` 对应的当前 CI 状态。
 6. 状态处理的优先级是：先比较源、目标 SHA，再判断可合并状态，最后处理 CI 状态。
+7. 查询当前目标分支 SHA 时，只能读取目标分支真实 ref，例如平台 Git refs API、`git ls-remote origin refs/heads/<目标分支>` 或语义等价的实时分支查询。GitHub PR 的 `base.sha`、GraphQL `baseRefOid` 以及其他平台中描述变更请求差异基准的字段可能不是目标分支当前 Head，禁止用它们建立 `REVIEW_TARGET_SHA` 或判断目标分支是否变化。
 
 ## 源或目标 SHA 变化规则
 
-只要当前源分支最新 SHA 不再等于 `REVIEW_HEAD_SHA`，或当前目标分支最新 SHA 不再等于 `REVIEW_TARGET_SHA`，说明本次审核结果已经失效。此时必须立即结束：
+只要当前源分支最新 SHA 不再等于 `REVIEW_HEAD_SHA`，或通过目标分支真实 ref 查询到的当前 SHA 不再等于 `REVIEW_TARGET_SHA`，说明本次审核结果已经失效。此时必须立即结束：
 
 - 不发布任何审核评论；
 - 不继续等待 CI；

@@ -477,6 +477,31 @@ def worktree_head(workspace: Path, *, timeout_seconds: int = 600) -> str:
     return result.stdout.strip()
 
 
+def worktree_ref_head(
+    workspace: Path,
+    ref: str,
+    *,
+    timeout_seconds: int = 600,
+) -> str:
+    """返回工作树可见的指定 Git 引用对应提交。"""
+
+    result = _run_git(
+        [
+            "-C",
+            str(workspace.resolve()),
+            "rev-parse",
+            "--verify",
+            f"{ref}^{{commit}}",
+        ],
+        check=False,
+        timeout_seconds=timeout_seconds,
+        operation="解析目标分支提交",
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise WorkspaceError(f"无法读取目标分支引用 {ref} 对应的提交")
+    return result.stdout.strip()
+
+
 def clear_retained_marker(workspace: Path) -> None:
     """清除已经重新投入使用或完成清理的保留标记。"""
 

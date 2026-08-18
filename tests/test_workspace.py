@@ -27,6 +27,7 @@ from teamwork_review_agents.workspace import (
     validate_linked_workspace,
     WorkspaceCancelled,
     WorkspaceError,
+    worktree_ref_head,
 )
 
 
@@ -187,6 +188,9 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
     assert change_ref == "refs/teamwork/change-requests/7/head"
     assert (workspace / ".git").exists()
     assert run_git("rev-parse", change_ref, cwd=workspace) == head_sha
+    assert worktree_ref_head(workspace, "refs/remotes/origin/main") == head_sha
+    with pytest.raises(WorkspaceError, match="无法读取目标分支引用"):
+        worktree_ref_head(workspace, "refs/remotes/origin/missing")
 
     (workspace / "parent-only.txt").write_text("父工作区未提交文件\n", encoding="utf-8")
     isolated = ensure_isolated_worktree(
@@ -254,10 +258,14 @@ async def test_root_agent_runs_in_its_own_temporary_worktree(
     (source / "README.md").write_text("Agent 测试\n", encoding="utf-8")
     run_git("add", "README.md", cwd=source)
     run_git("commit", "-m", "初始化 Agent 测试", cwd=source)
-    head_sha = run_git("rev-parse", "HEAD", cwd=source)
+    target_head_sha = run_git("rev-parse", "HEAD", cwd=source)
     run_git("remote", "add", "origin", str(origin), cwd=source)
     run_git("push", "origin", "main", cwd=source)
     run_git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    (source / "feature.txt").write_text("PR 变更\n", encoding="utf-8")
+    run_git("add", "feature.txt", cwd=source)
+    run_git("commit", "-m", "增加 PR 变更", cwd=source)
+    head_sha = run_git("rev-parse", "HEAD", cwd=source)
     run_git("push", "origin", "HEAD:refs/pull/7/head", cwd=source)
 
     fake_codex = tmp_path / "fake-codex"
@@ -299,6 +307,9 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert detail["workspace_status"] == "removed"
     assert detail["workspace_path"] != str(repository.workspace.resolve())
     assert not Path(detail["workspace_path"]).exists()
+    assert f'"head_sha": "{head_sha}"' in detail["prompt"]
+    assert f'"target_head_sha": "{target_head_sha}"' in detail["prompt"]
+    assert head_sha != target_head_sha
     log_types = {
         item["event_type"]
         for item in store.list_run_logs(result.run_id)

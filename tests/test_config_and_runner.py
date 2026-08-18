@@ -596,6 +596,7 @@ def test_root_and_sub_agent_prompt_contexts_are_separated(
         prompt_values={},
         change_ref="refs/teamwork/change-requests/7/head",
         actions=("change_request.reopened", "change_request.updated"),
+        target_head_sha="c" * 40,
     )
     child_prompt = executor.build_prompt(
         agent_name="security-reviewer",
@@ -611,6 +612,7 @@ def test_root_and_sub_agent_prompt_contexts_are_separated(
     assert '"mr"' in root_prompt
     assert '"action": [' in root_prompt
     assert '"reopened"' in root_prompt
+    assert f'"target_head_sha": "{"c" * 40}"' in root_prompt
     assert '"old"' not in root_prompt
     assert '"changed_fields"' not in root_prompt
     assert '"repository"' in child_prompt
@@ -666,11 +668,13 @@ def test_timeline_event_prompt_uses_final_snapshot(
         prompt_values={},
         change_ref="refs/teamwork/change-requests/7/head",
         actions=(event.type,),
+        target_head_sha="d" * 40,
     )
 
     assert event.new.state == "closed"
     assert '"state": "opened"' in prompt
     assert f'"head_sha": "{expected_head}"' in prompt
+    assert f'"target_head_sha": "{"d" * 40}"' in prompt
 
 
 def test_workspace_write_lock_uses_repository_source_branch(

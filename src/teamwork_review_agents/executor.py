@@ -26,6 +26,7 @@ from .workspace import (
     validate_linked_workspace,
     WorkspaceCancelled,
     worktree_head,
+    worktree_ref_head,
     worktree_starting_head,
 )
 
@@ -58,6 +59,7 @@ def _mr_payload(
     repository: RepositoryConfig,
     actions: Sequence[str],
     change_ref: str,
+    target_head_sha: str,
 ) -> dict[str, Any]:
     """返回根 Agent 所需的统一 MR / PR 当前信息。"""
 
@@ -80,6 +82,7 @@ def _mr_payload(
         "url": snapshot.web_url,
         "change_ref": change_ref,
         "target_ref": f"refs/remotes/origin/{snapshot.target_branch}",
+        "target_head_sha": target_head_sha,
     }
 
 
@@ -123,6 +126,7 @@ class AgentExecutor:
         prompt_values: dict[str, str],
         change_ref: str,
         actions: Sequence[str],
+        target_head_sha: str | None = None,
     ) -> str:
         """组合 Agent 固定角色、触发上下文和临时委托任务。"""
 
@@ -133,8 +137,16 @@ class AgentExecutor:
             template = agent.prompt or ""
         role_prompt = render_prompt(template, prompt_values).strip()
         if task is None:
+            if not target_head_sha:
+                raise AgentExecutionError("根 Agent 缺少目标分支当前提交")
             context: dict[str, Any] = {
-                "mr": _mr_payload(event, repository, actions, change_ref),
+                "mr": _mr_payload(
+                    event,
+                    repository,
+                    actions,
+                    change_ref,
+                    target_head_sha,
+                ),
             }
         else:
             context = {
@@ -269,6 +281,7 @@ class AgentExecutor:
         owned_workspace = False
         workspace_prepared = False
         starting_head = event.current_snapshot.head_sha
+        target_head_sha: str | None = None
         result: AgentResult
         try:
             async with lease:
@@ -345,6 +358,16 @@ class AgentExecutor:
                             cancel_check=git_cancel_check,
                             progress_callback=report_git_progress,
                         )
+                        if task is None:
+                            target_head_sha = await asyncio.to_thread(
+                                worktree_ref_head,
+                                configured_repository.workspace,
+                                (
+                                    "refs/remotes/origin/"
+                                    f"{event.current_snapshot.target_branch}"
+                                ),
+                                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                            )
                         await asyncio.to_thread(
                             cleanup_expired_worktrees,
                             configured_repository.workspace,
@@ -395,6 +418,13 @@ class AgentExecutor:
                 )
                 redactor = SecretRedactor(resolved_environment.secret_values)
                 effective_actions = tuple(actions or (event.type,))
+                if task is None and target_head_sha is None:
+                    target_head_sha = await asyncio.to_thread(
+                        worktree_ref_head,
+                        active_workspace,
+                        f"refs/remotes/origin/{event.current_snapshot.target_branch}",
+                        timeout_seconds=self.config.runtime.git_timeout_seconds,
+                    )
                 prompt = self.build_prompt(
                     agent_name=agent_name,
                     event=event,
@@ -404,6 +434,7 @@ class AgentExecutor:
                     prompt_values=resolved_environment.prompt_values,
                     change_ref=change_ref,
                     actions=effective_actions,
+                    target_head_sha=target_head_sha,
                 )
                 await asyncio.to_thread(
                     self.store.update_agent_run_inputs,
