@@ -145,7 +145,7 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 通用引擎只负责隔离检出、顺序执行、结果持久化和 Commit Status 回写；具体仓库负责提供 CI 脚本与审核规则。启用后，只有 Preflight 成功才启动匹配的 Review Agent。
 
-![本地 CI 与 Review Agent 流程](docs/assets/local-ci-review-agent-flow.png)
+![本地 CI 与 Review Agent 完整流程](docs/assets/local-ci-review-agent-flow.png)
 
 ```yaml
 scanner:
