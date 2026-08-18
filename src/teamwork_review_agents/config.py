@@ -34,6 +34,7 @@ CODEX_MANAGED_CONFIG_KEYS = {
     "notify",
     "openai_base_url",
     "profile",
+    "project_doc_max_bytes",
     "sandbox_mode",
     "sandbox_workspace_write",
     "shell_environment_policy",

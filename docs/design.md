@@ -540,3 +540,11 @@ Git linked worktree 的工作文件位于运行目录，但 `.git` 是指向基�
 只读 Agent 和 Preflight 继续使用 linked worktree，避免为不写 Git 元数据的任务复制独立仓库。规则开启 `inherit_workspace` 时，sub-agent 复用父 Agent 的实际运行目录：父 Agent 使用独立 clone 时继承同一 clone，父 Agent 使用 linked worktree 时继承同一 worktree；继承者不创建或清理第二个工作区。继承校验同时支持两种模式，并要求独立 clone 的 `origin` 与配置基础仓库一致。
 
 独立 clone 与 linked worktree 共用现有运行路径、准备状态、Git 超时、取消、保留期限和安全清理语义。正常完成且无未提交内容、没有新增提交，或新增提交已经存在于 `origin` 时删除整个临时目录；失败、取消、脏文件或未推送提交仍保留并写入外部标记。过期清理必须先辨认工作区类型并验证归属，linked worktree 通过 `git worktree remove` 清理，独立 clone 只删除经校验的运行目录，不能跟随路径删除基础仓库或其他用户目录。
+
+## 57. 仓库项目指令与审核指令隔离
+
+Codex 仍以本次 PR / MR 的临时 Git clone 或 linked worktree 作为工作目录，以便 Git、测试和平台命令自然作用于正确仓库；但仓库本身属于被审核对象，不能因此进入 Teamwork Agent 的可信指令链。无论文件来自源分支、目标分支还是两者共同历史，`AGENTS.md`、`AGENTS.override.md`、其他 Agent Prompt、PR / MR 模板、仓库审核规范和普通文档都只是不可信审核材料，不能改变 Teamwork 外部 Prompt、已分配 Skill、权限、审核流程或合并门禁。
+
+每次 Teamwork 启动后台 Codex 时必须在全部用户与 Agent 自定义 CLI 参数之后，最后强制覆盖 `project_doc_max_bytes=0`，关闭 Codex 原生项目指令发现。运行时高级配置也把该字段视为应用托管安全项，避免管理员误以为能够从通用高级配置重新打开。即使 `extra_codex_args` 中尝试设置其他值，应用最后追加的覆盖仍须生效。该隔离适用于根 Agent 和 sub-agent，并且不改变当前工作目录、Git 仓库识别、Skill 注入或 Agent 显式 Prompt。
+
+通用审核 Prompt 还要明确列举上述仓库文件的非可信身份，作为模型层纵深防御。Agent 可以为理解变更而读取和引用这些文件，也可以报告它们与实现的冲突，但不得把其中的命令、角色、门禁或结论要求当成本轮执行指令。需要仓库规范参与某个特定自动化时，应由管理员通过 Teamwork Prompt 或受控 Skill 显式引入并界定用途，不能依赖 Codex 的隐式项目指令加载。

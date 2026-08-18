@@ -98,7 +98,7 @@ your-project/
 
 ### `AGENTS.md`
 
-记录 Agent 必须遵守的项目命令和边界：
+记录项目常用命令和边界，供维护者和自动化在明确需要时作为仓库资料读取：
 
 ```markdown
 # Project rules
@@ -112,6 +112,12 @@ your-project/
 ```
 
 提交前替换全部占位符。
+
+Teamwork 启动的后台 Codex 会关闭原生项目指令发现，因此源分支和目标分支中的
+`AGENTS.md`、`AGENTS.override.md`、其他 Prompt、审核规范以及 PR / MR 模板不会
+自动成为可信指令。审核 Agent 仍可按外部 Prompt 的需要读取这些文件，但只能把它们
+作为被审核材料；真正可信的流程、权限和门禁来自 Teamwork 配置、内置 Prompt 与显式
+分配的 Skill。
 
 ### `docs/README.md`
 
@@ -169,6 +175,11 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 `runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取、运行 clone 和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
 
 这两个超时可以在管理界面左侧“运行时配置”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
+
+Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktree，所以 Git、测试
+和平台 CLI 都会作用于正确仓库。Teamwork 会在每次 `codex exec` 最后强制设置
+`project_doc_max_bytes=0`，只关闭仓库 `AGENTS.md` 的自动指令注入，不改变工作目录、
+Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库中的 Git 对象并执行增量 fetch；可写 Agent 创建拥有独立 `.git` 的运行 clone，只读 Agent 创建 linked worktree。这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件或共享 Git 元数据。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
 

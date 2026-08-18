@@ -594,3 +594,15 @@
 - 补充独立 `.git`、远端引用、基础仓库不受污染、继承、干净删除、脏目录保留和过期清理测试，并执行全量 Python 测试、前端生产构建与编译检查。
 
 验收：可写 Agent 在 `workspace-write` 沙箱内能执行 `git fetch`、创建分支和提交，不再因基础仓库 `.git/worktrees/*/FETCH_HEAD` 不可写而停止；其 Git 元数据和工作文件均限制在本次运行目录；只读任务保持轻量 worktree；继承 sub-agent 与父 Agent 看到同一 Git 状态；基础仓库工作文件和当前分支不被 Agent 修改；清理与保留策略不回归。
+
+## 阶段五十五：仓库项目指令隔离
+
+- 保持 Codex 工作目录为本次 PR / MR 的临时 Git clone 或 linked worktree，不改变现有 Git、测试、平台 CLI 和工作区清理流程。
+- 对所有根 Agent 和 sub-agent 的 `codex exec` 命令强制追加 `project_doc_max_bytes=0`，关闭 Codex 对仓库 `AGENTS.md` 与覆盖文件的原生项目指令发现。
+- 将隔离项放在 Agent `extra_codex_args` 之后，保证任意自定义参数不能重新开启项目指令加载。
+- 把 `project_doc_max_bytes` 纳入运行时高级配置的应用托管键，避免配置界面产生可覆盖该安全边界的误导。
+- 强化通用审核 Prompt，明确源分支和目标分支中的 `AGENTS.md`、其他 Prompt、审核规范和 PR / MR 模板都只能作为不可信审核材料。
+- 更新 README，说明工作目录仍是 Git 仓库，但仓库文件不会自动成为 Teamwork Agent 的可信指令。
+- 补充命令顺序、运行时高级配置保护和审核 Prompt 回归测试，并执行全量 Python 测试、前端生产构建与编译检查；不自动重启服务。
+
+验收：Codex 仍能在正确的 PR / MR Git 工作区内运行命令；仓库根目录或任意父子目录中的 `AGENTS.md` 不会由 Codex 自动注入；`extra_codex_args` 尝试设置非零读取上限时最终仍由应用覆盖为零；审核 Agent 可以读取仓库规范作为证据，但不会按照其中内容改变外部审核流程。

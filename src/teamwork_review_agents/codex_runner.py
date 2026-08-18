@@ -212,6 +212,8 @@ class CodexRunner:
         for override in overrides:
             command.extend(["--config", override])
         command.extend(agent.extra_codex_args)
+        # 仓库属于被处理对象，必须在全部自定义参数之后关闭项目指令发现。
+        command.extend(["--config", "project_doc_max_bytes=0"])
         command.append("-")
         return command
 
