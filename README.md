@@ -55,11 +55,25 @@ teamwork-review-agents start
 
 打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)，点击“编辑配置”：
 
+> 第一次使用建议直接按[首次配置图文指南](docs/first-time-setup.md)操作；下面只保留最短配置路径。
+
 1. 添加 GitHub / GitLab 连接，填写 API 地址和 Token 变量名。
 2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
 3. 在全局环境中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`。
 4. 检查 Codex、Agent 权限和 Prompt，保存后执行“立即扫描”。
 5. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
+
+平台连接与仓库配置：
+
+![仓库页中的平台连接与仓库入口](docs/assets/first-time-setup/01-repositories.png)
+
+Agent 权限与能力摘要：
+
+![Agent 列表及主要权限摘要](docs/assets/first-time-setup/03-agents.png)
+
+首次扫描结果检查：
+
+![运行概览中的服务状态、扫描快照和变化事件](docs/assets/first-time-setup/05-overview.png)
 
 Provider Token 只供扫描器使用，不会传给 Codex，也不能代替 Agent 所需的本机 `gh` / `glab` 登录态。平台操作使用独立的最小权限 CLI 身份。
 
@@ -283,6 +297,7 @@ teamwork-review-agents runs --limit 20
 | 文档 | 用途 |
 | --- | --- |
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
+| [`docs/first-time-setup.md`](docs/first-time-setup.md) | 首次启动后的管理界面图文配置流程 |
 | [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
 | [`docs/preflight-ci.md`](docs/preflight-ci.md) | GitHub Preflight 的执行、幂等与安全边界 |
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
