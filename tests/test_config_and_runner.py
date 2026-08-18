@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from teamwork_review_agents.codex_runner import CodexRunner
-from teamwork_review_agents.cli import _server_settings, build_parser
+from teamwork_review_agents.cli import (
+    _configure_standard_streams,
+    _server_settings,
+    build_parser,
+)
 from teamwork_review_agents.config import (
     AgentConfig,
     CodexRuntimeConfig,
@@ -33,6 +37,29 @@ from teamwork_review_agents.process_manager import (
 def test_cli_uses_root_config_by_default() -> None:
     args = build_parser().parse_args(["validate"])
     assert args.config == Path("config.yaml")
+
+
+def test_cli_configures_utf8_output_for_redirected_windows_streams() -> None:
+    """CLI 应把可重配的输出流统一设为 UTF-8。"""
+
+    class Stream:
+        """记录输出流重配参数。"""
+
+        def __init__(self) -> None:
+            self.options: dict[str, str] = {}
+
+        def reconfigure(self, **options: str) -> None:
+            """保存本次编码配置。"""
+
+            self.options = options
+
+    stdout = Stream()
+    stderr = Stream()
+
+    _configure_standard_streams(stdout, stderr)
+
+    assert stdout.options == {"encoding": "utf-8", "errors": "replace"}
+    assert stderr.options == {"encoding": "utf-8", "errors": "replace"}
 
 
 def test_cli_allows_config_override() -> None:

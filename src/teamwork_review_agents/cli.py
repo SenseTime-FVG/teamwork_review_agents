@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
@@ -23,6 +25,21 @@ from .webapp import create_app
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+
+
+def _configure_standard_streams(*streams: Any) -> None:
+    """统一使用 UTF-8 输出，避免 Windows 重定向控制台无法编码中文。"""
+
+    targets = streams or (sys.stdout, sys.stderr)
+    for stream in targets:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # 已关闭或不允许重配的流继续沿用宿主环境设置。
+            continue
 
 
 def add_config_argument(parser: argparse.ArgumentParser) -> None:
@@ -200,6 +217,7 @@ def _print_process_result(result: ProcessActionResult) -> int:
 def main() -> None:
     """解析命令并返回适合脚本使用的退出码。"""
 
+    _configure_standard_streams()
     args = build_parser().parse_args()
     if args.command == "validate":
         config = load_config(args.config)

@@ -457,7 +457,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 ## 48. 原生 Windows 进程与服务管理
 
-项目支持 Linux、macOS 和原生 Windows。Windows 用户可以在 PowerShell 中安装、校验并使用 `run`、`start`、`stop`、`restart`、`scan-once` 与其他 CLI 命令；WSL2 仍作为需要 Bash 工具链或类 Linux 部署环境时的可选方案，不能再把 WSL2 当作 Windows 用户唯一可运行路径。README 的快速开始分别给出 POSIX shell 和 PowerShell 命令，不能把 `cp`、`export`、绝对 POSIX 路径等命令直接展示为跨平台命令。
+项目支持 Linux、macOS 和原生 Windows。Windows 用户可以在 PowerShell 中安装、校验并使用 `run`、`start`、`stop`、`restart`、`scan-once` 与其他 CLI 命令；WSL2 仍作为需要 Bash 工具链或类 Linux 部署环境时的可选方案，不能再把 WSL2 当作 Windows 用户唯一可运行路径。README 的快速开始分别给出 POSIX shell 和 PowerShell 命令，不能把 `cp`、`export`、绝对 POSIX 路径等命令直接展示为跨平台命令。CLI 入口将可重配的标准输出和错误流统一设置为 UTF-8，保证 Windows 控制台重定向、后台日志和 CI 日志可以安全输出中文。
 
 单实例锁使用跨平台文件锁库，不在模块导入阶段依赖 Windows 不存在的 `fcntl`。进程身份、启动时间、存活状态和托管进程发现统一使用跨平台进程库读取，不调用 `ps` 或解析平台相关命令行文本；PID 文件继续同时记录 PID 与启动时间，防止 PID 复用导致误停止。升级前生成的旧 PID 记录如果无法匹配新格式，进程发现仍应根据完整 Python 模块命令和配置绝对路径找回实例。
 
