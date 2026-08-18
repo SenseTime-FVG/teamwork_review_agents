@@ -12,6 +12,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
+from .agent_home import TemporaryAgentHome, cleanup_stale_agent_homes_once
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .codex_settings import (
     agent_network_overrides,
@@ -49,6 +50,11 @@ BASE_ENVIRONMENT_NAMES = {
     "CODEX_HOME",
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
+    "GH_CONFIG_DIR",
+    "GLAB_CONFIG_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "HTTP_PROXY",
@@ -132,6 +138,7 @@ class CodexRunner:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        cleanup_stale_agent_homes_once()
 
     def build_command(
         self,
@@ -211,6 +218,8 @@ class CodexRunner:
     def child_environment(
         self,
         agent_environment: dict[str, str] | None = None,
+        *,
+        temporary_home: TemporaryAgentHome | None = None,
     ) -> dict[str, str]:
         """只继承运行必需变量，再叠加 Agent 明确声明的环境。"""
 
@@ -222,6 +231,11 @@ class CodexRunner:
         environment.update(agent_environment or {})
         if self.config.runtime.codex_home is not None:
             environment["CODEX_HOME"] = str(self.config.runtime.codex_home)
+        if temporary_home is not None:
+            temporary_home.apply_environment(
+                environment,
+                codex_home=codex_home(self.config.runtime.codex_home),
+            )
         # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
         for provider in self.config.providers.values():
             environment.pop(provider.token_env, None)
@@ -244,17 +258,21 @@ class CodexRunner:
         log_callback: LogCallback | None = None,
         cancel_check: CancelCheck | None = None,
     ) -> AgentResult:
-        """准备当前工作区的 Skill 投影，并保证 Codex 退出后立即清理。"""
+        """准备 Skill 与临时 HOME，并保证 Codex 退出后立即清理。"""
 
-        projection = SkillProjection(
-            repository.workspace,
-            {
-                skill_id: skill.path
-                for skill_id, skill in self.config.skills.items()
-            },
-            self.config.revision,
-        ).prepare()
+        temporary_home: TemporaryAgentHome | None = None
+        projection: SkillProjection | None = None
         try:
+            if agent.home_mode == "temporary":
+                temporary_home = TemporaryAgentHome.create(run_id)
+            projection = SkillProjection(
+                repository.workspace,
+                {
+                    skill_id: skill.path
+                    for skill_id, skill in self.config.skills.items()
+                },
+                self.config.revision,
+            ).prepare()
             return await self._run_with_projection(
                 run_id=run_id,
                 root_run_id=root_run_id,
@@ -270,9 +288,34 @@ class CodexRunner:
                 cancel_check=cancel_check,
                 skill_files=projection.skill_files,
                 git_excludes_file=projection.marker if self.config.skills else None,
+                temporary_home=temporary_home,
             )
         finally:
-            projection.cleanup()
+            try:
+                if projection is not None:
+                    projection.cleanup()
+            finally:
+                if temporary_home is not None:
+                    home_path = str(temporary_home.path)
+                    cleanup_error = temporary_home.cleanup()
+                    if log_callback is not None:
+                        event_type = (
+                            "run.home_cleanup_failed"
+                            if cleanup_error
+                            else "run.home_cleaned"
+                        )
+                        payload: dict[str, Any] = {
+                            "mode": "temporary",
+                            "path": home_path,
+                            "cleaned": cleanup_error is None,
+                        }
+                        if cleanup_error:
+                            payload["error"] = cleanup_error
+                        try:
+                            await log_callback("system", event_type, payload)
+                        except Exception:
+                            # 临时目录已经完成清理尝试，日志失败不能覆盖任务结果。
+                            pass
 
     async def _run_with_projection(
         self,
@@ -291,6 +334,7 @@ class CodexRunner:
         cancel_check: CancelCheck | None = None,
         skill_files: Mapping[str, Path],
         git_excludes_file: Path | None,
+        temporary_home: TemporaryAgentHome | None,
     ) -> AgentResult:
         """流式执行 Codex CLI；超时后终止整个进程组。"""
 
@@ -311,7 +355,20 @@ class CodexRunner:
             except Exception:
                 return
 
-        child_environment = self.child_environment(process_environment)
+        child_environment = self.child_environment(
+            process_environment,
+            temporary_home=temporary_home,
+        )
+        if temporary_home is not None:
+            await emit(
+                "system",
+                "run.home_prepared",
+                {
+                    "mode": "temporary",
+                    "path": str(temporary_home.path),
+                    "bridges": list(temporary_home.bridges),
+                },
+            )
         if git_excludes_file is not None:
             _add_git_excludes_file(child_environment, git_excludes_file)
         version_error = await asyncio.to_thread(

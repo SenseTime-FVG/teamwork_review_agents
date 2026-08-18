@@ -86,6 +86,7 @@ export type Agent = {
   personality?: "none" | "friendly" | "pragmatic";
   web_search?: "disabled" | "cached" | "live";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  home_mode?: "inherit" | "temporary";
   network_access?: boolean;
   network_domains?: string[];
   timeout_seconds?: number;

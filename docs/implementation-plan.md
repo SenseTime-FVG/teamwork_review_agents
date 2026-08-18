@@ -511,3 +511,16 @@
 - 更新事件选项、配置示例和 README，并补充 Provider、差异检测、扫描候选补齐、临时事件恢复清理和运行上下文回归测试。
 
 验收：目标分支一次推进只让每个打开 PR / MR 产生一个可匹配规则的目标提交变化事件；未更新的 PR / MR 即使未进入 Provider 更新时间候选仍能检测到变化；首次升级不补发历史变化；服务异常退出不会永久漏触发；成功或未匹配事件不留在事件历史和统计中；失败可重试；事件删除后关联 Agent 运行仍完整显示仓库与 PR / MR 信息。
+
+## 阶段四十八：Agent 每次运行临时 HOME
+
+- 为 Agent 增加向后兼容的 `home_mode: inherit | temporary`，默认继承系统 HOME；只允许可写沙箱选择临时 HOME。
+- 为每次根 Agent 和 sub-agent 创建独立的系统临时目录，预建 HOME、XDG 和 Windows 用户目录骨架，并在 Codex 及后代进程收尾后清理。
+- 在服务进程首次创建 Runner 时清理所属 PID 已经不存在的遗留临时 HOME，不删除仍由存活进程持有的目录。
+- 临时 HOME 模式显式固定原 `CODEX_HOME`，桥接已有 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR`、`GIT_CONFIG_GLOBAL` 和 SSH Agent 连接；不复制用户目录、私钥或凭据。
+- 保持 Provider Token 最终移除规则，Agent 环境变量不能覆盖临时 HOME 的托管目录或重新注入 Provider Token。
+- 运行日志增加 HOME 准备和清理事件，只记录临时路径、模式与桥接项，不读取桥接文件内容。
+- Agent 详情在本地文件权限附近增加 HOME 模式配置，列表摘要显示系统或临时 HOME；配置示例和 README 说明与 worktree、Codex Home、CLI 登录态的区别。
+- 补充配置组合、环境桥接、独立运行目录、正常/失败清理、遗留目录回收和 UI 类型回归测试，并执行全量 Python 测试、前端生产构建与编译检查。
+
+验收：不同仓库和不同 Agent 不需要声明仓库专用 HOME 变量即可把 `~/.cache`、`~/.config` 等写入本次运行临时目录；Codex 与已登录的 gh/glab 仍使用原认证入口；Provider Token 不进入 Agent；所有终态都清理临时 HOME，服务异常退出后的遗留目录可在后续启动安全回收；只读 Agent 不能保存误导性的临时可写 HOME 配置。

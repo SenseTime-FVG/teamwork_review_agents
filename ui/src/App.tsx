@@ -185,6 +185,7 @@ function createEmptyAgent(): Agent {
   return {
     prompt: "请处理当前 MR / PR。",
     sandbox: "read-only",
+    home_mode: "inherit",
     network_access: false,
     network_domains: [],
     timeout_seconds: 1200,
@@ -3303,6 +3304,7 @@ function AgentsEditor(props: {
                     : Array.from(new Set([...writeScopes, "workspace"]));
                   update(name, {
                     sandbox,
+                    home_mode: sandbox === "read-only" ? "inherit" : agent.home_mode ?? "inherit",
                     write_scopes: nextScopes as Agent["write_scopes"],
                     network_access: sandbox === "danger-full-access"
                       ? true
@@ -3312,6 +3314,7 @@ function AgentsEditor(props: {
                     network_domains: sandbox === "workspace-write" ? agent.network_domains ?? [] : [],
                   });
                 }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件</option><option value="danger-full-access">完全访问：高风险</option></select><small>切换为可写模式时会自动启用“本地仓库写操作”</small></label>
+                <label className="field"><span>HOME 目录</span><select value={agent.home_mode ?? "inherit"} disabled={agent.sandbox === "read-only"} onChange={(event) => update(name, { home_mode: event.target.value as Agent["home_mode"] })}><option value="inherit">继承系统 HOME</option><option value="temporary">每次运行使用临时 HOME</option></select><small>{agent.sandbox === "read-only" ? "只读沙箱不能提供可写的临时 HOME" : agent.home_mode === "temporary" ? "缓存与用户级配置写入本次运行目录，结束后清理" : "命令继续直接使用启动服务用户的 HOME"}</small></label>
                 <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
@@ -3448,6 +3451,7 @@ function AgentsEditor(props: {
                       sandbox: hasWorkspace
                         ? agent.sandbox === "danger-full-access" ? "danger-full-access" : "workspace-write"
                         : "read-only",
+                      home_mode: hasWorkspace ? agent.home_mode ?? "inherit" : "inherit",
                       network_access: hasWorkspace ? agent.network_access ?? false : false,
                       network_domains: hasWorkspace ? agent.network_domains ?? [] : [],
                     });
@@ -3487,6 +3491,9 @@ function AgentsEditor(props: {
                 <Toggle label="跳过 Git 仓库检查" checked={agent.skip_git_repo_check ?? false} onChange={(skip_git_repo_check) => update(name, { skip_git_repo_check })} />
               </div>
               <EnvironmentEditor compact title="Agent 环境变量" value={agent.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => update(name, { environment })} />
+              <p className="network-credential-note">
+                临时 HOME 与独立 worktree 相互独立：worktree 隔离仓库文件，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接，Provider Token 仍不会进入 Agent。
+              </p>
             </article>
           );
         })}
@@ -3506,6 +3513,10 @@ function agentNetworkLabel(agent: Agent): string {
   if (!agent.network_access) return "关闭";
   const domainCount = agent.network_domains?.length ?? 0;
   return domainCount > 0 ? `${domainCount} 个域名` : "允许联网";
+}
+
+function agentHomeLabel(agent: Agent): string {
+  return agent.home_mode === "temporary" ? "临时 HOME" : "系统 HOME";
 }
 
 function AgentsView(props: {
@@ -3724,7 +3735,7 @@ function AgentsView(props: {
         </div>
         <div className="agent-workspace-note">
           <strong>每次运行使用独立 worktree</strong>
-          <span>Agent 不绑定固定目录；文件权限、命令联网、Skill 与 sub-agent 白名单均在各自详情中独立配置。</span>
+          <span>Agent 不绑定固定目录；文件权限、HOME 模式、命令联网、Skill 与 sub-agent 白名单均在各自详情中独立配置。</span>
         </div>
         <div className="agent-list-toolbar">
           <label>
@@ -3744,7 +3755,7 @@ function AgentsView(props: {
                 <button type="button" className="agent-config-row" key={name} onClick={() => requestDetail(name)}>
                   <span className="agent-config-identity"><span className="agent-config-avatar" aria-hidden="true">A</span><span><strong>{name}</strong><small>Codex Agent</small></span></span>
                   <span className="agent-config-summary"><strong>{agent.prompt_file ? "文件 Prompt" : "内联 Prompt"}</strong><small>{agent.model || inheritedModel.value || "Codex 默认模型"}</small></span>
-                  <span><strong>{agentSandboxLabel(agent.sandbox)}</strong></span>
+                  <span><strong>{agentSandboxLabel(agent.sandbox)}</strong><small>{agentHomeLabel(agent)}</small></span>
                   <span><strong className={agent.network_access || agent.sandbox === "danger-full-access" ? "success-text" : ""}>{agentNetworkLabel(agent)}</strong></span>
                   <span><strong>{agent.skills?.length ?? 0}</strong><small>项</small></span>
                   <span><strong>{agent.allowed_sub_agents?.length ?? 0}</strong><small>个</small></span>

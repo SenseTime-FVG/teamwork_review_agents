@@ -1,6 +1,7 @@
 """配置解析和 Codex 命令边界测试。"""
 
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -166,6 +167,7 @@ def test_example_config_is_valid() -> None:
         "incremental-doc-update-runner",
         "incremental-doc-updater",
     ):
+        assert config.agents[agent_name].home_mode == "temporary"
         assert config.agents[agent_name].network_access is True
         assert config.agents[agent_name].network_domains == []
 
@@ -378,6 +380,31 @@ def test_agent_network_access_rejects_unsupported_sandbox_combinations() -> None
         {"prompt": "测试", "sandbox": "danger-full-access"}
     )
     assert danger.network_access is True
+
+
+def test_agent_temporary_home_requires_writable_sandbox() -> None:
+    """临时 HOME 需要可写沙箱，旧配置默认继续继承系统 HOME。"""
+
+    inherited = AgentConfig.model_validate({"prompt": "测试"})
+    assert inherited.home_mode == "inherit"
+
+    with pytest.raises(ValueError, match="临时 HOME"):
+        AgentConfig.model_validate(
+            {
+                "prompt": "测试",
+                "sandbox": "read-only",
+                "home_mode": "temporary",
+            }
+        )
+
+    temporary = AgentConfig.model_validate(
+        {
+            "prompt": "测试",
+            "sandbox": "workspace-write",
+            "home_mode": "temporary",
+        }
+    )
+    assert temporary.home_mode == "temporary"
 
 
 def test_runner_builds_agent_network_overrides(
@@ -809,6 +836,102 @@ for item in items:
     assert result.thread_id == "thread-test"
     assert result.final_message == "执行完成"
     assert result.usage == {"input_tokens": 10, "output_tokens": 2}
+
+
+async def test_runner_uses_and_cleans_temporary_home(
+    tmp_path,
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """临时 HOME 应对真实子进程生效，并在成功终态后立即删除。"""
+
+    config = configured_app_factory()
+    workspace = tmp_path / "workspace-temporary-home"
+    workspace.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    fake_codex = tmp_path / "fake-codex-temporary-home"
+    fake_codex.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import pathlib
+import sys
+sys.stdin.read()
+home = pathlib.Path.home()
+(home / "cache.txt").write_text("运行缓存", encoding="utf-8")
+message = json.dumps({{
+    "home": str(home),
+    "codex_home": os.environ.get("CODEX_HOME"),
+    "provider_token_present": "GITHUB_TOKEN" in os.environ,
+}}, ensure_ascii=False)
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": message}}}}, ensure_ascii=False), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config.runtime.codex_binary = str(fake_codex)
+    config.runtime.codex_home = codex_home
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    agent = config.agents["code-reviewer"]
+    agent.sandbox = "workspace-write"
+    agent.home_mode = "temporary"
+    agent.skip_git_repo_check = True
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-temporary-home",
+        root_run_id="run-temporary-home",
+        event=event,
+    )
+    emitted: list[tuple[str, str | dict[str, object]]] = []
+
+    async def capture_log(
+        stream: str,
+        event_type: str,
+        payload: str | dict[str, object],
+    ) -> None:
+        """记录临时 HOME 生命周期日志。"""
+
+        del stream
+        emitted.append((event_type, payload))
+
+    result = await CodexRunner(config).run(
+        run_id="run-temporary-home",
+        root_run_id="run-temporary-home",
+        parent_run_id=None,
+        agent_name="code-reviewer",
+        agent=agent,
+        repository=repository,
+        context=context,
+        prompt="执行临时 HOME 测试",
+        process_environment={"GITHUB_TOKEN": "不能进入 Codex"},
+        log_callback=capture_log,
+    )
+
+    assert result.status == "completed"
+    message = json.loads(result.final_message or "{}")
+    prepared = next(
+        payload
+        for event_type, payload in emitted
+        if event_type == "run.home_prepared" and isinstance(payload, dict)
+    )
+    home_path = Path(str(prepared["path"]))
+    assert message == {
+        "home": str(home_path),
+        "codex_home": str(codex_home),
+        "provider_token_present": False,
+    }
+    assert not home_path.exists()
+    assert any(event_type == "run.home_cleaned" for event_type, _ in emitted)
 
 
 @pytest.mark.parametrize(

@@ -219,6 +219,17 @@ rules:
     enabled: true
 ```
 
+可写 Agent 建议启用每次运行独立的临时 HOME，避免仓库程序把缓存、工具配置或测试产物写进服务账号真实的 `~/`：
+
+```yaml
+agents:
+  general-reviewer:
+    sandbox: workspace-write
+    home_mode: temporary
+```
+
+`home_mode: temporary` 是通用运行隔离，不需要随仓库配置 `BOX_AGENT_HOME`、`UV_HOME` 等项目专用变量。根 Agent 和 sub-agent 每次运行各自创建临时 HOME，并在成功、失败、取消或超时后清理；服务异常退出遗留的目录会在后续启动执行器时回收。真实 `CODEX_HOME` 继续显式传入，已有的 `gh`、`glab`、Git 全局配置和 SSH Agent 只桥接必要入口，不会复制整个用户目录、私钥或其他凭据。Provider Token 仍不会进入 Codex 进程。只读 Agent 不能选择临时 HOME；`danger-full-access` 仅改变默认 HOME，并不形成文件系统安全边界。
+
 接入仓库中的 `ci/preflight.sh` 应当是可独立运行、首个错误即退出的确定性脚本，例如：
 
 ```bash

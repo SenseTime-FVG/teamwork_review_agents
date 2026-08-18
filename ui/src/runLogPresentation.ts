@@ -25,6 +25,9 @@ const SYSTEM_TITLES: Record<string, string> = {
   "workspace.git.timed_out": "Git 工作区操作超时",
   "workspace.git.cancelled": "Git 工作区操作已取消",
   "workspace.prepared": "工作区已准备",
+  "run.home_prepared": "临时 HOME 已准备",
+  "run.home_cleaned": "临时 HOME 已清理",
+  "run.home_cleanup_failed": "临时 HOME 清理失败",
   "run.started": "Agent 开始运行",
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
@@ -144,6 +147,15 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     detail = [object.path ? `路径：${textValue(object.path)}` : "", object.mode ? `模式：${textValue(object.mode)}` : ""]
       .filter(Boolean)
       .join("\n");
+  } else if (log.event_type.startsWith("run.home_") && object) {
+    body = object.path ? `路径：${textValue(object.path)}` : "";
+    detail = [
+      object.mode ? `模式：${textValue(object.mode)}` : "",
+      Array.isArray(object.bridges) && object.bridges.length > 0
+        ? `桥接：${object.bridges.map(textValue).join("、")}`
+        : "",
+      object.error ? `错误：${textValue(object.error)}` : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type === "run.started" && object) {
     body = textValue(object.agent_name);
     detail = object.config_revision ? `配置版本：${textValue(object.config_revision)}` : "";

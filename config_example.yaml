@@ -202,6 +202,9 @@ agents:
     # read-only：本地只读；workspace-write：工作区可写；
     # danger-full-access：完全访问。
     sandbox: workspace-write
+    # 可写沙箱可为每次运行创建独立临时 HOME；缓存和用户级配置在结束后删除。
+    # Codex Home 与已有 gh / glab / Git / SSH 登录入口会单独桥接。
+    home_mode: temporary
     # 命令联网与本地文件权限分开控制。审核 Agent 默认允许联网，便于 gh 使用
     # 自己的系统钥匙串登录态；空白名单表示不限制目标域名。
     network_access: true
@@ -225,6 +228,7 @@ agents:
   incremental-doc-update-runner:
     prompt_file: ./prompts/增量文档更新入口.md
     sandbox: workspace-write
+    home_mode: temporary
     # 允许入口 Agent 按需通过自身 gh / glab 登录态读取平台信息。
     network_access: true
     network_domains: []
@@ -246,6 +250,7 @@ agents:
   incremental-doc-updater:
     prompt_file: ./prompts/增量文档更新.md
     sandbox: workspace-write
+    home_mode: temporary
     # 允许文档更新 Agent 按需通过自身 gh / glab 登录态读取平台信息。
     network_access: true
     network_domains: []

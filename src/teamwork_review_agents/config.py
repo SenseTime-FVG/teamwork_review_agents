@@ -313,6 +313,7 @@ class AgentConfig(BaseModel):
     personality: Literal["none", "friendly", "pragmatic"] | None = None
     web_search: Literal["disabled", "cached", "live"] | None = None
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
+    home_mode: Literal["inherit", "temporary"] = "inherit"
     network_access: bool = False
     network_domains: list[str] = Field(default_factory=list)
     timeout_seconds: PositiveInt = 1200
@@ -360,8 +361,10 @@ class AgentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_network_access(self) -> "AgentConfig":
-        """校验命令联网与本地沙箱之间可实际执行的组合。"""
+        """校验命令联网、临时 HOME 与本地沙箱的可执行组合。"""
 
+        if self.sandbox == "read-only" and self.home_mode == "temporary":
+            raise ValueError("read-only 沙箱不能配置可写的临时 HOME")
         if self.network_domains and not self.network_access:
             raise ValueError("配置命令联网域名白名单前必须先允许命令联网")
         if self.sandbox == "read-only" and self.network_access:

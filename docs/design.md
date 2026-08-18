@@ -484,3 +484,13 @@ Windows CI 至少安装项目并在真实 Windows runner 上执行 CLI 导入、
 目标分支变化事件属于临时可靠事件。为避免“快照已推进但规则尚未触发”造成永久漏触发，它仍先写入 SQLite 可靠队列，但事件载荷排除 Provider 原始响应，只保存规则匹配、重试和 Agent 上下文需要的数据。服务异常退出时沿用现有事件恢复与幂等调度；处理失败时保留到既有重试流程结束。事件成功处理、被规则判定为未匹配，或因仓库已禁用而结束后立即删除事件及临时调度关系，不进入长期事件历史。
 
 删除临时事件前，服务把仓库、PR / MR 编号、标题和地址固化到已经创建的 Agent 运行记录，确保“运行与日志”不依赖已删除事件仍可展示上下文。Agent 运行、最终结果和运行日志继续遵循各自的持久化与保留策略；删除临时事件不能删除或隐藏已经创建的运行。
+
+## 51. Agent 每次运行临时 HOME
+
+Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` 保持现有行为；`temporary` 为每次根 Agent 或 sub-agent 运行分别创建独立的临时 HOME，目录位于操作系统临时目录且名称包含当前服务进程与运行标识。临时 HOME 预建 `.cache`、`.config`、`.local/share`、`.local/state` 和 `tmp`，并同步设置对应 XDG 目录；Windows 额外设置 `USERPROFILE` 和用户应用数据目录。目标仓库中的任意程序只要按 HOME、用户目录或 XDG 规范写入缓存和配置，都会进入本次运行目录，不需要 Teamwork 识别仓库专用的 `BOX_AGENT_HOME` 等变量。
+
+临时 HOME 只允许用于可写沙箱。`read-only` 不得配置 `temporary`，避免把不可写目录误导为可用能力；`workspace-write` 依赖 Codex 对系统临时目录的既有可写边界，`danger-full-access` 只改变默认用户目录位置，不能阻止命令通过绝对路径访问宿主机。每次正常完成、失败、取消或超时都在 Codex 及后代进程收尾后清理临时 HOME。服务进程首次创建 Runner 时还会删除目录名所记录的宿主进程已经不存在的遗留 HOME；不能删除仍由存活服务进程持有的目录。
+
+切换 HOME 不能改变 Codex 与平台 CLI 的既有认证边界。Runner 在替换 `HOME` 前解析并固定实际 `CODEX_HOME`，使 Codex 登录、模型缓存和用户配置继续使用运行时指定目录或宿主机原目录。GitHub CLI 和 GitLab CLI 分别通过 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR` 显式引用宿主机已有配置目录，系统钥匙串仍由操作系统提供；Git 通过 `GIT_CONFIG_GLOBAL` 只读引用已有全局配置，SSH 只继承 `SSH_AUTH_SOCK` 等 Agent 连接信息。不存在的桥接目录不创建也不复制，Teamwork 不复制整个用户目录、SSH 私钥、Codex 凭据或 CLI Token。Provider 的 `token_env` 仍在最终子进程环境中强制移除，Agent 环境变量不能把它重新注入。
+
+运行日志记录临时 HOME 的准备、桥接项和清理结果，但不读取或记录被桥接配置文件的内容。Agent 管理详情在本地文件权限附近提供“继承系统 HOME / 每次运行使用临时 HOME”选项，列表摘要显示当前模式，并明确说明临时 HOME 与 worktree 是两个不同维度：worktree 隔离仓库文件，临时 HOME 隔离用户级缓存和配置写入。
