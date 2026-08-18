@@ -97,7 +97,7 @@ systemd 与 launchd 模板不适用于 Windows。Windows 可让服务管理器�
 teamwork-review-agents run -c C:\path\to\config.yaml
 ```
 
-确保服务用户拥有配置、数据库、基础仓库和 worktree 目录权限，并能读取所需的 Codex、Git、SSH、`gh` 或 `glab` 凭据。
+确保服务用户拥有配置、数据库、基础仓库和临时 Git 工作区目录权限，并能读取所需的 Codex、Git、SSH、`gh` 或 `glab` 凭据。
 
 ## 7. 扫描语义
 
@@ -112,9 +112,9 @@ teamwork-review-agents run -c C:\path\to\config.yaml
 
 ## 8. Agent 隔离与清理
 
-每次根 Agent 默认使用独立 detached worktree。声明 `workspace` 写操作后，同一源分支串行；声明 `change_request` 写操作后，同一 PR / MR 串行。
+每次根 Agent 默认使用独立 Git 工作区：声明 `workspace` 写操作的 Agent 使用本地 clone，只读 Agent 使用 detached worktree。声明 `workspace` 写操作后，同一源分支串行；声明 `change_request` 写操作后，同一 PR / MR 串行。
 
-成功且干净的 worktree 会立即删除。以下情况会保留，便于排查或恢复：
+成功且干净的 clone/worktree 会立即删除。以下情况会保留，便于排查或恢复：
 
 - Agent 失败或超时；
 - 存在未提交修改；
@@ -175,6 +175,6 @@ teamwork-review-agents run
 | Agent 无法访问平台 | 用服务用户执行 `gh auth status` / `glab auth status`，再检查 `network_access` |
 | Codex 立即失败 | 检查 CLI 路径、Codex Home 登录和期望版本 |
 | Agent 超时 | 查看运行消息，区分总超时和无进展超时 |
-| worktree 未删除 | 查看工作区状态和保留原因，不要直接删除仍在使用的目录 |
+| 临时 Git 工作区未删除 | 查看工作区状态和保留原因，不要直接删除仍在使用的目录 |
 
-无法判断时，先保留数据库和 worktree，再从管理界面的运行详情、后台日志和健康接口定位问题。
+无法判断时，先保留数据库和临时 Git 工作区，再从管理界面的运行详情、后台日志和健康接口定位问题。

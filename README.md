@@ -9,7 +9,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 ## 方案
 
 - 固定源、目标 SHA，结合完整 diff、设计、历史变更和 CI 审核。
-- 每次 Agent 使用独立 Git worktree，避免并发任务互相污染。
+- 每次 Agent 使用独立 Git 工作区：可写 Agent 使用自带 `.git` 的本地 clone，只读 Agent 使用轻量 worktree，避免并发任务互相污染。
 - 合并后按净差异和文档索引，只更新受影响文档。
 - 快照、事件、规则、运行和日志统一写入 SQLite，并在管理界面展示。
 - GitHub PR 可在 Review Agent 前执行仓库自定义的确定性 Preflight CI。
@@ -164,13 +164,13 @@ GitHub 历史 PR 的列表行会展示 Timeline 中最新一条可转换为规�
 
 ## Agent 运行状态与 Git 超时
 
-Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 worktree 后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
+Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，因此 Codex 可在沙箱内安全执行 fetch、建分支和提交；只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
-`runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
+`runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取、运行 clone 和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
 
 这两个超时可以在管理界面左侧“运行时配置”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
 
-仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库执行 fetch，再为每次运行创建独立 worktree；这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
+仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库中的 Git 对象并执行增量 fetch；可写 Agent 创建拥有独立 `.git` 的运行 clone，只读 Agent 创建 linked worktree。这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件或共享 Git 元数据。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
 
 ## GitHub 本地 CI 门禁
 
@@ -269,7 +269,7 @@ teamwork-review-agents start -c /path/to/review.config.yaml
 teamwork-review-agents scan-once -c /path/to/review.config.yaml
 ```
 
-Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent worktree。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
+Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent 运行工作区。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
 
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 

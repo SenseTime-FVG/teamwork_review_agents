@@ -1538,7 +1538,7 @@ function CodexRuntimeEditor(props: {
             type="number"
             value={Number(props.document.runtime.git_timeout_seconds ?? 600)}
             onChange={(value) => patchRuntime({ git_timeout_seconds: Number(value) })}
-            help="基础仓库就绪后，fetch 和 worktree 等命令默认最多等待 10 分钟"
+            help="基础仓库就绪后，fetch、运行 clone 和 worktree 等命令默认最多等待 10 分钟"
           />
           <Field
             label="默认无进展超时（秒）"
@@ -2260,7 +2260,7 @@ function RepositoryWorkspaceManager(props: {
         <div className="section-title-row">
           <div>
             <h2>基础仓库状态</h2>
-            <p>初始化一次后，Agent 只增量 fetch 并创建独立 worktree；操作始终绑定当前已保存配置。</p>
+            <p>初始化一次后，Agent 只增量 fetch；可写 Agent 创建独立 clone，只读 Agent 创建 linked worktree。</p>
           </div>
           <button className="button secondary" disabled={loading} onClick={() => { void refresh(); }}>刷新</button>
         </div>
@@ -2425,7 +2425,7 @@ function RepositoryDetailEditor(props: {
             <label className="field">
               <span>仓库 ID</span>
               <input value={repository.id} disabled />
-              <small>关联历史事件、运行记录和 worktree，已有仓库不可修改 ID</small>
+              <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
             </label>
           )}
           <label className="field">
@@ -2446,7 +2446,7 @@ function RepositoryDetailEditor(props: {
             label="基础 Git 仓库目录（自动管理）"
             value={repository.workspace}
             onChange={(workspace) => update({ workspace })}
-            help="只负责克隆、校验、fetch 和 worktree 管理；Codex 在每次运行独享的临时目录中工作"
+            help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
           />
         </div>
         <section className="repository-preflight-section">
@@ -2787,7 +2787,7 @@ function RepositoriesView(props: {
         { label: "基础仓库目录", value: originalRepository.workspace, mono: true },
       ],
       impactTitle: "不会删除磁盘与历史数据",
-      impact: "本地基础仓库、worktree、SQLite 快照、事件和运行记录均会保留；如需清理应另行确认具体目标。",
+      impact: "本地基础仓库、临时 Git 工作区、SQLite 快照、事件和运行记录均会保留；如需清理应另行确认具体目标。",
       confirmLabel: "确认删除配置",
       dangerous: true,
     };
@@ -3211,8 +3211,8 @@ function AgentsEditor(props: {
         }}>+ 添加 Agent</button>
       </div>}
       {props.showOverview !== false && <div className="agent-workspace-note">
-        <strong>每次运行使用独立 worktree</strong>
-        <span>Agent 本身不绑定固定目录；仓库配置目录只作基础仓库。每次根 Agent 在 MR / PR Head 上创建独立临时 worktree，不同分支可以并发；声明“本地仓库写操作”后，同一源分支会串行。sub-agent 是否复用父 Agent 当前 worktree，由触发规则中的“继承当前工作区”决定。</span>
+        <strong>每次运行使用独立 Git 工作区</strong>
+        <span>Agent 本身不绑定固定目录；仓库配置目录只作基础仓库。可写 Agent 使用自带 .git 的独立 clone，只读 Agent 使用轻量 linked worktree；不同分支可以并发，声明“本地仓库写操作”后同一源分支会串行。sub-agent 是否复用父 Agent 当前工作区，由触发规则中的“继承当前工作区”决定。</span>
       </div>}
       <div className="card-list">
         {names.map((name) => {
@@ -3493,7 +3493,7 @@ function AgentsEditor(props: {
               </div>
               <EnvironmentEditor compact title="Agent 环境变量" value={agent.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => update(name, { environment })} />
               <p className="network-credential-note">
-                临时 HOME 与独立 worktree 相互独立：worktree 隔离仓库文件，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接，Provider Token 仍不会进入 Agent。
+                临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接，Provider Token 仍不会进入 Agent。
               </p>
             </article>
           );
@@ -3735,7 +3735,7 @@ function AgentsView(props: {
           <button type="button" className="button primary" onClick={beginCreate}>+ 添加 Agent</button>
         </div>
         <div className="agent-workspace-note">
-          <strong>每次运行使用独立 worktree</strong>
+          <strong>每次运行使用独立 Git 工作区</strong>
           <span>Agent 不绑定固定目录；文件权限、HOME 模式、命令联网、Skill 与 sub-agent 白名单均在各自详情中独立配置。</span>
         </div>
         <div className="agent-list-toolbar">
@@ -3948,7 +3948,7 @@ function RulesEditor(props: {
                   checked={rule.inherit_workspace ?? false}
                   onChange={(inherit_workspace) => update(index, { inherit_workspace })}
                 />
-                <p>开启后，sub-agent 复用父 Agent 本次运行的临时 worktree，共享当前分支、暂存区和未提交文件；只继承工作区，不自动继承 MR 输入或父 Agent 对话。</p>
+                <p>开启后，sub-agent 复用父 Agent 本次运行的临时 clone 或 worktree，共享当前分支、暂存区和未提交文件；只继承工作区，不自动继承 MR 输入或父 Agent 对话。</p>
               </div>
             </div>
             <JsonEditor value={rule.conditions ?? {}} onChange={(conditions) => update(index, { conditions })} />

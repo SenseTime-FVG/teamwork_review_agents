@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal
 from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
@@ -30,6 +30,7 @@ class WorkspaceCancelled(WorkspaceError):
 
 
 GitCancelCheck = Callable[[], bool]
+RunWorkspaceKind = Literal["worktree", "clone"]
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,7 @@ GitProgressCallback = Callable[[GitProgressEvent], None]
 
 @dataclass(frozen=True)
 class WorkspaceCleanupResult:
-    """一次临时 worktree 清理判断的结果。"""
+    """一次临时 Git 工作区清理判断的结果。"""
 
     status: str
     reason: str
@@ -95,7 +96,7 @@ def repository_clone_url(
 
 
 def repository_git_lock_key(repository: RepositoryConfig) -> str:
-    """返回基础仓库 fetch 与 worktree 管理共用的资源锁键。"""
+    """返回基础仓库 fetch 与运行工作区管理共用的资源锁键。"""
 
     return f"git_repository:{repository.workspace.resolve()}"
 
@@ -389,6 +390,85 @@ def validate_linked_workspace(
     return candidate
 
 
+def _git_remote_url(workspace: Path, *, timeout_seconds: int = 600) -> str:
+    """读取工作区 origin 地址，不把地址写入运行日志。"""
+
+    result = _run_git(
+        ["-C", str(workspace.resolve()), "remote", "get-url", "origin"],
+        check=False,
+        timeout_seconds=timeout_seconds,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise WorkspaceError("Git 工作区缺少 origin 远端")
+    return result.stdout.strip()
+
+
+def validate_isolated_clone(
+    source_workspace: Path,
+    workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+) -> Path:
+    """校验候选目录是属于配置仓库的独立本地 clone。"""
+
+    source = source_workspace.resolve()
+    candidate = workspace.resolve()
+    if not candidate.is_dir():
+        raise WorkspaceError(f"继承的工作目录不存在：{candidate}")
+    if (
+        candidate == source
+        or candidate in source.parents
+        or source in candidate.parents
+    ):
+        raise WorkspaceError("独立运行工作区不能与基础仓库互相包含")
+    git_directory = candidate / ".git"
+    if not git_directory.is_dir():
+        raise WorkspaceError("候选工作目录不是拥有独立 Git 元数据的 clone")
+    if _git_common_directory(
+        candidate,
+        timeout_seconds=timeout_seconds,
+    ) != git_directory.resolve():
+        raise WorkspaceError("候选 clone 的 Git 元数据不在运行目录内")
+    if _git_remote_url(
+        source,
+        timeout_seconds=timeout_seconds,
+    ) != _git_remote_url(candidate, timeout_seconds=timeout_seconds):
+        raise WorkspaceError("候选 clone 的 origin 与配置仓库不一致")
+    return candidate
+
+
+def run_workspace_kind(workspace: Path) -> RunWorkspaceKind:
+    """根据 `.git` 形态辨认独立 clone 或 linked worktree。"""
+
+    git_path = workspace.resolve() / ".git"
+    if git_path.is_dir():
+        return "clone"
+    if git_path.is_file():
+        return "worktree"
+    raise WorkspaceError("临时目录不是可识别的 Git 工作区")
+
+
+def validate_run_workspace(
+    source_workspace: Path,
+    workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+) -> Path:
+    """校验可继承的运行工作区属于配置基础仓库。"""
+
+    if run_workspace_kind(workspace) == "clone":
+        return validate_isolated_clone(
+            source_workspace,
+            workspace,
+            timeout_seconds=timeout_seconds,
+        )
+    return validate_linked_workspace(
+        source_workspace,
+        workspace,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def ensure_isolated_worktree(
     source_workspace: Path,
     target_workspace: Path,
@@ -441,6 +521,102 @@ def ensure_isolated_worktree(
     )
 
 
+def ensure_isolated_clone(
+    source_workspace: Path,
+    target_workspace: Path,
+    revision: str,
+    *,
+    change_ref: str,
+    timeout_seconds: int = 600,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
+) -> Path:
+    """从基础仓库快速创建拥有独立 `.git` 的运行 clone。"""
+
+    source = source_workspace.resolve()
+    target = target_workspace.resolve()
+    if target.exists():
+        return validate_isolated_clone(
+            source,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    origin_url = _git_remote_url(source, timeout_seconds=timeout_seconds)
+    revision_head = worktree_ref_head(
+        source,
+        revision,
+        timeout_seconds=timeout_seconds,
+    )
+    with tempfile.TemporaryDirectory(
+        dir=target.parent,
+        prefix=f".{target.name}.clone-",
+    ) as temporary_root:
+        staged = Path(temporary_root) / "checkout"
+        clone_result = _run_git(
+            [
+                "clone",
+                "--no-checkout",
+                "--shared",
+                "--",
+                str(source),
+                str(staged),
+            ],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="创建可写运行仓库",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        if clone_result.returncode != 0:
+            raise WorkspaceError("无法从基础仓库创建可写运行 clone")
+        _run_git(
+            [
+                "-C",
+                str(staged),
+                "fetch",
+                "--prune",
+                "origin",
+                "+refs/remotes/origin/*:refs/remotes/origin/*",
+            ],
+            timeout_seconds=timeout_seconds,
+            operation="复制基础仓库远端引用",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        _run_git(
+            ["-C", str(staged), "remote", "set-url", "origin", origin_url],
+            timeout_seconds=timeout_seconds,
+            cancel_check=cancel_check,
+        )
+        _run_git(
+            ["-C", str(staged), "update-ref", change_ref, revision_head],
+            timeout_seconds=timeout_seconds,
+            operation="写入变更请求引用",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        _run_git(
+            ["-C", str(staged), "checkout", "--detach", revision_head],
+            timeout_seconds=timeout_seconds,
+            operation="检出变更请求提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        if target.exists():
+            return validate_isolated_clone(
+                source,
+                target,
+                timeout_seconds=timeout_seconds,
+            )
+        staged.replace(target)
+    return validate_isolated_clone(
+        source,
+        target,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def retained_marker_path(workspace: Path) -> Path:
     """返回保留工作区对应的外部标记文件路径。"""
 
@@ -449,7 +625,7 @@ def retained_marker_path(workspace: Path) -> Path:
 
 
 def worktree_starting_head(workspace: Path) -> str | None:
-    """读取临时 worktree 首次创建时记录的基线提交。"""
+    """读取临时 Git 工作区首次创建时记录的基线提交。"""
 
     marker = retained_marker_path(workspace)
     try:
@@ -461,7 +637,7 @@ def worktree_starting_head(workspace: Path) -> str | None:
 
 
 def worktree_head(workspace: Path, *, timeout_seconds: int = 600) -> str:
-    """返回工作树当前 HEAD 提交。"""
+    """返回临时 Git 工作区当前 HEAD 提交。"""
 
     result = _run_git(
         ["-C", str(workspace.resolve()), "rev-parse", "HEAD"],
@@ -479,7 +655,7 @@ def worktree_ref_head(
     *,
     timeout_seconds: int = 600,
 ) -> str:
-    """返回工作树可见的指定 Git 引用对应提交。"""
+    """返回 Git 工作区可见的指定引用对应提交。"""
 
     result = _run_git(
         [
@@ -511,7 +687,7 @@ def mark_active_worktree(
     retention_days: int,
     timeout_seconds: int,
 ) -> None:
-    """为运行中的 worktree 写入崩溃后仍可生效的兜底清理标记。"""
+    """为运行中的 Git 工作区写入崩溃后仍可生效的清理标记。"""
 
     marker = retained_marker_path(workspace)
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -520,6 +696,7 @@ def mark_active_worktree(
         json.dumps(
             {
                 "workspace": str(workspace.resolve()),
+                "workspace_kind": run_workspace_kind(workspace),
                 "starting_head": starting_head,
                 "reason": "Agent 运行中；若服务异常退出则按保留期限清理",
                 "retained_at": now,
@@ -537,16 +714,22 @@ def _retain_worktree(
     reason: str,
     retention_days: int,
 ) -> WorkspaceCleanupResult:
-    """写入保留标记，确保异常工作区可在期限内恢复。"""
+    """写入保留标记，确保异常 Git 工作区可在期限内恢复。"""
 
     marker = retained_marker_path(workspace)
     marker.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
     starting_head = worktree_starting_head(workspace)
+    try:
+        workspace_kind: str = run_workspace_kind(workspace)
+    except WorkspaceError:
+        # Agent 破坏 Git 元数据时仍保留外部标记，但绝不自动删除未知目录。
+        workspace_kind = "unknown"
     marker.write_text(
         json.dumps(
             {
                 "workspace": str(workspace.resolve()),
+                "workspace_kind": workspace_kind,
                 "starting_head": starting_head,
                 "reason": reason,
                 "retained_at": now,
@@ -589,6 +772,31 @@ def _remove_worktree(
     )
 
 
+def _remove_run_workspace(
+    source_workspace: Path,
+    workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+) -> None:
+    """按工作区类型删除已验证的 linked worktree 或独立 clone。"""
+
+    kind = run_workspace_kind(workspace)
+    if kind == "worktree":
+        _remove_worktree(
+            source_workspace,
+            workspace,
+            timeout_seconds=timeout_seconds,
+        )
+        return
+    target = validate_isolated_clone(
+        source_workspace,
+        workspace,
+        timeout_seconds=timeout_seconds,
+    )
+    shutil.rmtree(target)
+    clear_retained_marker(target)
+
+
 def cleanup_run_worktree(
     source_workspace: Path,
     workspace: Path,
@@ -598,9 +806,21 @@ def cleanup_run_worktree(
     retention_days: int,
     git_timeout_seconds: int = 600,
 ) -> WorkspaceCleanupResult:
-    """仅在没有丢失本地工作的风险时删除本次运行 worktree。"""
+    """仅在没有丢失本地工作的风险时删除本次运行 Git 工作区。"""
 
     target = workspace.resolve()
+    try:
+        validate_run_workspace(
+            source_workspace,
+            target,
+            timeout_seconds=git_timeout_seconds,
+        )
+    except WorkspaceError as exc:
+        return _retain_worktree(
+            target,
+            f"工作区归属校验失败，为避免误删而保留：{exc}",
+            retention_days,
+        )
     if run_status != "completed":
         return _retain_worktree(
             target,
@@ -666,7 +886,7 @@ def cleanup_run_worktree(
             )
 
     try:
-        _remove_worktree(
+        _remove_run_workspace(
             source_workspace,
             target,
             timeout_seconds=git_timeout_seconds,
@@ -692,7 +912,7 @@ def cleanup_expired_worktrees(
     now: float | None = None,
     git_timeout_seconds: int = 600,
 ) -> list[Path]:
-    """强制清理由保留期限控制且已经过期的临时 worktree。"""
+    """强制清理由保留期限控制且已经过期的临时 Git 工作区。"""
 
     current_time = time.time() if now is None else now
     removed: list[Path] = []
@@ -708,11 +928,14 @@ def cleanup_expired_worktrees(
             continue
         if cleanup_at > current_time:
             continue
+        if target.parent != worktrees_root.resolve():
+            # 标记只能管理同目录下的运行工作区，避免越界删除。
+            continue
         if not target.exists():
             marker.unlink(missing_ok=True)
             continue
         try:
-            _remove_worktree(
+            _remove_run_workspace(
                 source_workspace,
                 target,
                 timeout_seconds=git_timeout_seconds,
@@ -778,6 +1001,19 @@ def prepare_change_request_workspace(
             raise WorkspaceError(
                 "无法获取 MR/PR 代码引用，请检查远端权限或平台引用格式"
             )
+        _run_git(
+            [
+                "-C",
+                str(workspace),
+                "update-ref",
+                destination_ref,
+                snapshot.head_sha,
+            ],
+            timeout_seconds=timeout_seconds,
+            operation="校准变更请求引用",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
     return destination_ref
 
 

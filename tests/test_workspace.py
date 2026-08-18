@@ -20,11 +20,15 @@ from teamwork_review_agents.workspace import (
     _safe_git_command,
     cleanup_expired_worktrees,
     cleanup_run_worktree,
+    ensure_isolated_clone,
     ensure_isolated_worktree,
     prepare_change_request_workspace,
     retained_marker_path,
+    run_workspace_kind,
     temporary_change_request_worktree,
+    validate_isolated_clone,
     validate_linked_workspace,
+    validate_run_workspace,
     WorkspaceCancelled,
     WorkspaceError,
     worktree_ref_head,
@@ -224,6 +228,63 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
     assert cleanup.status == "removed"
     assert not isolated.exists()
 
+    cloned = ensure_isolated_clone(
+        workspace,
+        tmp_path / "data" / "worktrees" / "writable-clone",
+        change_ref,
+        change_ref=change_ref,
+    )
+    assert run_workspace_kind(cloned) == "clone"
+    assert (cloned / ".git").is_dir()
+    assert validate_isolated_clone(workspace, cloned) == cloned
+    assert validate_run_workspace(workspace, cloned) == cloned
+    assert run_git("rev-parse", "HEAD", cwd=cloned) == head_sha
+    assert run_git("rev-parse", change_ref, cwd=cloned) == head_sha
+    assert worktree_ref_head(cloned, "refs/remotes/origin/main") == head_sha
+    assert run_git("remote", "get-url", "origin", cwd=cloned) == str(origin)
+    run_git("config", "user.name", "Clone User", cwd=cloned)
+    run_git("config", "user.email", "clone@example.com", cwd=cloned)
+    run_git("switch", "-c", "agent-output", cwd=cloned)
+    (cloned / "agent-output.txt").write_text("独立提交\n", encoding="utf-8")
+    run_git("add", "agent-output.txt", cwd=cloned)
+    run_git("commit", "-m", "增加独立提交", cwd=cloned)
+    run_git("push", "origin", "HEAD:refs/heads/agent-output", cwd=cloned)
+    assert run_git("branch", "--show-current", cwd=workspace) == "main"
+    assert not (workspace / "agent-output.txt").exists()
+    cleanup = cleanup_run_worktree(
+        workspace,
+        cloned,
+        run_status="completed",
+        starting_head=head_sha,
+        retention_days=7,
+    )
+    assert cleanup.status == "removed"
+    assert not cloned.exists()
+
+    retained_clone = ensure_isolated_clone(
+        workspace,
+        tmp_path / "data" / "worktrees" / "retained-clone",
+        change_ref,
+        change_ref=change_ref,
+    )
+    (retained_clone / "待恢复.txt").write_text("不要删除\n", encoding="utf-8")
+    cleanup = cleanup_run_worktree(
+        workspace,
+        retained_clone,
+        run_status="completed",
+        starting_head=head_sha,
+        retention_days=7,
+    )
+    assert cleanup.status == "retained"
+    assert retained_clone.exists()
+    removed = cleanup_expired_worktrees(
+        workspace,
+        retained_clone.parent,
+        now=float("inf"),
+    )
+    assert retained_clone.resolve() in removed
+    assert not retained_clone.exists()
+
     retained = ensure_isolated_worktree(
         workspace,
         tmp_path / "data" / "worktrees" / "retained",
@@ -341,7 +402,17 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
         if payload["operation"] == "克隆基础仓库"
     )
     assert clone_payload["timeout_seconds"] == 1800
+    prepared_payload = json.loads(
+        next(
+            item["payload"]
+            for item in store.list_run_logs(result.run_id)
+            if item["event_type"] == "workspace.prepared"
+        )
+    )
+    assert prepared_payload["mode"] == "root-worktree"
 
+    config.agents["code-reviewer"].sandbox = "workspace-write"
+    config.agents["code-reviewer"].write_scopes = ["workspace"]
     fake_codex.write_text(
         f"""#!{sys.executable}
 import json
@@ -365,8 +436,43 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     retained_detail = store.get_run(retained_result.run_id)
     assert retained_detail is not None
     assert retained_detail["workspace_status"] == "retained"
-    assert Path(retained_detail["workspace_path"]).exists()
+    retained_workspace = Path(retained_detail["workspace_path"])
+    assert retained_workspace.exists()
+    assert (retained_workspace / ".git").is_dir()
     assert "未提交" in retained_detail["workspace_reason"]
+    retained_prepared_payload = json.loads(
+        next(
+            item["payload"]
+            for item in store.list_run_logs(retained_result.run_id)
+            if item["event_type"] == "workspace.prepared"
+        )
+    )
+    assert retained_prepared_payload["mode"] == "root-clone"
+
+    inherited_result = await AgentExecutor(config, store).execute(
+        agent_name="code-reviewer",
+        event=event,
+        idempotency_key="sub-agent-inherited-clone",
+        task="继续检查父 Agent 的本地修改",
+        root_run_id=retained_result.root_run_id,
+        parent_run_id=retained_result.run_id,
+        depth=1,
+        inherit_workspace=True,
+        parent_workspace=retained_workspace,
+    )
+    assert inherited_result is not None
+    inherited_detail = store.get_run(inherited_result.run_id)
+    assert inherited_detail is not None
+    assert inherited_detail["workspace_status"] == "inherited"
+    assert inherited_detail["workspace_path"] == str(retained_workspace)
+    inherited_prepared_payload = json.loads(
+        next(
+            item["payload"]
+            for item in store.list_run_logs(inherited_result.run_id)
+            if item["event_type"] == "workspace.prepared"
+        )
+    )
+    assert inherited_prepared_payload["mode"] == "inherited-clone"
 
 
 def test_temporary_change_request_worktree_isolated_and_removed(

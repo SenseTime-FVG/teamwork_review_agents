@@ -4,7 +4,7 @@
 
 ## 1. 一句话总览
 
-系统通过周期性扫描 GitHub PR / GitLab MR，把远端状态变化转换为可幂等处理的语义事件，再按 YAML 规则选择 Codex Agent；每次运行在独立 Git worktree 中执行，并由 SQLite 统一保存快照、事件、锁、运行状态和流式日志。
+系统通过周期性扫描 GitHub PR / GitLab MR，把远端状态变化转换为可幂等处理的语义事件，再按 YAML 规则选择 Codex Agent；每次运行在独立 Git 工作区中执行，可写 Agent 使用本地 clone，只读 Agent 使用 linked worktree，并由 SQLite 统一保存快照、事件、锁、运行状态和流式日志。
 
 ## 2. 系统分层
 
@@ -12,7 +12,7 @@
 2. **配置与运行层**：`ConfigManager` 负责 YAML 校验、版本和热加载；`BackgroundRuntime` 在 FastAPI 生命周期内串行发起扫描周期。
 3. **采集与事件层**：GitHub / GitLab Provider 将平台数据归一为 `ChangeRequestSnapshot`；事件检测器比较快照及活动时间线，生成 `opened`、`merged`、`commits_changed` 等语义事件。
 4. **规则与编排层**：`Orchestrator` 从 SQLite 领取待处理事件，以规则的事件名、仓库和字段条件进行匹配；同一轮的多个事件可以按 `deduplicate_per_scan` 合并为一次 Agent 运行。
-5. **Agent 执行层**：`AgentExecutor` 负责幂等预约、写资源锁、环境变量与 Prompt 组装、Secret 脱敏、临时 worktree 和清理策略；`CodexRunner` 启动 `codex exec --json --ephemeral` 并持续保存 JSONL 日志。
+5. **Agent 执行层**：`AgentExecutor` 负责幂等预约、写资源锁、环境变量与 Prompt 组装、Secret 脱敏、临时 clone/worktree 和清理策略；`CodexRunner` 启动 `codex exec --json --ephemeral` 并持续保存 JSONL 日志。
 6. **委托层**：根 Agent 只能通过应用注入的 MCP `invoke_agent` 调用白名单中的 sub-agent；系统限制递归深度、根任务总运行数和调用环。
 7. **持久化层**：SQLite 是跨进程一致性的中心，保存快照、活动游标、事件收件箱、事件到 Agent 的调度关系、Agent 运行、日志、配置版本、服务状态和资源租约。
 
@@ -32,7 +32,7 @@
 2. Provider 拉取启用仓库的 PR / MR 和可用的活动时间线，事件检测器把新旧快照差异写入 SQLite 事件收件箱。
 3. 编排器领取待处理事件，按规则规划 Agent 调用；未匹配事件标记为未触发，匹配事件记录事件到 Agent 的调度关系。
 4. 执行器为运行创建幂等记录并申请资源租约。声明 `workspace` 写操作时，同一源分支串行；声明 `change_request` 写操作时，同一 PR / MR 串行。
-5. 根 Agent 默认从当前变更请求 Head 创建独立 detached worktree。文档 Runner 的规则开启工作区继承，因此它调用的 Updater 可复用同一 worktree、分支和未提交状态，委托期间串行执行。
+5. 根 Agent 默认从当前变更请求 Head 创建独立 Git 工作区；声明本地仓库写权限时使用自带 `.git` 的 clone，否则使用 detached worktree。文档 Runner 的规则开启工作区继承，因此它调用的 Updater 可复用同一工作区、分支和未提交状态，委托期间串行执行。
 6. Codex CLI 只接收白名单环境变量；Provider Token 被强制从 Prompt 和 Codex 子进程剥离。应用临时注入 Agent 选择的 Skill 和仅含 `invoke_agent` 的 MCP 网关。
 7. stdout JSONL、stderr、最终消息、用量、超时、取消与工作区清理状态持续写入 SQLite，并通过 FastAPI SSE 提供给 React UI。
 

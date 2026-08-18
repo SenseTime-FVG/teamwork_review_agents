@@ -36,7 +36,7 @@ database:
 #   max_agent_runs_per_root: 8
 #   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。
 #   event_retry_count: 2
-#   # 失败、超时、存在未提交文件或未推送提交的临时 worktree 保留天数。
+#   # 失败、超时、存在未提交文件或未推送提交的临时 Git 工作区保留天数。
 #   # 到期后会在下次准备同一仓库时强制清理；默认 7 天。
 #   worktree_retention_days: 7
 #   # Codex CLI 命令名，也可以配置为绝对路径。
@@ -54,7 +54,7 @@ database:
 #   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   # 基础仓库首次克隆的超时，默认 30 分钟。
 #   repository_initialization_timeout_seconds: 1800
-#   # 基础仓库就绪后，fetch 和 worktree 等单次 Git 操作的超时，默认 10 分钟。
+#   # 基础仓库就绪后，fetch、运行 clone 和 worktree 等单次 Git 操作的超时，默认 10 分钟。
 #   git_timeout_seconds: 600
 #   agent_idle_timeout_seconds: 300
 #   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
@@ -153,7 +153,7 @@ web:
 #     # 支持 owner/repository、group/project、SSH 或 HTTPS Git 地址。
 #     project: git@github.com:owner/repository.git
 #     # 基础 Git 仓库目录；不存在时会自动克隆，已存在时只校验并 fetch。
-#     # Codex 不直接在这里运行，每次 Agent 会在 data/worktrees/ 下创建独立 worktree。
+#     # Codex 不直接在这里运行；可写 Agent 创建独立 clone，只读 Agent 创建 linked worktree。
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true
@@ -294,7 +294,7 @@ rules:
     deduplicate_per_scan: true
     # 合并后文档更新不需要执行 PR Head 的本地 CI。
     run_preflight: false
-    # sub-agent 复用入口 Agent 的 worktree、分支、暂存区和未提交文件。
+    # sub-agent 复用入口 Agent 的 Git 工作区、分支、暂存区和未提交文件。
     inherit_workspace: true
     # 内置规则绝不自动启用。
     enabled: false

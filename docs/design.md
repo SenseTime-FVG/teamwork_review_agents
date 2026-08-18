@@ -117,7 +117,7 @@ Provider Token 优先从全局环境配置中的同名变量解析，没有配�
 
 Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工作目录的 Agent 才使用 `workspace-write`，不默认开放 `danger-full-access`。
 
-基础 Git 仓库不存在时，执行器根据仓库 SSH/HTTPS 地址原子克隆；已存在时只校验并 fetch。当前 MR/PR head 写入 `refs/teamwork/change-requests/<编号>/head`，每次运行再从该引用创建独立临时 worktree，不会 checkout 或覆盖基础仓库。
+基础 Git 仓库不存在时，执行器根据仓库 SSH/HTTPS 地址原子克隆；已存在时只校验并 fetch。当前 MR/PR head 写入 `refs/teamwork/change-requests/<编号>/head`，每次运行再从该引用创建独立临时 Git 工作区，不会 checkout 或覆盖基础仓库。
 
 ## 10. 已知边界
 
@@ -125,7 +125,7 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 - 扫描器按更新时间自动分页，并在上次成功扫描时间水位处提前停止；`max_items_per_repository` 作为单仓库单轮安全上限，`api_page_size` 只控制内部 API 分页大小。
 - GitHub 审批数按每位用户最新有效 Review 粗略计算；复杂分支保护规则仍由合并前的远端检查兜底。
 - 单机 SQLite 适合初期部署，多实例生产部署应迁移到 PostgreSQL。
-- 根 Agent 与未继承父目录的 sub-agent 都使用按运行 ID 创建的独立 detached worktree；规则开启工作区继承时，sub-agent 调用链复用根 Agent 本次运行的 worktree 和实时 Git 状态。
+- 根 Agent 与未继承父目录的 sub-agent 都使用按运行 ID 创建的独立 Git 工作区；可写 Agent 使用独立 clone，只读 Agent 使用 detached worktree。规则开启工作区继承时，sub-agent 调用链复用根 Agent 本次运行目录和实时 Git 状态。
 - 第一版尚未提供窄权限的平台写入 MCP，评论、审批和合并依赖部署方预先认证的 `gh`/`glab`。
 
 ## 11. 后台管理服务
@@ -201,13 +201,13 @@ React 管理 UI 包含：
 
 ## 18. 每次运行独立工作区与 sub-agent 继承
 
-仓库配置中的 `workspace` 是基础 Git 仓库，只负责克隆、校验、fetch 和管理 worktree，不再直接作为 Codex CLI 的工作目录。每次根 Agent 运行都会在数据库目录旁的 `worktrees/<仓库>/<run-id>/` 创建以当前 MR / PR Head 为起点的 detached Git worktree，并将该路径写入 Prompt 仓库上下文、`REPOSITORY_WORKSPACE`、运行审计和日志。这样同一仓库的不同 MR、不同分支或同一 Agent 的不同运行可以真正并发，互不共享当前分支、暂存区和未提交文件。
+仓库配置中的 `workspace` 是基础 Git 仓库，只负责克隆、校验、fetch 和管理运行工作区，不再直接作为 Codex CLI 的工作目录。每次根 Agent 运行都会在数据库目录旁的 `worktrees/<仓库>/<run-id>/` 创建以当前 MR / PR Head 为起点的独立 Git 工作区，并将该路径写入 Prompt 仓库上下文、`REPOSITORY_WORKSPACE`、运行审计和日志。可写 Agent 使用拥有独立 `.git` 的本地 clone，只读 Agent 使用 detached linked worktree。这样同一仓库的不同 MR、不同分支或同一 Agent 的不同运行可以真正并发，互不共享当前分支、暂存区和未提交文件。
 
-声明 `workspace` 写作用域时，资源锁按仓库与 MR 源分支生成，而不是按临时目录生成。同一源分支的写 Agent 串行执行，防止不同临时 worktree 同时 push 覆盖远端；不同源分支可以并发。`change_request` 写作用域仍按 MR / PR 资源键串行。
+声明 `workspace` 写作用域时，资源锁按仓库与 MR 源分支生成，而不是按临时目录生成。同一源分支的写 Agent 串行执行，防止不同临时 clone 同时 push 覆盖远端；不同源分支可以并发。`change_request` 写作用域仍按 MR / PR 资源键串行。
 
-规则可配置 `inherit_workspace`，默认关闭。开启时，根 Agent 的后代 sub-agent 共用父 Agent 本次运行的临时 worktree，因此父 Agent 的分支切换、暂存区和未提交文件对子 Agent 可见；共享工作区委托在单个 MCP 进程内串行执行。关闭时，sub-agent 为自己的运行创建另一个独立 worktree。该选项只继承文件系统与 Git 状态，不自动继承 MR / PR Prompt、动作数组或父 Agent 对话内容。
+规则可配置 `inherit_workspace`，默认关闭。开启时，根 Agent 的后代 sub-agent 共用父 Agent 本次运行的临时 clone 或 worktree，因此父 Agent 的分支切换、暂存区和未提交文件对子 Agent 可见；共享工作区委托在单个 MCP 进程内串行执行。关闭时，sub-agent 按自身写权限为运行创建另一个独立 Git 工作区。该选项只继承文件系统与 Git 状态，不自动继承 MR / PR Prompt、动作数组或父 Agent 对话内容。
 
-拥有 worktree 的 Agent 结束后执行安全清理：运行成功且工作区无修改、没有新增提交，或者新增提交已经存在于远端引用时立即使用 `git worktree remove` 删除。失败、超时、存在未提交文件或新增提交尚未推送时保留工作区，并在运行记录中标记“待清理”。保留超过 `runtime.worktree_retention_days` 后，后台在下次准备同仓库工作区时强制清理；这项期限明确代表对遗留本地修改的最长恢复窗口。默认数据库位于项目 `data/` 时，仓库根目录的 `.gitignore` 必须忽略整个 `/data/worktrees/` 运行目录，包括保留标记，避免临时工作区进入版本控制；忽略规则不替代后台安全清理。
+拥有运行工作区的 Agent 结束后执行安全清理：运行成功且工作区无修改、没有新增提交，或者新增提交已经存在于远端引用时立即删除；linked worktree 使用 `git worktree remove`，独立 clone 删除经归属校验的运行目录。失败、超时、存在未提交文件或新增提交尚未推送时保留工作区，并在运行记录中标记“待清理”。保留超过 `runtime.worktree_retention_days` 后，后台在下次准备同仓库工作区时强制清理；这项期限明确代表对遗留本地修改的最长恢复窗口。默认数据库位于项目 `data/` 时，仓库根目录的 `.gitignore` 必须忽略整个 `/data/worktrees/` 运行目录，包括保留标记，避免临时工作区进入版本控制；忽略规则不替代后台安全清理。
 
 Agent 配置本身不绑定仓库或固定目录。管理 UI 在 Agent 页面说明基础仓库与临时运行工作区的关系，并在运行详情展示本次实际路径、清理状态和保留原因。
 
@@ -217,7 +217,7 @@ Agent 配置本身不绑定仓库或固定目录。管理 UI 在 Agent 页面说
 
 管理 UI 增加独立的 SKILL 页面，支持填写服务端已有目录，也支持从浏览器选择整个技能文件夹并复制到配置文件旁的 `./skills/`。导入时校验目录层级、文件数量、总大小和 `SKILL.md` 元数据，并拒绝路径穿越、重复目标及非法文件。导入只负责保存技能目录，管理员仍需将其加入配置后再在 Agent 中选择。
 
-运行 Codex CLI 前，执行器把应用配置中的技能完整投影到本次临时 worktree 的 `.agents/skills/` 下，并通过当前 Agent 的 Codex 配置显式启用已选技能、禁用其他由本应用管理的技能。投影保留技能内部相对路径和资源，但不修改技能源目录；Codex 子进程同时使用仅对本次进程生效的 Git 忽略文件，使投影不会出现在 `git status` 或普通 `git add -A` 中；进程结束后立即清理。根 Agent 与继承工作区的 sub-agent 可以看到同一份稳定投影，但各自的启用列表仍由各自 Agent 配置决定。未继承工作区的 sub-agent 在自己的临时 worktree 中创建和清理投影。
+运行 Codex CLI 前，执行器把应用配置中的技能完整投影到本次临时 Git 工作区的 `.agents/skills/` 下，并通过当前 Agent 的 Codex 配置显式启用已选技能、禁用其他由本应用管理的技能。投影保留技能内部相对路径和资源，但不修改技能源目录；Codex 子进程同时使用仅对本次进程生效的 Git 忽略文件，使投影不会出现在 `git status` 或普通 `git add -A` 中；进程结束后立即清理。根 Agent 与继承工作区的 sub-agent 可以看到同一份稳定投影，但各自的启用列表仍由各自 Agent 配置决定。未继承工作区的 sub-agent 在自己的临时 clone 或 worktree 中创建和清理投影。
 
 技能装载表示该技能可被 Codex 根据 `description` 隐式匹配，也可由 Prompt 使用 `$skill-name` 显式要求；选择技能不等于每次运行都强制执行。应用只控制 `skills` 中注册的技能，Codex 自带技能及部署环境原有的其他发现来源不在这份选择列表内。
 
@@ -357,9 +357,9 @@ GitHub PR 的“最新事件”来自 Issues 命名空间下的 Timeline Events 
 
 ## 35. Agent 工作区准备状态与 Git 超时
 
-Agent 运行在完成并发额度、业务写锁和仓库管理锁等待后，从 `queued` 切换为 `preparing`。该状态覆盖基础仓库首次克隆、远端 fetch、MR / PR 引用获取、过期 worktree 清理和本次隔离 worktree 创建；只有 Codex CLI 即将启动时才切换为 `running`。运行列表、详情、事件聚合和统计均单独展示“准备工作区”，避免把耗时 Git 网络操作误解为等待并发槽。
+Agent 运行在完成并发额度、业务写锁和仓库管理锁等待后，从 `queued` 切换为 `preparing`。该状态覆盖基础仓库首次克隆、远端 fetch、MR / PR 引用获取、过期运行工作区清理和本次隔离 clone/worktree 创建；只有 Codex CLI 即将启动时才切换为 `running`。运行列表、详情、事件聚合和统计均单独展示“准备工作区”，避免把耗时 Git 网络操作误解为等待并发槽。
 
-运行时新增 `runtime.git_timeout_seconds`，默认 600 秒，并传入基础仓库首次初始化之外的 fetch、引用获取、worktree 创建与清理等 Git 操作。Git 操作开始时写入操作阶段日志，执行期间按固定间隔写入已等待秒数，完成后写入耗时；日志不包含可能带凭据的完整命令或远端 URL。管理员取消准备中的运行时，持久化取消请求必须终止整个 Git 进程组，避免 SSH、index-pack 等子进程继续占用网络和临时目录。
+运行时新增 `runtime.git_timeout_seconds`，默认 600 秒，并传入基础仓库首次初始化之外的 fetch、引用获取、运行 clone/worktree 创建与清理等 Git 操作。Git 操作开始时写入操作阶段日志，执行期间按固定间隔写入已等待秒数，完成后写入耗时；日志不包含可能带凭据的完整命令或远端 URL。管理员取消准备中的运行时，持久化取消请求必须终止整个 Git 进程组，避免 SSH、index-pack 等子进程继续占用网络和临时目录。
 
 首次克隆继续在目标目录旁的临时目录执行，成功后原子移动为正式基础仓库。首次克隆使用独立的 `runtime.repository_initialization_timeout_seconds`，默认 1800 秒；超时、取消或失败时终止完整进程组并清理当前临时目录，系统不把不完整克隆当成可复用仓库。管理员也可以预先完成基础仓库克隆，或把仓库工作目录指向已有的完整本地克隆。
 
@@ -367,7 +367,7 @@ Agent 运行在完成并发额度、业务写锁和仓库管理锁等待后，�
 
 仓库配置页面在配置表单之外增加“基础仓库状态”操作区，只针对当前已保存且启用的仓库。每个仓库展示已解析绝对路径、初始化状态、最近操作阶段、已耗时、最近完成时间、磁盘占用和脱敏错误。目录不存在或不是完整 Git 仓库时显示“初始化仓库”；有效仓库显示“立即更新”。配置草稿中的仓库 ID、远端或工作目录与已保存配置不一致时，禁止对该仓库执行操作，避免初始化错误目标。
 
-初始化任务使用当前 Provider 与仓库配置：目录缺失时通过既有原子克隆流程创建基础仓库；目录已经有效时校验并执行 `fetch --prune origin`。任务不创建 Agent worktree、不切换基础仓库分支，也不复制或修改工作文件。初始化与 Agent 工作区准备共用相同的 `git_repository:<绝对路径>` 资源锁，因此并发操作先显示等待仓库锁，取得锁后再进入克隆、校验或更新阶段。
+初始化任务使用当前 Provider 与仓库配置：目录缺失时通过既有原子克隆流程创建基础仓库；目录已经有效时校验并执行 `fetch --prune origin`。任务不创建 Agent 运行工作区、不切换基础仓库分支，也不复制或修改工作文件。初始化与 Agent 工作区准备共用相同的 `git_repository:<绝对路径>` 资源锁，因此并发操作先显示等待仓库锁，取得锁后再进入克隆、校验或更新阶段。
 
 初始化管理器在服务进程内维护每个仓库唯一的任务与取消事件，状态不会写入 SQLite。页面刷新后仍可查询同一服务进程内的任务；服务退出时先请求取消并等待 Git 进程组回收，重启后重新从磁盘检查仓库是否完整。首次克隆使用 `runtime.repository_initialization_timeout_seconds`，已存在仓库的校验和更新使用 `runtime.git_timeout_seconds`。取消会终止 git、ssh、index-pack 等完整进程组。
 
@@ -451,7 +451,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 根 Agent 的审核基准不能把 GitHub PR 的 `base.sha`、GraphQL `baseRefOid` 或 GitLab 中用于描述 MR 差异基准的字段当作目标分支当前最新提交。这些字段属于变更请求关联的基准信息，可能与目标分支实时 ref 不一致。目标分支当前 SHA 必须来自真实分支引用；GitHub、GitLab 和其他 Git Provider 统一以本次工作区准备完成后的 `refs/remotes/origin/<目标分支>` 为启动时权威值。
 
-执行器已经在创建隔离 worktree 前完成 `fetch --prune origin`。同一个仓库管理锁内的 fetch 完成后，服务端解析目标远端跟踪 ref，并把结果作为 `mr.target_head_sha` 与已有的 `mr.target_ref` 一起传给根 Agent。解析失败时不得启动 Codex，也不能回退到 PR/MR 元数据中的 base SHA。该值在工作区准备结束、Codex 启动之前生成，避免扫描快照排队期间的目标分支变化被错误固化为本轮审核基准。
+执行器在创建隔离工作区前更新基础仓库；可写 clone 创建时从基础仓库复制刚更新的远端跟踪引用。服务端最终从本次运行工作区的目标远端跟踪 ref 解析提交，并把结果作为 `mr.target_head_sha` 与已有的 `mr.target_ref` 一起传给根 Agent。解析失败时不得启动 Codex，也不能回退到 PR/MR 元数据中的 base SHA。该值在工作区准备结束、Codex 启动之前生成，避免扫描快照排队期间的目标分支变化被错误固化为本轮审核基准。
 
 通用审核 Prompt 明确令 `REVIEW_HEAD_SHA = mr.head_sha`、`REVIEW_TARGET_SHA = mr.target_head_sha`。后续关键状态刷新仍须查询目标分支真实 ref，并与同一个 `REVIEW_TARGET_SHA` 比较；可以使用平台 Git refs API、`git ls-remote` 或语义等价的实时分支查询，但禁止使用 `base.sha`、`baseRefOid` 判断目标分支是否变化。PR/MR 的 base SHA 只可作为历史、差异或平台诊断信息，不能参与当前目标分支竞态判断。合并结果类 CI 继续要求其合并提交父节点明确对应 `REVIEW_TARGET_SHA` 与 `REVIEW_HEAD_SHA`。
 
@@ -495,7 +495,7 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 
 macOS 的系统钥匙串搜索列表会受到 `HOME` 影响，仅设置 `GH_CONFIG_DIR` 不能保证 `gh` 找到原登录态。临时 HOME 模式在宿主机 `~/Library/Keychains` 已存在时，只在本次临时 HOME 的 `Library/Keychains` 创建指向该目录的符号链接，使 `gh` 继续通过 macOS Keychain 读取既有登录态。该桥接不复制钥匙串数据库、不读取或输出 Token，也不把 `GH_TOKEN` 或 Provider Token 注入 Codex 环境；宿主目录不存在或平台不是 macOS 时保持原有行为。运行清理与遗留目录回收只能删除临时 HOME 和符号链接本身，绝不能跟随链接删除真实钥匙串目录。
 
-运行日志记录临时 HOME 的准备、桥接项和清理结果，但不读取或记录被桥接配置文件的内容。Agent 管理详情在本地文件权限附近提供“继承系统 HOME / 每次运行使用临时 HOME”选项，列表摘要显示当前模式，并明确说明临时 HOME 与 worktree 是两个不同维度：worktree 隔离仓库文件，临时 HOME 隔离用户级缓存和配置写入。
+运行日志记录临时 HOME 的准备、桥接项和清理结果，但不读取或记录被桥接配置文件的内容。Agent 管理详情在本地文件权限附近提供“继承系统 HOME / 每次运行使用临时 HOME”选项，列表摘要显示当前模式，并明确说明临时 HOME 与 Git 工作区是两个不同维度：运行 clone/worktree 隔离仓库状态，临时 HOME 隔离用户级缓存和配置写入。
 
 ## 52. 扫描循环与 Agent 执行解耦
 
@@ -530,3 +530,13 @@ README 与首次配置图文指南必须同时提供 POSIX shell 和 Windows Pow
 CLI 在发送服务停止信号前记录服务后代进程的 PID 与启动时间。正常关闭结束后仍存活的已记录后代必须单独终止；若服务超过宽限期，则重新补录后代并同时强制结束服务进程组和已验证身份的后代。该兜底用于覆盖 Codex、MCP 或命令自行创建独立会话后脱离服务进程组的情况，并通过启动时间校验避免 PID 重用导致误杀。`restart` 只有在旧服务及其已记录后代全部确认退出后才能启动新服务；关闭失败时必须停止重启并返回错误。
 
 “暂停”仍只影响新扫描，不取消 Agent；只有单次运行取消、服务 `stop` 或 `restart` 才触发上述终止协议。正常完成、失败或已经取消的终态运行不会再次收到取消请求。
+
+## 56. 可写 Agent 的独立 Git 元数据工作区
+
+Git linked worktree 的工作文件位于运行目录，但 `.git` 是指向基础仓库共享元数据的文件，实际索引、引用和 `FETCH_HEAD` 位于基础仓库的 `.git/worktrees/`。当 Codex 使用 `workspace-write` 沙箱且只允许写入本次运行目录时，Agent 虽然可以修改业务文件，却不能执行必须更新共享 Git 元数据的 `git fetch`、创建分支或提交；扩大沙箱到基础仓库会破坏“Agent 不修改基础仓库”的隔离边界。
+
+因此，声明 `workspace` 写作用域的根 Agent，以及未继承父目录且声明该作用域的 sub-agent，必须使用每次运行独立的本地 clone。clone 通过基础仓库复用对象并在本地建立自己的 `.git` 目录，复制基础仓库刚更新的远端跟踪引用，再把 `origin` 恢复为配置仓库的真实远端、写入当前变更请求稳定引用并 detached 检出精确 Head。Codex 的可写根目录由此同时包含工作文件和 Git 元数据，安全 Prompt 中要求的启动前 `git fetch`、分支、提交等操作不需要额外开放基础仓库目录。基础仓库仍只由服务端在仓库管理锁内更新，Agent 不在其中执行命令或写入文件。
+
+只读 Agent 和 Preflight 继续使用 linked worktree，避免为不写 Git 元数据的任务复制独立仓库。规则开启 `inherit_workspace` 时，sub-agent 复用父 Agent 的实际运行目录：父 Agent 使用独立 clone 时继承同一 clone，父 Agent 使用 linked worktree 时继承同一 worktree；继承者不创建或清理第二个工作区。继承校验同时支持两种模式，并要求独立 clone 的 `origin` 与配置基础仓库一致。
+
+独立 clone 与 linked worktree 共用现有运行路径、准备状态、Git 超时、取消、保留期限和安全清理语义。正常完成且无未提交内容、没有新增提交，或新增提交已经存在于 `origin` 时删除整个临时目录；失败、取消、脏文件或未推送提交仍保留并写入外部标记。过期清理必须先辨认工作区类型并验证归属，linked worktree 通过 `git worktree remove` 清理，独立 clone 只删除经校验的运行目录，不能跟随路径删除基础仓库或其他用户目录。

@@ -582,3 +582,15 @@
 - 补充存在与缺失宿主钥匙串目录、符号链接目标、真实目录保留和临时 HOME 清理测试，并执行全量 Python 测试、前端生产构建与编译检查；不自动重启服务。
 
 验收：macOS 中使用临时 HOME 的 Agent 可以通过既有 `gh` Keychain 登录态访问 GitHub API；仓库程序对普通 `~/` 路径的写入仍落在临时目录；Token 不进入环境或日志；运行结束后临时 HOME 被删除且真实 `~/Library/Keychains` 完整保留；其他平台行为不回归。
+
+## 阶段五十四：可写 Agent 使用独立 Git 元数据工作区
+
+- 保留只读 Agent 与 Preflight 的 linked worktree；声明 `workspace` 写作用域的根 Agent 和独立 sub-agent 改为每次运行创建本地独立 clone。
+- 从基础仓库复用 Git 对象并复制最新远端跟踪引用，在运行目录内创建独立 `.git`，恢复真实 `origin`，建立当前变更请求稳定引用后 detached 检出精确 Head。
+- 不向 Codex `workspace-write` 沙箱额外开放基础仓库或 `.git/worktrees`，使 Prompt 中的 `git fetch`、建分支、提交等 Git 元数据写操作只影响运行 clone。
+- 扩展工作区归属校验、运行标记、即时清理和过期清理，同时支持 linked worktree 与独立 clone；删除 clone 前校验其远端与基础仓库一致。
+- 保持 `inherit_workspace` 语义：sub-agent 直接复用父 Agent 的实际目录，不创建或清理第二个 clone/worktree。
+- 更新 README 与管理界面说明，明确基础仓库、只读 worktree 和可写独立 clone 的边界。
+- 补充独立 `.git`、远端引用、基础仓库不受污染、继承、干净删除、脏目录保留和过期清理测试，并执行全量 Python 测试、前端生产构建与编译检查。
+
+验收：可写 Agent 在 `workspace-write` 沙箱内能执行 `git fetch`、创建分支和提交，不再因基础仓库 `.git/worktrees/*/FETCH_HEAD` 不可写而停止；其 Git 元数据和工作文件均限制在本次运行目录；只读任务保持轻量 worktree；继承 sub-agent 与父 Agent 看到同一 Git 状态；基础仓库工作文件和当前分支不被 Agent 修改；清理与保留策略不回归。

@@ -10,7 +10,7 @@
 
 同一批次中未要求 CI 的 Agent 会立即启动，不等待 Preflight。要求 CI 的规则共享以仓库 ID、PR 编号、Head SHA 和完整配置 revision 生成的幂等结果。`success`、`failure` 与 `timed_out` 是可复用的本地终态；Git、进程启动或清理故障产生的 `error` 只影响要求 CI 的事件路径，并按事件重试额度再次执行。
 
-执行器先写入 `pending` Commit Status，再更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule，然后按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent worktree 相互独立，均不修改基础仓库。
+执行器先写入 `pending` Commit Status，再更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule，然后按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。
 
 本地命令终态和 Commit Status 发布标记分别持久化。终态已经生成但 GitHub 回写失败时，后续重试只补发状态，不重新执行仓库命令。
 

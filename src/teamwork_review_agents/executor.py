@@ -20,11 +20,13 @@ from .workspace import (
     change_request_ref,
     cleanup_expired_worktrees,
     cleanup_run_worktree,
+    ensure_isolated_clone,
     ensure_isolated_worktree,
     mark_active_worktree,
     prepare_change_request_workspace,
     repository_git_lock_key,
-    validate_linked_workspace,
+    run_workspace_kind,
+    validate_run_workspace,
     WorkspaceCancelled,
     worktree_head,
     worktree_ref_head,
@@ -118,7 +120,7 @@ class AgentExecutor:
         repository: RepositoryConfig,
         run_id: str,
     ) -> Path:
-        """返回一次 Agent 运行专属的临时 worktree 路径。"""
+        """返回一次 Agent 运行专属的临时 Git 工作区路径。"""
 
         repository_directory = stable_hash(repository.id)[:16]
         return (
@@ -129,7 +131,7 @@ class AgentExecutor:
         ).resolve()
 
     def git_admin_lock_key(self, repository: RepositoryConfig) -> str:
-        """返回基础仓库 fetch 与 worktree 管理使用的短时锁。"""
+        """返回基础仓库 fetch 与运行工作区管理使用的短时锁。"""
 
         return repository_git_lock_key(repository)
 
@@ -320,14 +322,18 @@ class AgentExecutor:
                             "工作区继承已开启，但父 Agent 工作目录缺失"
                         )
                     active_workspace = await asyncio.to_thread(
-                        validate_linked_workspace,
+                        validate_run_workspace,
                         configured_repository.workspace,
                         parent_workspace,
                         timeout_seconds=self.config.runtime.git_timeout_seconds,
                     )
                     change_ref = change_request_ref(provider, event.number)[1]
-                    workspace_mode = "inherited"
-                    workspace_reason = "复用父 Agent 本次运行的临时 worktree"
+                    inherited_kind = await asyncio.to_thread(
+                        run_workspace_kind,
+                        active_workspace,
+                    )
+                    workspace_mode = f"inherited-{inherited_kind}"
+                    workspace_reason = "复用父 Agent 本次运行的临时 Git 工作区"
                 else:
                     active_workspace = self.run_workspace_path(
                         configured_repository,
@@ -386,16 +392,6 @@ class AgentExecutor:
                             cancel_check=git_cancel_check,
                             progress_callback=report_git_progress,
                         )
-                        if task is None:
-                            target_head_sha = await asyncio.to_thread(
-                                worktree_ref_head,
-                                configured_repository.workspace,
-                                (
-                                    "refs/remotes/origin/"
-                                    f"{event.current_snapshot.target_branch}"
-                                ),
-                                timeout_seconds=self.config.runtime.git_timeout_seconds,
-                            )
                         await asyncio.to_thread(
                             cleanup_expired_worktrees,
                             configured_repository.workspace,
@@ -406,15 +402,28 @@ class AgentExecutor:
                             worktree_starting_head,
                             active_workspace,
                         )
-                        active_workspace = await asyncio.to_thread(
-                            ensure_isolated_worktree,
-                            configured_repository.workspace,
-                            active_workspace,
-                            change_ref,
-                            timeout_seconds=self.config.runtime.git_timeout_seconds,
-                            cancel_check=git_cancel_check,
-                            progress_callback=report_git_progress,
-                        )
+                        uses_independent_clone = "workspace" in agent.write_scopes
+                        if uses_independent_clone:
+                            active_workspace = await asyncio.to_thread(
+                                ensure_isolated_clone,
+                                configured_repository.workspace,
+                                active_workspace,
+                                change_ref,
+                                change_ref=change_ref,
+                                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                                cancel_check=git_cancel_check,
+                                progress_callback=report_git_progress,
+                            )
+                        else:
+                            active_workspace = await asyncio.to_thread(
+                                ensure_isolated_worktree,
+                                configured_repository.workspace,
+                                active_workspace,
+                                change_ref,
+                                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                                cancel_check=git_cancel_check,
+                                progress_callback=report_git_progress,
+                            )
                         starting_head = original_starting_head or await asyncio.to_thread(
                             worktree_head,
                             active_workspace,
@@ -428,10 +437,17 @@ class AgentExecutor:
                             timeout_seconds=agent.timeout_seconds,
                         )
                     owned_workspace = True
+                    workspace_kind = "clone" if uses_independent_clone else "worktree"
                     workspace_mode = (
-                        "root-isolated" if task is None else "sub-agent-isolated"
+                        f"root-{workspace_kind}"
+                        if task is None
+                        else f"sub-agent-{workspace_kind}"
                     )
-                    workspace_reason = "本次 Agent 运行独享临时 worktree"
+                    workspace_reason = (
+                        "本次可写 Agent 运行独享本地 clone 与 Git 元数据"
+                        if uses_independent_clone
+                        else "本次只读 Agent 运行独享轻量 linked worktree"
+                    )
 
                 repository = configured_repository.model_copy(
                     update={"workspace": active_workspace},

@@ -58,7 +58,7 @@ teamwork-review-agents start
 3. 填写平台项目路径、SSH 地址或 HTTPS Git 地址。
 4. 填写本地基础仓库目录并启用仓库。目录不存在时，服务会在需要时自动克隆。
 
-平台连接负责扫描 API；仓库配置负责远端项目定位和本地 Git 基础目录，两者不能互相替代。Agent 不会直接在基础仓库中运行，每次根 Agent 都会创建独立临时 worktree。
+平台连接负责扫描 API；仓库配置负责远端项目定位和本地 Git 基础目录，两者不能互相替代。Agent 不会直接在基础仓库中运行；可写 Agent 创建独立临时 clone，只读 Agent 创建轻量 linked worktree。
 
 ## 3. 引用宿主机 Provider Token
 
