@@ -16,6 +16,20 @@
 - Codex CLI 运行时默认参数与 Agent 级独立覆盖。
 - FastAPI 常驻后台、配置热加载、React 管理界面和实时运行日志。
 
+## 架构与 Agent 触发流程
+
+系统的主流程是：周期性扫描 GitHub PR / GitLab MR，将远端状态变化转换为语义事件，再由 YAML 规则选择 Codex Agent；每次运行使用独立 Git worktree，并由 SQLite 统一保存快照、事件、锁、运行状态和日志。
+
+![Teamwork Review Agents 的当前架构与 Agent 流程](docs/assets/teamwork-review-agents-architecture.png)
+
+| Agent | 主要思路 | 触发时机 |
+| --- | --- | --- |
+| `general-reviewer` | 固定源/目标 SHA，以代码证据、CI 和平台门禁决定是否合并 | `change_request.opened` 或 `change_request.reopened` |
+| `incremental-doc-update-runner` | 只负责分支、流程、门禁与清理，不亲自修改文档 | `change_request.merged` |
+| `incremental-doc-updater` | 根据固定净差异和文档索引，执行最小必要文档更新 | Runner 通过 MCP `invoke_agent` 委托，不由内置规则直接触发 |
+
+内置规则默认全部关闭；只有管理员启用规则后，根 Agent 才会被自动触发。完整分层、运行链路和实现边界见 [`docs/architecture.md`](docs/architecture.md)。
+
 ## 快速开始
 
 ```bash
