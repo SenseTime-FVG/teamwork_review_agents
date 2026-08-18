@@ -7,10 +7,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -130,6 +132,86 @@ def _process_state(pid: int) -> str | None:
     return value[0] if value else None
 
 
+def _argument_value(arguments: list[str], *names: str) -> str | None:
+    """读取命令行中独立参数或等号形式参数的值。"""
+
+    for index, argument in enumerate(arguments):
+        if argument in names and index + 1 < len(arguments):
+            return arguments[index + 1]
+        for name in names:
+            prefix = f"{name}="
+            if argument.startswith(prefix):
+                return argument[len(prefix) :]
+    return None
+
+
+def _discover_managed_processes(config_path: str | Path) -> list[ProcessRecord]:
+    """在运行文件失效时按完整命令身份发现同一配置的托管进程。"""
+
+    resolved = resolve_config_path(config_path)
+    try:
+        result = subprocess.run(
+            ["ps", "-ww", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    records: list[ProcessRecord] = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*(\d+)\s+(.+)", line)
+        if match is None:
+            continue
+        pid = int(match.group(1))
+        if pid == os.getpid():
+            continue
+        try:
+            arguments = shlex.split(match.group(2))
+        except ValueError:
+            continue
+        module_positions = [
+            index
+            for index, argument in enumerate(arguments[:-2])
+            if argument == "-m"
+            and arguments[index + 1] == "teamwork_review_agents"
+            and arguments[index + 2] == "run"
+        ]
+        if not module_positions or "--managed-child" not in arguments:
+            continue
+        configured = _argument_value(arguments, "-c", "--config")
+        if configured is None:
+            continue
+        try:
+            candidate_path = resolve_config_path(configured)
+        except OSError:
+            continue
+        if candidate_path != resolved:
+            continue
+        started_at = _process_started_at(pid)
+        state = _process_state(pid)
+        if not started_at or not state or state.startswith("Z"):
+            continue
+        port_value = _argument_value(arguments, "--port")
+        try:
+            port = int(port_value) if port_value is not None else 8080
+        except ValueError:
+            continue
+        records.append(
+            ProcessRecord(
+                pid=pid,
+                config_path=str(resolved),
+                process_started_at=started_at,
+                host=_argument_value(arguments, "--host") or "127.0.0.1",
+                port=port,
+                detached=True,
+            )
+        )
+    return sorted(records, key=lambda record: record.pid)
+
+
 def _reap_child(pid: int) -> None:
     """当前进程恰好是父进程时回收已经退出的子进程。"""
 
@@ -184,22 +266,35 @@ def _lock_is_held(paths: RuntimePaths) -> bool:
         return False
 
 
-def running_process(config_path: str | Path) -> ProcessRecord | None:
-    """返回当前配置正在运行的服务记录，并清理失效 PID。"""
+def _running_processes(config_path: str | Path) -> list[ProcessRecord]:
+    """组合 PID 记录与系统进程表，返回当前配置的全部存活实例。"""
 
     resolved = resolve_config_path(config_path)
     paths = runtime_paths(resolved)
     record = _read_record(paths)
+    lock_held = _lock_is_held(paths)
+    discovered_records = _discover_managed_processes(resolved)
+    discovered_by_pid = {item.pid: item for item in discovered_records}
+    records: dict[int, ProcessRecord] = {}
     if (
         record
         and record.config_path == str(resolved)
         and _record_is_running(record)
-        and _lock_is_held(paths)
+        and (lock_held or record.pid in discovered_by_pid)
     ):
-        return record
-    if not _lock_is_held(paths):
+        records[record.pid] = record
+    for discovered in discovered_records:
+        records.setdefault(discovered.pid, discovered)
+    if not records and not lock_held:
         paths.pid_file.unlink(missing_ok=True)
-    return None
+    return sorted(records.values(), key=lambda item: item.pid)
+
+
+def running_process(config_path: str | Path) -> ProcessRecord | None:
+    """返回当前配置正在运行的一个服务记录，并兼容管理文件丢失。"""
+
+    records = _running_processes(config_path)
+    return records[0] if records else None
 
 
 class ServiceLease:
@@ -287,6 +382,25 @@ def _tail_log(path: Path, limit: int = 20) -> str:
     return "\n".join(lines[-limit:])
 
 
+def _health_process_id(host: str, port: int) -> int | None:
+    """读取健康接口实际响应进程的 PID，连接失败时返回空。"""
+
+    url = f"{management_url(host, port)}/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=0.5) as response:
+            if response.status != 200:
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def start_background(
     config_path: str | Path,
     *,
@@ -298,8 +412,24 @@ def start_background(
 
     resolved = resolve_config_path(config_path)
     paths = runtime_paths(resolved)
-    existing = running_process(resolved)
-    if existing:
+    existing_records = _running_processes(resolved)
+    if len(existing_records) > 1:
+        pids = ", ".join(str(record.pid) for record in existing_records)
+        return ProcessActionResult(
+            1,
+            f"检测到同一配置的多个后台服务进程：PID {pids}，请先执行 stop",
+        )
+    if existing_records:
+        existing = existing_records[0]
+        if _health_process_id(existing.host, existing.port) != existing.pid:
+            return ProcessActionResult(
+                1,
+                (
+                    f"检测到后台服务进程 PID {existing.pid}，但健康接口未由该进程响应；"
+                    "请执行 stop 或 restart 恢复"
+                ),
+                existing,
+            )
         return ProcessActionResult(
             0,
             (
@@ -339,20 +469,10 @@ def start_background(
         )
 
     deadline = time.monotonic() + startup_timeout_seconds
-    registered_at: float | None = None
     while time.monotonic() < deadline:
         return_code = process.poll()
-        record = running_process(resolved)
+        record = _read_record(paths)
         if return_code is not None:
-            if record and record.pid != process.pid:
-                return ProcessActionResult(
-                    0,
-                    (
-                        f"后台服务已在运行：PID {record.pid}，"
-                        f"{management_url(record.host, record.port)}"
-                    ),
-                    record,
-                )
             log_tail = _tail_log(paths.log_file)
             detail = f"\n{log_tail}" if log_tail else ""
             return ProcessActionResult(
@@ -362,31 +482,46 @@ def start_background(
                     f"日志：{paths.log_file}{detail}"
                 ),
             )
-        if record and record.pid == process.pid:
-            registered_at = registered_at or time.monotonic()
-            if time.monotonic() - registered_at >= 1:
-                return ProcessActionResult(
-                    0,
-                    (
-                        f"后台服务已启动：PID {record.pid}\n"
-                        f"管理界面：{management_url(record.host, record.port)}\n"
-                        f"后台日志：{paths.log_file}"
-                    ),
-                    record,
-                )
+        if (
+            record
+            and record.pid == process.pid
+            and _record_is_running(record)
+            and _health_process_id(host, port) == process.pid
+        ):
+            return ProcessActionResult(
+                0,
+                (
+                    f"后台服务已启动：PID {record.pid}\n"
+                    f"管理界面：{management_url(record.host, record.port)}\n"
+                    f"后台日志：{paths.log_file}"
+                ),
+                record,
+            )
         time.sleep(0.1)
 
     if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+    log_tail = _tail_log(paths.log_file)
+    detail = f"\n{log_tail}" if log_tail else ""
     return ProcessActionResult(
         1,
         (
             f"后台服务未在 {startup_timeout_seconds:g} 秒内完成启动，"
-            f"请查看日志：{paths.log_file}"
+            f"请查看日志：{paths.log_file}{detail}"
         ),
     )
 
@@ -396,42 +531,77 @@ def stop_managed_process(
     *,
     timeout_seconds: float = 30,
 ) -> ProcessActionResult:
-    """优雅停止服务，超时后再强制结束。"""
+    """优雅停止当前配置全部实例，超时后再强制结束。"""
 
     resolved = resolve_config_path(config_path)
     paths = runtime_paths(resolved)
-    record = running_process(resolved)
-    if not record:
+    records = _running_processes(resolved)
+    if not records:
         return ProcessActionResult(0, "服务当前未运行")
 
-    try:
-        os.kill(record.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        paths.pid_file.unlink(missing_ok=True)
-        return ProcessActionResult(0, "服务已经结束")
+    target_pids = {record.pid for record in records}
+    for record in records:
+        if not _record_is_running(record):
+            continue
+        try:
+            os.kill(record.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            return ProcessActionResult(
+                1,
+                f"无权结束服务进程 PID {record.pid}：{exc}",
+                record,
+            )
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not _record_is_running(record):
-            _reap_child(record.pid)
-            paths.pid_file.unlink(missing_ok=True)
-            return ProcessActionResult(0, f"服务已停止：PID {record.pid}", record)
+        if all(not _record_is_running(record) for record in records):
+            for record in records:
+                _reap_child(record.pid)
+            current = _read_record(paths)
+            if current and current.pid in target_pids:
+                paths.pid_file.unlink(missing_ok=True)
+            pids = ", ".join(str(record.pid) for record in records)
+            return ProcessActionResult(0, f"服务已停止：PID {pids}", records[0])
         time.sleep(0.1)
 
-    if _record_is_running(record):
-        if record.detached:
-            os.killpg(record.pid, signal.SIGKILL)
-        else:
-            os.kill(record.pid, signal.SIGKILL)
+    forced = [record for record in records if _record_is_running(record)]
+    for record in forced:
+        try:
+            if record.detached:
+                os.killpg(record.pid, signal.SIGKILL)
+            else:
+                os.kill(record.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            return ProcessActionResult(
+                1,
+                f"无权强制结束服务进程 PID {record.pid}：{exc}",
+                record,
+            )
     force_deadline = time.monotonic() + 3
-    while time.monotonic() < force_deadline and _record_is_running(record):
+    while time.monotonic() < force_deadline and any(
+        _record_is_running(record) for record in forced
+    ):
         time.sleep(0.1)
-    _reap_child(record.pid)
-    paths.pid_file.unlink(missing_ok=True)
-    if _record_is_running(record):
-        return ProcessActionResult(1, f"无法结束服务进程：PID {record.pid}", record)
+    for record in records:
+        _reap_child(record.pid)
+    current = _read_record(paths)
+    if current and current.pid in target_pids:
+        paths.pid_file.unlink(missing_ok=True)
+    remaining = [record for record in records if _record_is_running(record)]
+    if remaining:
+        pids = ", ".join(str(record.pid) for record in remaining)
+        return ProcessActionResult(
+            1,
+            f"无法结束服务进程：PID {pids}",
+            remaining[0],
+        )
+    pids = ", ".join(str(record.pid) for record in records)
     return ProcessActionResult(
         0,
-        f"服务未在 {timeout_seconds:g} 秒内完成收尾，已强制停止：PID {record.pid}",
-        record,
+        f"服务未在 {timeout_seconds:g} 秒内完成收尾，已强制停止：PID {pids}",
+        records[0],
     )

@@ -94,7 +94,7 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "version": app.version}
+        return {"status": "ok", "version": app.version, "pid": os.getpid()}
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:

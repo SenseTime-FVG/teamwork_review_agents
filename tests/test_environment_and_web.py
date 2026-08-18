@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import yaml
 from fastapi.testclient import TestClient
 
@@ -219,7 +221,9 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
     config_path = write_config(tmp_path)
     app = create_app(config_path, start_scheduler=False)
     with TestClient(app) as client:
-        assert client.get("/api/health").json()["status"] == "ok"
+        health = client.get("/api/health").json()
+        assert health["status"] == "ok"
+        assert health["pid"] == os.getpid()
         response = client.get("/api/config")
         assert response.status_code == 200
         document = response.json()["document"]
