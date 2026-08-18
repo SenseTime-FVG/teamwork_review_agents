@@ -194,6 +194,7 @@ teamwork-review-agents runs --limit 20
 | --- | --- |
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
 | [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
+| [`docs/preflight-ci.md`](docs/preflight-ci.md) | GitHub Preflight 的执行、幂等与安全边界 |
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
 | [`docs/architecture.md`](docs/architecture.md) | 架构、Agent 边界和数据流 |
 | [`docs/design.md`](docs/design.md) | 精确实现语义 |
