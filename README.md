@@ -31,6 +31,43 @@ teamwork-review-agents start
 
 首次启动时，管理 UI 中的 GitHub / GitLab 连接、仓库、环境变量和 Skill 都是空的；Agent 页面会显示内置 Agent，触发规则页面会显示已关闭的内置模板。运行时配置显示默认继承状态，但不会预先写入某个模型。访问 [http://127.0.0.1:8080](http://127.0.0.1:8080) 后先配置平台连接和仓库，检查 Agent 权限与 Prompt，再按需启用规则。
 
+### 首次配置流程
+
+首次使用时，建议在一次编辑中依次完成平台连接、仓库、Provider Token 和触发规则配置，最后统一保存：
+
+```mermaid
+flowchart TD
+    A["启动服务并打开管理 UI"] --> B["点击“编辑配置”"]
+    B --> C["仓库：添加 GitHub / GitLab 平台连接"]
+    C --> D["填写 API 地址和 Token 变量名"]
+    D --> E["添加并启用需要扫描的仓库"]
+    E --> F["全局环境：配置对应的 Provider Token"]
+    F --> G{"使用的平台"}
+    G -->|GitHub| H["配置 GITHUB_TOKEN"]
+    G -->|GitLab| I["配置 GITLAB_TOKEN"]
+    H --> J["检查 Agent 的 Prompt、权限和 Skill"]
+    I --> J
+    J --> K["触发规则：启用需要的规则"]
+    K --> L["保存配置"]
+    L --> M["立即扫描或等待定时扫描"]
+    M --> N["在运行概览和日志中查看结果"]
+```
+
+具体操作顺序如下：
+
+1. 打开管理 UI，点击右上角“编辑配置”。
+2. 进入“仓库”，点击“添加平台连接”：
+   - GitHub.com 的 API 地址保持 `https://api.github.com`，Token 变量名通常使用 `GITHUB_TOKEN`。
+   - GitLab.com 的 API 地址保持 `https://gitlab.com/api/v4`，Token 变量名通常使用 `GITLAB_TOKEN`；自建 GitLab 应填写该实例实际的 `/api/v4` 地址。
+3. 在同一页面点击“添加仓库”，选择刚创建的平台连接，填写远端项目路径或 SSH/HTTPS Git 地址、本地基础仓库目录，并打开“启用”。未启用的仓库不会参与扫描。
+4. 进入“全局环境”，添加实际使用平台对应的变量：GitHub 配置 `GITHUB_TOKEN`，GitLab 配置 `GITLAB_TOKEN`。只使用一个平台时不需要配置另一个平台的 Token。
+5. Provider Token 推荐选择“宿主机环境”，并让它读取同名宿主机变量，避免真实 Token 写入 `config.yaml`；也可以选择“固定值”。系统会自动把与平台连接 `token_env` 同名的变量保护为 Provider 凭据，不允许进入 Prompt 或 Codex CLI 进程。
+6. 按需检查“Agent”页面中的 Prompt、Sandbox、写操作声明、Skill 和允许调用的 sub-agent。
+7. 进入“触发规则”，打开需要的规则并确认其事件、仓库和 Agent。内置规则默认全部关闭，不主动启用就只会记录 MR/PR 和事件，不会运行 Agent。
+8. 点击右上角“保存配置”。保存成功后，可以在“运行概览”点击“立即扫描”，或者等待下一次定时扫描，再到“运行与日志”查看结果。
+
+`GITHUB_TOKEN` 和 `GITLAB_TOKEN` 是界面为两类平台提供的默认变量名，不是不可修改的硬编码。自定义变量名时，平台连接中的 `token_env` 与“全局环境”中的变量名必须完全一致。
+
 ## 运行模式
 
 ### `start`：在后台启动
@@ -192,6 +229,53 @@ Agent 的 Prompt 支持两种来源：
 - `prompts/增量文档更新.md`
 
 其他 Prompt 仍保持忽略。内置 Agent 会随示例配置显示，但内置规则默认关闭；只有管理员主动启用规则后，扫描事件才会启动对应 Agent。
+
+### 目标仓库文件与目录准备
+
+内置 Agent 不要求业务仓库为了启动扫描而预先创建固定文件或目录。不过，启用内置审核或文档更新规则前，应了解下面这些可选路径；一旦为目录变量配置了非空值，对应目录就必须真实存在于目标仓库内并且可读，否则 Agent 会把它视为配置错误，而不会静默回退到自动发现。
+
+| 使用方 | 配置或约定 | 是否需要预先创建 | 行为 |
+| --- | --- | --- | --- |
+| `general-reviewer` | `REVIEW_DESIGN_DOC_DIR` | 可选 | 目标仓库内的设计、架构、ADR 或 Spec 文档目录，例如 `docs/design/`。留空时自动发现；没有找到也不阻塞审核。配置非空值时，目录必须存在、可读且位于当前仓库内。 |
+| `general-reviewer` | `REVIEW_CHANGE_HISTORY_DIR` | 可选 | 目标仓库内的变更历史或归档目录，例如 `docs/changes/`。留空时自动发现；没有找到也不阻塞审核。配置非空值时适用与设计文档目录相同的校验。 |
+| `general-reviewer` | `REVIEW_SKILLS` | 不属于仓库路径 | 可选的 Teamwork Skill ID 列表，例如 `security-review,python-guidelines`。这些 Skill 需要先在本服务的“SKILL”页面配置并由当前 Agent 装载，不要求目标仓库创建同名目录。 |
+| `incremental-doc-updater` | `DOC_UPDATE_INDEX_PATH` | 无需预先创建 | 文档索引文件路径，默认是 `docs/README.md`。文件或安全的父目录不存在时，Agent 会创建并把它纳入文档更新提交；指定其他路径后不会再回退到默认路径。 |
+| `incremental-doc-updater` | `DOC_UPDATE_EXCLUDE_DIRECTORIES` | 无需创建 | 可选的排除目录列表或说明，只用于跳过目标仓库中已经存在的目录。留空时使用内置排除规则。 |
+| `incremental-doc-updater` | `.tmp/` 或 `tmp/` | 无需创建 | 可选的任务临时目录。只有路径位于仓库内且已被 Git 实际忽略时才会使用；否则自动改用系统临时目录。 |
+| 所有内置 Agent | `AGENTS.md`、`CLAUDE.md`、`CONTRIBUTING*` | 无需专门创建 | 仓库中存在这些约束或贡献说明时，Agent 会按适用范围读取；不存在不影响运行。 |
+
+这些路径通常按仓库配置，推荐使用相对于目标仓库根目录的相对路径。内置 Prompt 是通过 Codex CLI 进程读取这些变量，因此变量需要开启“传给进程”；不需要把路径值直接渲染进 Prompt。例如：
+
+```yaml
+repositories:
+  - id: example
+    provider: github-main
+    project: owner/repository
+    workspace: ./workspaces/example
+    environment:
+      REVIEW_DESIGN_DOC_DIR:
+        value: docs/design
+        expose_to_prompt: false
+        expose_to_process: true
+      REVIEW_CHANGE_HISTORY_DIR:
+        value: docs/changes
+        expose_to_prompt: false
+        expose_to_process: true
+      REVIEW_SKILLS:
+        value: security-review,python-guidelines
+        expose_to_prompt: false
+        expose_to_process: true
+      DOC_UPDATE_INDEX_PATH:
+        value: docs/README.md
+        expose_to_prompt: false
+        expose_to_process: true
+      DOC_UPDATE_EXCLUDE_DIRECTORIES:
+        value: vendor,generated
+        expose_to_prompt: false
+        expose_to_process: true
+```
+
+如果不需要固定目录或项目专属 Skill，可以不添加相应变量。尤其是 `REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR`：留空表示自动发现，不应为了填写配置而创建空目录。启用增量文档更新规则时还应注意，默认索引 `docs/README.md` 不存在会触发文档索引的全量初始化，并由 Agent 自动创建该文件。
 
 ## Skill 配置与装载
 
