@@ -147,6 +147,7 @@ class RuntimeConfig(BaseModel):
     expected_codex_version: str | None = None
     inherit_user_mcp_servers: bool = False
     allowed_user_mcp_servers: list[str] = Field(default_factory=list)
+    git_timeout_seconds: PositiveInt = 600
     agent_idle_timeout_seconds: PositiveInt = 300
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15

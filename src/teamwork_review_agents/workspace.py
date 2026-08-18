@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
@@ -17,6 +21,14 @@ from .models import ChangeRequestSnapshot
 
 class WorkspaceError(RuntimeError):
     """表示本地 Git 工作目录无法安全准备。"""
+
+
+class WorkspaceCancelled(WorkspaceError):
+    """表示管理员在 Git 工作区准备期间取消了运行。"""
+
+
+GitCancelCheck = Callable[[], bool]
+GitProgressCallback = Callable[[str, str, int], None]
 
 
 @dataclass(frozen=True)
@@ -46,6 +58,12 @@ def repository_clone_url(
     return f"git@{host}:{repository.project}.git"
 
 
+def repository_git_lock_key(repository: RepositoryConfig) -> str:
+    """返回基础仓库 fetch 与 worktree 管理共用的资源锁键。"""
+
+    return f"git_repository:{repository.workspace.resolve()}"
+
+
 def change_request_ref(provider: ProviderConfig, number: int) -> tuple[str, str]:
     """返回平台变更请求源引用与本地稳定引用。"""
 
@@ -60,26 +78,90 @@ def change_request_ref(provider: ProviderConfig, number: int) -> tuple[str, str]
 def _run_git(
     arguments: list[str],
     *,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 600,
     check: bool = True,
+    operation: str = "Git 操作",
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """以参数数组运行 Git，并避免将可能包含凭据的输出写入异常。"""
+    """在独立进程组运行 Git，并支持安全进度、超时与取消。"""
 
     git_binary = shutil.which("git")
     if not git_binary:
         raise WorkspaceError("系统中没有找到 git 命令")
+    started_at = time.monotonic()
+
+    def report(state: str) -> None:
+        """回调只携带操作名称与耗时，禁止泄露完整 Git 参数。"""
+
+        if progress_callback is None:
+            return
+        with suppress(Exception):
+            progress_callback(operation, state, int(time.monotonic() - started_at))
+
+    def terminate(process: subprocess.Popen[str]) -> None:
+        """终止 Git 进程组，避免 ssh 与 index-pack 成为遗留进程。"""
+
+        if process.poll() is not None:
+            return
+        with suppress(ProcessLookupError):
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            with suppress(subprocess.TimeoutExpired):
+                process.communicate(timeout=2)
+
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [git_binary, *arguments],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
+            start_new_session=os.name != "nt",
         )
-    except subprocess.TimeoutExpired as exc:
-        raise WorkspaceError("Git 操作超时，请检查网络和 SSH 认证") from exc
+    except OSError as exc:
+        raise WorkspaceError("无法启动 Git 命令") from exc
+    report("started")
+    last_progress_at = 0
+    while True:
+        if cancel_check is not None and cancel_check():
+            terminate(process)
+            report("cancelled")
+            raise WorkspaceCancelled("运行已在 Git 工作区准备期间取消")
+        elapsed = time.monotonic() - started_at
+        if elapsed >= timeout_seconds:
+            terminate(process)
+            report("timed_out")
+            raise WorkspaceError(
+                f"Git 操作超过 {timeout_seconds} 秒，请检查网络和 SSH 认证"
+            )
+        try:
+            stdout, stderr = process.communicate(
+                timeout=min(0.25, max(0.01, timeout_seconds - elapsed))
+            )
+            break
+        except subprocess.TimeoutExpired:
+            elapsed_seconds = int(time.monotonic() - started_at)
+            if elapsed_seconds - last_progress_at >= 10:
+                last_progress_at = elapsed_seconds
+                report("progress")
+    result = subprocess.CompletedProcess(
+        [git_binary, *arguments],
+        process.returncode,
+        stdout,
+        stderr,
+    )
+    report("completed" if result.returncode == 0 else "failed")
     if check and result.returncode != 0:
         raise WorkspaceError("Git 操作失败，请检查仓库地址、网络和 SSH/HTTPS 权限")
     return result
@@ -88,6 +170,10 @@ def _run_git(
 def ensure_repository_workspace(
     provider: ProviderConfig,
     repository: RepositoryConfig,
+    *,
+    timeout_seconds: int = 600,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
 ) -> Path:
     """目录不存在时原子克隆，存在时只校验而不覆盖用户文件。"""
 
@@ -100,7 +186,13 @@ def ensure_repository_workspace(
             prefix=f".{workspace.name}.clone-",
         ) as temporary_root:
             checkout = Path(temporary_root) / "repository"
-            _run_git(["clone", "--origin", "origin", "--", clone_url, str(checkout)])
+            _run_git(
+                ["clone", "--origin", "origin", "--", clone_url, str(checkout)],
+                timeout_seconds=timeout_seconds,
+                operation="克隆基础仓库",
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
             if workspace.exists():
                 # 另一进程可能已经完成克隆，保留先完成的工作目录。
                 pass
@@ -111,18 +203,75 @@ def ensure_repository_workspace(
     result = _run_git(
         ["-C", str(workspace), "rev-parse", "--is-inside-work-tree"],
         check=False,
+        timeout_seconds=timeout_seconds,
+        operation="校验基础仓库",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
     )
     if result.returncode != 0 or result.stdout.strip() != "true":
         raise WorkspaceError(f"本地工作目录不是 Git 仓库：{workspace}")
     return workspace
 
 
-def _git_common_directory(workspace: Path) -> Path:
+def inspect_repository_workspace(
+    workspace: Path,
+    *,
+    timeout_seconds: int = 10,
+) -> tuple[bool, str | None]:
+    """只读检查路径是否为完整可用的 Git 工作目录。"""
+
+    target = workspace.expanduser().resolve()
+    if not target.exists():
+        return False, None
+    if not target.is_dir():
+        return False, "基础仓库路径不是目录"
+    result = _run_git(
+        ["-C", str(target), "rev-parse", "--is-inside-work-tree"],
+        check=False,
+        timeout_seconds=timeout_seconds,
+        operation="检查基础仓库",
+    )
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        return False, "基础仓库目录不是有效的 Git 仓库"
+    return True, None
+
+
+def initialize_repository_workspace(
+    provider: ProviderConfig,
+    repository: RepositoryConfig,
+    *,
+    timeout_seconds: int = 600,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
+) -> tuple[Path, str]:
+    """初始化缺失的基础仓库，或增量更新已经存在的仓库。"""
+
+    existed = repository.workspace.expanduser().resolve().exists()
+    workspace = ensure_repository_workspace(
+        provider,
+        repository,
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    if existed:
+        _run_git(
+            ["-C", str(workspace), "fetch", "--prune", "origin"],
+            timeout_seconds=timeout_seconds,
+            operation="更新基础仓库",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+    return workspace, "update" if existed else "initialize"
+
+
+def _git_common_directory(workspace: Path, *, timeout_seconds: int = 600) -> Path:
     """返回工作树所属仓库的公共 Git 目录。"""
 
     result = _run_git(
         ["-C", str(workspace), "rev-parse", "--git-common-dir"],
         check=False,
+        timeout_seconds=timeout_seconds,
     )
     if result.returncode != 0:
         raise WorkspaceError(f"本地工作目录不是 Git 工作树：{workspace}")
@@ -132,14 +281,22 @@ def _git_common_directory(workspace: Path) -> Path:
     return common_directory.resolve()
 
 
-def validate_linked_workspace(source_workspace: Path, workspace: Path) -> Path:
+def validate_linked_workspace(
+    source_workspace: Path,
+    workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+) -> Path:
     """校验候选工作树与主工作目录属于同一个 Git 仓库。"""
 
     source = source_workspace.resolve()
     candidate = workspace.resolve()
     if not candidate.is_dir():
         raise WorkspaceError(f"继承的工作目录不存在：{candidate}")
-    if _git_common_directory(source) != _git_common_directory(candidate):
+    if _git_common_directory(
+        source,
+        timeout_seconds=timeout_seconds,
+    ) != _git_common_directory(candidate, timeout_seconds=timeout_seconds):
         raise WorkspaceError("继承的工作目录与配置仓库不属于同一个 Git 仓库")
     return candidate
 
@@ -148,13 +305,21 @@ def ensure_isolated_worktree(
     source_workspace: Path,
     target_workspace: Path,
     revision: str,
+    *,
+    timeout_seconds: int = 600,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
 ) -> Path:
     """为一次 Agent 运行创建或复用独立 detached Git worktree。"""
 
     source = source_workspace.resolve()
     target = target_workspace.resolve()
     if target.exists():
-        return validate_linked_workspace(source, target)
+        return validate_linked_workspace(
+            source,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     result = _run_git(
         [
@@ -167,13 +332,25 @@ def ensure_isolated_worktree(
             revision,
         ],
         check=False,
+        timeout_seconds=timeout_seconds,
+        operation="创建隔离工作区",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
     )
     if result.returncode != 0:
         # 相同幂等任务并发准备时，另一进程可能已经先创建成功。
         if target.exists():
-            return validate_linked_workspace(source, target)
+            return validate_linked_workspace(
+                source,
+                target,
+                timeout_seconds=timeout_seconds,
+            )
         raise WorkspaceError("无法创建 Agent 独立 Git worktree")
-    return validate_linked_workspace(source, target)
+    return validate_linked_workspace(
+        source,
+        target,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def retained_marker_path(workspace: Path) -> Path:
@@ -195,12 +372,13 @@ def worktree_starting_head(workspace: Path) -> str | None:
     return str(value) if value else None
 
 
-def worktree_head(workspace: Path) -> str:
+def worktree_head(workspace: Path, *, timeout_seconds: int = 600) -> str:
     """返回工作树当前 HEAD 提交。"""
 
     result = _run_git(
         ["-C", str(workspace.resolve()), "rev-parse", "HEAD"],
         check=False,
+        timeout_seconds=timeout_seconds,
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise WorkspaceError("无法读取临时 worktree 的 HEAD")
@@ -269,19 +447,33 @@ def _retain_worktree(
     return WorkspaceCleanupResult(status="retained", reason=reason)
 
 
-def _remove_worktree(source_workspace: Path, workspace: Path) -> None:
+def _remove_worktree(
+    source_workspace: Path,
+    workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+) -> None:
     """通过 Git 删除临时 worktree，并同步清除其保留标记。"""
 
     source = source_workspace.resolve()
-    target = validate_linked_workspace(source, workspace)
+    target = validate_linked_workspace(
+        source,
+        workspace,
+        timeout_seconds=timeout_seconds,
+    )
     result = _run_git(
         ["-C", str(source), "worktree", "remove", "--force", str(target)],
         check=False,
+        timeout_seconds=timeout_seconds,
     )
     if result.returncode != 0:
         raise WorkspaceError("Git 无法删除临时 worktree")
     clear_retained_marker(target)
-    _run_git(["-C", str(source), "worktree", "prune"], check=False)
+    _run_git(
+        ["-C", str(source), "worktree", "prune"],
+        check=False,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def cleanup_run_worktree(
@@ -291,6 +483,7 @@ def cleanup_run_worktree(
     run_status: str,
     starting_head: str,
     retention_days: int,
+    git_timeout_seconds: int = 600,
 ) -> WorkspaceCleanupResult:
     """仅在没有丢失本地工作的风险时删除本次运行 worktree。"""
 
@@ -305,6 +498,7 @@ def cleanup_run_worktree(
     status = _run_git(
         ["-C", str(target), "status", "--porcelain", "--untracked-files=all"],
         check=False,
+        timeout_seconds=git_timeout_seconds,
     )
     if status.returncode != 0:
         return _retain_worktree(
@@ -322,6 +516,7 @@ def cleanup_run_worktree(
     head_result = _run_git(
         ["-C", str(target), "rev-parse", "HEAD"],
         check=False,
+        timeout_seconds=git_timeout_seconds,
     )
     if head_result.returncode != 0:
         return _retain_worktree(
@@ -332,7 +527,11 @@ def cleanup_run_worktree(
     current_head = head_result.stdout.strip()
     if current_head != starting_head:
         source = source_workspace.resolve()
-        _run_git(["-C", str(source), "fetch", "--prune", "origin"], check=False)
+        _run_git(
+            ["-C", str(source), "fetch", "--prune", "origin"],
+            check=False,
+            timeout_seconds=git_timeout_seconds,
+        )
         remote_refs = _run_git(
             [
                 "-C",
@@ -344,6 +543,7 @@ def cleanup_run_worktree(
                 "refs/remotes/origin",
             ],
             check=False,
+            timeout_seconds=git_timeout_seconds,
         )
         if remote_refs.returncode != 0 or not remote_refs.stdout.strip():
             return _retain_worktree(
@@ -353,7 +553,11 @@ def cleanup_run_worktree(
             )
 
     try:
-        _remove_worktree(source_workspace, target)
+        _remove_worktree(
+            source_workspace,
+            target,
+            timeout_seconds=git_timeout_seconds,
+        )
     except Exception as exc:
         return _retain_worktree(
             target,
@@ -373,6 +577,7 @@ def cleanup_expired_worktrees(
     worktrees_root: Path,
     *,
     now: float | None = None,
+    git_timeout_seconds: int = 600,
 ) -> list[Path]:
     """强制清理由保留期限控制且已经过期的临时 worktree。"""
 
@@ -394,7 +599,11 @@ def cleanup_expired_worktrees(
             marker.unlink(missing_ok=True)
             continue
         try:
-            _remove_worktree(source_workspace, target)
+            _remove_worktree(
+                source_workspace,
+                target,
+                timeout_seconds=git_timeout_seconds,
+            )
         except Exception:
             continue
         removed.append(target)
@@ -405,11 +614,27 @@ def prepare_change_request_workspace(
     provider: ProviderConfig,
     repository: RepositoryConfig,
     snapshot: ChangeRequestSnapshot,
+    *,
+    timeout_seconds: int = 600,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
 ) -> str:
     """更新远端引用并准备 MR/PR head，但不切换用户当前分支。"""
 
-    workspace = ensure_repository_workspace(provider, repository)
-    _run_git(["-C", str(workspace), "fetch", "--prune", "origin"])
+    workspace = ensure_repository_workspace(
+        provider,
+        repository,
+        timeout_seconds=timeout_seconds,
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    _run_git(
+        ["-C", str(workspace), "fetch", "--prune", "origin"],
+        timeout_seconds=timeout_seconds,
+        operation="更新远端引用",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
     source_ref, destination_ref = change_request_ref(provider, snapshot.number)
     fetch_result = _run_git(
         [
@@ -420,11 +645,19 @@ def prepare_change_request_workspace(
             f"+{source_ref}:{destination_ref}",
         ],
         check=False,
+        timeout_seconds=timeout_seconds,
+        operation="获取变更请求引用",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
     )
     if fetch_result.returncode != 0:
         existing_commit = _run_git(
             ["-C", str(workspace), "cat-file", "-e", f"{snapshot.head_sha}^{{commit}}"],
             check=False,
+            timeout_seconds=timeout_seconds,
+            operation="校验变更请求提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
         if existing_commit.returncode != 0:
             raise WorkspaceError(

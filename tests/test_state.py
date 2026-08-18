@@ -253,6 +253,9 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     )
     assert reservation is not None
     assert store.agent_run_status("dispatch-key") == "queued"
+    assert store.mark_agent_run_preparing(reservation.run_id)
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.closed"]["agent_preparing_count"] == 1
     store.mark_agent_run_running(reservation.run_id)
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["agent_running_count"] == 1
@@ -355,6 +358,34 @@ def test_cancel_request_persists_and_cascades_to_descendants(tmp_path) -> None:
     assert child_detail["status"] == "cancelled"
     assert child_detail["finished_at"] is not None
     assert not store.mark_agent_run_running(child.run_id)
+
+
+def test_cancel_request_marks_preparing_run_for_cooperative_stop(tmp_path) -> None:
+    """准备工作区的运行应保留状态，并向 Git 工作线程发出取消请求。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    reservation = store.begin_agent_run(
+        proposed_run_id="run-preparing",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="cancel-preparing",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:7",
+        prompt="",
+        max_attempts=1,
+    )
+    assert reservation is not None
+    assert store.mark_agent_run_preparing(reservation.run_id)
+
+    assert store.request_cancel_run(reservation.run_id) == [reservation.run_id]
+    detail = store.get_run(reservation.run_id)
+    assert detail is not None
+    assert detail["status"] == "preparing"
+    assert detail["cancel_requested"] == 1
+    assert not store.mark_agent_run_running(reservation.run_id)
 
 
 def test_activity_cursor_is_saved_with_snapshot_and_events(

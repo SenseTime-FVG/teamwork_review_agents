@@ -227,7 +227,7 @@ class StateStore:
                         ELSE workspace_reason
                     END,
                     finished_at = ?
-                WHERE status IN ('queued', 'running')
+                WHERE status IN ('queued', 'preparing', 'running')
                 """,
                 (now,),
             )
@@ -766,6 +766,21 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = 'running'
+                WHERE run_id = ? AND status IN ('queued', 'preparing')
+                    AND cancel_requested = 0
+                """,
+                (run_id,),
+            )
+        return cursor.rowcount == 1
+
+    def mark_agent_run_preparing(self, run_id: str) -> bool:
+        """取得仓库管理锁后把 Agent 从排队切换为准备工作区。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET status = 'preparing'
                 WHERE run_id = ? AND status = 'queued' AND cancel_requested = 0
                 """,
                 (run_id,),
@@ -813,7 +828,7 @@ class StateStore:
             active_ids = [
                 str(row["run_id"])
                 for row in rows
-                if row["status"] in {"queued", "running"}
+                if row["status"] in {"queued", "preparing", "running"}
             ]
             if active_ids:
                 placeholders = ", ".join("?" for _ in active_ids)
@@ -1232,6 +1247,8 @@ class StateStore:
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
+                       COALESCE(dispatch_stats.agent_preparing_count, 0)
+                           AS agent_preparing_count,
                        COALESCE(dispatch_stats.agent_running_count, 0)
                            AS agent_running_count,
                        COALESCE(dispatch_stats.agent_completed_count, 0)
@@ -1252,6 +1269,8 @@ class StateStore:
                                    THEN 1 ELSE 0
                                END
                            ) AS agent_queued_count,
+                           SUM(CASE WHEN run.status = 'preparing' THEN 1 ELSE 0 END)
+                               AS agent_preparing_count,
                            SUM(CASE WHEN run.status = 'running' THEN 1 ELSE 0 END)
                                AS agent_running_count,
                            SUM(CASE WHEN run.status = 'completed' THEN 1 ELSE 0 END)

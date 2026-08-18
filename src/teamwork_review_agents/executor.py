@@ -21,7 +21,9 @@ from .workspace import (
     ensure_isolated_worktree,
     mark_active_worktree,
     prepare_change_request_workspace,
+    repository_git_lock_key,
     validate_linked_workspace,
+    WorkspaceCancelled,
     worktree_head,
     worktree_starting_head,
 )
@@ -107,7 +109,7 @@ class AgentExecutor:
     def git_admin_lock_key(self, repository: RepositoryConfig) -> str:
         """返回基础仓库 fetch 与 worktree 管理使用的短时锁。"""
 
-        return f"git_repository:{repository.workspace.resolve()}"
+        return repository_git_lock_key(repository)
 
     def build_prompt(
         self,
@@ -231,7 +233,7 @@ class AgentExecutor:
                 self.store.agent_run_status,
                 idempotency_key,
             )
-            if status in {"completed", "queued", "running"}:
+            if status in {"completed", "queued", "preparing", "running"}:
                 return None
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
@@ -278,6 +280,7 @@ class AgentExecutor:
                         validate_linked_workspace,
                         configured_repository.workspace,
                         parent_workspace,
+                        timeout_seconds=self.config.runtime.git_timeout_seconds,
                     )
                     change_ref = change_request_ref(provider, event.number)[1]
                     workspace_mode = "inherited"
@@ -295,16 +298,54 @@ class AgentExecutor:
                         timeout_seconds=self.config.runtime.lock_timeout_seconds,
                     )
                     async with git_admin_lease:
+                        preparing = await asyncio.to_thread(
+                            self.store.mark_agent_run_preparing,
+                            reservation.run_id,
+                        )
+                        if not preparing:
+                            raise WorkspaceCancelled(
+                                "运行在 Git 工作区准备前被管理员取消"
+                            )
+                        event_loop = asyncio.get_running_loop()
+
+                        def report_git_progress(
+                            operation: str,
+                            state: str,
+                            elapsed_seconds: int,
+                        ) -> None:
+                            """从 Git 工作线程向运行日志提交脱敏阶段进度。"""
+
+                            asyncio.run_coroutine_threadsafe(
+                                persist_log(
+                                    "system",
+                                    f"workspace.git.{state}",
+                                    {
+                                        "operation": operation,
+                                        "elapsed_seconds": elapsed_seconds,
+                                    },
+                                ),
+                                event_loop,
+                            )
+
+                        git_cancel_check = lambda: (
+                            self.store.agent_run_cancel_requested(
+                                reservation.run_id
+                            )
+                        )
                         change_ref = await asyncio.to_thread(
                             prepare_change_request_workspace,
                             provider,
                             configured_repository,
                             event.current_snapshot,
+                            timeout_seconds=self.config.runtime.git_timeout_seconds,
+                            cancel_check=git_cancel_check,
+                            progress_callback=report_git_progress,
                         )
                         await asyncio.to_thread(
                             cleanup_expired_worktrees,
                             configured_repository.workspace,
                             active_workspace.parent,
+                            git_timeout_seconds=self.config.runtime.git_timeout_seconds,
                         )
                         original_starting_head = await asyncio.to_thread(
                             worktree_starting_head,
@@ -315,10 +356,14 @@ class AgentExecutor:
                             configured_repository.workspace,
                             active_workspace,
                             change_ref,
+                            timeout_seconds=self.config.runtime.git_timeout_seconds,
+                            cancel_check=git_cancel_check,
+                            progress_callback=report_git_progress,
                         )
                         starting_head = original_starting_head or await asyncio.to_thread(
                             worktree_head,
                             active_workspace,
+                            timeout_seconds=self.config.runtime.git_timeout_seconds,
                         )
                         await asyncio.to_thread(
                             mark_active_worktree,
@@ -436,14 +481,31 @@ class AgentExecutor:
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
-        except Exception as exc:
-            error = redactor.text(str(exc))
+        except WorkspaceCancelled as exc:
             result = AgentResult(
                 run_id=reservation.run_id,
                 root_run_id=reservation.root_run_id,
                 parent_run_id=reservation.parent_run_id,
                 agent_name=agent_name,
-                status="failed",
+                status="cancelled",
+                error=redactor.text(str(exc)),
+            )
+        except Exception as exc:
+            cancelled = await asyncio.to_thread(
+                self.store.agent_run_cancel_requested,
+                reservation.run_id,
+            )
+            error = (
+                "运行已由管理员取消"
+                if cancelled
+                else redactor.text(str(exc))
+            )
+            result = AgentResult(
+                run_id=reservation.run_id,
+                root_run_id=reservation.root_run_id,
+                parent_run_id=reservation.parent_run_id,
+                agent_name=agent_name,
+                status="cancelled" if cancelled else "failed",
                 error=error,
             )
 
@@ -464,6 +526,7 @@ class AgentExecutor:
                         run_status=result.status,
                         starting_head=starting_head,
                         retention_days=self.config.runtime.worktree_retention_days,
+                        git_timeout_seconds=self.config.runtime.git_timeout_seconds,
                     )
                 await asyncio.to_thread(
                     self.store.update_agent_run_workspace,

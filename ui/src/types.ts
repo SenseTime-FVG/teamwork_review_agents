@@ -18,6 +18,22 @@ export type Repository = {
   environment?: EnvironmentMap;
 };
 
+export type RepositoryWorkspaceStatus = {
+  repository_id: string;
+  workspace: string;
+  enabled: boolean;
+  ready: boolean;
+  status: "uninitialized" | "invalid" | "ready" | "waiting" | "initializing" | "updating" | "failed" | "cancelled";
+  operation?: "initialize" | "update" | null;
+  phase: string;
+  elapsed_seconds: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  size_bytes?: number | null;
+  error?: string | null;
+  cancel_requested: boolean;
+};
+
 export type Agent = {
   prompt_file?: string;
   prompt?: string;
@@ -59,6 +75,7 @@ export type RuntimeConfig = Record<string, unknown> & {
   expected_codex_version?: string;
   inherit_user_mcp_servers?: boolean;
   allowed_user_mcp_servers?: string[];
+  git_timeout_seconds?: number;
   agent_idle_timeout_seconds?: number;
   codex?: CodexRuntimeConfig;
 };
@@ -276,6 +293,7 @@ export type EventRecord = {
   error?: string | null;
   trigger_count: number;
   agent_queued_count: number;
+  agent_preparing_count: number;
   agent_running_count: number;
   agent_completed_count: number;
   agent_failed_count: number;

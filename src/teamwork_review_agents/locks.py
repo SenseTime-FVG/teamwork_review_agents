@@ -6,12 +6,17 @@ import asyncio
 import time
 from contextlib import suppress
 from types import TracebackType
+from typing import Callable
 
 from .state import StateStore
 
 
 class LockTimeoutError(TimeoutError):
     """在限定时间内无法取得全部写资源。"""
+
+
+class LockCancelledError(RuntimeError):
+    """表示资源锁等待被调用方主动取消。"""
 
 
 class ResourceLease:
@@ -25,12 +30,14 @@ class ResourceLease:
         *,
         ttl_seconds: int,
         timeout_seconds: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.resource_keys = sorted(set(resource_keys))
         self.owner = owner
         self.ttl_seconds = ttl_seconds
         self.timeout_seconds = timeout_seconds
+        self.cancel_check = cancel_check
         self.lost = False
         self._heartbeat_task: asyncio.Task[None] | None = None
 
@@ -39,6 +46,8 @@ class ResourceLease:
             return self
         deadline = time.monotonic() + self.timeout_seconds
         while True:
+            if self.cancel_check is not None and self.cancel_check():
+                raise LockCancelledError("等待资源锁的操作已取消")
             acquired = await asyncio.to_thread(
                 self.store.acquire_locks,
                 self.resource_keys,

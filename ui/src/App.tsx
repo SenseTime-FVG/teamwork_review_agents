@@ -21,6 +21,7 @@ import type {
   EnvironmentVariable,
   EventRecord,
   Repository,
+  RepositoryWorkspaceStatus,
   Rule,
   RunDetail,
   RunLog,
@@ -37,6 +38,20 @@ type OverviewFilter = {
   repositoryId: string;
   status: string;
   limit: OverviewLimit;
+};
+
+type OverviewConfirmation = {
+  kind: "discovered" | "latest";
+  item: ChangeRequestRecord;
+  eyebrow: string;
+  title: string;
+  description: string;
+  details: Array<{ label: string; value: string; mono?: boolean }>;
+  impactTitle: string;
+  impact: string;
+  impactTone: "attention" | "quiet";
+  safetyNote: string;
+  confirmLabel: string;
 };
 
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
@@ -115,6 +130,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       codex_binary: "codex",
       inherit_user_mcp_servers: false,
       allowed_user_mcp_servers: [],
+      git_timeout_seconds: 600,
       agent_idle_timeout_seconds: 300,
       ...runtimeInput,
       codex: {
@@ -166,6 +182,7 @@ function shortRevision(revision?: string): string {
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     queued: "排队中",
+    preparing: "准备工作区",
     running: "执行中",
     completed: "已完成",
     failed: "失败",
@@ -793,6 +810,102 @@ function OverviewListControls(props: {
   );
 }
 
+function OverviewConfirmationDialog(props: {
+  model: OverviewConfirmation | null;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { model, busy, onCancel } = props;
+
+  useEffect(() => {
+    if (!model) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [busy, model, onCancel]);
+
+  if (!model) return null;
+  return (
+    <div className="overview-confirmation-layer">
+      <button
+        type="button"
+        className="overview-confirmation-backdrop"
+        aria-label="取消当前操作"
+        disabled={busy}
+        onClick={onCancel}
+      />
+      <section
+        className="overview-confirmation"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="overview-confirmation-title"
+        aria-describedby="overview-confirmation-description"
+      >
+        <header className="overview-confirmation-head">
+          <div className={`overview-confirmation-icon ${model.kind}`} aria-hidden="true">
+            {model.kind === "latest" ? "↗" : "+"}
+          </div>
+          <div>
+            <span className="eyebrow">{model.eyebrow}</span>
+            <h2 id="overview-confirmation-title">{model.title}</h2>
+            <p id="overview-confirmation-description">{model.description}</p>
+          </div>
+          <button
+            type="button"
+            className="overview-confirmation-close"
+            aria-label="关闭确认弹窗"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            ×
+          </button>
+        </header>
+
+        <dl className="overview-confirmation-details">
+          {model.details.map((detail) => (
+            <div key={detail.label}>
+              <dt>{detail.label}</dt>
+              <dd className={detail.mono ? "mono" : ""}>{detail.value}</dd>
+            </div>
+          ))}
+        </dl>
+
+        <div className={`overview-confirmation-impact ${model.impactTone}`}>
+          <span>{model.impactTitle}</span>
+          <p>{model.impact}</p>
+        </div>
+        <p className="overview-confirmation-safety">
+          <span aria-hidden="true">✓</span>
+          {model.safetyNote}
+        </p>
+
+        <footer className="overview-confirmation-actions">
+          <button type="button" className="button secondary" disabled={busy} onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            disabled={busy}
+            autoFocus
+            onClick={props.onConfirm}
+          >
+            {busy ? "正在提交…" : model.confirmLabel}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function Overview(props: {
   status: RuntimeStatus;
   events: EventRecord[];
@@ -836,7 +949,7 @@ function Overview(props: {
       <div className="metric-grid">
         <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{props.status.stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
         <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
-        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个执行中 · {props.status.stats.runs.queued ?? 0} 个排队中</small></div>
+        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个执行中 · {props.status.stats.runs.preparing ?? 0} 个准备中 · {props.status.stats.runs.queued ?? 0} 个排队中</small></div>
         <div className="metric-card"><span>最近周期</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
       </div>
       <section className="section-card">
@@ -1099,6 +1212,13 @@ function CodexRuntimeEditor(props: {
             placeholder={props.options.binary.version ?? "例如 0.146.0"}
             onChange={(expected_codex_version) => patchRuntime({ expected_codex_version: expected_codex_version || undefined })}
             help="填写后版本不一致会阻止 Agent 启动"
+          />
+          <Field
+            label="Git 操作超时（秒）"
+            type="number"
+            value={Number(props.document.runtime.git_timeout_seconds ?? 600)}
+            onChange={(value) => patchRuntime({ git_timeout_seconds: Number(value) })}
+            help="克隆、fetch 和 worktree 操作默认最多等待 10 分钟"
           />
           <Field
             label="默认无进展超时（秒）"
@@ -1645,6 +1765,154 @@ function RepositoriesEditor(props: {
         </div>
       </section>
     </div>
+  );
+}
+
+function bytesText(value?: number | null): string {
+  if (value === undefined || value === null) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let amount = value;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function RepositoryWorkspaceManager(props: {
+  configuredRepositories: Repository[];
+  draftRepositories: Repository[];
+}) {
+  const [items, setItems] = useState<RepositoryWorkspaceStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [workingId, setWorkingId] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setItems(await api<RepositoryWorkspaceStatus[]>("/api/repositories/workspaces"));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取基础仓库状态失败");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 2000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  function targetChanged(repository: Repository): boolean {
+    const draft = props.draftRepositories.find((item) => item.id === repository.id);
+    if (!draft) return true;
+    return draft.provider !== repository.provider
+      || draft.project !== repository.project
+      || String(draft.clone_url ?? "") !== String(repository.clone_url ?? "")
+      || draft.workspace !== repository.workspace
+      || (draft.enabled !== false) !== (repository.enabled !== false);
+  }
+
+  async function start(repositoryId: string) {
+    setWorkingId(repositoryId);
+    setError("");
+    try {
+      const next = await api<RepositoryWorkspaceStatus>(
+        `/api/repositories/${encodeURIComponent(repositoryId)}/workspace/initialize`,
+        { method: "POST" },
+      );
+      setItems((current) => current.map((item) => item.repository_id === repositoryId ? next : item));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "启动基础仓库操作失败");
+    } finally {
+      setWorkingId("");
+    }
+  }
+
+  async function cancel(repositoryId: string) {
+    setWorkingId(repositoryId);
+    setError("");
+    try {
+      const next = await api<RepositoryWorkspaceStatus>(
+        `/api/repositories/${encodeURIComponent(repositoryId)}/workspace/cancel`,
+        { method: "POST" },
+      );
+      setItems((current) => current.map((item) => item.repository_id === repositoryId ? next : item));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消基础仓库操作失败");
+    } finally {
+      setWorkingId("");
+    }
+  }
+
+  const configured = props.configuredRepositories.filter((repository) => repository.enabled !== false);
+  const byId = new Map(items.map((item) => [item.repository_id, item]));
+  const statusLabels: Record<RepositoryWorkspaceStatus["status"], string> = {
+    uninitialized: "未初始化",
+    invalid: "目录无效",
+    ready: "已就绪",
+    waiting: "等待仓库锁",
+    initializing: "初始化中",
+    updating: "更新中",
+    failed: "失败",
+    cancelled: "已取消",
+  };
+
+  return (
+    <section className="section-card repository-workspace-manager">
+      <div className="section-title-row">
+        <div>
+          <h2>基础仓库状态</h2>
+          <p>初始化一次后，Agent 只增量 fetch 并创建独立 worktree；操作始终绑定当前已保存配置。</p>
+        </div>
+        <button className="button secondary" disabled={loading} onClick={() => { void refresh(); }}>刷新</button>
+      </div>
+      {error && <div className="alert error">{error}</div>}
+      {loading && <div className="repository-workspace-empty"><span className="spinner" />正在检查基础仓库…</div>}
+      {!loading && configured.length === 0 && <div className="repository-workspace-empty">当前没有已保存并启用的仓库。</div>}
+      {!loading && configured.length > 0 && (
+        <div className="repository-workspace-list">
+          {configured.map((repository) => {
+            const item = byId.get(repository.id);
+            const changed = targetChanged(repository);
+            const active = item ? ["waiting", "initializing", "updating"].includes(item.status) : false;
+            const busy = workingId === repository.id;
+            return (
+              <article className="repository-workspace-row" key={repository.id}>
+                <div className="repository-workspace-main">
+                  <div className="repository-workspace-title">
+                    <strong>{repository.id}</strong>
+                    {item && <span className={`repository-workspace-status status-${item.status}`}>{statusLabels[item.status]}</span>}
+                  </div>
+                  <code>{item?.workspace ?? repository.workspace}</code>
+                  <small>{item?.phase ?? "正在读取状态"}{item && active ? ` · ${item.elapsed_seconds} 秒` : ""}</small>
+                  {changed && <small className="repository-workspace-warning">仓库目标有未保存修改，请先保存或取消编辑。</small>}
+                  {item?.error && <small className="repository-workspace-error">{item.error}</small>}
+                </div>
+                <dl className="repository-workspace-metrics">
+                  <div><dt>磁盘占用</dt><dd>{bytesText(item?.size_bytes)}</dd></div>
+                  <div><dt>最近完成</dt><dd>{timeText(item?.finished_at)}</dd></div>
+                </dl>
+                <div className="repository-workspace-actions">
+                  {active ? (
+                    <button className="button danger" disabled={busy || item?.cancel_requested} onClick={() => { void cancel(repository.id); }}>
+                      {item?.cancel_requested ? "取消中…" : "取消操作"}
+                    </button>
+                  ) : (
+                    <button className="button primary" disabled={busy || changed || !item} onClick={() => { void start(repository.id); }}>
+                      {busy ? "启动中…" : item?.ready ? "立即更新" : item?.status === "failed" || item?.status === "cancelled" ? "重新初始化" : "初始化仓库"}
+                    </button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -2249,6 +2517,13 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
       </span>
     );
   }
+  if (event.agent_preparing_count > 0) {
+    return (
+      <span className="event-agent-progress preparing">
+        准备工作区 {event.agent_preparing_count} · 已结束 {settled}/{total}
+      </span>
+    );
+  }
   if (event.agent_queued_count > 0) {
     return (
       <span className="event-agent-progress queued">
@@ -2419,7 +2694,7 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
                 {detail && <p>{runTargetText(detail)} · {detail.rule_name ?? "Sub-agent 调用"}</p>}
               </div>
               <div className="run-drawer-actions">
-                {detail && (detail.status === "queued" || detail.status === "running") && (
+                {detail && (["queued", "preparing", "running"].includes(detail.status)) && (
                   <button className="button danger" disabled={cancelling} onClick={() => { void cancelSelectedRun(); }}>
                     {cancelling ? "取消中…" : "取消运行"}
                   </button>
@@ -2504,6 +2779,8 @@ export default function App() {
   );
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKey, setTriggeringKey] = useState("");
+  const [overviewConfirmation, setOverviewConfirmation] = useState<OverviewConfirmation | null>(null);
+  const [confirmingOverviewAction, setConfirmingOverviewAction] = useState(false);
   const [eventOptions, setEventOptions] = useState<string[]>([]);
   const [codexOptions, setCodexOptions] = useState<CodexRuntimeOptions>(EMPTY_CODEX_OPTIONS);
   const [revision, setRevision] = useState("");
@@ -2631,35 +2908,34 @@ export default function App() {
     }
   }
 
-  async function emitDiscovered(item: ChangeRequestRecord) {
+  function requestEmitDiscovered(item: ChangeRequestRecord) {
     const hasMatchingRule = Boolean(document?.rules.some((rule) => (
       rule.enabled !== false
       && rule.events.includes("change_request.discovered")
       && (!rule.repositories || rule.repositories.includes(item.repository_id))
     )));
-    const impact = hasMatchingRule
-      ? "补发后会立即按当前触发规则调度 Agent，可能执行规则允许的写操作。"
-      : "当前没有匹配的首次发现规则，补发只会记录事件，不会运行 Agent。";
-    if (!window.confirm(`确定为 ${item.repository_id} #${item.number} 补发首次发现事件吗？\n\n${impact}`)) return;
-
-    setEmittingKey(item.snapshot_key);
-    setError("");
-    try {
-      const result = await api<{ created: boolean; reason: string }>(
-        `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/emit-discovered`,
-        { method: "POST" },
-      );
-      await Promise.all([refreshOperationalData(), refreshOverviewData()]);
-      setNotice(result.reason);
-      window.setTimeout(() => setNotice(""), 3500);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "补发首次发现事件失败");
-    } finally {
-      setEmittingKey("");
-    }
+    setOverviewConfirmation({
+      kind: "discovered",
+      item,
+      eyebrow: "首次事件",
+      title: "确认补发首次事件",
+      description: "请核对目标与规则影响。确认后会创建一条首次发现事件。",
+      details: [
+        { label: "目标", value: `${item.repository_id} · #${item.number} ${item.title}` },
+        { label: "事件", value: "change_request.discovered", mono: true },
+        { label: "当前状态", value: item.state },
+      ],
+      impactTitle: hasMatchingRule ? "可能触发 Agent" : "当前没有候选规则",
+      impact: hasMatchingRule
+        ? "存在事件和仓库范围可能匹配的启用规则；最终仍需满足规则条件，Agent 可能执行其获准操作。"
+        : "本次事件预计会被记录为未触发，不会启动 Agent。",
+      impactTone: hasMatchingRule ? "attention" : "quiet",
+      safetyNote: "确认动作本身不会直接修改远端 PR；后续 Agent 行为受规则权限控制。",
+      confirmLabel: "确认补发",
+    });
   }
 
-  async function triggerLatestEvent(item: ChangeRequestRecord) {
+  function requestTriggerLatestEvent(item: ChangeRequestRecord) {
     const latestEvent = item.latest_event;
     if (!latestEvent) return;
     const hasCandidateRule = Boolean(document?.rules.some((rule) => (
@@ -2667,29 +2943,57 @@ export default function App() {
       && rule.events.includes(latestEvent.event_type)
       && (!rule.repositories || rule.repositories.includes(item.repository_id))
     )));
-    const ruleImpact = hasCandidateRule
-      ? "当前存在事件和仓库范围可能匹配的启用规则；最终仍需满足规则条件。"
-      : "当前没有事件和仓库范围匹配的启用规则，本次事件预计会记录为未触发。";
-    const confirmed = window.confirm(
-      `确定为 ${item.repository_id} #${item.number} 手动发送 ${latestEvent.event_type} 吗？\n\n`
-      + `平台原事件时间：${dateTimeText(latestEvent.occurred_at)}\n`
-      + `${ruleImpact}\n\n此操作不会修改远端 PR。`,
-    );
-    if (!confirmed) return;
+    setOverviewConfirmation({
+      kind: "latest",
+      item,
+      eyebrow: "手动事件",
+      title: "确认手动触发",
+      description: "将缓存的最新平台事件重新发送到当前规则引擎。",
+      details: [
+        { label: "目标", value: `${item.repository_id} · #${item.number} ${item.title}` },
+        { label: "事件", value: latestEvent.event_type, mono: true },
+        { label: "平台原事件时间", value: dateTimeText(latestEvent.occurred_at) },
+      ],
+      impactTitle: hasCandidateRule ? "可能触发 Agent" : "当前没有候选规则",
+      impact: hasCandidateRule
+        ? "存在事件和仓库范围可能匹配的启用规则；最终仍需满足规则条件，Agent 可能执行其获准操作。"
+        : "本次事件预计会被记录为未触发，不会启动 Agent。",
+      impactTone: hasCandidateRule ? "attention" : "quiet",
+      safetyNote: "确认动作本身不会直接修改远端 PR；后续 Agent 行为受规则权限控制。",
+      confirmLabel: "确认触发",
+    });
+  }
 
-    setTriggeringKey(item.snapshot_key);
+  function closeOverviewConfirmation() {
+    if (!confirmingOverviewAction) setOverviewConfirmation(null);
+  }
+
+  async function confirmOverviewAction() {
+    const action = overviewConfirmation;
+    if (!action || confirmingOverviewAction) return;
+
+    setConfirmingOverviewAction(true);
     setError("");
     try {
-      const result = await api<{ created: boolean; reason: string }>(
-        `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/trigger-latest-event`,
-        { method: "POST" },
-      );
+      const item = action.item;
+      if (action.kind === "discovered") setEmittingKey(item.snapshot_key);
+      else setTriggeringKey(item.snapshot_key);
+      const endpoint = action.kind === "discovered"
+        ? `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/emit-discovered`
+        : `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/trigger-latest-event`;
+      const result = await api<{ created: boolean; reason: string }>(endpoint, { method: "POST" });
       await Promise.all([refreshOperationalData(), refreshOverviewData()]);
       setNotice(result.reason);
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "手动触发最新事件失败");
+      const fallback = action.kind === "discovered"
+        ? "补发首次发现事件失败"
+        : "手动触发最新事件失败";
+      setError(reason instanceof Error ? reason.message : fallback);
     } finally {
+      setOverviewConfirmation(null);
+      setConfirmingOverviewAction(false);
+      setEmittingKey("");
       setTriggeringKey("");
     }
   }
@@ -2767,8 +3071,8 @@ export default function App() {
                   emittingKey={emittingKey}
                   triggeringKey={triggeringKey}
                   onAction={control}
-                  onEmitDiscovered={(item) => { void emitDiscovered(item); }}
-                  onTriggerLatestEvent={(item) => { void triggerLatestEvent(item); }}
+                  onEmitDiscovered={requestEmitDiscovered}
+                  onTriggerLatestEvent={requestTriggerLatestEvent}
                   onChangeRequestFilterChange={setChangeRequestFilter}
                   onEventFilterChange={setEventFilter}
                 />
@@ -2787,6 +3091,12 @@ export default function App() {
                     {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
                     {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
                   </fieldset>
+                  {tab === "repositories" && (
+                    <RepositoryWorkspaceManager
+                      configuredRepositories={savedDocument?.repositories ?? []}
+                      draftRepositories={document.repositories}
+                    />
+                  )}
                   {tab === "runtime" && (
                     <CodexAccountCard
                       configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}
@@ -2801,6 +3111,12 @@ export default function App() {
           )}
         </div>
       </main>
+      <OverviewConfirmationDialog
+        model={overviewConfirmation}
+        busy={confirmingOverviewAction}
+        onCancel={closeOverviewConfirmation}
+        onConfirm={() => { void confirmOverviewAction(); }}
+      />
     </div>
   );
 }

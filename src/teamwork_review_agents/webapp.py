@@ -24,6 +24,7 @@ from .codex_settings import inspect_runtime_options
 from .environment import render_prompt
 from .events import FIELD_EVENTS, create_manual_activity_event, detect_events
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
+from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
 from .skill_files import (
     MAX_SKILL_FILE_BYTES,
@@ -64,6 +65,7 @@ def create_app(
     manager = ConfigManager(config_path)
     runtime = BackgroundRuntime(manager)
     login_manager = CodexLoginManager()
+    repository_initialization_manager = RepositoryInitializationManager(manager)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -72,6 +74,7 @@ def create_app(
         try:
             yield
         finally:
+            await repository_initialization_manager.close()
             await login_manager.close()
             if start_scheduler:
                 await runtime.stop()
@@ -84,6 +87,7 @@ def create_app(
     app.state.config_manager = manager
     app.state.runtime = runtime
     app.state.codex_login_manager = login_manager
+    app.state.repository_initialization_manager = repository_initialization_manager
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -192,6 +196,42 @@ def create_app(
                 "changed",
             ],
         }
+
+    @app.get("/api/repositories/workspaces")
+    async def repository_workspaces() -> list[dict[str, Any]]:
+        """返回已保存仓库的基础 Git 目录状态。"""
+
+        return await repository_initialization_manager.list()
+
+    @app.get("/api/repositories/{repository_id}/workspace")
+    async def repository_workspace(repository_id: str) -> dict[str, Any]:
+        """返回一个已保存仓库的基础 Git 目录状态。"""
+
+        result = await repository_initialization_manager.get(repository_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.post("/api/repositories/{repository_id}/workspace/initialize")
+    async def initialize_repository(repository_id: str) -> dict[str, Any]:
+        """启动基础仓库初始化或增量更新。"""
+
+        try:
+            result = await repository_initialization_manager.start(repository_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.post("/api/repositories/{repository_id}/workspace/cancel")
+    async def cancel_repository_initialization(repository_id: str) -> dict[str, Any]:
+        """取消仍在进行的基础仓库初始化或更新。"""
+
+        result = await repository_initialization_manager.cancel(repository_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
 
     @app.get("/api/codex/runtime-options")
     async def codex_runtime_options() -> dict[str, Any]:

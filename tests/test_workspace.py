@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutor
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.workspace import (
+    _run_git,
     cleanup_expired_worktrees,
     cleanup_run_worktree,
     ensure_isolated_worktree,
     prepare_change_request_workspace,
     retained_marker_path,
     validate_linked_workspace,
+    WorkspaceCancelled,
+    WorkspaceError,
 )
 
 
@@ -31,6 +38,86 @@ def run_git(*arguments: str, cwd=None) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def test_git_cancel_terminates_process_group_and_reports_safe_progress(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """准备阶段取消应终止 Git 及其子进程，并只报告脱敏阶段信息。"""
+
+    fake_git = tmp_path / "fake-git"
+    child_pid_path = tmp_path / "child.pid"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "sleep 30 &\n"
+        "child=$!\n"
+        "printf '%s' \"$child\" > \"$1\"\n"
+        "wait \"$child\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(
+        "teamwork_review_agents.workspace.shutil.which",
+        lambda _: str(fake_git),
+    )
+    progress: list[tuple[str, str, int]] = []
+
+    with pytest.raises(WorkspaceCancelled):
+        _run_git(
+            [str(child_pid_path)],
+            timeout_seconds=5,
+            operation="测试 Git 操作",
+            cancel_check=child_pid_path.exists,
+            progress_callback=lambda operation, state, elapsed: progress.append(
+                (operation, state, elapsed)
+            ),
+        )
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("Git 子进程在取消后仍然存活")
+    assert progress[0] == ("测试 Git 操作", "started", 0)
+    assert progress[-1][1] == "cancelled"
+
+
+def test_git_timeout_terminates_process_group(tmp_path, monkeypatch) -> None:
+    """Git 超时应结束整个进程组，而不是只结束直接 git 进程。"""
+
+    fake_git = tmp_path / "fake-git"
+    child_pid_path = tmp_path / "timeout-child.pid"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "sleep 30 &\n"
+        "child=$!\n"
+        "printf '%s' \"$child\" > \"$1\"\n"
+        "wait \"$child\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(
+        "teamwork_review_agents.workspace.shutil.which",
+        lambda _: str(fake_git),
+    )
+
+    with pytest.raises(WorkspaceError, match="超过 1 秒"):
+        _run_git([str(child_pid_path)], timeout_seconds=1)
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("Git 子进程在超时后仍然存活")
 
 
 def test_workspace_is_cloned_and_change_request_ref_is_fetched(
@@ -192,6 +279,13 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert detail["workspace_status"] == "removed"
     assert detail["workspace_path"] != str(repository.workspace.resolve())
     assert not Path(detail["workspace_path"]).exists()
+    log_types = {
+        item["event_type"]
+        for item in store.list_run_logs(result.run_id)
+    }
+    assert "workspace.git.started" in log_types
+    assert "workspace.git.completed" in log_types
+    assert "workspace.prepared" in log_types
 
     fake_codex.write_text(
         f"""#!{sys.executable}

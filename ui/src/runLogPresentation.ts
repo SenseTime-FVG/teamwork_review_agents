@@ -18,6 +18,12 @@ export type RunMessage = {
 type JsonObject = Record<string, unknown>;
 
 const SYSTEM_TITLES: Record<string, string> = {
+  "workspace.git.started": "开始 Git 工作区操作",
+  "workspace.git.progress": "Git 工作区操作进行中",
+  "workspace.git.completed": "Git 工作区操作完成",
+  "workspace.git.failed": "Git 工作区操作失败",
+  "workspace.git.timed_out": "Git 工作区操作超时",
+  "workspace.git.cancelled": "Git 工作区操作已取消",
   "workspace.prepared": "工作区已准备",
   "run.started": "Agent 开始运行",
   "thread.started": "Codex 会话已创建",
@@ -124,7 +130,10 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     || /(?:error|failed|timed_out|mismatch|cancelled)/.test(log.event_type);
   let body = "";
   let detail = "";
-  if (log.event_type === "workspace.prepared" && object) {
+  if (log.event_type.startsWith("workspace.git.") && object) {
+    body = textValue(object.operation);
+    detail = `耗时：${textValue(object.elapsed_seconds)} 秒`;
+  } else if (log.event_type === "workspace.prepared" && object) {
     body = textValue(object.reason);
     detail = [object.path ? `路径：${textValue(object.path)}` : "", object.mode ? `模式：${textValue(object.mode)}` : ""]
       .filter(Boolean)

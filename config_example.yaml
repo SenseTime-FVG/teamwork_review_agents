@@ -51,6 +51,8 @@ database:
 #   # 在保持隔离时，可按 ~/.codex/config.toml 中的 MCP 名称显式放行所需服务。
 #   allowed_user_mcp_servers: []
 #   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
+#   # 克隆、fetch 和 worktree 等单次 Git 操作的超时，默认 10 分钟。
+#   git_timeout_seconds: 600
 #   agent_idle_timeout_seconds: 300
 #   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
 #   codex:
