@@ -943,7 +943,7 @@ def test_codex_runtime_options_report_catalog_and_user_model(
         return {
             "model": "gpt-user",
             "model_reasoning_effort": "high",
-            "service_tier": "fast",
+            "service_tier": "priority",
             "model_verbosity": "low",
             "personality": "friendly",
             "web_search": "live",

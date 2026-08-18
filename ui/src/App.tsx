@@ -1338,6 +1338,7 @@ const SETTING_VALUE_LABELS: Record<InheritedSettingKey, Record<string, string>> 
     standard: "标准模式",
     default: "标准模式",
     fast: "快速模式",
+    priority: "快速模式",
   },
   model_verbosity: { low: "低", medium: "中", high: "高" },
   personality: { none: "无预设", friendly: "友好", pragmatic: "务实" },

@@ -170,7 +170,7 @@ def _inherited_settings_from_document(
     service_tier = configured_string("service_tier")
     web_search = configured_string("web_search")
 
-    if service_tier == "fast":
+    if service_tier in {"fast", "priority"}:
         fast_mode = _inherited_setting("fast", configured_source, known=True)
     elif service_tier == "default":
         fast_mode = _inherited_setting("standard", configured_source, known=True)
