@@ -669,12 +669,44 @@ def test_root_and_sub_agent_prompt_contexts_are_separated(
     assert f'"target_head_sha": "{"c" * 40}"' in root_prompt
     assert '"old"' not in root_prompt
     assert '"changed_fields"' not in root_prompt
+    assert '"provider": "github-main"' in root_prompt
+    assert '"provider_kind": "github"' in root_prompt
+    assert '"provider_base_url": "https://api.github.com"' in root_prompt
     assert '"repository"' in child_prompt
     assert '"delegated_task": "只检查依赖安全风险"' in child_prompt
     assert '"delegated_context"' in child_prompt
+    assert '"provider": "github-main"' in child_prompt
+    assert '"provider_kind": "github"' in child_prompt
+    assert '"provider_base_url": "https://api.github.com"' in child_prompt
     assert '"mr"' not in child_prompt
     assert '"action"' not in child_prompt
     assert snapshot.title not in child_prompt
+
+
+def test_incremental_document_prompts_support_github_and_gitlab() -> None:
+    """内置文档更新链必须显式支持 GitHub PR 与 GitLab MR。"""
+
+    root = Path(__file__).resolve().parents[1]
+    runner_prompt = (root / "prompts/增量文档更新入口.md").read_text(
+        encoding="utf-8"
+    )
+    updater_prompt = (root / "prompts/增量文档更新.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "mr.repository.provider_kind" in runner_prompt
+    assert "provider_kind = github" in runner_prompt
+    assert "gh pr create" in runner_prompt
+    assert "Check Suites / Check Runs" in runner_prompt
+    assert "Branch Protection" in runner_prompt
+    assert "provider_kind = gitlab" in runner_prompt
+    assert "glab mr create" in runner_prompt
+    assert "Pipeline / Job" in runner_prompt
+    assert "输入中会提供一条已经合并的 GitLab Merge Request" not in runner_prompt
+    assert "平台无关的兼容协议" in updater_prompt
+    assert "GitHub" in updater_prompt
+    assert "GitLab" in updater_prompt
+    assert "不负责查询、创建、关闭、审批或合并平台 PR / MR" in updater_prompt
 
 
 def test_timeline_event_prompt_uses_final_snapshot(

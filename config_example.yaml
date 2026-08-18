@@ -251,7 +251,7 @@ agents:
     prompt_file: ./prompts/增量文档更新.md
     sandbox: workspace-write
     home_mode: temporary
-    # 允许文档更新 Agent 按需通过自身 gh / glab 登录态读取平台信息。
+    # 文档子 Agent 只处理 Git 与文档；不负责创建、关闭、审批或合并平台 PR / MR。
     network_access: true
     network_domains: []
     timeout_seconds: 1200

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .codex_runner import CodexRunner
-from .config import AppConfig, RepositoryConfig
+from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import SecretRedactor, render_prompt, resolve_environment
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
@@ -43,6 +43,7 @@ def _action_name(event_type: str) -> str:
 
 def _repository_payload(
     repository: RepositoryConfig,
+    provider: ProviderConfig,
 ) -> dict[str, Any]:
     """返回根 Agent 与 sub-agent 共用的仓库上下文。"""
 
@@ -50,6 +51,8 @@ def _repository_payload(
         "id": repository.id,
         "project": repository.project,
         "provider": repository.provider,
+        "provider_kind": provider.kind,
+        "provider_base_url": provider.base_url,
         "workspace": str(repository.workspace),
     }
 
@@ -57,6 +60,7 @@ def _repository_payload(
 def _mr_payload(
     event: ChangeEvent,
     repository: RepositoryConfig,
+    provider: ProviderConfig,
     actions: Sequence[str],
     change_ref: str,
     target_head_sha: str,
@@ -65,7 +69,7 @@ def _mr_payload(
 
     snapshot = event.current_snapshot
     return {
-        "repository": _repository_payload(repository),
+        "repository": _repository_payload(repository, provider),
         "number": snapshot.number,
         "title": snapshot.title,
         "state": snapshot.state,
@@ -136,6 +140,7 @@ class AgentExecutor:
         else:
             template = agent.prompt or ""
         role_prompt = render_prompt(template, prompt_values).strip()
+        provider = self.config.providers[repository.provider]
         if task is None:
             if not target_head_sha:
                 raise AgentExecutionError("根 Agent 缺少目标分支当前提交")
@@ -143,6 +148,7 @@ class AgentExecutor:
                 "mr": _mr_payload(
                     event,
                     repository,
+                    provider,
                     actions,
                     change_ref,
                     target_head_sha,
@@ -150,7 +156,7 @@ class AgentExecutor:
             }
         else:
             context = {
-                "repository": _repository_payload(repository),
+                "repository": _repository_payload(repository, provider),
                 "delegated_task": task,
             }
             if extra_context:

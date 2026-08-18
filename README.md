@@ -21,7 +21,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 | Agent | 职责 | 触发时机 |
 | --- | --- | --- |
 | `general-reviewer` | 审核代码和门禁；全部通过才评论并合并 | PR / MR `opened`、`reopened` |
-| `incremental-doc-update-runner` | 编排文档分支、sub-agent、文档 MR 和清理 | GitLab MR `merged` |
+| `incremental-doc-update-runner` | 编排文档分支、sub-agent、文档 PR / MR 和清理 | GitHub PR / GitLab MR `merged` |
 | `incremental-doc-updater` | 增量更新受影响文档 | Runner 通过 MCP 委托 |
 
 内置规则默认关闭。先验证扫描，再按需启用。
@@ -152,7 +152,7 @@ your-project/
 2. 启用 `general-review`，用新的 PR / MR 验证审核链。
 3. 准备好 `docs/README.md` 后，再启用“增量文档更新”。
 
-当前内置文档 Runner 面向 GitLab MR；通用审核同时支持 GitHub PR 和 GitLab MR。
+当前内置文档 Runner 与通用审核都支持 GitHub PR 和 GitLab MR。Runner 根据运行上下文中的平台类型选择 `gh` / GitHub API 或 `glab` / GitLab API；不会根据 URL 或 Git remote 猜测平台。
 
 ## 运行概览与手动事件
 

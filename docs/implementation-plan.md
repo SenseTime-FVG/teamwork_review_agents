@@ -537,3 +537,14 @@
 - 更新前端状态类型和概览文案，重新构建内置静态资源，并执行全量 Python 测试和编译检查。
 
 验收：Agent 连续运行一小时不会推迟下一轮 Provider 扫描；点击“立即扫描”无需等待当前 Agent；新事件可靠进入 SQLite 并由独立执行循环处理；服务异常退出后事件可以重新入队且不重复成功运行；暂停扫描不取消 Agent；概览的扫描状态与 Agent 状态互不混淆。
+
+## 阶段五十：增量文档更新 GitHub / GitLab 双平台适配
+
+- 扩展根 Agent 和 sub-agent 的仓库上下文，在 Provider 连接 ID 之外传递已校验的 `provider_kind` 与 `provider_base_url`。
+- 将增量文档入口 Prompt 从 GitLab-only 改为平台分流：GitHub 使用 `gh` / GitHub API 与 PR / Checks / Reviews / Rulesets 语义，GitLab 使用 `glab` / GitLab API 与 MR / Pipeline / Approval 语义。
+- 保留原始变更请求合并前后 SHA、文档任务起始 SHA、目标分支漂移检查、唯一文档提交、防循环、失败清理和不绕过门禁等现有安全边界。
+- 调整文档更新 sub-agent Prompt，明确现有 `MR_*` 字段是同时服务 GitHub PR 和 GitLab MR 的兼容协议，sub-agent 不负责平台 PR / MR 生命周期。
+- 同步 README、架构说明和示例配置文案，不再宣称文档 Runner 只支持 GitLab。
+- 补充上下文载荷与双平台 Prompt 回归测试，并执行配置与 Runner 相关测试。
+
+验收：GitHub 合并 PR 触发入口 Agent 时不再因“必须是 GitLab MR”停止；根 Agent 只使用上下文声明的平台适配器；GitHub 文档 PR 只在精确 Head 的必要 Checks、Review、可合并状态和分支保护全部通过后合并；GitLab 原有 MR / Pipeline / Approval 路径不回归；sub-agent 继续只处理 Git 与文档更新。

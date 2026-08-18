@@ -504,3 +504,11 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 “暂停”只阻止新的 Provider 扫描，不中断正在执行的 Agent，也不阻止已经持久化事件的调度和收尾。服务停止继续等待当前扫描和 Agent 执行安全结束；管理员需要立即终止单次运行时仍使用运行取消功能。配置热加载创建的新编排器只用于后续扫描或调度周期，已经开始的周期使用其启动时捕获的配置实例，避免执行中途切换规则、权限或运行时参数。
 
 运行状态分别记录扫描进行状态与事件调度状态。概览中的“最近扫描”只反映 Provider 扫描，不再因 Agent 长时间运行而显示“正在扫描与调度”；Agent 的执行中、准备中和排队中数量继续由持久化运行记录展示。扫描错误与调度错误分别保存，任一错误都可以在管理界面显示，但调度失败不能把已经成功完成的扫描伪装为仍在进行。
+
+## 53. 增量文档更新的 GitHub / GitLab 双平台适配
+
+增量文档入口 Agent 不能根据链接、remote 或项目名称猜测代码托管平台。根 Agent 与 sub-agent 的仓库上下文在保留 Provider 连接 ID 的同时，明确提供 `provider_kind` 和 `provider_base_url`；`provider_kind` 只允许 `github` 或 `gitlab`，Prompt 必须以该字段选择平台操作路径。
+
+入口 Prompt 统一使用“变更请求”表达业务流程：GitHub 上是 Pull Request（PR），通过已登录的 `gh` 或 GitHub API 核验原始 PR、创建文档 PR、查询精确文档提交的 Check Runs / Status Checks、Review 和分支保护或 Ruleset，最后在不绕过保护的前提下合并并删除源分支；GitLab 上是 Merge Request（MR），通过已登录的 `glab` 或 GitLab API 执行等价的 MR、Pipeline / Job、Approval、保护分支与合并流程。未知、冲突或不可认证的平台必须安全停止，不得混用另一平台的状态和命令。
+
+文档更新 sub-agent 仍只负责 Git 差异、文档候选、索引、验证、唯一提交与普通推送，不调用 GitHub 或 GitLab 的变更请求 API。为了兼容现有入口与结构化状态，`MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA` 及“MR 目标分支”等字段名继续保留，但 Prompt 必须明确这些是平台无关的历史协议名，对 GitHub PR 与 GitLab MR 含义完全一致。Provider Token 仍不进入 Agent，平台操作依赖启动 Teamwork 的同一系统用户已建立的 `gh` / `glab` 登录态。
