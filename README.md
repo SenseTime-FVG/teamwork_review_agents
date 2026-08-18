@@ -35,8 +35,6 @@ teamwork-review-agents start
 
 首次使用时，建议在一次编辑中依次完成平台连接、仓库、Provider Token 和触发规则配置，最后统一保存：
 
-![](docs/img.png)
-
 ```mermaid
 flowchart TD
     A["启动服务并打开管理 UI"] --> B["点击“编辑配置”"]
