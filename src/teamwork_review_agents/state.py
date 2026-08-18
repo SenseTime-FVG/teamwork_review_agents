@@ -825,6 +825,27 @@ class StateStore:
             ).fetchall()
         return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
 
+    def has_retryable_failed_events_for_resource(
+        self,
+        repository_id: str,
+        number: int,
+        *,
+        max_attempts: int,
+    ) -> bool:
+        """判断指定变更请求是否仍有允许重试的失败事件。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM event_inbox
+                WHERE repository_id = ? AND number = ?
+                  AND status = 'failed' AND attempts < ?
+                LIMIT 1
+                """,
+                (repository_id, number, max_attempts),
+            ).fetchone()
+        return row is not None
+
     def set_event_queue_reason(
         self,
         event_ids: Iterable[str],

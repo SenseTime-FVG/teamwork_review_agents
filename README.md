@@ -174,7 +174,7 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 不同 PR / MR 的事件批次可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。全局环境页的 `runtime.max_concurrent_agents` 和运行时配置页的 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
 
-排队记录会说明当前是在等待全局/运行时额度、此 Agent 额度、同一 PR / MR 前序批次、业务资源锁还是基础仓库锁。修改并发配置只影响尚未取得额度的新运行，不会强制终止已经开始准备或执行的任务。
+排队记录会说明当前是在等待全局/运行时额度、此 Agent 额度、同一 PR / MR 前序批次、前序事件重试、业务资源锁还是基础仓库锁。前序事件发生可重试失败时只短暂延迟当前 PR / MR，其他变更请求继续使用空闲额度；达到重试上限后，该失败事件保留终态并立即继续同一 PR / MR 的后续批次。修改并发配置只影响尚未取得额度的新运行，不会强制终止已经开始准备或执行的任务。
 
 `runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取、运行 clone 和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
 

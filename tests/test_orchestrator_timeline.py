@@ -882,3 +882,184 @@ async def test_batches_for_same_change_request_keep_event_order(
     await asyncio.wait_for(second_started.wait(), timeout=1)
     await asyncio.wait_for(dispatch, timeout=1)
     assert actions == ["change_request.closed", "change_request.reopened"]
+
+
+async def test_retrying_resource_progresses_while_unrelated_agent_is_running(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """其他 PR 长时间运行时，失败资源仍应独立退避、重试并继续。"""
+
+    config = configured_app_factory()
+    config.runtime.event_retry_count = 1
+    config.rules = [
+        RuleConfig(
+            name="state-review",
+            events=["change_request.closed", "change_request.reopened"],
+            agents=["code-reviewer"],
+        )
+    ]
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.EVENT_RETRY_BACKOFF_SECONDS",
+        0.05,
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+
+    long_opened = snapshot_factory(number=44)
+    long_closed = snapshot_factory(
+        number=44,
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    long_event = detect_events(
+        long_opened,
+        long_closed,
+        batch_id="long-batch",
+    )[0]
+    retry_opened = snapshot_factory(number=45)
+    retry_closed = snapshot_factory(
+        number=45,
+        state="closed",
+        updated_at="2026-08-17T08:06:00Z",
+    )
+    retry_reopened = snapshot_factory(
+        number=45,
+        state="opened",
+        updated_at="2026-08-17T08:07:00Z",
+    )
+    failed_event = detect_events(
+        retry_opened,
+        retry_closed,
+        batch_id="retry-close-batch",
+    )[0]
+    later_event = detect_events(
+        retry_closed,
+        retry_reopened,
+        batch_id="retry-reopen-batch",
+    )[0]
+    orchestrator.store.save_snapshot_and_events(long_closed, [long_event])
+    orchestrator.store.save_snapshot_and_events(retry_closed, [failed_event])
+    orchestrator.store.save_snapshot_and_events(retry_reopened, [later_event])
+
+    long_started = asyncio.Event()
+    release_long = asyncio.Event()
+    later_started = asyncio.Event()
+    close_attempts = 0
+
+    async def fake_execute(**kwargs):
+        """首次关闭审核失败，重试成功后再执行同 PR 后续批次。"""
+
+        nonlocal close_attempts
+        event = kwargs["event"]
+        action = kwargs["actions"][0]
+        if event.number == 44:
+            long_started.set()
+            await release_long.wait()
+        elif action == "change_request.closed":
+            close_attempts += 1
+            if close_attempts == 1:
+                raise RuntimeError("模拟可重试失败")
+        else:
+            later_started.set()
+        return AgentResult(
+            run_id=f"run-{event.number}-{action}-{close_attempts}",
+            root_run_id=f"run-{event.number}-{action}-{close_attempts}",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    dispatch = asyncio.create_task(orchestrator.process_events(CycleSummary()))
+    await asyncio.wait_for(long_started.wait(), timeout=1)
+
+    for _ in range(50):
+        later_record = next(
+            item
+            for item in orchestrator.store.list_events()
+            if item["event_type"] == "change_request.reopened"
+        )
+        if later_record["queue_reason"] == "event_retry_backoff":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("后续事件没有显示前序事件重试原因")
+
+    await asyncio.wait_for(later_started.wait(), timeout=1)
+    assert not release_long.is_set()
+    assert close_attempts == 2
+
+    release_long.set()
+    await asyncio.wait_for(dispatch, timeout=1)
+    records = {
+        (item["number"], item["event_type"]): item
+        for item in orchestrator.store.list_events()
+    }
+    assert records[(45, "change_request.closed")]["status"] == "completed"
+    assert records[(45, "change_request.reopened")]["status"] == "completed"
+
+
+async def test_exhausted_retry_does_not_block_later_batch_for_same_resource(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """前序事件达到重试上限后，同一 PR 的后续批次应立即继续。"""
+
+    config = configured_app_factory()
+    config.runtime.event_retry_count = 0
+    config.rules = [
+        RuleConfig(
+            name="state-review",
+            events=["change_request.closed", "change_request.reopened"],
+            agents=["code-reviewer"],
+        )
+    ]
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.EVENT_RETRY_BACKOFF_SECONDS",
+        10.0,
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    opened = snapshot_factory(number=46)
+    closed = snapshot_factory(
+        number=46,
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    reopened = snapshot_factory(
+        number=46,
+        state="opened",
+        updated_at="2026-08-17T08:06:00Z",
+    )
+    failed_event = detect_events(opened, closed, batch_id="failed-batch")[0]
+    later_event = detect_events(closed, reopened, batch_id="later-batch")[0]
+    orchestrator.store.save_snapshot_and_events(closed, [failed_event])
+    orchestrator.store.save_snapshot_and_events(reopened, [later_event])
+
+    later_started = asyncio.Event()
+
+    async def fake_execute(**kwargs):
+        """让前序关闭事件失败，并观察后续重新打开事件。"""
+
+        action = kwargs["actions"][0]
+        if action == "change_request.closed":
+            raise RuntimeError("模拟终态失败")
+        later_started.set()
+        return AgentResult(
+            run_id="run-later-batch",
+            root_run_id="run-later-batch",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    dispatch = asyncio.create_task(orchestrator.process_events(CycleSummary()))
+    await asyncio.wait_for(later_started.wait(), timeout=1)
+    await asyncio.wait_for(dispatch, timeout=1)
+
+    records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert records["change_request.closed"]["status"] == "failed"
+    assert records["change_request.closed"]["attempts"] == 1
+    assert records["change_request.reopened"]["status"] == "completed"

@@ -305,11 +305,11 @@ async def test_failed_preflight_only_blocks_rules_that_requested_ci(
     assert summary.agent_runs == 1
 
 
-async def test_preflight_infrastructure_error_requeues_event(
+async def test_preflight_infrastructure_error_retries_without_running_agent(
     tmp_path,
     snapshot_factory,
 ) -> None:
-    """Git、进程或状态 API 故障必须进入现有事件重试，而不是放行 Agent。"""
+    """Git、进程或状态 API 故障必须按上限重试，且不能放行 Agent。"""
 
     orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
     event = enqueue_discovered(orchestrator, snapshot_factory)
@@ -324,7 +324,11 @@ async def test_preflight_infrastructure_error_requeues_event(
 
     assert agents.calls == []
     assert [pending.id for pending in orchestrator.store.pending_events()] == [event.id]
-    assert summary.preflight_errors == 1
+    record = orchestrator.store.list_events()[0]
+    max_attempts = orchestrator.config.runtime.event_retry_count + 1
+    assert record["status"] == "failed"
+    assert record["attempts"] == max_attempts
+    assert summary.preflight_errors == max_attempts
     assert any("GitHub 状态 API 不可用" in error for error in summary.errors)
 
 

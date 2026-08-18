@@ -35,6 +35,9 @@ from .state import (
 )
 
 
+EVENT_RETRY_BACKOFF_SECONDS = 1.0
+
+
 @dataclass
 class CycleSummary:
     """一次扫描和处理周期的统计结果。"""
@@ -730,7 +733,8 @@ class Orchestrator:
         active: dict[tuple[str, int], asyncio.Task[str | None]] = {}
         max_attempts = self.config.runtime.event_retry_count + 1
         stop_scheduling = False
-        deferred_resources: set[tuple[str, int]] = set()
+        retry_after: dict[tuple[str, int], float] = {}
+        loop = asyncio.get_running_loop()
         while not self._shutdown_requested:
             resources = []
             if not stop_scheduling:
@@ -738,9 +742,12 @@ class Orchestrator:
                     self.store.pending_event_resources,
                     max_attempts,
                 )
+            resource_set = set(resources)
+            for resource in tuple(retry_after):
+                if resource not in resource_set and resource not in active:
+                    retry_after.pop(resource, None)
+            now = loop.time()
             for resource in resources:
-                if resource in deferred_resources:
-                    continue
                 if resource in active:
                     waiting_events = await asyncio.to_thread(
                         self.store.pending_events_for_resource,
@@ -754,12 +761,35 @@ class Orchestrator:
                         "change_request_order",
                     )
                     continue
+                retry_deadline = retry_after.get(resource)
+                if retry_deadline is not None and now < retry_deadline:
+                    waiting_events = await asyncio.to_thread(
+                        self.store.pending_events_for_resource,
+                        resource[0],
+                        resource[1],
+                        max_attempts=max_attempts,
+                    )
+                    await asyncio.to_thread(
+                        self.store.set_event_queue_reason,
+                        (event.id for event in waiting_events),
+                        "event_retry_backoff",
+                    )
+                    continue
+                retry_after.pop(resource, None)
                 active[resource] = asyncio.create_task(
                     self._process_resource_events(summary, resource),
                     name=f"event-dispatch-{resource[0]}-{resource[1]}",
                 )
 
             if not active:
+                if stop_scheduling:
+                    return
+                if retry_after:
+                    nearest_retry = min(retry_after.values())
+                    await asyncio.sleep(
+                        min(0.25, max(0.0, nearest_retry - loop.time()))
+                    )
+                    continue
                 return
             done, _ = await asyncio.wait(
                 tuple(active.values()),
@@ -775,9 +805,33 @@ class Orchestrator:
                     if outcome == "service_shutdown":
                         stop_scheduling = True
                     elif outcome == "retry":
-                        deferred_resources.add(resource)
+                        retryable = await asyncio.to_thread(
+                            self.store.has_retryable_failed_events_for_resource,
+                            resource[0],
+                            resource[1],
+                            max_attempts=max_attempts,
+                        )
+                        if retryable:
+                            retry_after[resource] = (
+                                loop.time() + EVENT_RETRY_BACKOFF_SECONDS
+                            )
+                            waiting_events = await asyncio.to_thread(
+                                self.store.pending_events_for_resource,
+                                resource[0],
+                                resource[1],
+                                max_attempts=max_attempts,
+                            )
+                            await asyncio.to_thread(
+                                self.store.set_event_queue_reason,
+                                (event.id for event in waiting_events),
+                                "event_retry_backoff",
+                            )
+                        else:
+                            retry_after.pop(resource, None)
                 except Exception as exc:
-                    deferred_resources.add(resource)
+                    retry_after[resource] = (
+                        loop.time() + EVENT_RETRY_BACKOFF_SECONDS
+                    )
                     summary.errors.append(
                         f"处理 {resource[0]} #{resource[1]} 的事件队列失败：{exc}"
                     )

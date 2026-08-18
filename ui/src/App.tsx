@@ -4354,6 +4354,7 @@ function queueReasonLabel(reason?: string | null): string | null {
     runtime_concurrency: "等待运行时 Agent 并发槽",
     agent_concurrency: "等待此 Agent 并发槽",
     change_request_order: "等待同一 PR / MR 前序批次",
+    event_retry_backoff: "等待前序事件重试",
     resource_lock: "等待变更请求或分支资源锁",
     repository_lock: "等待基础仓库管理锁",
   };

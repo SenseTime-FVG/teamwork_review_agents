@@ -36,7 +36,7 @@ database:
 #   max_sub_agent_depth: 2
 #   # 一个根任务最多启动的 Agent 总数，包含全部 sub-agent。
 #   max_agent_runs_per_root: 8
-#   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。
+#   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。资源级短退避不会阻塞其他 PR / MR。
 #   event_retry_count: 2
 #   # 失败、超时、存在未提交文件或未推送提交的临时 Git 工作区保留天数。
 #   # 到期后会在下次准备同一仓库时强制清理；默认 7 天。
