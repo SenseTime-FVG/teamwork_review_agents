@@ -226,11 +226,13 @@ agents:
 
 `workspace-write` 默认禁止命令联网。开启联网且 `network_domains` 为空时允许直接访问公开网络；配置白名单后只允许精确域名、`*.example.com` 或 `**.example.com`。`read-only` 不能通过该开关开放网络；`danger-full-access` 本身不隔离网络，因此域名白名单不能作为有效保护。Teamwork 会显式覆盖这些参数，并禁止 `runtime.codex.extra_config` 绕过它们。该行为对应 [OpenAI 对 Codex 命令网络访问和网络代理的说明](https://learn.chatgpt.com/docs/agent-approvals-security#network-access)。
 
-开启联网不会把 Provider Token 交给 Agent。所有 Provider `token_env` 仍会在创建 Codex 子进程前强制移除；子进程只继承宿主机 `HOME` 等基础环境，因此 `gh` / `glab` 使用各自已经建立的系统钥匙串或 CLI 登录态。可以先在运行服务的同一用户下执行 `gh auth status` 或 `glab auth status` 核验登录，不需要也不应把 Provider Token 重新配置到 Agent 环境变量中。内置 `general-reviewer` 默认开启命令联网并保持域名白名单为空；其他内置 Agent 默认关闭。
+开启联网不会把 Provider Token 交给 Agent。所有 Provider `token_env` 仍会在创建 Codex 子进程前强制移除；子进程只继承宿主机 `HOME` 等基础环境，因此 `gh` / `glab` 使用各自已经建立的系统钥匙串或 CLI 登录态。可以先在运行服务的同一用户下执行 `gh auth status` 或 `glab auth status` 核验登录，不需要也不应把 Provider Token 重新配置到 Agent 环境变量中。三个内置 Agent 默认都开启命令联网并保持域名白名单为空；管理员仍可按部署环境收紧权限。
 
 后台运行默认把用户配置中的 MCP Server 逐个设为禁用，只保留 Teamwork 自己的 `invoke_agent` 网关和 `allowed_user_mcp_servers` 明确列出的服务。这样不会因为用户桌面环境中配置了浏览器、Computer Use 或应用内工具，就让无人值守 Agent 卡在等待交互的工具调用上。如果确实需要继承全部用户 MCP，可以显式设置 `inherit_user_mcp_servers: true`，但这会重新引入无人值守运行风险。
 
-`codex_home` 留空时继续使用服务进程当前的 `CODEX_HOME` 或 `~/.codex`。配置独立目录可以隔离 `config.toml`、登录状态与 `models_cache.json`，但首次使用前必须先为该目录完成 Codex 登录。`expected_codex_version` 用来固定后台实际执行的 CLI 版本；服务会在启动 Agent 前调用 `codex --version`，不匹配时立即失败并显示实际路径、实际版本和缓存版本诊断，而不是让多个版本反复覆盖同一个模型缓存。
+`codex_home` 留空时继续使用服务进程当前的 `CODEX_HOME` 或 `~/.codex`，账户登录仍按原来的 Codex CLI 方式管理。保存非空的独立目录后，运行时页面会显示“登录/重新登录”按钮；浏览器授权完成后可查看账号邮箱、套餐、认证方式以及当前 CLI 实际返回的额度窗口和重置时间。登录使用当前 `codex_binary` 的 App Server 接口，Teamwork 不读取 `auth.json`，也不会把访问令牌、刷新令牌或 API Key 返回给浏览器或写入数据库。编辑中尚未保存的目录不能启动登录，避免把凭据写入错误位置。
+
+配置独立目录可以隔离 `config.toml`、登录状态与 `models_cache.json`。`expected_codex_version` 用来固定后台实际执行的 CLI 版本；服务会在启动 Agent 前调用 `codex --version`，不匹配时立即失败并显示实际路径、实际版本和缓存版本诊断，而不是让多个版本反复覆盖同一个模型缓存。
 
 Agent 的 `timeout_seconds` 是单次运行总时长上限；`runtime.agent_idle_timeout_seconds` 是连续没有新 JSONL 进度的上限，两者任意一个先到都会终止整个 Codex 进程组。Agent 还可以用 `idle_timeout_seconds` 单独覆盖默认值。在“运行与日志”中可以对“排队中”或“执行中”的任务点击“取消运行”：排队任务会直接取消，执行中任务会先请求正常终止，短暂等待后再强制结束整个进程组，取消状态会持久化到 SQLite，因此后台服务与 UI 不在同一进程时仍然有效。
 

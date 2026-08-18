@@ -19,4 +19,5 @@ data/*.db-wal
 data/*.pid
 data/*.lock
 data/*.log
+/data/worktrees/
 tmp/

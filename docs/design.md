@@ -202,7 +202,7 @@ React 管理 UI 包含：
 
 规则可配置 `inherit_workspace`，默认关闭。开启时，根 Agent 的后代 sub-agent 共用父 Agent 本次运行的临时 worktree，因此父 Agent 的分支切换、暂存区和未提交文件对子 Agent 可见；共享工作区委托在单个 MCP 进程内串行执行。关闭时，sub-agent 为自己的运行创建另一个独立 worktree。该选项只继承文件系统与 Git 状态，不自动继承 MR / PR Prompt、动作数组或父 Agent 对话内容。
 
-拥有 worktree 的 Agent 结束后执行安全清理：运行成功且工作区无修改、没有新增提交，或者新增提交已经存在于远端引用时立即使用 `git worktree remove` 删除。失败、超时、存在未提交文件或新增提交尚未推送时保留工作区，并在运行记录中标记“待清理”。保留超过 `runtime.worktree_retention_days` 后，后台在下次准备同仓库工作区时强制清理；这项期限明确代表对遗留本地修改的最长恢复窗口。
+拥有 worktree 的 Agent 结束后执行安全清理：运行成功且工作区无修改、没有新增提交，或者新增提交已经存在于远端引用时立即使用 `git worktree remove` 删除。失败、超时、存在未提交文件或新增提交尚未推送时保留工作区，并在运行记录中标记“待清理”。保留超过 `runtime.worktree_retention_days` 后，后台在下次准备同仓库工作区时强制清理；这项期限明确代表对遗留本地修改的最长恢复窗口。默认数据库位于项目 `data/` 时，仓库根目录的 `.gitignore` 必须忽略整个 `/data/worktrees/` 运行目录，包括保留标记，避免临时工作区进入版本控制；忽略规则不替代后台安全清理。
 
 Agent 配置本身不绑定仓库或固定目录。管理 UI 在 Agent 页面说明基础仓库与临时运行工作区的关系，并在运行详情展示本次实际路径、清理状态和保留原因。
 
@@ -312,4 +312,14 @@ Agent 的本地文件能力与命令联网能力采用两个独立配置维度�
 
 联网参数由 Teamwork 作为应用托管的 Codex CLI 覆盖项注入。Agent 高级配置不得覆盖 `sandbox_workspace_write.network_access` 或 `features.network_proxy`，避免绕过 UI 与配置校验。未开启联网时显式传入关闭状态；开启且白名单为空时显式关闭域名代理；开启且存在白名单时显式启用代理并传入域名映射，使行为不受用户 `config.toml` 中同名设置影响。
 
-Provider Token 与命令联网权限完全分离。GitHub、GitLab 等 Provider 的 `token_env` 在创建 Codex 子进程前始终移除，不能通过开启联网、配置域名或 Agent 环境变量进入 Prompt 和命令环境。Codex 子进程继续继承宿主机 `HOME` 等基础环境，因此 `gh`、`glab` 可以使用各自已经建立的系统钥匙串或 CLI 登录态；Teamwork 不复制、不代理也不展示这些登录凭据。内置通用审核 Agent 默认开启命令联网且不设置域名白名单，以便使用自身 `gh` 登录态完成平台只读核验；部署配置仍可由管理员收紧。
+Provider Token 与命令联网权限完全分离。GitHub、GitLab 等 Provider 的 `token_env` 在创建 Codex 子进程前始终移除，不能通过开启联网、配置域名或 Agent 环境变量进入 Prompt 和命令环境。Codex 子进程继续继承宿主机 `HOME` 等基础环境，因此 `gh`、`glab` 可以使用各自已经建立的系统钥匙串或 CLI 登录态；Teamwork 不复制、不代理也不展示这些登录凭据。三个内置 Agent 默认都开启命令联网且不设置域名白名单，以便审核和增量文档任务按需使用自身 `gh` / `glab` 登录态；部署配置仍可由管理员收紧。
+
+## 31. 独立 Codex Home 账户登录与额度展示
+
+运行时页面只在 `runtime.codex_home` 已经保存为非空路径时提供后台 Codex 账户管理。留空继续沿用服务进程继承的 `CODEX_HOME` 或 `~/.codex`，不在 Teamwork 中展示登录、重新登录或账户详情，避免应用无意修改用户桌面和终端共用的认证状态。用户在编辑模式中刚填写但尚未保存的新路径也不能启动登录；账户操作始终绑定当前已生效配置中的 Codex 二进制与绝对 Home 路径。
+
+账户管理使用当前 `runtime.codex_binary` 的 Codex App Server JSON-RPC 接口，不读取或解析 `auth.json`，也不把访问令牌、刷新令牌或 API Key 传到浏览器、SQLite 与应用日志。后端以指定 `CODEX_HOME` 启动独立 App Server，完成初始化后通过 `account/read` 获取认证类型、账号邮箱和套餐，通过 `account/rateLimits/read` 获取额度窗口、使用比例和重置时间，并在能力可用时通过 `account/usage/read` 获取用量摘要。API Key 等不提供 ChatGPT 额度的认证类型只展示认证方式，不伪造额度信息。
+
+登录采用 App Server 的 `account/login/start`。本机管理界面优先使用 ChatGPT 浏览器授权地址；登录进程在成功、失败、取消或超时前保持存活，以承接本地 OAuth 回调和 `account/login/completed` 通知。管理 API 为每个 Codex Home 只保留一个内存登录会话，提供启动、查询和取消操作；服务重启后不恢复中间登录会话，而是重新通过 `account/read` 判断最终认证状态。重新登录复用同一授权流程，不先执行退出，避免授权失败时主动删除已有凭据。
+
+运行时页面在只读模式下展示账户卡片，因为登录属于对已保存运行环境的操作而不是配置草稿。卡片区分未配置独立 Home、检查中、未登录、登录中、已登录和诊断失败；已登录时展示官方接口实际返回的邮箱、套餐、认证方式、额度使用比例和重置时间，并明确标记缺失字段。所有账户管理接口继续受管理 Token 保护，授权 URL 只返回给发起请求的管理员且不写日志。

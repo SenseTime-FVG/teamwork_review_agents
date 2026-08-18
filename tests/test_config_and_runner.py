@@ -128,9 +128,13 @@ def test_example_config_is_valid() -> None:
     assert config.scanner.api_page_size == 50
     assert config.runtime.worktree_retention_days == 7
     assert config.runtime.codex.fast_mode == "inherit"
-    assert config.agents["general-reviewer"].network_access is True
-    assert config.agents["general-reviewer"].network_domains == []
-    assert config.agents["incremental-doc-updater"].network_access is False
+    for agent_name in (
+        "general-reviewer",
+        "incremental-doc-update-runner",
+        "incremental-doc-updater",
+    ):
+        assert config.agents[agent_name].network_access is True
+        assert config.agents[agent_name].network_domains == []
 
 
 def test_scanner_migrates_legacy_pagination_settings() -> None:

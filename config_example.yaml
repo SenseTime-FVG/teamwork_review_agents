@@ -204,7 +204,8 @@ agents:
   incremental-doc-update-runner:
     prompt_file: ./prompts/增量文档更新入口.md
     sandbox: workspace-write
-    network_access: false
+    # 允许入口 Agent 按需通过自身 gh / glab 登录态读取平台信息。
+    network_access: true
     network_domains: []
     timeout_seconds: 1200
     write_scopes:
@@ -224,7 +225,8 @@ agents:
   incremental-doc-updater:
     prompt_file: ./prompts/增量文档更新.md
     sandbox: workspace-write
-    network_access: false
+    # 允许文档更新 Agent 按需通过自身 gh / glab 登录态读取平台信息。
+    network_access: true
     network_domains: []
     timeout_seconds: 1200
     write_scopes:

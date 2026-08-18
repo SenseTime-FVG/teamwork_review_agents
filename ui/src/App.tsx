@@ -12,6 +12,8 @@ import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import type {
   Agent,
   ChangeRequestRecord,
+  CodexAccountStatus,
+  CodexLoginSession,
   CodexRuntimeConfig,
   CodexRuntimeOptions,
   ConfigDocument,
@@ -993,6 +995,194 @@ function CodexRuntimeEditor(props: {
         />
       </section>
     </div>
+  );
+}
+
+function CodexQuotaWindow(props: {
+  label: string;
+  value?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
+}) {
+  if (!props.value) return null;
+  const usedPercent = Math.max(0, Math.min(100, Number(props.value.usedPercent ?? 0)));
+  const duration = props.value.windowDurationMins
+    ? `${props.value.windowDurationMins} 分钟窗口`
+    : "额度窗口";
+  return (
+    <div className="codex-quota-window">
+      <div><span>{props.label} · {duration}</span><strong>{usedPercent.toFixed(0)}% 已使用</strong></div>
+      <div className="codex-quota-track"><span style={{ width: `${usedPercent}%` }} /></div>
+      {props.value.resetsAt && <small>重置时间：{timeText(props.value.resetsAt)}</small>}
+    </div>
+  );
+}
+
+function CodexAccountCard(props: {
+  configuredHome?: string;
+  homeHasUnsavedChange: boolean;
+}) {
+  const [account, setAccount] = useState<CodexAccountStatus | null>(null);
+  const [login, setLogin] = useState<CodexLoginSession | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+
+  const refresh = useCallback(async () => {
+    if (!props.configuredHome) {
+      setAccount(null);
+      setError("");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      setAccount(await api<CodexAccountStatus>("/api/codex/account"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取 Codex 账户失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [props.configuredHome]);
+
+  useEffect(() => {
+    setLogin(null);
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!login || login.status !== "pending") return undefined;
+    let stopped = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const next = await api<CodexLoginSession>(`/api/codex/login/${login.session_id}`);
+        if (stopped) return;
+        setLogin(next);
+        if (next.status === "pending") {
+          timer = window.setTimeout(() => { void poll(); }, 1000);
+        } else if (next.status === "completed") {
+          await refresh();
+        }
+      } catch (reason) {
+        if (!stopped) {
+          setError(reason instanceof Error ? reason.message : "读取 Codex 登录状态失败");
+        }
+      }
+    };
+    timer = window.setTimeout(() => { void poll(); }, 700);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [login?.session_id, login?.status, refresh]);
+
+  async function startLogin() {
+    if (props.homeHasUnsavedChange) return;
+    setWorking(true);
+    setError("");
+    const authWindow = window.open("about:blank", "codex-account-login");
+    if (authWindow) authWindow.opener = null;
+    try {
+      const next = await api<CodexLoginSession>("/api/codex/login", { method: "POST" });
+      setLogin(next);
+      if (authWindow) {
+        authWindow.location.replace(next.auth_url);
+      } else {
+        window.open(next.auth_url, "_blank", "noopener,noreferrer");
+      }
+    } catch (reason) {
+      authWindow?.close();
+      setError(reason instanceof Error ? reason.message : "启动 Codex 登录失败");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function cancelLogin() {
+    if (!login) return;
+    setWorking(true);
+    setError("");
+    try {
+      setLogin(await api<CodexLoginSession>(`/api/codex/login/${login.session_id}/cancel`, { method: "POST" }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消 Codex 登录失败");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  const limits = account?.rate_limits?.rateLimitsByLimitId?.length
+    ? account.rate_limits.rateLimitsByLimitId
+    : account?.rate_limits?.rateLimits
+      ? [account.rate_limits.rateLimits]
+      : [];
+  const accountName = account?.account?.email ?? "已登录的 ChatGPT 账户";
+
+  return (
+    <section className="section-card codex-account-card">
+      <div className="section-title-row codex-account-head">
+        <div>
+          <h2>独立 Codex Home 账户</h2>
+          <p>登录态只写入已保存的独立目录；页面不会读取或展示认证凭据。</p>
+        </div>
+        {props.configuredHome && (
+          <div className="button-group">
+            <button className="button secondary" disabled={loading || working} onClick={() => { void refresh(); }}>刷新</button>
+            {login?.status === "pending" ? (
+              <>
+                <button className="button secondary" onClick={() => window.open(login.auth_url, "_blank", "noopener,noreferrer")}>打开登录页</button>
+                <button className="button danger" disabled={working} onClick={() => { void cancelLogin(); }}>取消登录</button>
+              </>
+            ) : (
+              <button className="button primary" disabled={loading || working || props.homeHasUnsavedChange} onClick={() => { void startLogin(); }}>
+                {working ? "启动中…" : account?.status === "signed_in" ? "重新登录" : "登录"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {!props.configuredHome && (
+        <div className="codex-account-empty">
+          当前未配置独立 Codex Home，后台继续继承环境中的 <code>CODEX_HOME</code> 或 <code>~/.codex</code>；账户登录仍按原方式管理。
+        </div>
+      )}
+      {props.configuredHome && (
+        <>
+          <div className="agent-workspace-note codex-home-note"><strong>已保存目录</strong><span>{props.configuredHome}</span></div>
+          {props.homeHasUnsavedChange && <div className="alert error">Codex Home 有未保存修改。请先保存或取消修改，再管理该目录的登录态。</div>}
+          {error && <div className="alert error">{error}</div>}
+          {login?.status === "pending" && <div className="alert success">浏览器登录进行中；完成授权后，本页会自动刷新账户信息。</div>}
+          {login?.status === "failed" && <div className="alert error">{login.error || "Codex 登录失败"}</div>}
+          {login?.status === "cancelled" && <div className="codex-account-empty">本次登录已取消。</div>}
+          {loading && <div className="codex-account-empty"><span className="spinner" />正在读取账户与额度…</div>}
+          {!loading && account?.status === "signed_out" && <div className="codex-account-empty">该独立 Codex Home 尚未登录。</div>}
+          {!loading && account?.status === "signed_in" && (
+            <div className="codex-account-content">
+              <dl className="codex-account-details">
+                <div><dt>账户</dt><dd>{accountName}</dd></div>
+                <div><dt>账户类型</dt><dd>{account.account?.type === "chatgpt" ? "ChatGPT" : account.account?.type ?? "—"}</dd></div>
+                <div><dt>套餐</dt><dd>{account.account?.planType ?? "未提供"}</dd></div>
+                <div><dt>凭据来源</dt><dd>{account.account?.credentialSource ?? "Codex Home"}</dd></div>
+              </dl>
+              <div className="codex-quota-list">
+                <div className="codex-quota-title"><strong>额度</strong><span>{limits.length ? `${limits.length} 个额度窗口` : "当前 CLI 未返回额度信息"}</span></div>
+                {limits.map((limit, index) => (
+                  <div className="codex-quota-item" key={limit.limitId ?? `${limit.limitName ?? "limit"}-${index}`}>
+                    <strong>{limit.limitName ?? limit.limitId ?? `额度 ${index + 1}`}</strong>
+                    <CodexQuotaWindow label="主要" value={limit.primary} />
+                    <CodexQuotaWindow label="次要" value={limit.secondary} />
+                  </div>
+                ))}
+                {account.rate_limits?.rateLimitResetCredits && (
+                  <small className="codex-reset-credits">可用额度重置次数：{account.rate_limits.rateLimitResetCredits.availableCount}</small>
+                )}
+                {account.rate_limits_error && <small className="codex-account-warning">{account.rate_limits_error}</small>}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -2298,6 +2488,12 @@ export default function App() {
                     {tab === "rules" && <RulesEditor document={document} events={eventOptions} onChange={changeDocument} />}
                     {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
                   </fieldset>
+                  {tab === "runtime" && (
+                    <CodexAccountCard
+                      configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}
+                      homeHasUnsavedChange={String(document.runtime.codex_home ?? "") !== String(savedDocument?.runtime.codex_home ?? "")}
+                    />
+                  )}
                   {tab === "environment" && <ConfigHistory />}
                 </>
               )}

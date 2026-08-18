@@ -98,6 +98,60 @@ export type CodexRuntimeOptions = {
   user_mcp_error?: string | null;
 };
 
+export type CodexRateLimitWindow = {
+  usedPercent?: number;
+  windowDurationMins?: number;
+  resetsAt?: number;
+};
+
+export type CodexRateLimit = {
+  limitId?: string;
+  limitName?: string;
+  planType?: string;
+  rateLimitReachedType?: string;
+  primary?: CodexRateLimitWindow;
+  secondary?: CodexRateLimitWindow;
+};
+
+export type CodexAccountStatus = {
+  managed: boolean;
+  status: "inherited" | "signed_out" | "signed_in";
+  codex_home?: string;
+  requires_openai_auth?: boolean | null;
+  account?: {
+    type?: string;
+    email?: string;
+    planType?: string;
+    credentialSource?: string;
+  } | null;
+  rate_limits?: {
+    rateLimits?: CodexRateLimit;
+    rateLimitsByLimitId?: CodexRateLimit[];
+    rateLimitResetCredits?: { availableCount: number };
+  } | null;
+  usage?: {
+    summary?: {
+      lifetimeTokens?: number;
+      peakDailyTokens?: number;
+      longestRunningTurnSec?: number;
+      currentStreakDays?: number;
+      longestStreakDays?: number;
+    };
+  } | null;
+  rate_limits_error?: string;
+  usage_error?: string;
+};
+
+export type CodexLoginSession = {
+  session_id: string;
+  codex_home: string;
+  auth_url: string;
+  status: "pending" | "completed" | "failed" | "cancelled";
+  error?: string | null;
+  started_at: number;
+  finished_at?: number | null;
+};
+
 export type Skill = {
   path: string;
 };

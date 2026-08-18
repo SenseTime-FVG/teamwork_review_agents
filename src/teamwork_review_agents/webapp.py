@@ -14,6 +14,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .codex_account import (
+    CodexAccountError,
+    CodexLoginManager,
+    inspect_codex_account,
+)
 from .config_manager import ConfigManager
 from .codex_settings import inspect_runtime_options
 from .environment import render_prompt
@@ -58,6 +63,7 @@ def create_app(
 
     manager = ConfigManager(config_path)
     runtime = BackgroundRuntime(manager)
+    login_manager = CodexLoginManager()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -66,6 +72,7 @@ def create_app(
         try:
             yield
         finally:
+            await login_manager.close()
             if start_scheduler:
                 await runtime.stop()
 
@@ -76,6 +83,7 @@ def create_app(
     )
     app.state.config_manager = manager
     app.state.runtime = runtime
+    app.state.codex_login_manager = login_manager
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -196,6 +204,54 @@ def create_app(
             manager.config.runtime.codex_home,
             manager.config.runtime.expected_codex_version,
         )
+
+    @app.get("/api/codex/account")
+    async def codex_account() -> dict[str, Any]:
+        """返回已保存独立 Codex Home 的脱敏账户和额度信息。"""
+
+        try:
+            return await inspect_codex_account(
+                manager.config.runtime.codex_binary,
+                manager.config.runtime.codex_home,
+            )
+        except (CodexAccountError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/codex/login")
+    async def start_codex_login() -> dict[str, Any]:
+        """为已保存的独立 Codex Home 启动 ChatGPT 浏览器登录。"""
+
+        home = manager.config.runtime.codex_home
+        if home is None:
+            raise HTTPException(
+                status_code=409,
+                detail="请先配置并保存独立的后台 Codex Home",
+            )
+        try:
+            return await login_manager.start(
+                manager.config.runtime.codex_binary,
+                home,
+            )
+        except (CodexAccountError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/codex/login/{session_id}")
+    async def codex_login_status(session_id: str) -> dict[str, Any]:
+        """返回登录会话状态，不包含任何认证凭据。"""
+
+        session = login_manager.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Codex 登录会话不存在")
+        return session
+
+    @app.post("/api/codex/login/{session_id}/cancel")
+    async def cancel_codex_login(session_id: str) -> dict[str, Any]:
+        """取消仍在等待浏览器授权的 Codex 登录。"""
+
+        session = await login_manager.cancel(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Codex 登录会话不存在")
+        return session
 
     @app.post("/api/prompts/preview")
     async def preview_prompt(body: PromptPreviewRequest) -> dict[str, str]:
