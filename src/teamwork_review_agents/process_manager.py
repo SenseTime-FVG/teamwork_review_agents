@@ -18,13 +18,17 @@ from typing import IO
 import portalocker
 
 from .process_control import (
+    ProcessIdentity,
+    descendant_process_identities,
     iter_process_commands,
     pid_exists,
+    process_identity_exists,
     process_group_options,
     process_started_at,
     process_state,
     reap_child,
     terminate_process,
+    terminate_process_identities,
 )
 
 
@@ -502,6 +506,10 @@ def stop_managed_process(
         return ProcessActionResult(0, "服务当前未运行")
 
     target_pids = {record.pid for record in records}
+    descendant_identities: dict[int, ProcessIdentity] = {}
+    for record in records:
+        for identity in descendant_process_identities(record.pid):
+            descendant_identities[identity.pid] = identity
     for record in records:
         if not _record_is_running(record):
             continue
@@ -523,6 +531,60 @@ def stop_managed_process(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if all(not _record_is_running(record) for record in records):
+            remaining_descendants = tuple(
+                identity
+                for identity in descendant_identities.values()
+                if process_identity_exists(identity)
+            )
+            if remaining_descendants:
+                try:
+                    terminate_process_identities(remaining_descendants, force=False)
+                except PermissionError as exc:
+                    return ProcessActionResult(
+                        1,
+                        f"服务已退出，但无法结束 Agent/Codex 后代进程：{exc}",
+                        records[0],
+                    )
+                descendant_deadline = min(deadline, time.monotonic() + 3)
+                while time.monotonic() < descendant_deadline and any(
+                    process_identity_exists(identity)
+                    for identity in remaining_descendants
+                ):
+                    time.sleep(0.1)
+                still_running = tuple(
+                    identity
+                    for identity in remaining_descendants
+                    if process_identity_exists(identity)
+                )
+                if still_running:
+                    try:
+                        terminate_process_identities(still_running, force=True)
+                    except PermissionError as exc:
+                        return ProcessActionResult(
+                            1,
+                            f"服务已退出，但无法强制结束 Agent/Codex 后代进程：{exc}",
+                            records[0],
+                        )
+                    force_descendant_deadline = time.monotonic() + 3
+                    while time.monotonic() < force_descendant_deadline and any(
+                        process_identity_exists(identity)
+                        for identity in still_running
+                    ):
+                        time.sleep(0.1)
+                remaining_descendants = tuple(
+                    identity
+                    for identity in remaining_descendants
+                    if process_identity_exists(identity)
+                )
+                if remaining_descendants:
+                    pids = ", ".join(
+                        str(identity.pid) for identity in remaining_descendants
+                    )
+                    return ProcessActionResult(
+                        1,
+                        f"服务已退出，但无法结束 Agent/Codex 后代进程：PID {pids}",
+                        records[0],
+                    )
             for record in records:
                 _reap_child(record.pid)
             current = _read_record(paths)
@@ -533,6 +595,9 @@ def stop_managed_process(
         time.sleep(0.1)
 
     forced = [record for record in records if _record_is_running(record)]
+    for record in forced:
+        for identity in descendant_process_identities(record.pid):
+            descendant_identities[identity.pid] = identity
     for record in forced:
         try:
             terminate_process(
@@ -548,9 +613,24 @@ def stop_managed_process(
                 f"无权强制结束服务进程 PID {record.pid}：{exc}",
                 record,
             )
+    try:
+        terminate_process_identities(
+            tuple(descendant_identities.values()),
+            force=True,
+        )
+    except PermissionError as exc:
+        return ProcessActionResult(
+            1,
+            f"无权强制结束 Agent/Codex 后代进程：{exc}",
+            records[0],
+        )
     force_deadline = time.monotonic() + 3
-    while time.monotonic() < force_deadline and any(
-        _record_is_running(record) for record in forced
+    while time.monotonic() < force_deadline and (
+        any(_record_is_running(record) for record in forced)
+        or any(
+            process_identity_exists(identity)
+            for identity in descendant_identities.values()
+        )
     ):
         time.sleep(0.1)
     for record in records:
@@ -559,12 +639,22 @@ def stop_managed_process(
     if current and current.pid in target_pids:
         paths.pid_file.unlink(missing_ok=True)
     remaining = [record for record in records if _record_is_running(record)]
-    if remaining:
-        pids = ", ".join(str(record.pid) for record in remaining)
+    remaining_descendants = [
+        identity
+        for identity in descendant_identities.values()
+        if process_identity_exists(identity)
+    ]
+    if remaining or remaining_descendants:
+        pids = ", ".join(
+            [
+                *(str(record.pid) for record in remaining),
+                *(str(identity.pid) for identity in remaining_descendants),
+            ]
+        )
         return ProcessActionResult(
             1,
-            f"无法结束服务进程：PID {pids}",
-            remaining[0],
+            f"无法结束服务或 Agent/Codex 后代进程：PID {pids}",
+            remaining[0] if remaining else records[0],
         )
     pids = ", ".join(str(record.pid) for record in records)
     return ProcessActionResult(

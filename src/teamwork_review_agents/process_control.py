@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 import psutil
@@ -21,6 +22,14 @@ _WINDOWS_DETACHED_PROCESS = getattr(
     "DETACHED_PROCESS",
     0x00000008,
 )
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """用于关闭期间防止 PID 重用误杀的进程身份快照。"""
+
+    pid: int
+    started_at: str
 
 
 def process_group_options(*, detached: bool = False) -> dict[str, Any]:
@@ -83,6 +92,62 @@ def iter_process_commands() -> list[tuple[int, list[str], str]]:
     return processes
 
 
+def descendant_process_identities(pid: int) -> tuple[ProcessIdentity, ...]:
+    """记录指定进程当前全部后代的 PID 与启动时间。"""
+
+    try:
+        root = psutil.Process(pid)
+        descendants = root.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        return ()
+    identities: list[ProcessIdentity] = []
+    for process in descendants:
+        try:
+            identities.append(
+                ProcessIdentity(
+                    pid=process.pid,
+                    started_at=f"{process.create_time():.6f}",
+                )
+            )
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            continue
+    return tuple(identities)
+
+
+def process_identity_exists(identity: ProcessIdentity) -> bool:
+    """确认进程仍存活且启动时间与快照一致。"""
+
+    return process_started_at(identity.pid) == identity.started_at and pid_exists(
+        identity.pid
+    )
+
+
+def terminate_process_identities(
+    identities: tuple[ProcessIdentity, ...],
+    *,
+    force: bool = False,
+) -> None:
+    """按身份快照终止后代，忽略已经退出或已被 PID 重用的目标。"""
+
+    denied: list[int] = []
+    for identity in reversed(identities):
+        if not process_identity_exists(identity):
+            continue
+        try:
+            process = psutil.Process(identity.pid)
+            if force:
+                process.kill()
+            else:
+                process.terminate()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied:
+            denied.append(identity.pid)
+    if denied:
+        joined = ", ".join(str(item) for item in denied)
+        raise PermissionError(f"无权结束进程 PID {joined}")
+
+
 def _windows_process_targets(pid: int, *, tree: bool) -> list[psutil.Process]:
     """返回 Windows 目标进程，并找回直接父进程已退出的后代。"""
 
@@ -130,11 +195,16 @@ def terminate_process(
     if pid <= 0:
         return
     if os.name != "nt":
+        descendants = descendant_process_identities(pid) if tree else ()
         target_signal = signal.SIGKILL if force else signal.SIGTERM
-        if tree:
-            os.killpg(pid, target_signal)
-        else:
-            os.kill(pid, target_signal)
+        try:
+            if tree:
+                os.killpg(pid, target_signal)
+            else:
+                os.kill(pid, target_signal)
+        finally:
+            if descendants:
+                terminate_process_identities(descendants, force=force)
         return
 
     targets = _windows_process_targets(pid, tree=tree)

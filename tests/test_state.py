@@ -483,6 +483,63 @@ def test_cancel_request_marks_preparing_run_for_cooperative_stop(tmp_path) -> No
     assert not store.mark_agent_run_running(reservation.run_id)
 
 
+def test_service_shutdown_requests_cancel_for_every_active_run(tmp_path) -> None:
+    """服务停止应覆盖全部活动根任务和 sub-agent，终态运行保持不变。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    queued = store.begin_agent_run(
+        proposed_run_id="run-queued",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="shutdown-queued",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:8",
+        prompt="",
+        max_attempts=1,
+    )
+    running = store.begin_agent_run(
+        proposed_run_id="run-running",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="shutdown-running",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:9",
+        prompt="",
+        max_attempts=1,
+    )
+    child = store.begin_agent_run(
+        proposed_run_id="run-child",
+        root_run_id="run-running",
+        parent_run_id="run-running",
+        idempotency_key="shutdown-child",
+        event_id=None,
+        rule_name=None,
+        agent_name="helper",
+        resource_key="github:demo:9",
+        prompt="",
+        max_attempts=1,
+    )
+    assert queued is not None
+    assert running is not None
+    assert child is not None
+    assert store.mark_agent_run_running(running.run_id)
+    assert store.mark_agent_run_preparing(child.run_id)
+
+    cancelled = store.request_cancel_active_runs()
+
+    assert set(cancelled) == {queued.run_id, running.run_id, child.run_id}
+    assert store.get_run(queued.run_id)["status"] == "cancelled"
+    assert store.get_run(running.run_id)["status"] == "running"
+    assert store.get_run(child.run_id)["status"] == "preparing"
+    assert all(store.agent_run_cancel_requested(run_id) for run_id in cancelled)
+    assert store.request_cancel_active_runs() == []
+
+
 def test_activity_cursor_is_saved_with_snapshot_and_events(
     tmp_path,
     snapshot_factory,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Sequence
@@ -98,6 +99,19 @@ class AgentExecutor:
         self.store = store
         self.runner = CodexRunner(config)
         self.repositories = config.repository_map()
+        self._shutdown_requested = threading.Event()
+
+    def begin_shutdown(self) -> None:
+        """阻止本执行器继续创建 Codex，并让准备阶段尽快退出。"""
+
+        self._shutdown_requested.set()
+
+    def _cancel_requested(self, run_id: str) -> bool:
+        """合并服务停止标志与持久化的单次运行取消请求。"""
+
+        return self._shutdown_requested.is_set() or self.store.agent_run_cancel_requested(
+            run_id
+        )
 
     def run_workspace_path(
         self,
@@ -208,6 +222,9 @@ class AgentExecutor:
     ) -> AgentResult | None:
         """申请审计记录与写锁，然后运行一个 Codex CLI Agent。"""
 
+        if self._shutdown_requested.is_set():
+            raise AgentExecutionError("服务正在停止，不再创建新的 Agent 运行")
+
         if agent_name not in self.config.agents:
             raise AgentExecutionError(f"不存在 Agent：{agent_name}")
         if event.repository_id not in self.repositories:
@@ -257,6 +274,11 @@ class AgentExecutor:
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
             )
+        if self._shutdown_requested.is_set():
+            await asyncio.to_thread(
+                self.store.request_cancel_run,
+                reservation.run_id,
+            )
 
         keys = self.lock_keys(agent_name, event, configured_repository)
         lease = ResourceLease(
@@ -265,6 +287,7 @@ class AgentExecutor:
             reservation.root_run_id,
             ttl_seconds=self.config.runtime.lock_ttl_seconds,
             timeout_seconds=self.config.runtime.lock_timeout_seconds,
+            cancel_check=lambda: self._cancel_requested(reservation.run_id),
         )
 
         async def persist_log(
@@ -316,6 +339,7 @@ class AgentExecutor:
                         reservation.run_id,
                         ttl_seconds=self.config.runtime.lock_ttl_seconds,
                         timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                        cancel_check=lambda: self._cancel_requested(reservation.run_id),
                     )
                     async with git_admin_lease:
                         preparing = await asyncio.to_thread(
@@ -347,10 +371,8 @@ class AgentExecutor:
                                 event_loop,
                             )
 
-                        git_cancel_check = lambda: (
-                            self.store.agent_run_cancel_requested(
-                                reservation.run_id
-                            )
+                        git_cancel_check = lambda: self._cancel_requested(
+                            reservation.run_id
                         )
                         change_ref = await asyncio.to_thread(
                             prepare_change_request_workspace,
@@ -515,7 +537,7 @@ class AgentExecutor:
                         redactor=redactor,
                         log_callback=persist_log,
                         cancel_check=lambda: asyncio.to_thread(
-                            self.store.agent_run_cancel_requested,
+                            self._cancel_requested,
                             reservation.run_id,
                         ),
                     )
@@ -533,7 +555,7 @@ class AgentExecutor:
             )
         except Exception as exc:
             cancelled = await asyncio.to_thread(
-                self.store.agent_run_cancel_requested,
+                self._cancel_requested,
                 reservation.run_id,
             )
             error = (

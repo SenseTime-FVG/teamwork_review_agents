@@ -32,6 +32,9 @@ async def test_manual_dispatch_runs_while_paused_without_scanning(
     class FakeOrchestrator:
         """记录运行循环选择了完整扫描还是仅事件调度。"""
 
+        async def request_shutdown(self) -> list[str]:
+            return []
+
         async def process_events(self, summary: CycleSummary) -> None:
             summary.processed_events = 1
             dispatch_finished.set()
@@ -80,11 +83,17 @@ async def test_agent_dispatch_does_not_block_the_next_scheduled_scan(
     second_scan_finished = asyncio.Event()
     third_scan_finished = asyncio.Event()
     dispatch_started = asyncio.Event()
+    shutdown_requested = asyncio.Event()
     release_dispatch = asyncio.Event()
     scan_calls = 0
 
     class FakeOrchestrator:
         """用阻塞调度模拟运行一小时的 Agent。"""
+
+        async def request_shutdown(self) -> list[str]:
+            shutdown_requested.set()
+            release_dispatch.set()
+            return []
 
         async def scan(self, summary: CycleSummary) -> None:
             nonlocal scan_calls
@@ -121,8 +130,8 @@ async def test_agent_dispatch_does_not_block_the_next_scheduled_scan(
         assert scan_calls == 3
         assert runtime.dispatching_events
     finally:
-        release_dispatch.set()
         await runtime.stop()
 
+    assert shutdown_requested.is_set()
     assert runtime.last_dispatch_summary is not None
     assert runtime.last_dispatch_summary["agent_runs"] == 1

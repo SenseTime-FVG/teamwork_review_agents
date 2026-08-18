@@ -242,7 +242,7 @@ agents:
     home_mode: temporary
 ```
 
-`home_mode: temporary` 是通用运行隔离，不需要随仓库配置 `BOX_AGENT_HOME`、`UV_HOME` 等项目专用变量。根 Agent 和 sub-agent 每次运行各自创建临时 HOME，并在成功、失败、取消或超时后清理；服务异常退出遗留的目录会在后续启动执行器时回收。真实 `CODEX_HOME` 继续显式传入，已有的 `gh`、`glab`、Git 全局配置和 SSH Agent 只桥接必要入口，不会复制整个用户目录、私钥或其他凭据。Provider Token 仍不会进入 Codex 进程。只读 Agent 不能选择临时 HOME；`danger-full-access` 仅改变默认 HOME，并不形成文件系统安全边界。
+`home_mode: temporary` 是通用运行隔离，不需要随仓库配置 `BOX_AGENT_HOME`、`UV_HOME` 等项目专用变量。根 Agent 和 sub-agent 每次运行各自创建临时 HOME，并在成功、失败、取消或超时后清理；服务异常退出遗留的目录会在后续启动执行器时回收。真实 `CODEX_HOME` 继续显式传入，已有的 `gh`、`glab`、Git 全局配置和 SSH Agent 只桥接必要入口，不会复制整个用户目录、私钥或其他凭据。macOS 会额外把临时 HOME 的 `Library/Keychains` 链接到当前系统用户的钥匙串目录，使 `gh` 在 HOME 隔离后仍能使用原有 Keychain 登录态；任务清理只删除链接，不会删除真实钥匙串。该过程不会生成 `GH_TOKEN`，Provider Token 仍不会进入 Codex 进程。只读 Agent 不能选择临时 HOME；`danger-full-access` 仅改变默认 HOME，并不形成文件系统安全边界。
 
 接入仓库中的 `ci/preflight.sh` 应当是可独立运行、首个错误即退出的确定性脚本，例如：
 
@@ -291,6 +291,12 @@ teamwork-review-agents runs --limit 20
 ```
 
 默认读取当前目录的 `config.yaml`。其他配置文件使用 `-c /path/to/config.yaml`。
+
+`stop` 会先持久化取消所有排队中、准备中和执行中的 Agent，并等待 Codex CLI
+及其子命令退出；超过收尾时限后会按进程身份快照强制清理残留后代进程。
+`restart` 复用同一停止流程，确认旧 Agent/Codex 已退出后才启动新服务，避免重启后
+旧 Codex 继续消耗 Token。管理界面的“取消运行”也会递归取消该根 Agent 的
+sub-agent，并终止对应 Codex 进程树。
 
 ## 文档导航
 

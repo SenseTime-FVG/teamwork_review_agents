@@ -25,7 +25,7 @@ from teamwork_review_agents.config import (
     validate_runtime_files,
 )
 from teamwork_review_agents.models import InvocationContext
-from teamwork_review_agents.executor import AgentExecutor
+from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.process_manager import (
     ServiceLease,
@@ -683,6 +683,91 @@ def test_root_and_sub_agent_prompt_contexts_are_separated(
     assert snapshot.title not in child_prompt
 
 
+@pytest.mark.asyncio
+async def test_executor_rejects_new_runs_after_shutdown(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """服务进入停止阶段后不得再登记或启动新的 Agent。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = AgentExecutor(config, store)
+    executor.begin_shutdown()
+
+    with pytest.raises(AgentExecutionError, match="服务正在停止"):
+        await executor.execute(
+            agent_name="code-reviewer",
+            event=event,
+            idempotency_key="shutdown-no-new-run",
+            rule_name="review",
+        )
+
+    assert store.list_runs() == []
+
+
+@pytest.mark.asyncio
+async def test_executor_cancellation_interrupts_resource_lock_wait(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """取消请求应中断资源锁等待，不能继续阻塞到锁超时。"""
+
+    config = configured_app_factory()
+    config.agents["code-reviewer"].write_scopes = ["change_request"]
+    repository = config.repositories[0]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = AgentExecutor(config, store)
+    lock_keys = executor.lock_keys("code-reviewer", event, repository)
+    assert store.acquire_locks(lock_keys, "other-run", 60)
+    task = asyncio.create_task(
+        executor.execute(
+            agent_name="code-reviewer",
+            event=event,
+            idempotency_key="cancel-lock-wait",
+            rule_name="review",
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        runs: list[dict[str, object]] = []
+        while asyncio.get_running_loop().time() < deadline:
+            runs = store.list_runs()
+            if runs:
+                break
+            await asyncio.sleep(0.05)
+        assert runs
+        run_id = str(runs[0]["run_id"])
+        store.request_cancel_run(run_id)
+
+        with pytest.raises(AgentExecutionError, match="管理员取消"):
+            await asyncio.wait_for(task, timeout=2)
+
+        assert store.get_run(run_id)["status"] == "cancelled"
+    finally:
+        store.release_locks(lock_keys, "other-run")
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 def test_incremental_document_prompts_support_github_and_gitlab() -> None:
     """内置文档更新链必须显式支持 GitHub PR 与 GitLab MR。"""
 
@@ -1189,7 +1274,7 @@ async def test_runner_does_not_wait_forever_for_inherited_stream_pipe(
     configured_app_factory,
     monkeypatch,
 ) -> None:
-    """脱离进程组的后代持有管道时，超时运行仍必须有界结束。"""
+    """脱离进程组的后代持有管道时也应被终止，无需等待管道超时。"""
 
     monkeypatch.setattr(
         "teamwork_review_agents.codex_runner._STREAM_DRAIN_TIMEOUT_SECONDS",
@@ -1290,4 +1375,4 @@ time.sleep(30)
 
     assert result.status == "timed_out"
     assert "没有 stdout / JSONL 进展" in (result.error or "")
-    assert "run.stream_drain_timed_out" in emitted
+    assert "run.stream_drain_timed_out" not in emitted

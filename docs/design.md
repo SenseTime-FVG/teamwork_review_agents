@@ -491,7 +491,9 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 
 临时 HOME 只允许用于可写沙箱。`read-only` 不得配置 `temporary`，避免把不可写目录误导为可用能力；`workspace-write` 依赖 Codex 对系统临时目录的既有可写边界，`danger-full-access` 只改变默认用户目录位置，不能阻止命令通过绝对路径访问宿主机。每次正常完成、失败、取消或超时都在 Codex 及后代进程收尾后清理临时 HOME。服务进程首次创建 Runner 时还会删除目录名所记录的宿主进程已经不存在的遗留 HOME；不能删除仍由存活服务进程持有的目录。
 
-切换 HOME 不能改变 Codex 与平台 CLI 的既有认证边界。Runner 在替换 `HOME` 前解析并固定实际 `CODEX_HOME`，使 Codex 登录、模型缓存和用户配置继续使用运行时指定目录或宿主机原目录。GitHub CLI 和 GitLab CLI 分别通过 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR` 显式引用宿主机已有配置目录，系统钥匙串仍由操作系统提供；Git 通过 `GIT_CONFIG_GLOBAL` 只读引用已有全局配置，SSH 只继承 `SSH_AUTH_SOCK` 等 Agent 连接信息。不存在的桥接目录不创建也不复制，Teamwork 不复制整个用户目录、SSH 私钥、Codex 凭据或 CLI Token。Provider 的 `token_env` 仍在最终子进程环境中强制移除，Agent 环境变量不能把它重新注入。
+切换 HOME 不能改变 Codex 与平台 CLI 的既有认证边界。Runner 在替换 `HOME` 前解析并固定实际 `CODEX_HOME`，使 Codex 登录、模型缓存和用户配置继续使用运行时指定目录或宿主机原目录。GitHub CLI 和 GitLab CLI 分别通过 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR` 显式引用宿主机已有配置目录；Git 通过 `GIT_CONFIG_GLOBAL` 只读引用已有全局配置，SSH 只继承 `SSH_AUTH_SOCK` 等 Agent 连接信息。不存在的桥接目录不创建也不复制，Teamwork 不复制整个用户目录、SSH 私钥、Codex 凭据或 CLI Token。Provider 的 `token_env` 仍在最终子进程环境中强制移除，Agent 环境变量不能把它重新注入。
+
+macOS 的系统钥匙串搜索列表会受到 `HOME` 影响，仅设置 `GH_CONFIG_DIR` 不能保证 `gh` 找到原登录态。临时 HOME 模式在宿主机 `~/Library/Keychains` 已存在时，只在本次临时 HOME 的 `Library/Keychains` 创建指向该目录的符号链接，使 `gh` 继续通过 macOS Keychain 读取既有登录态。该桥接不复制钥匙串数据库、不读取或输出 Token，也不把 `GH_TOKEN` 或 Provider Token 注入 Codex 环境；宿主目录不存在或平台不是 macOS 时保持原有行为。运行清理与遗留目录回收只能删除临时 HOME 和符号链接本身，绝不能跟随链接删除真实钥匙串目录。
 
 运行日志记录临时 HOME 的准备、桥接项和清理结果，但不读取或记录被桥接配置文件的内容。Agent 管理详情在本地文件权限附近提供“继承系统 HOME / 每次运行使用临时 HOME”选项，列表摘要显示当前模式，并明确说明临时 HOME 与 worktree 是两个不同维度：worktree 隔离仓库文件，临时 HOME 隔离用户级缓存和配置写入。
 
@@ -501,7 +503,7 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 
 事件执行循环继续以 SQLite `event_inbox`、`event_agent_dispatches` 和 Agent 运行幂等键作为可靠交接边界。它在单一循环内领取待处理事件，并按照最大并发 Agent、资源锁、Preflight 和重试规则执行；扫描期间新写入的事件会再次唤醒执行循环，当前批次完成后继续领取。服务异常退出时，已有恢复逻辑把 `processing` 和 `triggered` 事件重新入队，并把未正常结束的 Agent 运行标记为失败，后续仍按既有幂等键和重试上限恢复，不能依赖仅存在于内存的临时任务队列。
 
-“暂停”只阻止新的 Provider 扫描，不中断正在执行的 Agent，也不阻止已经持久化事件的调度和收尾。服务停止继续等待当前扫描和 Agent 执行安全结束；管理员需要立即终止单次运行时仍使用运行取消功能。配置热加载创建的新编排器只用于后续扫描或调度周期，已经开始的周期使用其启动时捕获的配置实例，避免执行中途切换规则、权限或运行时参数。
+“暂停”只阻止新的 Provider 扫描，不中断正在执行的 Agent，也不阻止已经持久化事件的调度和收尾。服务停止会取消活动 Agent 并等待其进程树安全结束；管理员只需终止单次运行时仍使用运行取消功能。配置热加载创建的新编排器只用于后续扫描或调度周期，已经开始的周期使用其启动时捕获的配置实例，避免执行中途切换规则、权限或运行时参数。
 
 运行状态分别记录扫描进行状态与事件调度状态。概览中的“最近扫描”只反映 Provider 扫描，不再因 Agent 长时间运行而显示“正在扫描与调度”；Agent 的执行中、准备中和排队中数量继续由持久化运行记录展示。扫描错误与调度错误分别保存，任一错误都可以在管理界面显示，但调度失败不能把已经成功完成的扫描伪装为仍在进行。
 
@@ -518,3 +520,13 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 README 与首次配置图文指南必须同时提供 POSIX shell 和 Windows PowerShell 的可复制启动命令。Linux、macOS 和 WSL2 使用 `cp`，原生 Windows 使用 `Copy-Item`；不能让 README 声明支持 Windows 后，又在其直接链接的首次配置流程中只展示 POSIX 命令。
 
 `codex`、`gh`、`glab` 和 Teamwork CLI 的登录与校验命令在两个终端中保持一致。Provider Token 的说明必须强调环境变量属于启动服务的进程环境：PowerShell 当前会话变量只会被从该会话启动的服务继承，用户级或服务管理器环境变更只对之后创建的进程生效，已经运行的 Teamwork 服务仍需由用户手动重启。
+
+## 55. 服务停止与 Agent 进程树收尾
+
+运行详情中的“取消运行”是执行生命周期操作，不是单纯修改数据库状态。取消请求持久化到 SQLite，并递归覆盖该根运行的全部 sub-agent；正在准备工作区或运行 Codex 的执行器持续检查该状态。Codex 收到取消后先向自身进程组及命令后代发送温和终止信号，宽限期结束仍未退出时再强制终止。已产生的模型用量不能撤销，但取消完成后不得继续保留 Codex 进程消耗 Token。
+
+`teamwork-review-agents stop` 与 `restart` 使用同一关闭协议。后台运行时收到服务停止请求后，先停止接受新的扫描和 Agent 调度，再把当前数据库中排队、准备和执行中的 Agent 运行全部标记为取消请求；执行器的服务级停止标志还必须关闭“查询活动运行与创建新运行”之间的竞态窗口。运行时等待 Agent、sub-agent、Codex、Git 工作区和临时 HOME 完成受控收尾后才能退出。停止期间被中断的事件沿用既有失败重试与幂等规则，不能把取消中的运行误记为成功。
+
+CLI 在发送服务停止信号前记录服务后代进程的 PID 与启动时间。正常关闭结束后仍存活的已记录后代必须单独终止；若服务超过宽限期，则重新补录后代并同时强制结束服务进程组和已验证身份的后代。该兜底用于覆盖 Codex、MCP 或命令自行创建独立会话后脱离服务进程组的情况，并通过启动时间校验避免 PID 重用导致误杀。`restart` 只有在旧服务及其已记录后代全部确认退出后才能启动新服务；关闭失败时必须停止重启并返回错误。
+
+“暂停”仍只影响新扫描，不取消 Agent；只有单次运行取消、服务 `stop` 或 `restart` 才触发上述终止协议。正常完成、失败或已经取消的终态运行不会再次收到取消请求。

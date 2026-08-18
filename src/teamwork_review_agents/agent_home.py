@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import uuid
@@ -113,6 +114,21 @@ def _environment_path(environment: Mapping[str, str], name: str) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def _bridge_macos_keychains(temporary_home: Path, host_home: Path) -> bool:
+    """让临时 HOME 继续使用当前 macOS 用户的系统钥匙串搜索入口。"""
+
+    if sys.platform != "darwin":
+        return False
+    host_keychains = host_home / "Library/Keychains"
+    if not host_keychains.is_dir():
+        return False
+    bridge_parent = temporary_home / "Library"
+    bridge_parent.mkdir(parents=True, exist_ok=True)
+    bridge = bridge_parent / "Keychains"
+    bridge.symlink_to(host_keychains.resolve(), target_is_directory=True)
+    return True
+
+
 @dataclass
 class TemporaryAgentHome:
     """一次 Agent 运行所拥有的临时 HOME 与认证配置桥接。"""
@@ -182,6 +198,9 @@ class TemporaryAgentHome:
         bridges: list[str] = []
         environment["CODEX_HOME"] = str(codex_home)
         bridges.append("CODEX_HOME")
+
+        if _bridge_macos_keychains(self.path, host_home):
+            bridges.append("MACOS_KEYCHAINS")
 
         gh_config = _environment_path(host, "GH_CONFIG_DIR") or _existing_directory(
             host_xdg / "gh" if host_xdg is not None else None,

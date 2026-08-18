@@ -26,6 +26,7 @@ class BackgroundRuntime:
             manager.config,
             recover_interrupted=False,
         )
+        self._active_orchestrators: set[Orchestrator] = set()
         self._revision = manager.config.revision
         self.paused = False
         self.running_cycle = False
@@ -54,11 +55,19 @@ class BackgroundRuntime:
             )
 
     async def stop(self) -> None:
-        """请求退出并等待当前扫描和事件执行安全收尾。"""
+        """停止新工作、取消活动 Agent，并等待全部子进程安全收尾。"""
 
         self._stop_event.set()
         self._scan_wake_event.set()
         self._dispatch_event.set()
+        orchestrators = {
+            self._orchestrator,
+            *self._active_orchestrators,
+        }
+        if orchestrators:
+            await asyncio.gather(
+                *(orchestrator.request_shutdown() for orchestrator in orchestrators)
+            )
         tasks = tuple(
             task
             for task in (self._scan_task, self._dispatch_task)
@@ -162,7 +171,11 @@ class BackgroundRuntime:
         try:
             summary = CycleSummary()
             orchestrator = self._orchestrator
-            await orchestrator.scan(summary)
+            self._active_orchestrators.add(orchestrator)
+            try:
+                await orchestrator.scan(summary)
+            finally:
+                self._active_orchestrators.discard(orchestrator)
             self.last_summary = summary.to_dict()
             if summary.errors:
                 self.last_error = "; ".join(summary.errors)
@@ -186,7 +199,11 @@ class BackgroundRuntime:
         try:
             summary = CycleSummary()
             orchestrator = self._orchestrator
-            await orchestrator.process_events(summary)
+            self._active_orchestrators.add(orchestrator)
+            try:
+                await orchestrator.process_events(summary)
+            finally:
+                self._active_orchestrators.discard(orchestrator)
             self.last_dispatch_summary = summary.to_dict()
             if summary.errors:
                 self.last_dispatch_error = "; ".join(summary.errors)
@@ -206,6 +223,8 @@ class BackgroundRuntime:
         next_scan_at = 0.0
         while not self._stop_event.is_set():
             self._reload_config()
+            if self._stop_event.is_set():
+                break
             if self.paused:
                 self._persist_status()
                 try:

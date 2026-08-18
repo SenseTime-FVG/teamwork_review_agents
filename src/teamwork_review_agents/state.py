@@ -1130,6 +1130,46 @@ class StateStore:
             connection.commit()
         return active_ids
 
+    def request_cancel_active_runs(self) -> list[str]:
+        """为服务内全部活动运行请求取消，并立即结束排队任务。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT run_id FROM agent_runs
+                WHERE status IN ('queued', 'preparing', 'running')
+                  AND cancel_requested = 0
+                ORDER BY started_at ASC
+                """
+            ).fetchall()
+            active_ids = [str(row["run_id"]) for row in rows]
+            if active_ids:
+                placeholders = ", ".join("?" for _ in active_ids)
+                connection.execute(
+                    f"""
+                    UPDATE agent_runs
+                    SET cancel_requested = 1,
+                        status = CASE
+                            WHEN status = 'queued' THEN 'cancelled'
+                            ELSE status
+                        END,
+                        error = CASE
+                            WHEN status = 'queued' THEN '服务正在停止，运行已取消'
+                            ELSE error
+                        END,
+                        finished_at = CASE
+                            WHEN status = 'queued' THEN ?
+                            ELSE finished_at
+                        END
+                    WHERE run_id IN ({placeholders})
+                    """,
+                    (now, *active_ids),
+                )
+            connection.commit()
+        return active_ids
+
     def update_agent_run_inputs(
         self,
         run_id: str,

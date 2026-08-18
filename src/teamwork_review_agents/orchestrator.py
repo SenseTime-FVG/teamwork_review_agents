@@ -109,6 +109,25 @@ class Orchestrator:
         self.preflight = PreflightExecutor(config, self.store)
         self.agent_semaphore = asyncio.Semaphore(config.runtime.max_concurrent_agents)
 
+    async def request_shutdown(self) -> list[str]:
+        """停止创建新 Agent，并持久化取消当前服务的全部活动运行。"""
+
+        self.executor.begin_shutdown()
+        run_ids = await asyncio.to_thread(self.store.request_cancel_active_runs)
+        for run_id in run_ids:
+            await asyncio.to_thread(
+                self.store.append_run_log,
+                run_id,
+                stream="system",
+                event_type="run.cancel_requested",
+                payload={
+                    "run_id": run_id,
+                    "reason": "服务正在停止",
+                    "source": "service_shutdown",
+                },
+            )
+        return run_ids
+
     @staticmethod
     def _scan_state_key(repository_id: str) -> str:
         """返回仓库扫描时间水位的持久化键。"""

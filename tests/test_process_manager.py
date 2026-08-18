@@ -15,7 +15,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import yaml
 
-from teamwork_review_agents.process_control import process_group_options
+from teamwork_review_agents.process_control import (
+    pid_exists,
+    process_group_options,
+    terminate_process,
+)
 from teamwork_review_agents.process_manager import (
     running_process,
     runtime_paths,
@@ -274,3 +278,72 @@ def test_stop_closes_all_managed_processes_for_same_config(tmp_path) -> None:
             second.wait(timeout=3)
     assert cleanup.exit_code == 0, cleanup.message
     assert running_process(config_path) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="测试脚本使用 POSIX 会话与 SIGTERM")
+def test_stop_reclaims_managed_service_descendant_in_separate_session(tmp_path) -> None:
+    """服务自行退出后，stop 仍应回收已脱离服务进程组的 Codex 类后代。"""
+
+    port = _unused_port()
+    config_path = _write_config(tmp_path, port)
+    child_pid_file = tmp_path / "managed-descendant.pid"
+    service_stub = tmp_path / "managed_service_stub.py"
+    service_stub.write_text(
+        """import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time;time.sleep(30)"],
+    start_new_session=True,
+)
+open(sys.argv[-1], "w", encoding="utf-8").write(str(child.pid))
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            str(service_stub),
+            "-m",
+            "teamwork_review_agents",
+            "run",
+            "-c",
+            str(config_path),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--managed-child",
+            str(child_pid_file),
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **process_group_options(),
+    )
+    child_pid = 0
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not child_pid_file.exists():
+            time.sleep(0.05)
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+
+        stopped = stop_managed_process(config_path, timeout_seconds=5)
+
+        assert stopped.exit_code == 0, stopped.message
+        assert not pid_exists(parent.pid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and pid_exists(child_pid):
+            time.sleep(0.05)
+        assert not pid_exists(child_pid)
+    finally:
+        if pid_exists(parent.pid):
+            terminate_process(parent.pid, force=True, tree=True)
+        if child_pid and pid_exists(child_pid):
+            terminate_process(child_pid, force=True, tree=False)
