@@ -171,6 +171,14 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["status"] == "completed"
     assert records["change_request.closed"]["agent_completed_count"] == 1
+    summary = store.list_runs()[0]
+    detail = store.get_run(reservation.run_id)
+    assert summary["repository_id"] == new.repository_id
+    assert summary["change_request_number"] == new.number
+    assert summary["change_request_title"] == new.title
+    assert summary["change_request_url"] == new.web_url
+    assert detail is not None
+    assert detail["change_request_title"] == new.title
 
 
 def test_agent_run_exposes_workspace_cleanup_status(tmp_path) -> None:

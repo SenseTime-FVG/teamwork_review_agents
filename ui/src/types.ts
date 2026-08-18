@@ -169,6 +169,10 @@ export type RunSummary = {
   rule_name?: string | null;
   agent_name: string;
   resource_key: string;
+  repository_id?: string | null;
+  change_request_number?: number | null;
+  change_request_title?: string | null;
+  change_request_url?: string | null;
   status: string;
   attempts: number;
   error?: string | null;

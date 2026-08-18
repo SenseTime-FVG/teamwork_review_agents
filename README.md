@@ -214,6 +214,8 @@ runtime:
 
 Agent 的 `timeout_seconds` 是单次运行总时长上限；`runtime.agent_idle_timeout_seconds` 是连续没有新 JSONL 进度的上限，两者任意一个先到都会终止整个 Codex 进程组。Agent 还可以用 `idle_timeout_seconds` 单独覆盖默认值。在“运行与日志”中可以对“排队中”或“执行中”的任务点击“取消运行”：排队任务会直接取消，执行中任务会先请求正常终止，短暂等待后再强制结束整个进程组，取消状态会持久化到 SQLite，因此后台服务与 UI 不在同一进程时仍然有效。
 
+“运行与日志”默认使用全宽列表展示 Agent、仓库与 MR / PR、触发规则、状态、开始时间和耗时。点击记录后，详情会从右侧滑出；其中“消息”把 Codex JSONL 转换为 Agent 回复、命令、工具、文件、系统和错误卡片，Agent 文本按安全 Markdown 渲染，连续重复诊断会合并计数。完整原始数据、最终结果、Prompt、脱敏环境、工作区和 sub-agent 仍可在抽屉中按需展开；查看历史消息时不会被实时日志强制拉回底部。
+
 模型候选来自服务端当前 `codex_binary` 的本机模型目录。读取失败时仍可手工填写模型 ID。Agent 模型留空时，界面会优先显示具体的 Teamwork 运行时模型，其次显示 `~/.codex/config.toml` 中可读取的模型；如果两处都没有固定模型，则明确显示“由 Codex CLI / 账号默认决定”，不会猜测一个可能变化的模型。不同仓库里的 `.codex/config.toml` 仍可能影响没有被更高层覆盖的运行。
 
 `extra_config` 的键使用 Codex `config.toml` 点号格式，值支持字符串、数字、布尔值和简单数组。模型结构化字段请使用上方专门配置；Sandbox、审批策略、MCP、Skill 和其他应用托管边界禁止通过高级配置覆盖。“快速模式”会把 Codex `service_tier` 设为 `fast`，“标准模式”设为 `default`；快速档位是否可用以及相应的用量倍率由当前模型和账号决定。

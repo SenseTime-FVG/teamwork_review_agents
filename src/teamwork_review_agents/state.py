@@ -980,7 +980,14 @@ class StateStore:
 
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM agent_runs WHERE run_id = ?",
+                """
+                SELECT agent_runs.*, event_inbox.repository_id,
+                       event_inbox.number AS change_request_number,
+                       event_inbox.payload AS event_payload
+                FROM agent_runs
+                LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
+                WHERE agent_runs.run_id = ?
+                """,
                 (run_id,),
             ).fetchone()
             if row is None:
@@ -993,13 +1000,29 @@ class StateStore:
                 """,
                 (run_id,),
             ).fetchall()
-        result = dict(row)
+        result = self._decorate_run_record(dict(row))
         for key in ("environment", "usage"):
             if result.get(key):
                 result[key] = json.loads(result[key])
         result.pop("events", None)
         result["children"] = [dict(child) for child in children]
         return result
+
+    @staticmethod
+    def _decorate_run_record(record: dict[str, Any]) -> dict[str, Any]:
+        """从关联事件中提取运行列表需要的 MR/PR 摘要。"""
+
+        event_payload = record.pop("event_payload", None)
+        if not event_payload:
+            return record
+        try:
+            event = json.loads(event_payload)
+        except (TypeError, json.JSONDecodeError):
+            return record
+        snapshot = event.get("current") or event.get("new") or {}
+        record["change_request_title"] = snapshot.get("title")
+        record["change_request_url"] = snapshot.get("web_url")
+        return record
 
     def list_runs(
         self,
@@ -1014,13 +1037,13 @@ class StateStore:
         conditions: list[str] = []
         parameters: list[Any] = []
         if status:
-            conditions.append("status = ?")
+            conditions.append("agent_runs.status = ?")
             parameters.append(status)
         if agent_name:
-            conditions.append("agent_name = ?")
+            conditions.append("agent_runs.agent_name = ?")
             parameters.append(agent_name)
         if repository_id:
-            conditions.append("resource_key LIKE ?")
+            conditions.append("agent_runs.resource_key LIKE ?")
             parameters.append(f"%:{repository_id}:%")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         parameters.append(limit)
@@ -1028,16 +1051,24 @@ class StateStore:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT run_id, root_run_id, parent_run_id, event_id, rule_name,
-                       agent_name, resource_key, status, attempts, error,
-                       cancel_requested,
-                       workspace_path, workspace_status, workspace_reason,
-                       started_at, finished_at
-                FROM agent_runs {where} ORDER BY started_at DESC LIMIT ?
+                SELECT agent_runs.run_id, agent_runs.root_run_id,
+                       agent_runs.parent_run_id, agent_runs.event_id,
+                       agent_runs.rule_name, agent_runs.agent_name,
+                       agent_runs.resource_key, agent_runs.status,
+                       agent_runs.attempts, agent_runs.error,
+                       agent_runs.cancel_requested,
+                       agent_runs.workspace_path, agent_runs.workspace_status,
+                       agent_runs.workspace_reason, agent_runs.started_at,
+                       agent_runs.finished_at, event_inbox.repository_id,
+                       event_inbox.number AS change_request_number,
+                       event_inbox.payload AS event_payload
+                FROM agent_runs
+                LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
+                {where} ORDER BY agent_runs.started_at DESC LIMIT ?
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decorate_run_record(dict(row)) for row in rows]
 
     def dashboard_stats(self) -> dict[str, Any]:
         """返回管理首页需要的运行与事件统计。"""

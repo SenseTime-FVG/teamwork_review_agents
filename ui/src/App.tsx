@@ -8,6 +8,7 @@ import {
   uploadSkillDirectory,
 } from "./api";
 import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
+import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import type {
   Agent,
   ChangeRequestRecord,
@@ -1785,12 +1786,44 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   );
 }
 
+type RunDrawerTab = "messages" | "result" | "context";
+
+function durationText(startedAt: number, finishedAt?: number | null): string {
+  const totalSeconds = Math.max(0, Math.floor((finishedAt ?? Date.now() / 1000) - startedAt));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
+  if (minutes > 0) return `${minutes}分钟 ${seconds}秒`;
+  return `${seconds}秒`;
+}
+
+function runTargetText(run: RunSummary): string {
+  if (run.repository_id && run.change_request_number !== undefined && run.change_request_number !== null) {
+    return `${run.repository_id} · #${run.change_request_number}`;
+  }
+  return run.resource_key;
+}
+
 function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
+
+  function openRun(runId: string) {
+    setSelectedId(runId);
+    setDrawerTab("messages");
+  }
+
+  function closeDrawer() {
+    setSelectedId(null);
+    setDetail(null);
+    setLogs([]);
+    setError("");
+  }
 
   async function cancelSelectedRun() {
     if (!selectedId || !detail || !window.confirm(`确定取消 ${detail.agent_name} 的本次运行吗？\n\n它的全部 sub-agent 也会收到取消请求。`)) return;
@@ -1841,56 +1874,130 @@ function RunsView(props: { runs: RunSummary[]; onRefresh: () => void }) {
     return () => controller.abort();
   }, [selectedId]);
 
+  useEffect(() => {
+    if (!selectedId) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeDrawer();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [selectedId]);
+
   return (
-    <div className="runs-layout">
+    <>
       <section className="section-card runs-list">
-        <div className="section-title-row"><div><h2>Agent 运行记录</h2><p>点击一条记录查看 Prompt、环境摘要和持续日志。</p></div><button className="button secondary" onClick={props.onRefresh}>刷新</button></div>
-        <div className="run-items">
-          {props.runs.map((run) => (
-            <button key={run.run_id} className={`run-item ${selectedId === run.run_id ? "selected" : ""}`} onClick={() => setSelectedId(run.run_id)}>
-              <span className="run-status-dot" data-status={run.status} />
-              <span><strong>{run.agent_name}</strong><small>{run.resource_key}</small>{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
-              <span><StatusPill value={run.status} /><small>{timeText(run.started_at)}</small></span>
-            </button>
-          ))}
-          {props.runs.length === 0 && <div className="empty">尚无 Agent 运行记录</div>}
+        <div className="section-title-row">
+          <div><h2>Agent 运行记录</h2><p>按时间查看所有运行；点击一行后从右侧打开消息、结果与上下文。</p></div>
+          <button className="button secondary" onClick={props.onRefresh}>刷新</button>
+        </div>
+        <div className="run-table">
+          <div className="run-table-head" aria-hidden="true">
+            <span>Agent</span><span>仓库 / MR / PR</span><span>触发来源</span><span>状态</span><span>开始时间</span><span>耗时</span><span />
+          </div>
+          <div className="run-items">
+            {props.runs.map((run) => (
+              <button key={run.run_id} className={`run-row ${selectedId === run.run_id ? "selected" : ""}`} onClick={() => openRun(run.run_id)}>
+                <span className="run-agent-cell">
+                  <span className="run-status-dot" data-status={run.status} />
+                  <span><strong>{run.agent_name}</strong><small>{run.run_id.slice(0, 8)}</small></span>
+                </span>
+                <span className="run-target-cell">
+                  <strong>{runTargetText(run)}</strong>
+                  <small>{run.change_request_title ?? run.resource_key}</small>
+                </span>
+                <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
+                <span><StatusPill value={run.status} />{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
+                <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
+                <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
+                <span className="run-row-arrow" aria-hidden="true">›</span>
+              </button>
+            ))}
+            {props.runs.length === 0 && <div className="empty">尚无 Agent 运行记录</div>}
+          </div>
         </div>
       </section>
-      <section className="section-card log-panel">
-        {!selectedId && <div className="empty tall">选择左侧运行记录查看详情</div>}
-        {selectedId && !detail && !error && <div className="empty tall">正在加载运行详情…</div>}
-        {error && <div className="alert error">{error}</div>}
-        {detail && (
-          <>
-            <div className="run-detail-head">
-              <div><span className="eyebrow">{detail.run_id}</span><h2>{detail.agent_name}</h2><p>{detail.rule_name ?? "sub-agent 调用"} · 配置 {shortRevision(detail.config_revision)}</p></div>
-              <div className="button-group">
-                {(detail.status === "queued" || detail.status === "running") && (
+      {selectedId && (
+        <div className="run-drawer-layer">
+          <button className="run-drawer-backdrop" aria-label="关闭运行详情" onClick={closeDrawer} />
+          <aside className="run-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
+            <header className="run-drawer-head">
+              <div>
+                <span className="eyebrow">{detail?.run_id ?? selectedId}</span>
+                <h2>{detail?.agent_name ?? "正在加载…"}</h2>
+                {detail && <p>{runTargetText(detail)} · {detail.rule_name ?? "Sub-agent 调用"}</p>}
+              </div>
+              <div className="run-drawer-actions">
+                {detail && (detail.status === "queued" || detail.status === "running") && (
                   <button className="button danger" disabled={cancelling} onClick={() => { void cancelSelectedRun(); }}>
                     {cancelling ? "取消中…" : "取消运行"}
                   </button>
                 )}
-                <StatusPill value={detail.status} />
+                {detail && <StatusPill value={detail.status} />}
+                <button className="run-drawer-close" aria-label="关闭" onClick={closeDrawer}>×</button>
               </div>
+            </header>
+            <nav className="run-drawer-tabs" aria-label="运行详情分类">
+              <button className={drawerTab === "messages" ? "active" : ""} onClick={() => setDrawerTab("messages")}>消息 <span>{logs.length}</span></button>
+              <button className={drawerTab === "result" ? "active" : ""} onClick={() => setDrawerTab("result")}>最终结果</button>
+              <button className={drawerTab === "context" ? "active" : ""} onClick={() => setDrawerTab("context")}>运行详情</button>
+            </nav>
+            <div className="run-drawer-body">
+              {error && <div className="alert error">{error}</div>}
+              {!detail && !error && <div className="empty tall">正在加载运行详情…</div>}
+              {detail && drawerTab === "messages" && <RunMessageFeed logs={logs} />}
+              {detail && drawerTab === "result" && (
+                <div className="run-result-panel">
+                  <div className="run-result-summary">
+                    <div><span>状态</span><StatusPill value={detail.status} /></div>
+                    <div><span>耗时</span><strong>{durationText(detail.started_at, detail.finished_at)}</strong></div>
+                    <div><span>配置版本</span><strong>{shortRevision(detail.config_revision)}</strong></div>
+                  </div>
+                  <h3>Agent 最终消息</h3>
+                  {detail.final_message
+                    ? <div className="run-result-message"><MarkdownMessage>{detail.final_message}</MarkdownMessage></div>
+                    : <pre className={`detail-pre ${detail.error ? "detail-error" : ""}`}>{detail.error ?? "暂无最终消息"}</pre>}
+                  {detail.usage && <><h3>用量</h3><pre className="detail-pre">{JSON.stringify(detail.usage, null, 2)}</pre></>}
+                </div>
+              )}
+              {detail && drawerTab === "context" && (
+                <div className="detail-tabs run-context-panel">
+                  <details open>
+                    <summary>运行信息</summary>
+                    <dl className="run-metadata">
+                      <div><dt>运行 ID</dt><dd>{detail.run_id}</dd></div>
+                      <div><dt>触发规则</dt><dd>{detail.rule_name ?? "Sub-agent 调用"}</dd></div>
+                      <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
+                      <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
+                      <div><dt>Codex 会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
+                    </dl>
+                  </details>
+                  <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>
+                  <details><summary>环境变量审计</summary><pre className="detail-pre">{JSON.stringify(detail.environment, null, 2)}</pre></details>
+                  <details>
+                    <summary>运行工作区 <span className={`workspace-state workspace-${detail.workspace_status ?? "unknown"}`}>{workspaceStatusLabel(detail.workspace_status)}</span></summary>
+                    <pre className="detail-pre">{[
+                      detail.workspace_path ? `路径：${detail.workspace_path}` : "路径：未创建",
+                      detail.workspace_reason ? `说明：${detail.workspace_reason}` : "",
+                    ].filter(Boolean).join("\n")}</pre>
+                  </details>
+                  {detail.children.length > 0 && (
+                    <details open>
+                      <summary>Sub-agent <span>{detail.children.length}</span></summary>
+                      <div className="children-list">{detail.children.map((child) => <button key={child.run_id} onClick={() => openRun(child.run_id)}>{child.agent_name}<StatusPill value={child.status} /></button>)}</div>
+                    </details>
+                  )}
+                </div>
+              )}
             </div>
-            <div className="detail-tabs">
-              <details open><summary>实时日志 <span>{logs.length}</span></summary><div className="terminal">{logs.map((log) => <div key={log.id} className={`log-line stream-${log.stream}`}><time>{new Date(log.created_at * 1000).toLocaleTimeString("zh-CN")}</time><b>{log.event_type}</b><pre>{log.payload}</pre></div>)}{logs.length === 0 && <span className="terminal-empty">等待 Codex 输出…</span>}</div></details>
-              <details><summary>最终消息</summary><pre className="detail-pre">{detail.final_message ?? detail.error ?? "暂无"}</pre></details>
-              <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>
-              <details><summary>环境变量审计</summary><pre className="detail-pre">{JSON.stringify(detail.environment, null, 2)}</pre></details>
-              <details>
-                <summary>运行工作区 <span className={`workspace-state workspace-${detail.workspace_status ?? "unknown"}`}>{workspaceStatusLabel(detail.workspace_status)}</span></summary>
-                <pre className="detail-pre">{[
-                  detail.workspace_path ? `路径：${detail.workspace_path}` : "路径：未创建",
-                  detail.workspace_reason ? `说明：${detail.workspace_reason}` : "",
-                ].filter(Boolean).join("\n")}</pre>
-              </details>
-              {detail.children.length > 0 && <details><summary>Sub-agent <span>{detail.children.length}</span></summary><div className="children-list">{detail.children.map((child) => <button key={child.run_id} onClick={() => setSelectedId(child.run_id)}>{child.agent_name}<StatusPill value={child.status} /></button>)}</div></details>}
-            </div>
-          </>
-        )}
-      </section>
-    </div>
+          </aside>
+        </div>
+      )}
+    </>
   );
 }
 
