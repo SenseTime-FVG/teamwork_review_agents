@@ -92,6 +92,34 @@ const EVENT_STATUS_OPTIONS = [
   { value: "cancelled", label: "已取消" },
 ];
 
+let bodyScrollLockCount = 0;
+let bodyScrollOriginalOverflow: string | null = null;
+
+function acquireBodyScrollLock(): () => void {
+  if (bodyScrollLockCount === 0) {
+    bodyScrollOriginalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  bodyScrollLockCount += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+    if (bodyScrollLockCount === 0) {
+      document.body.style.overflow = bodyScrollOriginalOverflow ?? "";
+      bodyScrollOriginalOverflow = null;
+    }
+  };
+}
+
+function useBodyScrollLock(active: boolean): void {
+  useEffect(() => {
+    if (!active) return undefined;
+    return acquireBodyScrollLock();
+  }, [active]);
+}
+
 const EMPTY_STATUS: RuntimeStatus = {
   paused: false,
   running_cycle: false,
@@ -862,16 +890,15 @@ function OverviewConfirmationDialog(props: {
 }) {
   const { model, busy, onCancel } = props;
 
+  useBodyScrollLock(model !== null);
+
   useEffect(() => {
     if (!model) return undefined;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onCancel();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [busy, model, onCancel]);
@@ -961,16 +988,15 @@ function AgentActionConfirmationDialog(props: {
 }) {
   const { model, busy = false, onCancel } = props;
 
+  useBodyScrollLock(model !== null);
+
   useEffect(() => {
     if (!model) return undefined;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onCancel();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [busy, model, onCancel]);
@@ -2139,6 +2165,8 @@ function RepositoryWorkspaceManager(props: {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
 
+  useBodyScrollLock(detailRepositoryId !== null);
+
   const refresh = useCallback(async () => {
     try {
       setItems(await api<RepositoryWorkspaceStatus[]>("/api/repositories/workspaces"));
@@ -2177,8 +2205,6 @@ function RepositoryWorkspaceManager(props: {
     setDetailLoading(true);
     void load();
     const timer = window.setInterval(() => { void load(); }, 1000);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setDetailRepositoryId(null);
     };
@@ -2186,7 +2212,6 @@ function RepositoryWorkspaceManager(props: {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [detailRepositoryId]);
@@ -4435,6 +4460,8 @@ function RunsView(props: {
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
 
+  useBodyScrollLock(selectedId !== null);
+
   function openRun(runId: string) {
     setSelectedId(runId);
     setDrawerTab("messages");
@@ -4526,8 +4553,6 @@ function RunsView(props: {
 
   useEffect(() => {
     if (!selectedId) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !cancelConfirmationOpen && !cancelling) {
         closeDrawer();
@@ -4535,7 +4560,6 @@ function RunsView(props: {
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [cancelConfirmationOpen, cancelling, selectedId]);
