@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from contextlib import contextmanager
+
+import pytest
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
 from teamwork_review_agents.events import detect_events
@@ -138,6 +141,10 @@ async def test_preflight_timeout_kills_background_process_holding_stdout(
     assert time.monotonic() - started_at < 3
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="该用例专门验证 POSIX setsid 后代，不适用于 Windows",
+)
 async def test_preflight_timeout_is_bounded_when_background_process_escapes_group(
     tmp_path,
 ) -> None:

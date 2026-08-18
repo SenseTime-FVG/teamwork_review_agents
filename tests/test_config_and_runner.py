@@ -997,6 +997,10 @@ time.sleep(30)
     assert ("system", "run.stream_failed") in emitted
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="该用例专门创建脱离 POSIX 会话的后代，不适用于 Windows",
+)
 async def test_runner_does_not_wait_forever_for_inherited_stream_pipe(
     tmp_path,
     snapshot_factory,

@@ -28,10 +28,12 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 
 ## 快速开始
 
-运行端需要 Linux / macOS、Python 3.11+、Git、已登录的 Codex CLI，以及 GitHub / GitLab Token。
+运行端支持 Linux、macOS、原生 Windows 和 WSL2，需要 Python 3.11+、Git、已登录的 Codex CLI，以及 GitHub / GitLab Token。
 
 > [!IMPORTANT]
 > 使用 GitHub 仓库前，必须为启动 Teamwork 服务的同一系统用户安装并登录 `gh`；使用 GitLab 仓库前，必须以相同方式配置 `glab`。否则 Agent 无法通过平台 CLI 读取或执行评论、审批、标签、合并等操作。具体命令见[配置 `gh` / `glab`](docs/platform-cli-auth.md)。
+
+Linux、macOS 或 WSL2：
 
 ```bash
 python -m pip install -e .
@@ -39,6 +41,17 @@ cp config_example.yaml config.yaml
 teamwork-review-agents validate
 teamwork-review-agents start
 ```
+
+Windows PowerShell：
+
+```powershell
+py -m pip install -e .
+Copy-Item config_example.yaml config.yaml
+teamwork-review-agents validate
+teamwork-review-agents start
+```
+
+原生 Windows 支持 `run`、`start`、`stop`、`restart`、`scan-once` 等 CLI 命令。需要长期托管时，可以让 Windows 服务管理器或任务计划程序执行前台命令 `teamwork-review-agents run -c C:\path\to\config.yaml`；需要 Bash 工具链的仓库 CI 脚本可以继续使用 Git Bash 或 WSL2。
 
 打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)，点击“编辑配置”：
 

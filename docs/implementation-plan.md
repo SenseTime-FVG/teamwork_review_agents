@@ -425,7 +425,7 @@
 - 为 Codex 子进程 stdout/stderr 配置显式流缓冲上限，覆盖带有大体积命令输出的单条 JSONL 事件。
 - 捕获并记录 stdout/stderr 读取异常的脱敏摘要；禁止静默吞掉读取任务异常，超长或损坏的 JSONL 必须使运行明确失败。
 - 为子进程退出后的流读取任务增加有界排空与取消机制；取消、无进展超时和总超时必须在流管道异常时仍能返回终态。
-- 保持进程组 SIGTERM/SIGKILL 逻辑，并确保收尾诊断不会覆盖管理员取消或既定超时原因。
+- 保持 POSIX 进程组 SIGTERM/SIGKILL 逻辑，并确保收尾诊断不会覆盖管理员取消或既定超时原因。
 - 将 StateStore 连接创建改为显式关闭的上下文管理器，统一覆盖事务成功、异常回滚和连接回收。
 - 增加超长 JSONL、读取异常、终止后管道不结束、超时终态和 SQLite 文件描述符稳定性的回归测试。
 
@@ -473,7 +473,18 @@
 
 验收：目标分支在 Agent 启动前未变化时，PR/MR 的旧 base SHA 不会导致审核误终止；传入的 `target_head_sha` 与工作区 fetch 后的远端跟踪 ref 完全一致；目标 ref 无效时 Codex 不启动；审核期间真实目标 ref 变化仍会阻止使用旧审核和旧 CI 结果执行评论或合并。
 
-## 阶段四十五：规则级可选本地 CI
+## 阶段四十五：原生 Windows 运行支持
+
+- 增加跨平台进程控制模块，为同步和异步子进程统一生成 POSIX 新会话或 Windows 新进程组参数，并提供温和、强制的进程树终止能力。
+- 使用跨平台文件锁替换直接 `fcntl.flock`，保持单配置单实例、锁探测和进程退出自动释放语义。
+- 使用跨平台进程信息读取替换 `ps`、`shlex` 进程表解析和无条件 `waitpid`，继续以 PID、启动时间、模块命令和配置绝对路径确认托管服务身份。
+- 改造后台服务、Codex Runner、Codex App Server、Git 工作区和 Preflight，使启动、取消、超时与停止在 Windows 上不调用 `os.killpg`、`SIGKILL` 或 `start_new_session`。
+- README 增加 PowerShell 快速开始和 Windows 运行说明，运维文档区分 POSIX 信号与 Windows 进程树终止，并说明 Bash 脚本和 systemd/launchd 的平台边界。
+- 新增 Windows GitHub Actions，真实执行安装、导入、配置校验、后台启停重启、进程发现和进程树回收测试；保留 POSIX 全量回归。
+
+验收：原生 Windows 安装后导入 CLI 不依赖 `fcntl` 或 `ps`；PowerShell 中可以复制示例配置并完成 `validate`、`start`、`restart` 和 `stop`；终止服务、Codex、Git 或 Preflight 时不遗留可识别后代进程；Linux/macOS 原有文件锁、进程组与信号行为不回归；文档不再把 POSIX 命令误称为跨平台用法。
+
+## 阶段四十六：规则级可选本地 CI
 
 - 为触发规则增加“执行仓库 CI（如已启用）”配置，默认关闭，并在规则详情与列表摘要中展示。
 - 保留仓库级 CI 主开关，在仓库详情增加状态名称、总超时、日志上限和有序命令步骤编辑器；步骤支持名称、执行程序、逐项参数和可选单步超时。
@@ -486,7 +497,7 @@
 
 验收：规则选择全部仓库时，未配置 CI 的仓库仍能正常触发 Agent；同批次不要求 CI 的规则不等待 CI；CI 失败只阻断明确选择 CI 的规则；仓库详情可以完整编辑 CI 步骤，规则详情可以独立选择是否执行；保存后后台热加载且无需重启。
 
-## 阶段四十六：目标分支提交变化临时事件
+## 阶段四十七：目标分支提交变化临时事件
 
 - 为统一快照增加向后兼容的 `target_head_sha`，GitHub 通过 Git Ref API、GitLab 通过 Repository Branch API 获取目标分支真实 Head。
 - 每个仓库扫描批次按目标分支缓存查询结果，同时覆盖 Provider 本轮候选和数据库中未被更新时间筛选命中的打开状态 PR / MR。

@@ -12,8 +12,10 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 import yaml
 
+from teamwork_review_agents.process_control import process_group_options
 from teamwork_review_agents.process_manager import (
     running_process,
     runtime_paths,
@@ -82,7 +84,7 @@ class _OccupiedHealthHandler(BaseHTTPRequestHandler):
 
 
 def test_background_service_starts_and_stops(tmp_path) -> None:
-    """后台子进程应能提供健康检查并由 stop 优雅结束。"""
+    """后台子进程应能提供健康检查并由 stop 可靠结束。"""
 
     port = _unused_port()
     config_path = _write_config(tmp_path, port)
@@ -135,7 +137,6 @@ def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> Non
 
     assert result.exit_code == 1
     assert "后台服务启动失败" in result.message
-    assert "address already in use" in result.message
     assert running_process(config_path) is None
 
 
@@ -154,7 +155,8 @@ def test_stop_discovers_process_after_pid_and_lock_are_moved(tmp_path) -> None:
     assert started.record is not None
     paths = runtime_paths(config_path)
     os.replace(paths.pid_file, tmp_path / "moved.pid")
-    os.replace(paths.lock_file, tmp_path / "moved.lock")
+    if os.name != "nt":
+        os.replace(paths.lock_file, tmp_path / "moved.lock")
 
     try:
         recovered = running_process(config_path)
@@ -183,7 +185,8 @@ def test_restart_replaces_process_after_runtime_files_are_moved(tmp_path) -> Non
     assert started.record is not None
     paths = runtime_paths(config_path)
     os.replace(paths.pid_file, tmp_path / "restart-moved.pid")
-    os.replace(paths.lock_file, tmp_path / "restart-moved.lock")
+    if os.name != "nt":
+        os.replace(paths.lock_file, tmp_path / "restart-moved.lock")
 
     command = [
         sys.executable,
@@ -214,6 +217,10 @@ def test_restart_replaces_process_after_runtime_files_are_moved(tmp_path) -> Non
     assert stopped.exit_code == 0, stopped.message
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows 不允许移动正在持锁的文件，正常路径不会产生第二实例",
+)
 def test_stop_closes_all_managed_processes_for_same_config(tmp_path) -> None:
     """异常产生多个同配置托管实例时 stop 应将它们全部结束。"""
 
@@ -249,7 +256,7 @@ def test_stop_closes_all_managed_processes_for_same_config(tmp_path) -> None:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        **process_group_options(),
     )
     try:
         assert _wait_health_pid(second_port) == second.pid

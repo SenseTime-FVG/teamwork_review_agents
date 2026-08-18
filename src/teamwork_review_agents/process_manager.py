@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import re
-import shlex
-import signal
 import subprocess
 import sys
 import time
@@ -17,6 +14,18 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
+
+import portalocker
+
+from .process_control import (
+    iter_process_commands,
+    pid_exists,
+    process_group_options,
+    process_started_at,
+    process_state,
+    reap_child,
+    terminate_process,
+)
 
 
 @dataclass(frozen=True)
@@ -87,49 +96,19 @@ def runtime_paths(config_path: str | Path) -> RuntimePaths:
 def _process_started_at(pid: int) -> str | None:
     """读取进程启动时间，用于防止 PID 重用时误杀其他进程。"""
 
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    value = " ".join(result.stdout.split())
-    return value or None
+    return process_started_at(pid)
 
 
 def _pid_exists(pid: int) -> bool:
     """检查 PID 是否仍然存在。"""
 
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return pid_exists(pid)
 
 
 def _process_state(pid: int) -> str | None:
     """读取进程状态；僵尸进程视为已经结束。"""
 
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "stat="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    value = result.stdout.strip().split()
-    return value[0] if value else None
+    return process_state(pid)
 
 
 def _argument_value(arguments: list[str], *names: str) -> str | None:
@@ -149,28 +128,9 @@ def _discover_managed_processes(config_path: str | Path) -> list[ProcessRecord]:
     """在运行文件失效时按完整命令身份发现同一配置的托管进程。"""
 
     resolved = resolve_config_path(config_path)
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-axo", "pid=,command="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-
     records: list[ProcessRecord] = []
-    for line in result.stdout.splitlines():
-        match = re.match(r"\s*(\d+)\s+(.+)", line)
-        if match is None:
-            continue
-        pid = int(match.group(1))
+    for pid, arguments, started_at in iter_process_commands():
         if pid == os.getpid():
-            continue
-        try:
-            arguments = shlex.split(match.group(2))
-        except ValueError:
             continue
         module_positions = [
             index
@@ -190,7 +150,6 @@ def _discover_managed_processes(config_path: str | Path) -> list[ProcessRecord]:
             continue
         if candidate_path != resolved:
             continue
-        started_at = _process_started_at(pid)
         state = _process_state(pid)
         if not started_at or not state or state.startswith("Z"):
             continue
@@ -215,10 +174,7 @@ def _discover_managed_processes(config_path: str | Path) -> list[ProcessRecord]:
 def _reap_child(pid: int) -> None:
     """当前进程恰好是父进程时回收已经退出的子进程。"""
 
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except (ChildProcessError, OSError):
-        return
+    reap_child(pid)
 
 
 def _read_record(paths: RuntimePaths) -> ProcessRecord | None:
@@ -259,10 +215,13 @@ def _lock_is_held(paths: RuntimePaths) -> bool:
     paths.directory.mkdir(parents=True, exist_ok=True)
     with paths.lock_file.open("a+", encoding="utf-8") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            portalocker.lock(
+                lock_file,
+                portalocker.LOCK_EX | portalocker.LOCK_NB,
+            )
+        except portalocker.exceptions.LockException:
             return True
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        portalocker.unlock(lock_file)
         return False
 
 
@@ -327,14 +286,17 @@ class ServiceLease:
         paths.directory.mkdir(parents=True, exist_ok=True)
         lock_file = paths.lock_file.open("a+", encoding="utf-8")
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            portalocker.lock(
+                lock_file,
+                portalocker.LOCK_EX | portalocker.LOCK_NB,
+            )
+        except portalocker.exceptions.LockException:
             lock_file.close()
             return None
 
         started_at = _process_started_at(os.getpid())
         if not started_at:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            portalocker.unlock(lock_file)
             lock_file.close()
             raise RuntimeError("无法读取当前服务进程的启动时间")
         record = ProcessRecord(
@@ -361,7 +323,7 @@ class ServiceLease:
         current = _read_record(self.paths)
         if current and current.pid == self.record.pid:
             self.paths.pid_file.unlink(missing_ok=True)
-        fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+        portalocker.unlock(self.lock_file)
         self.lock_file.close()
         self._released = True
 
@@ -463,9 +425,9 @@ def start_background(
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
             close_fds=True,
             env=os.environ.copy(),
+            **process_group_options(detached=True),
         )
 
     deadline = time.monotonic() + startup_timeout_seconds
@@ -501,14 +463,14 @@ def start_background(
 
     if process.poll() is None:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            terminate_process(process.pid, force=False, tree=True)
         except ProcessLookupError:
             pass
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                terminate_process(process.pid, force=True, tree=True)
             except ProcessLookupError:
                 pass
             try:
@@ -531,7 +493,7 @@ def stop_managed_process(
     *,
     timeout_seconds: float = 30,
 ) -> ProcessActionResult:
-    """优雅停止当前配置全部实例，超时后再强制结束。"""
+    """请求停止当前配置全部实例，超时后再强制结束。"""
 
     resolved = resolve_config_path(config_path)
     paths = runtime_paths(resolved)
@@ -544,7 +506,11 @@ def stop_managed_process(
         if not _record_is_running(record):
             continue
         try:
-            os.kill(record.pid, signal.SIGTERM)
+            terminate_process(
+                record.pid,
+                force=False,
+                tree=os.name == "nt",
+            )
         except ProcessLookupError:
             continue
         except PermissionError as exc:
@@ -569,10 +535,11 @@ def stop_managed_process(
     forced = [record for record in records if _record_is_running(record)]
     for record in forced:
         try:
-            if record.detached:
-                os.killpg(record.pid, signal.SIGKILL)
-            else:
-                os.kill(record.pid, signal.SIGKILL)
+            terminate_process(
+                record.pid,
+                force=True,
+                tree=record.detached or os.name == "nt",
+            )
         except ProcessLookupError:
             continue
         except PermissionError as exc:

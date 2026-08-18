@@ -132,9 +132,9 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 
 应用升级为 FastAPI 后台服务，HTTP API、配置管理、定时扫描和 Agent 队列在同一服务进程中运行。CLI 提供 `run` 前台运行，以及 `start`、`stop`、`end`、`restart` 本地后台进程管理；同一配置文件通过 PID 文件和进程锁保证只有一个服务实例。
 
-`start` 使用脱离终端的子进程运行服务，并将标准输出与错误写入配置目录旁的 `data/teamwork-review-agents.log`。`stop` 先发送 `SIGTERM` 等待优雅收尾，超时后强制结束。PID 记录同时保存进程启动时间，防止 PID 被系统复用时误结束其他进程。
+`start` 使用脱离终端的子进程运行服务，并将标准输出与错误写入配置目录旁的 `data/teamwork-review-agents.log`。`stop` 在 POSIX 上先发送 `SIGTERM` 等待优雅收尾，在 Windows 上结束已确认的受管进程树；超时后统一强制结束。PID 记录同时保存进程启动时间，防止 PID 被系统复用时误结束其他进程。
 
-生产环境需要故障自动恢复和开机启动时，仍由 systemd、launchd 或容器平台运行 `run` 并负责保活。
+生产环境需要故障自动恢复和开机启动时，仍由 systemd、launchd、Windows 服务管理器、任务计划程序或容器平台运行 `run` 并负责保活。
 
 后台支持立即扫描、暂停、恢复、配置热加载、服务心跳和运行状态汇总。默认只监听 `127.0.0.1`；监听非本机地址时必须配置管理员 Token。
 
@@ -291,7 +291,7 @@ Teamwork 启动的后台 Codex CLI 默认不继承用户 `config.toml` 中配置
 
 总运行超时与无进展超时分离。`Agent.timeout_seconds` 继续限制完整执行时间；`runtime.agent_idle_timeout_seconds` 是默认无进展窗口，Agent 可通过 `idle_timeout_seconds` 单独覆盖。只有 Codex stdout/JSONL 新事件表示语义进展，重复 stderr 诊断不会续期；连续超过窗口后服务终止整个 Codex 进程组并记录明确的 `run.idle_timed_out`。这样卡在某个 MCP/tool item 的运行无需等待完整二十分钟，同时正常持续输出的长任务仍可继续。
 
-运行记录增加持久化取消请求。管理 API 取消某个运行时，会同时标记它的全部后代：仍在排队的运行直接进入 `cancelled`，已经执行的根 Agent 或跨 MCP 进程 sub-agent 通过 SQLite 短轮询感知请求，先发送 `SIGTERM`，宽限期后发送 `SIGKILL`。Runner 返回 `cancelled`，工作区继续走既有安全清理策略；脏工作区或未推送提交仍会保留。UI 只对 `queued`、`running` 展示“取消运行”，并把已取消数量独立纳入事件关联 Agent 的终态统计。
+运行记录增加持久化取消请求。管理 API 取消某个运行时，会同时标记它的全部后代：仍在排队的运行直接进入 `cancelled`，已经执行的根 Agent 或跨 MCP 进程 sub-agent 通过 SQLite 短轮询感知请求，并按平台结束 Codex 进程组或进程树。Runner 返回 `cancelled`，工作区继续走既有安全清理策略；脏工作区或未推送提交仍会保留。UI 只对 `queued`、`running` 展示“取消运行”，并把已取消数量独立纳入事件关联 Agent 的终态统计。
 
 ## 28. 后台服务进程发现与就绪确认
 
@@ -299,7 +299,7 @@ Teamwork 启动的后台 Codex CLI 默认不继承用户 `config.toml` 中配置
 
 正常情况下，进程管理器继续用配置专属 PID 文件、进程启动时间和文件锁确认服务身份。若 PID 或锁文件在服务运行期间丢失、被移动或损坏，管理器使用系统进程表作为恢复路径，只匹配同时满足 `python -m teamwork_review_agents run`、`--managed-child` 和同一配置绝对路径的托管子进程。不能仅凭监听端口终止进程，避免误杀其他应用；同一配置出现多个托管子进程时按异常多实例明确报告并由 `stop` 一并收尾。
 
-`stop` 必须向全部已确认属于当前配置的服务进程发送 `SIGTERM`，等待其真实退出，超时后才对仍存活的托管进程组发送 `SIGKILL`。只有目标 PID 全部退出后才能返回成功。`restart` 严格串联“发现旧实例 → 确认旧实例退出 → 启动新实例 → 确认健康响应属于新 PID”；停止或启动任一阶段失败时立即返回失败，不得输出重启成功。
+`stop` 必须向全部已确认属于当前配置的服务进程发出平台对应的停止请求，等待其真实退出，超时后才强制结束仍存活的托管进程组或进程树。只有目标 PID 全部退出后才能返回成功。`restart` 严格串联“发现旧实例 → 确认旧实例退出 → 启动新实例 → 确认健康响应属于新 PID”；停止或启动任一阶段失败时立即返回失败，不得输出重启成功。
 
 ## 29. 运行列表、详情抽屉与消息化日志
 
@@ -455,7 +455,17 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 通用审核 Prompt 明确令 `REVIEW_HEAD_SHA = mr.head_sha`、`REVIEW_TARGET_SHA = mr.target_head_sha`。后续关键状态刷新仍须查询目标分支真实 ref，并与同一个 `REVIEW_TARGET_SHA` 比较；可以使用平台 Git refs API、`git ls-remote` 或语义等价的实时分支查询，但禁止使用 `base.sha`、`baseRefOid` 判断目标分支是否变化。PR/MR 的 base SHA 只可作为历史、差异或平台诊断信息，不能参与当前目标分支竞态判断。合并结果类 CI 继续要求其合并提交父节点明确对应 `REVIEW_TARGET_SHA` 与 `REVIEW_HEAD_SHA`。
 
-## 48. 规则级可选本地 CI
+## 48. 原生 Windows 进程与服务管理
+
+项目支持 Linux、macOS 和原生 Windows。Windows 用户可以在 PowerShell 中安装、校验并使用 `run`、`start`、`stop`、`restart`、`scan-once` 与其他 CLI 命令；WSL2 仍作为需要 Bash 工具链或类 Linux 部署环境时的可选方案，不能再把 WSL2 当作 Windows 用户唯一可运行路径。README 的快速开始分别给出 POSIX shell 和 PowerShell 命令，不能把 `cp`、`export`、绝对 POSIX 路径等命令直接展示为跨平台命令。
+
+单实例锁使用跨平台文件锁库，不在模块导入阶段依赖 Windows 不存在的 `fcntl`。进程身份、启动时间、存活状态和托管进程发现统一使用跨平台进程库读取，不调用 `ps` 或解析平台相关命令行文本；PID 文件继续同时记录 PID 与启动时间，防止 PID 复用导致误停止。升级前生成的旧 PID 记录如果无法匹配新格式，进程发现仍应根据完整 Python 模块命令和配置绝对路径找回实例。
+
+所有需要携带后代进程的命令统一通过进程控制模块创建。POSIX 保持新会话和进程组语义，温和终止使用 `SIGTERM`，强制终止使用 `SIGKILL`；Windows 使用新的进程组，后台服务额外使用脱离终端标志，并通过进程树枚举终止服务、Codex、Git、SSH、`index-pack`、App Server 和 Preflight 后代。Windows 没有与 POSIX 完全等价且适用于脱离终端进程的 `SIGTERM`，因此停止阶段使用系统终止进程树并继续等待真实退出；状态恢复和工作区安全保留不得依赖信号名称。
+
+Windows CI 至少安装项目并在真实 Windows runner 上执行 CLI 导入、配置校验、后台启动、重复启动、停止、重启、进程发现和进程树终止测试。Linux/macOS 的现有全量测试继续验证 POSIX 行为。systemd 与 launchd 模板仍只适用于各自平台；Windows 长期部署可让 Windows 服务管理器或任务计划程序执行前台 `teamwork-review-agents run`，项目内置的 `start` 适用于本机后台运行。
+
+## 49. 规则级可选本地 CI
 
 本地 CI 分为两层配置。仓库配置负责声明该仓库是否具备本地 CI 能力，以及状态名称、总超时、日志上限和按顺序执行的命令步骤；触发规则通过“执行仓库 CI（如已启用）”决定当前规则是否使用该能力。规则选择全部仓库时，不要求全部启用仓库都配置 CI，也不增加跨仓库配置校验。
 
@@ -465,7 +475,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 仓库管理页使用结构化步骤编辑器维护本地 CI。每个步骤包含名称、执行程序、参数数组和可选单步超时；命令继续直接以参数数组启动，不隐式经过 shell。复杂 CI 可以由目标仓库维护脚本，并把 `bash ci/preflight.sh` 表达为执行程序 `bash` 加参数 `ci/preflight.sh`。规则详情和规则列表同时显示是否使用仓库 CI，避免“仓库已启用”被误解为所有审核规则都会固定执行。
 
-## 49. 目标分支提交变化与临时可靠事件
+## 50. 目标分支提交变化与临时可靠事件
 
 统一快照增加 `target_head_sha`，表示扫描时从目标分支真实 Git ref 读取到的当前提交。Provider 必须通过 GitHub Git Ref API 或 GitLab Repository Branch API 获取该值，不能使用 PR / MR 详情中的历史差异基准字段。一次仓库扫描对相同目标分支只请求一次，并把结果复用于全部指向该分支的打开状态 PR / MR；已经关闭或合并的记录不持续跟踪目标分支。
 

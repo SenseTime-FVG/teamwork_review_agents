@@ -1,0 +1,59 @@
+name: 跨平台测试
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    name: 全量测试（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 安装项目
+        run: python -m pip install -e ".[dev]"
+      - name: 运行 Python 测试
+        run: python -m pytest
+      - name: 检查 Python 编译
+        run: python -m compileall -q src tests
+
+  windows:
+    name: 原生 Windows CLI 与进程管理
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 安装项目
+        run: py -m pip install -e ".[dev]"
+      - name: 验证 Windows 导入与示例配置
+        shell: pwsh
+        run: |
+          py -c "import teamwork_review_agents.cli; import teamwork_review_agents.process_manager"
+          Copy-Item config_example.yaml config.windows-ci.yaml
+          teamwork-review-agents validate -c config.windows-ci.yaml
+      - name: 验证 Windows CLI 与进程树
+        run: >-
+          py -m pytest
+          tests/test_process_control.py
+          tests/test_process_manager.py
+          tests/test_preflight.py
+          tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
+      - name: 检查 Python 编译
+        run: py -m compileall -q src tests

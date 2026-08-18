@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from typing import Literal
 from .config import AppConfig, PreflightConfig
 from .environment import resolve_provider_token
 from .models import ChangeEvent, PreflightResult, stable_hash
+from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
 from .workspace import temporary_change_request_worktree
@@ -88,12 +88,9 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     """请求终止超时步骤及其子进程组，不在此处无界等待退出。"""
 
     try:
-        if os.name == "posix":
-            # leader 可能已经退出，但继承 stdout 的后台子进程仍在同一进程组中。
-            os.killpg(process.pid, signal.SIGKILL)
-        elif process.returncode is None:
-            process.kill()
-    except ProcessLookupError:
+        # 主进程可能已退出，但继承输出管道的后代仍必须被完整回收。
+        terminate_process(process.pid, force=True, tree=True)
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -143,7 +140,7 @@ async def execute_preflight_steps(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                start_new_session=os.name == "posix",
+                **process_group_options(),
             )
         except (OSError, ValueError) as exc:
             return StepExecutionOutcome(

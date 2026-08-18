@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import os
-import signal
 import sys
 import time
 from contextlib import suppress
@@ -24,6 +23,7 @@ from .codex_settings import (
 )
 from .environment import SecretRedactor
 from .models import AgentResult, InvocationContext
+from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
 
 
@@ -348,8 +348,8 @@ class CodexRunner:
             stderr=asyncio.subprocess.PIPE,
             cwd=repository.workspace,
             env=child_environment,
-            start_new_session=True,
             limit=_CODEX_STREAM_LIMIT_BYTES,
+            **process_group_options(),
         )
         assert process.stdin is not None
         assert process.stdout is not None
@@ -457,10 +457,10 @@ class CodexRunner:
         )
 
         async def terminate_process_group() -> None:
-            """先温和、再强制结束当前 Codex 及同进程组子进程。"""
+            """按平台先请求停止、再强制结束当前 Codex 及其子进程。"""
 
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+            with suppress(ProcessLookupError, PermissionError):
+                terminate_process(process.pid, force=False, tree=True)
             try:
                 await asyncio.wait_for(
                     asyncio.shield(wait_task),
@@ -469,8 +469,8 @@ class CodexRunner:
             except TimeoutError:
                 # asyncio 的 wait() 可能等待继承管道的后代关闭；已有退出码就不再误判主进程存活。
                 if process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                    with suppress(ProcessLookupError, PermissionError):
+                        terminate_process(process.pid, force=True, tree=True)
                     try:
                         await asyncio.wait_for(
                             asyncio.shield(wait_task),

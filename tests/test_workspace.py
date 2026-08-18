@@ -59,6 +59,10 @@ def test_git_command_display_removes_url_credentials_and_query() -> None:
     assert "hidden" not in command
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="该用例使用 POSIX shell 构造 Git 子进程，Windows 由跨平台进程树测试覆盖",
+)
 def test_git_cancel_terminates_process_group_and_reports_safe_progress(
     tmp_path,
     monkeypatch,
@@ -108,6 +112,10 @@ def test_git_cancel_terminates_process_group_and_reports_safe_progress(
     assert progress[-1].error == "Git 操作已由管理员取消"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="该用例使用 POSIX shell 构造 Git 子进程，Windows 由跨平台进程树测试覆盖",
+)
 def test_git_timeout_terminates_process_group(tmp_path, monkeypatch) -> None:
     """Git 超时应结束整个进程组，而不是只结束直接 git 进程。"""
 

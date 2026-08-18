@@ -6,13 +6,14 @@ import asyncio
 import json
 import os
 import shutil
-import signal
 import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .process_control import process_group_options, terminate_process
 
 
 APP_SERVER_TIMEOUT_SECONDS = 10.0
@@ -80,7 +81,7 @@ class CodexAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=_codex_environment(self.home),
                 cwd=str(self.working_directory) if self.working_directory else None,
-                start_new_session=os.name != "nt",
+                **process_group_options(),
             )
             self._reader_task = asyncio.create_task(self._read_stdout())
             self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -204,19 +205,13 @@ class CodexAppServer:
         if process is not None and process.stdin is not None:
             process.stdin.close()
         if process is not None and process.returncode is None:
-            with suppress(ProcessLookupError):
-                if os.name != "nt":
-                    os.killpg(process.pid, signal.SIGTERM)
-                else:
-                    process.terminate()
+            with suppress(ProcessLookupError, PermissionError):
+                terminate_process(process.pid, force=False, tree=True)
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
             except TimeoutError:
-                with suppress(ProcessLookupError):
-                    if os.name != "nt":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:
-                        process.kill()
+                with suppress(ProcessLookupError, PermissionError):
+                    terminate_process(process.pid, force=True, tree=True)
                 with suppress(TimeoutError):
                     await asyncio.wait_for(process.wait(), timeout=2)
         for task in (self._reader_task, self._stderr_task):

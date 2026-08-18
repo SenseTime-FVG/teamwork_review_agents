@@ -186,7 +186,7 @@ def _run_server(
         try:
             return asyncio.run(_serve(resolved, host, port))
         except KeyboardInterrupt:
-            # 终端 Ctrl+C 与服务管理命令的 SIGTERM 都视为正常停机。
+            # 终端 Ctrl+C 与服务管理命令发出的停止请求都视为正常停机。
             return 0
 
 

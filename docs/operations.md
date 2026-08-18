@@ -4,7 +4,7 @@
 
 ## 1. 运行前提
 
-- Linux 或 macOS；
+- Linux、macOS、原生 Windows 或 WSL2；
 - Python 3.11+、Git、Codex CLI；
 - 目标仓库的 SSH Key 或 HTTPS 凭据；
 - GitHub / GitLab Provider Token；
@@ -42,7 +42,7 @@ Provider Token 优先从全局环境中的同名变量读取，否则读取宿�
 | --- | --- |
 | `teamwork-review-agents start` | 后台启动；健康接口确认新 PID 后才返回成功 |
 | `teamwork-review-agents run` | 前台运行；适合调试和进程管理器 |
-| `teamwork-review-agents stop` | 先发送 `SIGTERM`，30 秒后仍未退出则强制结束 |
+| `teamwork-review-agents stop` | POSIX 先请求优雅停止，Windows 终止受管进程树；等待 30 秒后仍未退出则强制结束 |
 | `teamwork-review-agents restart` | 停止旧实例，确认退出后启动新实例 |
 | `teamwork-review-agents scan-once` | 扫描、生成事件并等待 Agent 执行完成 |
 | `teamwork-review-agents scan-once --dry-run` | 保存快照和事件，但不启动 Agent |
@@ -54,6 +54,14 @@ Provider Token 优先从全局环境中的同名变量读取，否则读取宿�
 teamwork-review-agents start -c /path/to/config.yaml
 teamwork-review-agents restart -c /path/to/config.yaml
 teamwork-review-agents stop -c /path/to/config.yaml
+```
+
+Windows PowerShell 使用 Windows 路径：
+
+```powershell
+teamwork-review-agents start -c C:\path\to\config.yaml
+teamwork-review-agents restart -c C:\path\to\config.yaml
+teamwork-review-agents stop -c C:\path\to\config.yaml
 ```
 
 ## 5. 运行文件
@@ -82,6 +90,12 @@ teamwork-review-agents run -c /path/to/config.yaml
 
 - [systemd](../deploy/teamwork-review-agents.service)
 - [launchd](../deploy/com.teamwork.review-agents.plist)
+
+systemd 与 launchd 模板不适用于 Windows。Windows 可让服务管理器或任务计划程序执行：
+
+```powershell
+teamwork-review-agents run -c C:\path\to\config.yaml
+```
 
 确保服务用户拥有配置、数据库、基础仓库和 worktree 目录权限，并能读取所需的 Codex、Git、SSH、`gh` 或 `glab` 凭据。
 

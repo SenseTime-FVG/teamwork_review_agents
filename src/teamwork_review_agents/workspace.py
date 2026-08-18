@@ -6,7 +6,6 @@ import json
 import os
 import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -19,6 +18,7 @@ from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
 from .models import ChangeRequestSnapshot
+from .process_control import process_group_options, terminate_process
 
 
 class WorkspaceError(RuntimeError):
@@ -178,23 +178,17 @@ def _run_git(
             )
 
     def terminate(process: subprocess.Popen[str]) -> None:
-        """终止 Git 进程组，避免 ssh 与 index-pack 成为遗留进程。"""
+        """终止 Git 进程组或进程树，避免 ssh 与 index-pack 成为遗留进程。"""
 
         if process.poll() is not None:
             return
-        with suppress(ProcessLookupError):
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
+        with suppress(ProcessLookupError, PermissionError):
+            terminate_process(process.pid, force=False, tree=True)
         try:
             process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
-            with suppress(ProcessLookupError):
-                if os.name != "nt":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
+            with suppress(ProcessLookupError, PermissionError):
+                terminate_process(process.pid, force=True, tree=True)
             with suppress(subprocess.TimeoutExpired):
                 process.communicate(timeout=2)
 
@@ -205,7 +199,7 @@ def _run_git(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=os.name != "nt",
+            **process_group_options(),
         )
     except OSError as exc:
         report("failed", error="无法启动 Git 命令")
