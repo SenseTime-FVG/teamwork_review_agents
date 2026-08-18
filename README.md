@@ -45,7 +45,7 @@ teamwork-review-agents start
 Windows PowerShell：
 
 ```powershell
-py -m pip install -e .
+python -m pip install -e .
 Copy-Item config_example.yaml config.yaml
 teamwork-review-agents validate
 teamwork-review-agents start

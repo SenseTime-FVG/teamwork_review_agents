@@ -41,19 +41,19 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: 安装项目
-        run: py -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev]"
       - name: 验证 Windows 导入与示例配置
         shell: pwsh
         run: |
-          py -c "import teamwork_review_agents.cli; import teamwork_review_agents.process_manager"
+          python -c "import teamwork_review_agents.cli; import teamwork_review_agents.process_manager"
           Copy-Item config_example.yaml config.windows-ci.yaml
           teamwork-review-agents validate -c config.windows-ci.yaml
       - name: 验证 Windows CLI 与进程树
         run: >-
-          py -m pytest
+          python -m pytest
           tests/test_process_control.py
           tests/test_process_manager.py
           tests/test_preflight.py
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
       - name: 检查 Python 编译
-        run: py -m compileall -q src tests
+        run: python -m compileall -q src tests
