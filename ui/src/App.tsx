@@ -4213,6 +4213,7 @@ function RunsView(props: {
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
 
   function openRun(runId: string) {
@@ -4221,6 +4222,7 @@ function RunsView(props: {
   }
 
   function closeDrawer() {
+    setCancelConfirmationOpen(false);
     setSelectedId(null);
     setDetail(null);
     setLogs([]);
@@ -4235,7 +4237,7 @@ function RunsView(props: {
   }, [props.requestedRunId, props.onRequestedRunOpened]);
 
   async function cancelSelectedRun() {
-    if (!selectedId || !detail || !window.confirm(`确定取消 ${detail.agent_name} 的本次运行吗？\n\n它的全部 sub-agent 也会收到取消请求。`)) return;
+    if (!selectedId || !detail) return;
     setCancelling(true);
     setError("");
     try {
@@ -4249,9 +4251,29 @@ function RunsView(props: {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "取消运行失败");
     } finally {
+      setCancelConfirmationOpen(false);
       setCancelling(false);
     }
   }
+
+  const cancelConfirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!cancelConfirmationOpen || !selectedId || !detail) return null;
+    return {
+      eyebrow: "RUN CANCELLATION",
+      title: `取消 ${detail.agent_name} 的本次运行？`,
+      description: "取消请求提交后，本次运行将进入终止流程。",
+      details: [
+        { label: "Agent", value: detail.agent_name },
+        { label: "仓库 / MR / PR", value: runTargetText(detail) },
+        { label: "运行 ID", value: selectedId, mono: true },
+        { label: "当前状态", value: statusLabel(detail.status) },
+      ],
+      impactTitle: "将递归取消本次运行",
+      impact: "本次运行的全部 sub-agent 也会收到取消请求；正在执行的 Codex 或 Git 进程组可能被终止。",
+      confirmLabel: "确认取消运行",
+      dangerous: true,
+    };
+  }, [cancelConfirmationOpen, detail, selectedId]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -4288,14 +4310,16 @@ function RunsView(props: {
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeDrawer();
+      if (event.key === "Escape" && !cancelConfirmationOpen && !cancelling) {
+        closeDrawer();
+      }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [selectedId]);
+  }, [cancelConfirmationOpen, cancelling, selectedId]);
 
   return (
     <>
@@ -4342,7 +4366,7 @@ function RunsView(props: {
               </div>
               <div className="run-drawer-actions">
                 {detail && (["queued", "preparing", "running"].includes(detail.status)) && (
-                  <button className="button danger" disabled={cancelling} onClick={() => { void cancelSelectedRun(); }}>
+                  <button className="button danger" disabled={cancelling} onClick={() => setCancelConfirmationOpen(true)}>
                     {cancelling ? "取消中…" : "取消运行"}
                   </button>
                 )}
@@ -4406,6 +4430,12 @@ function RunsView(props: {
           </aside>
         </div>
       )}
+      <AgentActionConfirmationDialog
+        model={cancelConfirmation}
+        busy={cancelling}
+        onCancel={() => { if (!cancelling) setCancelConfirmationOpen(false); }}
+        onConfirm={() => { void cancelSelectedRun(); }}
+      />
     </>
   );
 }
