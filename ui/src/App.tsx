@@ -25,7 +25,9 @@ import type {
   ConfigDocument,
   EnvironmentMap,
   EnvironmentVariable,
+  EventAgentRunSummary,
   EventDetailRecord,
+  EventDispatchDetail,
   EventRecord,
   ManualLatestEventBatchResponse,
   PreflightRunDetail,
@@ -5326,10 +5328,13 @@ function EventStatusPill({
 }
 
 function EventAgentProgress({ event }: { event: EventRecord }) {
-  const total = event.trigger_count;
+  const rootCount = event.trigger_count;
+  const subAgentCount = event.sub_agent_count ?? 0;
+  const total = rootCount + subAgentCount;
   if (total === 0) {
     return <span className="event-agent-none">—</span>;
   }
+  const scope = `根 Agent ${rootCount} · sub-agent ${subAgentCount}`;
   const settled = event.agent_completed_count
     + event.agent_failed_count
     + event.agent_timed_out_count
@@ -5337,21 +5342,21 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   if (event.agent_running_count > 0) {
     return (
       <span className="event-agent-progress running">
-        执行中 {event.agent_running_count} · 已结束 {settled}/{total}
+        {scope} · 执行中 {event.agent_running_count} · 已结束 {settled}/{total}
       </span>
     );
   }
   if (event.agent_preparing_count > 0) {
     return (
       <span className="event-agent-progress preparing">
-        准备工作区 {event.agent_preparing_count} · 已结束 {settled}/{total}
+        {scope} · 准备工作区 {event.agent_preparing_count} · 已结束 {settled}/{total}
       </span>
     );
   }
   if (event.agent_queued_count > 0) {
     return (
       <span className="event-agent-progress queued">
-        排队中 {event.agent_queued_count} · 已结束 {settled}/{total}
+        {scope} · 排队中 {event.agent_queued_count} · 已结束 {settled}/{total}
       </span>
     );
   }
@@ -5361,15 +5366,82 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   if (failed > 0) {
     return (
       <span className="event-agent-progress failed">
-        异常 {failed} · 已结束 {settled}/{total}
+        {scope} · 异常 {failed} · 已结束 {settled}/{total}
       </span>
     );
   }
   return (
     <span className="event-agent-progress completed">
-      已完成 {event.agent_completed_count}/{total}
+      {scope} · 已完成 {event.agent_completed_count}/{total}
     </span>
   );
+}
+
+type EventAgentTreeRow = {
+  key: string;
+  agentName: string;
+  description: string;
+  runId?: string | null;
+  status: string;
+  depth: number;
+};
+
+function buildEventAgentTreeRows(
+  dispatches: EventDispatchDetail[],
+  agentRuns: EventAgentRunSummary[],
+): EventAgentTreeRow[] {
+  const rows: EventAgentTreeRow[] = [];
+  const childrenByParent = new Map<string, EventAgentRunSummary[]>();
+  for (const run of agentRuns) {
+    if (!run.parent_run_id) continue;
+    const children = childrenByParent.get(run.parent_run_id) ?? [];
+    children.push(run);
+    childrenByParent.set(run.parent_run_id, children);
+  }
+
+  const visited = new Set<string>();
+  const appendChildren = (parentRunId: string, parentAgentName: string, depth: number) => {
+    for (const child of childrenByParent.get(parentRunId) ?? []) {
+      if (visited.has(child.run_id)) continue;
+      visited.add(child.run_id);
+      rows.push({
+        key: child.run_id,
+        agentName: child.agent_name,
+        description: `sub-agent · 由 ${parentAgentName} 触发`,
+        runId: child.run_id,
+        status: child.run_status,
+        depth: depth + 1,
+      });
+      appendChildren(child.run_id, child.agent_name, depth + 1);
+    }
+  };
+
+  for (const dispatch of dispatches) {
+    if (dispatch.run_id) visited.add(dispatch.run_id);
+    rows.push({
+      key: `${dispatch.idempotency_key}:${dispatch.agent_name}`,
+      agentName: dispatch.agent_name,
+      description: `根 Agent · 规则 ${dispatch.rule_name}`,
+      runId: dispatch.run_id,
+      status: dispatch.run_status ?? "queued",
+      depth: 0,
+    });
+    if (dispatch.run_id) appendChildren(dispatch.run_id, dispatch.agent_name, 0);
+  }
+
+  // 历史异常数据若缺失父节点，也应保留可追溯入口，不能静默隐藏运行记录。
+  for (const run of agentRuns) {
+    if (visited.has(run.run_id)) continue;
+    rows.push({
+      key: run.run_id,
+      agentName: run.agent_name,
+      description: run.parent_run_id ? "sub-agent · 父运行未找到" : "根 Agent",
+      runId: run.run_id,
+      status: run.run_status,
+      depth: run.parent_run_id ? 1 : 0,
+    });
+  }
+  return rows;
 }
 
 function preflightStatusLabel(status?: string | null): string {
@@ -5424,7 +5496,8 @@ function eventDetailNeedsRefresh(detail: EventDetailRecord): boolean {
   if (["pending", "processing"].includes(detail.status)) return true;
   if (detail.preflights.some((preflight) => preflight.status === "running")) return true;
   if (detail.agent_queued_count + detail.agent_preparing_count + detail.agent_running_count > 0) return true;
-  return detail.dispatches.some((dispatch) => ["queued", "preparing", "running"].includes(dispatch.run_status ?? ""));
+  if (detail.dispatches.some((dispatch) => ["queued", "preparing", "running"].includes(dispatch.run_status ?? ""))) return true;
+  return (detail.agent_runs ?? []).some((run) => ["queued", "preparing", "running"].includes(run.run_status));
 }
 
 function eventStatusExplanation(event: EventRecord): string {
@@ -5625,6 +5698,9 @@ function EventDetailDrawer(props: {
   if (!event) return null;
   const current = detail ?? event;
   const preflights = detail?.preflights ?? (detail?.preflight ? [detail.preflight] : []);
+  const agentRows = detail
+    ? buildEventAgentTreeRows(detail.dispatches, detail.agent_runs ?? [])
+    : [];
   return (
     <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
       <button type="button" className="run-drawer-backdrop" aria-label="关闭事件详情" disabled={!active} onClick={onClose} />
@@ -5686,25 +5762,29 @@ function EventDetailDrawer(props: {
               <section className="event-detail-section">
                 <div className="event-detail-section-title">
                   <div><span className="eyebrow">AGENT</span><h3>规则与运行</h3></div>
-                  <span className="event-detail-count">{detail.dispatches.length}</span>
+                  <span className="event-detail-count">{agentRows.length}</span>
                 </div>
-                {detail.dispatches.length === 0 ? (
+                {agentRows.length === 0 ? (
                   <div className="event-detail-empty">本事件没有产生 Agent 调度。</div>
                 ) : (
                   <div className="event-dispatch-list">
-                    {detail.dispatches.map((dispatch) => (
+                    {agentRows.map((run) => {
+                      const indent = Math.min(run.depth, 6) * 18;
+                      return (
                       <button
                         type="button"
-                        className="event-record-card"
-                        key={`${dispatch.idempotency_key}:${dispatch.agent_name}`}
-                        disabled={!dispatch.run_id}
-                        onClick={() => { if (dispatch.run_id) onOpenAgent(dispatch.run_id); }}
+                        className={`event-record-card${run.depth > 0 ? " event-record-card-sub-agent" : ""}`}
+                        key={run.key}
+                        disabled={!run.runId}
+                        style={{ marginLeft: indent, width: `calc(100% - ${indent}px)` }}
+                        onClick={() => { if (run.runId) onOpenAgent(run.runId); }}
                       >
-                        <span><strong>{dispatch.agent_name}</strong><small>{dispatch.rule_name}</small></span>
-                        <StatusPill value={dispatch.run_status ?? "queued"} />
+                        <span><strong>{run.depth > 0 ? "↳ " : ""}{run.agentName}</strong><small>{run.description}</small></span>
+                        <StatusPill value={run.status} />
                         <span className="run-row-arrow" aria-hidden="true">›</span>
                       </button>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </section>

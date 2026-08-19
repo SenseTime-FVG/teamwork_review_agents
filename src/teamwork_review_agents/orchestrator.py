@@ -537,11 +537,32 @@ class Orchestrator:
             service_interrupted_event_ids: set[str] = set()
             administrator_cancelled_event_ids: set[str] = set()
             matched_event_ids: set[str] = set()
+            settled_unmatched_event_ids: set[str] = set()
             task_items: list[
                 tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
             ] = []
             try:
                 invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                planned_matched_event_ids = {
+                    event.id
+                    for invocation in invocations
+                    for event in invocation.events
+                }
+                for event in claimed_events:
+                    if event.id in planned_matched_event_ids:
+                        continue
+                    # 同批次其他事件的 Agent 或 CI 不应延迟本事件的未匹配结论。
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="unmatched",
+                    )
+                    settled_unmatched_event_ids.add(event.id)
+                    await asyncio.to_thread(
+                        self.store.cleanup_terminal_transient_event,
+                        event.id,
+                    )
+                    summary.processed_events += 1
                 direct_invocations = [
                     invocation
                     for invocation in invocations
@@ -704,6 +725,8 @@ class Orchestrator:
                         errors_by_event[event.id].append(error)
 
             for event in claimed_events:
+                if event.id in settled_unmatched_event_ids:
+                    continue
                 if event.id in service_interrupted_event_ids:
                     await asyncio.to_thread(
                         self.store.release_event_after_service_shutdown,

@@ -242,6 +242,16 @@ async def test_matching_event_stays_processing_while_preflight_is_running(
 
     orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
     event = enqueue_discovered(orchestrator, snapshot_factory)
+    unmatched_event = event.model_copy(
+        update={
+            "id": f"{event.id}-updated",
+            "type": "change_request.updated",
+        }
+    )
+    orchestrator.store.save_snapshot_and_events(
+        event.current_snapshot,
+        [unmatched_event],
+    )
     agents = FakeAgentExecutor()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -284,6 +294,14 @@ async def test_matching_event_stays_processing_while_preflight_is_running(
     assert record["status"] == "processing"
     assert record["preflight_status"] == "running"
     assert record["trigger_count"] == 0
+    unmatched_record = next(
+        item
+        for item in orchestrator.store.list_events()
+        if item["event_id"] == unmatched_event.id
+    )
+    assert unmatched_record["status"] == "unmatched"
+    assert unmatched_record["preflight_status"] is None
+    assert unmatched_record["trigger_count"] == 0
 
     release.set()
     await asyncio.wait_for(processing, timeout=1)

@@ -460,6 +460,72 @@ async def test_process_events_marks_events_without_matching_rules_as_unmatched(
     assert {item["trigger_count"] for item in records} == {0}
 
 
+async def test_unmatched_event_settles_while_same_batch_agent_is_running(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """同批次 Agent 运行时，无匹配事件应立即显示未触发。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="close-review",
+            events=["change_request.closed"],
+            agents=["code-reviewer"],
+        )
+    ]
+    old = snapshot_factory(provider="github-main", repository_id="demo")
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(old, current)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(current, events)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def waiting_execute(**kwargs):
+        """保持 Agent 运行，以便检查同批次其他事件的中间状态。"""
+
+        started.set()
+        await release.wait()
+        return AgentResult(
+            run_id="waiting-run",
+            root_run_id="waiting-run",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", waiting_execute)
+    summary = CycleSummary()
+    processing = asyncio.create_task(orchestrator.process_events(summary))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        records = {
+            item["event_type"]: item for item in orchestrator.store.list_events()
+        }
+        assert records["change_request.closed"]["status"] == "triggered"
+        assert records["change_request.updated"]["status"] == "unmatched"
+        assert records["change_request.updated"]["trigger_count"] == 0
+    finally:
+        release.set()
+        await asyncio.wait_for(processing, timeout=1)
+
+    final_records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert final_records["change_request.closed"]["status"] == "completed"
+    assert final_records["change_request.updated"]["status"] == "unmatched"
+    assert summary.processed_events == 2
+
+
 async def test_deduplicated_run_is_linked_to_every_matching_event(
     monkeypatch,
     configured_app_factory,

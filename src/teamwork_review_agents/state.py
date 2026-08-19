@@ -2602,6 +2602,8 @@ class StateStore:
                        preflight.status_published AS preflight_status_published,
                        preflight_link.reused AS preflight_reused,
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
+                       COALESCE(dispatch_stats.sub_agent_count, 0)
+                           AS sub_agent_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
                        COALESCE(dispatch_stats.agent_preparing_count, 0)
@@ -2619,28 +2621,38 @@ class StateStore:
                 FROM event_inbox
                 LEFT JOIN (
                     SELECT dispatch.event_id,
-                           COUNT(*) AS trigger_count,
+                           COUNT(DISTINCT dispatch.idempotency_key)
+                               AS trigger_count,
                            SUM(
                                CASE
-                                   WHEN run.run_id IS NULL OR run.status = 'queued'
+                                   WHEN family.parent_run_id IS NOT NULL
+                                   THEN 1 ELSE 0
+                               END
+                           ) AS sub_agent_count,
+                           SUM(
+                               CASE
+                                   WHEN family.run_id IS NULL
+                                     OR family.status = 'queued'
                                    THEN 1 ELSE 0
                                END
                            ) AS agent_queued_count,
-                           SUM(CASE WHEN run.status = 'preparing' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'preparing' THEN 1 ELSE 0 END)
                                AS agent_preparing_count,
-                           SUM(CASE WHEN run.status = 'running' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'running' THEN 1 ELSE 0 END)
                                AS agent_running_count,
-                           SUM(CASE WHEN run.status = 'completed' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'completed' THEN 1 ELSE 0 END)
                                AS agent_completed_count,
-                           SUM(CASE WHEN run.status = 'failed' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'failed' THEN 1 ELSE 0 END)
                                AS agent_failed_count,
-                           SUM(CASE WHEN run.status = 'timed_out' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'timed_out' THEN 1 ELSE 0 END)
                                AS agent_timed_out_count,
-                           SUM(CASE WHEN run.status = 'cancelled' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'cancelled' THEN 1 ELSE 0 END)
                                AS agent_cancelled_count
                     FROM event_agent_dispatches AS dispatch
-                    LEFT JOIN agent_runs AS run
-                        ON run.idempotency_key = dispatch.idempotency_key
+                    LEFT JOIN agent_runs AS root_run
+                        ON root_run.idempotency_key = dispatch.idempotency_key
+                    LEFT JOIN agent_runs AS family
+                        ON family.root_run_id = root_run.run_id
                     GROUP BY dispatch.event_id
                 ) AS dispatch_stats
                     ON dispatch_stats.event_id = event_inbox.event_id
@@ -2677,7 +2689,8 @@ class StateStore:
                 """
                 SELECT dispatch.idempotency_key, dispatch.rule_name,
                        dispatch.agent_name, dispatch.created_at,
-                       run.run_id, run.status AS run_status,
+                       run.run_id, run.root_run_id, run.parent_run_id,
+                       run.status AS run_status,
                        run.error AS run_error, run.started_at,
                        run.finished_at
                 FROM event_agent_dispatches AS dispatch
@@ -2686,6 +2699,24 @@ class StateStore:
                 WHERE dispatch.event_id = ?
                 ORDER BY dispatch.created_at, dispatch.rule_name,
                          dispatch.agent_name
+                """,
+                (event_id,),
+            ).fetchall()
+            agent_run_rows = connection.execute(
+                """
+                SELECT family.run_id, family.root_run_id,
+                       family.parent_run_id, family.idempotency_key,
+                       family.rule_name, family.agent_name,
+                       family.status AS run_status,
+                       family.error AS run_error, family.started_at,
+                       family.finished_at
+                FROM event_agent_dispatches AS dispatch
+                JOIN agent_runs AS root_run
+                    ON root_run.idempotency_key = dispatch.idempotency_key
+                JOIN agent_runs AS family
+                    ON family.root_run_id = root_run.run_id
+                WHERE dispatch.event_id = ?
+                ORDER BY family.started_at, family.run_id
                 """,
                 (event_id,),
             ).fetchall()
@@ -2711,6 +2742,7 @@ class StateStore:
         return {
             **records[0],
             "dispatches": [dict(row) for row in dispatch_rows],
+            "agent_runs": [dict(row) for row in agent_run_rows],
             "preflights": preflights,
             # 保留最新单条字段，兼容只识别旧事件详情结构的客户端。
             "preflight": preflights[0] if preflights else None,

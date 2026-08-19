@@ -770,11 +770,13 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         event_record = client.get("/api/events").json()[0]
         assert event_record["status"] == "pending"
         assert event_record["trigger_count"] == 0
+        assert event_record["sub_agent_count"] == 0
         assert event_record["agent_running_count"] == 0
         event_detail = client.get(
             f"/api/events/{event_record['event_id']}"
         ).json()
         assert event_detail["dispatches"] == []
+        assert event_detail["agent_runs"] == []
         assert event_detail["preflight"] is None
         assert client.get("/api/events/unknown-event").status_code == 404
         assert client.post(

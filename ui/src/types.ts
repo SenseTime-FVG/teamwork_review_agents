@@ -414,6 +414,7 @@ export type EventRecord = {
   error?: string | null;
   queue_reason?: string | null;
   trigger_count: number;
+  sub_agent_count: number;
   agent_queued_count: number;
   agent_preparing_count: number;
   agent_running_count: number;
@@ -443,9 +444,24 @@ export type EventDispatchDetail = {
   agent_name: string;
   created_at: number;
   run_id?: string | null;
+  root_run_id?: string | null;
+  parent_run_id?: string | null;
   run_status?: string | null;
   run_error?: string | null;
   started_at?: number | null;
+  finished_at?: number | null;
+};
+
+export type EventAgentRunSummary = {
+  run_id: string;
+  root_run_id: string;
+  parent_run_id?: string | null;
+  idempotency_key: string;
+  rule_name?: string | null;
+  agent_name: string;
+  run_status: string;
+  run_error?: string | null;
+  started_at: number;
   finished_at?: number | null;
 };
 
@@ -469,6 +485,7 @@ export type EventPreflightSummary = {
 
 export type EventDetailRecord = EventRecord & {
   dispatches: EventDispatchDetail[];
+  agent_runs: EventAgentRunSummary[];
   preflights: EventPreflightSummary[];
   preflight?: EventPreflightSummary | null;
 };

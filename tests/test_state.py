@@ -500,6 +500,58 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["agent_running_count"] == 1
 
+    child = store.begin_agent_run(
+        proposed_run_id="run-security-review",
+        root_run_id=reservation.root_run_id,
+        parent_run_id=reservation.run_id,
+        idempotency_key="security-dispatch-key",
+        event_id=closed.id,
+        rule_name="close-review",
+        agent_name="security-reviewer",
+        resource_key=closed.resource_key,
+        prompt="",
+        max_attempts=1,
+    )
+    assert child is not None
+    store.mark_agent_run_running(child.run_id)
+
+    grandchild = store.begin_agent_run(
+        proposed_run_id="run-license-review",
+        root_run_id=reservation.root_run_id,
+        parent_run_id=child.run_id,
+        idempotency_key="license-dispatch-key",
+        event_id=closed.id,
+        rule_name="close-review",
+        agent_name="license-reviewer",
+        resource_key=closed.resource_key,
+        prompt="",
+        max_attempts=1,
+    )
+    assert grandchild is not None
+    store.mark_agent_run_running(grandchild.run_id)
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.closed"]["trigger_count"] == 1
+    assert records["change_request.closed"]["sub_agent_count"] == 2
+    assert records["change_request.closed"]["agent_running_count"] == 3
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=grandchild.run_id,
+            root_run_id=grandchild.root_run_id,
+            agent_name="license-reviewer",
+            status="completed",
+        )
+    )
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=child.run_id,
+            root_run_id=child.root_run_id,
+            agent_name="security-reviewer",
+            status="completed",
+        )
+    )
+
     store.finish_agent_run(
         AgentResult(
             run_id=reservation.run_id,
@@ -511,7 +563,7 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     store.finish_event(closed.id)
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["status"] == "completed"
-    assert records["change_request.closed"]["agent_completed_count"] == 1
+    assert records["change_request.closed"]["agent_completed_count"] == 3
     summary = store.list_runs()[0]
     detail = store.get_run(reservation.run_id)
     assert summary["repository_id"] == new.repository_id
@@ -523,11 +575,26 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
         repository_id=new.repository_id,
         number=new.number,
     )
-    assert [item["run_id"] for item in filtered_runs] == [reservation.run_id]
+    assert {item["run_id"] for item in filtered_runs} == {
+        reservation.run_id,
+        child.run_id,
+        grandchild.run_id,
+    }
     assert store.list_runs(statuses=()) == []
-    assert len(store.list_runs(limit=None)) == 1
+    assert len(store.list_runs(limit=None)) == 3
     assert detail is not None
     assert detail["change_request_title"] == new.title
+    event_detail = store.get_event_detail(closed.id)
+    assert event_detail is not None
+    assert len(event_detail["dispatches"]) == 1
+    assert {
+        run["run_id"]: run["parent_run_id"]
+        for run in event_detail["agent_runs"]
+    } == {
+        reservation.run_id: None,
+        child.run_id: reservation.run_id,
+        grandchild.run_id: child.run_id,
+    }
 
 
 def test_agent_run_exposes_workspace_cleanup_status(tmp_path) -> None:

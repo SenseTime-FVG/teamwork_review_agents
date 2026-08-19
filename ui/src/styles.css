@@ -635,6 +635,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .preflight-step-error { border-color: #513039; background: #1b1015; color: #ee9299; }
 .event-record-card { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) auto 18px; gap: 12px; align-items: center; padding: 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: #09101a; color: inherit; cursor: pointer; text-align: left; }
 .event-record-card:hover { border-color: #365341; background: #101b16; }
+.event-record-card-sub-agent { border-left-color: #315b49; background: #0c1518; }
 .event-record-card:focus-visible { outline: 2px solid #5488c8; outline-offset: 2px; }
 .event-record-card:disabled { cursor: default; opacity: .55; }
 .event-record-card > span { min-width: 0; }
