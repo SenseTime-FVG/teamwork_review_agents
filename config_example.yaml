@@ -113,6 +113,12 @@ web:
 #   global:
 #     # 简写等价于 value: Example Team；默认进入 Prompt 和 Codex 进程。
 #     ORGANIZATION_NAME: Example Team
+#     # Review Prompt 的自动合并开关；只有 true 才会合并，缺失或其他值只审核。
+#     REVIEW_AUTO_MERGE:
+#       value: "false"
+#       secret: false
+#       expose_to_prompt: true
+#       expose_to_process: false
 #     # 完整写法：value 与 from_system 只能选择一个。
 #     DOCS_LANGUAGE:
 #       value: zh-CN
@@ -314,6 +320,9 @@ rules:
     # 内置规则绝不自动启用。
     enabled: false
 
+# Prompt 支持 Jinja2 条件和变量，例如
+# `{% if REVIEW_AUTO_MERGE | as_bool %}...{% else %}...{% endif %}`；
+# 旧 `${{ENV_NAME}}` 语法继续兼容，缺失变量渲染为空字符串。
 # Prompt 可直接使用的系统运行变量：
 # REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、MR_NUMBER、MR_TITLE、
 # MR_STATE、MR_HEAD_SHA、MR_SOURCE_BRANCH、MR_TARGET_BRANCH、MR_URL、EVENT_TYPE、RUN_ID。

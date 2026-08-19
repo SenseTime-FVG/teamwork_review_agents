@@ -22,7 +22,7 @@ from .codex_account import (
 )
 from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import codex_home, inspect_runtime_options
-from .environment import render_prompt
+from .environment import PromptRenderError, render_prompt
 from .events import (
     FIELD_EVENTS,
     TARGET_COMMITS_CHANGED_EVENT,
@@ -590,9 +590,13 @@ def create_app(
 
     @app.post("/api/prompts/preview")
     async def preview_prompt(body: PromptPreviewRequest) -> dict[str, str]:
-        """按运行时相同规则预览模板，未定义变量渲染为空字符串。"""
+        """按运行时相同的沙盒 Jinja 规则预览 Prompt。"""
 
-        return {"rendered": render_prompt(body.template, body.variables)}
+        try:
+            rendered = render_prompt(body.template, body.variables)
+        except PromptRenderError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"rendered": rendered}
 
     @app.get("/api/prompt-files")
     async def prompt_files() -> list[dict[str, Any]]:

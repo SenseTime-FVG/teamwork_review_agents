@@ -8,6 +8,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from jinja2 import Undefined
+from jinja2.exceptions import TemplateError
+from jinja2.sandbox import SandboxedEnvironment
+
 from .config import (
     AgentConfig,
     AppConfig,
@@ -20,6 +24,31 @@ from .models import ChangeEvent
 
 TEMPLATE_PATTERN = re.compile(r"\$\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}")
 MASK = "********"
+
+
+class PromptRenderError(ValueError):
+    """表示 Prompt 模板无法安全完成渲染。"""
+
+
+def _as_bool(value: Any) -> bool:
+    """只把显式布尔真或字符串 true 解释为开启。"""
+
+    if value is True:
+        return True
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() == "true"
+
+
+PROMPT_TEMPLATE_ENVIRONMENT = SandboxedEnvironment(
+    autoescape=False,
+    loader=None,
+    undefined=Undefined,
+    keep_trailing_newline=True,
+)
+# Prompt 不需要 Jinja 默认全局对象，只保留模板语法和安全过滤器。
+PROMPT_TEMPLATE_ENVIRONMENT.globals.clear()
+PROMPT_TEMPLATE_ENVIRONMENT.filters["as_bool"] = _as_bool
 
 
 @dataclass(frozen=True)
@@ -142,9 +171,17 @@ def resolve_environment(
 
 
 def render_prompt(template: str, values: dict[str, str]) -> str:
-    """渲染 `${{NAME}}`，缺失变量按要求替换为空字符串。"""
+    """使用沙盒 Jinja 渲染 Prompt，并兼容旧 `${{NAME}}` 语法。"""
 
-    return TEMPLATE_PATTERN.sub(lambda match: values.get(match.group(1), ""), template)
+    normalized = TEMPLATE_PATTERN.sub(
+        lambda match: "{{ " + match.group(1) + " }}",
+        template,
+    )
+    try:
+        return PROMPT_TEMPLATE_ENVIRONMENT.from_string(normalized).render(values)
+    except TemplateError as exc:
+        message = getattr(exc, "message", None) or str(exc)
+        raise PromptRenderError(f"Prompt 模板渲染失败：{message}") from exc
 
 
 class SecretRedactor:

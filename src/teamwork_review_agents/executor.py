@@ -11,7 +11,12 @@ from typing import Any, Sequence
 
 from .codex_runner import CodexRunner
 from .config import AppConfig, ProviderConfig, RepositoryConfig
-from .environment import SecretRedactor, render_prompt, resolve_environment
+from .environment import (
+    PromptRenderError,
+    SecretRedactor,
+    render_prompt,
+    resolve_environment,
+)
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .state import (
@@ -185,7 +190,10 @@ class AgentExecutor:
             template = agent.prompt_file.read_text(encoding="utf-8")
         else:
             template = agent.prompt or ""
-        role_prompt = render_prompt(template, prompt_values).strip()
+        try:
+            role_prompt = render_prompt(template, prompt_values).strip()
+        except PromptRenderError as exc:
+            raise AgentExecutionError(str(exc)) from exc
         provider = self.config.providers[repository.provider]
         if task is None:
             if not target_head_sha:

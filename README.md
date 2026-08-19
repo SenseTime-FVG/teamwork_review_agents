@@ -147,10 +147,13 @@ Teamwork 启动的后台 Codex 会关闭原生项目指令发现，因此源分�
 | --- | --- |
 | `REVIEW_DESIGN_DOC_DIR` | `docs/design` |
 | `REVIEW_CHANGE_HISTORY_DIR` | `docs/changes` |
+| `REVIEW_AUTO_MERGE` | `false` |
 | `DOC_UPDATE_INDEX_PATH` | `docs/README.md` |
 | `DOC_UPDATE_EXCLUDE_DIRECTORIES` | `vendor,generated` |
 
-这些变量需要开启“传给进程”。`REVIEW_SKILLS` 不是仓库路径；Skill 应导入本服务后再分配给 Agent。
+`REVIEW_SKILLS`、两个审核目录和文档更新变量需要开启“传给进程”。`REVIEW_AUTO_MERGE` 只需开启“Prompt”，无需进入 Codex 子进程；只有去除空白且不区分大小写等于 `true` 时，通用审核 Agent 才会在全部门禁通过后自动合并，缺失或其他值均只审核和评论。`REVIEW_SKILLS` 不是仓库路径；Skill 应导入本服务后再分配给 Agent。
+
+Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` 等标准语法。布尔环境变量可以使用 `{% if REVIEW_AUTO_MERGE | as_bool %}`；已有 `${{ENV_NAME}}` 写法继续兼容，缺失变量仍渲染为空字符串。只有开启“Prompt”的非 Provider 变量才进入模板上下文，变量值不会作为 Jinja 模板再次执行。
 
 ## 首次启用
 
