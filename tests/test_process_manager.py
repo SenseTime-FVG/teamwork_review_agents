@@ -21,6 +21,8 @@ from teamwork_review_agents.process_control import (
     terminate_process,
 )
 from teamwork_review_agents.process_manager import (
+    ServiceLease,
+    _write_stop_request,
     running_process,
     runtime_paths,
     start_background,
@@ -116,7 +118,41 @@ def test_background_service_starts_and_stops(tmp_path) -> None:
     finally:
         stopped = stop_managed_process(config_path, timeout_seconds=10)
     assert stopped.exit_code == 0, stopped.message
+    assert "强制停止" not in stopped.message
+    assert not runtime_paths(config_path).stop_file.exists()
     assert running_process(config_path) is None
+
+
+def test_service_lease_matches_only_its_stop_request(tmp_path) -> None:
+    """停止请求必须绑定进程启动时间，陈旧 PID 不能误停新服务。"""
+
+    config_path = _write_config(tmp_path, _unused_port())
+    paths = runtime_paths(config_path)
+    lease = ServiceLease.acquire(
+        config_path,
+        host="127.0.0.1",
+        port=8080,
+        detached=False,
+    )
+    assert lease is not None
+    try:
+        assert not lease.stop_requested()
+        _write_stop_request(paths, [lease.record])
+        assert lease.stop_requested()
+    finally:
+        lease.release()
+
+    replacement = ServiceLease.acquire(
+        config_path,
+        host="127.0.0.1",
+        port=8080,
+        detached=False,
+    )
+    assert replacement is not None
+    try:
+        assert not replacement.stop_requested()
+    finally:
+        replacement.release()
 
 
 def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> None:

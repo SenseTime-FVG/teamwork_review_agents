@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -17,6 +16,7 @@ from typing import Callable, Iterator, Literal
 from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
+from .filesystem import remove_tree, temporary_directory
 from .models import ChangeRequestSnapshot
 from .process_control import process_group_options, terminate_process
 
@@ -268,11 +268,11 @@ def ensure_repository_workspace(
     if not workspace.exists():
         workspace.parent.mkdir(parents=True, exist_ok=True)
         clone_url = repository_clone_url(provider, repository)
-        with tempfile.TemporaryDirectory(
-            dir=workspace.parent,
+        with temporary_directory(
+            directory=workspace.parent,
             prefix=f".{workspace.name}.clone-",
         ) as temporary_root:
-            checkout = Path(temporary_root) / "repository"
+            checkout = temporary_root / "repository"
             _run_git(
                 ["clone", "--origin", "origin", "--", clone_url, str(checkout)],
                 timeout_seconds=initialization_timeout_seconds,
@@ -554,11 +554,11 @@ def ensure_isolated_clone(
         revision,
         timeout_seconds=timeout_seconds,
     )
-    with tempfile.TemporaryDirectory(
-        dir=target.parent,
+    with temporary_directory(
+        directory=target.parent,
         prefix=f".{target.name}.clone-",
     ) as temporary_root:
-        staged = Path(temporary_root) / "checkout"
+        staged = temporary_root / "checkout"
         clone_result = _run_git(
             [
                 "clone",
@@ -813,7 +813,7 @@ def _remove_run_workspace(
         workspace,
         timeout_seconds=timeout_seconds,
     )
-    shutil.rmtree(target)
+    remove_tree(target)
     clear_retained_marker(target)
 
 
@@ -1060,11 +1060,11 @@ def temporary_change_request_worktree(
         progress_callback=progress_callback,
     )
     workspace = repository.workspace.resolve()
-    with tempfile.TemporaryDirectory(
-        dir=workspace.parent,
+    with temporary_directory(
+        directory=workspace.parent,
         prefix=f".{workspace.name}.preflight-",
     ) as temporary_root:
-        checkout = Path(temporary_root) / "checkout"
+        checkout = temporary_root / "checkout"
         _run_git(
             [
                 "-C",
@@ -1214,11 +1214,11 @@ def temporary_default_branch_worktree(
         if remote_ref.startswith("origin/")
         else remote_ref
     )
-    with tempfile.TemporaryDirectory(
-        dir=workspace.parent,
+    with temporary_directory(
+        directory=workspace.parent,
         prefix=f".{workspace.name}.manual-preflight-",
     ) as temporary_root:
-        checkout = Path(temporary_root) / "checkout"
+        checkout = temporary_root / "checkout"
         _run_git(
             [
                 "-C",

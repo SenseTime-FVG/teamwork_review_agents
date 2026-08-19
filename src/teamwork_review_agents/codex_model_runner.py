@@ -35,6 +35,11 @@ from .model_tools import (
 )
 from .models import AgentResult, InvocationContext
 from .skill_files import SkillProjection
+from .subprocess_utils import (
+    WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
+    remove_environment_names,
+    selected_environment,
+)
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
@@ -59,7 +64,7 @@ _BASE_ENVIRONMENT_NAMES = {
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
-}
+} | WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 
 
 class CodexModelRunner:
@@ -290,11 +295,7 @@ class CodexModelRunner:
     ) -> dict[str, str]:
         """只给工具进程继承明确允许的宿主和 Agent 环境。"""
 
-        environment = {
-            name: value
-            for name, value in os.environ.items()
-            if name in _BASE_ENVIRONMENT_NAMES
-        }
+        environment = selected_environment(_BASE_ENVIRONMENT_NAMES)
         environment.update(agent_environment or {})
         real_codex_home = codex_home(self.config.runtime.codex_home)
         if temporary_home is not None:
@@ -305,10 +306,14 @@ class CodexModelRunner:
         # 模型客户端单独读取真实登录；工具只看见空的本轮 Codex 运行目录。
         environment["CODEX_HOME"] = str(tool_codex_home)
         # OAuth 与 Provider 凭据都不能进入 Teamwork 工具子进程。
-        environment.pop("CODEX_API_KEY", None)
-        environment.pop("OPENAI_API_KEY", None)
-        for provider in self.config.providers.values():
-            environment.pop(provider.token_env, None)
+        remove_environment_names(
+            environment,
+            (
+                "CODEX_API_KEY",
+                "OPENAI_API_KEY",
+                *(provider.token_env for provider in self.config.providers.values()),
+            ),
+        )
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
 

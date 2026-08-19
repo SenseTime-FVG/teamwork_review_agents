@@ -6,9 +6,8 @@ import asyncio
 import json
 import os
 import shlex
-import shutil
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -17,6 +16,7 @@ from .config import AgentConfig, AppConfig, RepositoryConfig
 from .managed_sandbox import wrap_managed_sandbox_command
 from .models import InvocationContext
 from .process_control import process_group_options, terminate_process
+from .subprocess_utils import resolve_executable
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -185,6 +185,7 @@ class ModelToolExecutor:
         inner_command = shell_command(
             command,
             workdir=workdir if self.managed_sandbox else None,
+            environment=self.environment,
         )
         process_command = self._wrap(inner_command)
         result = await self._run_process(
@@ -210,7 +211,7 @@ class ModelToolExecutor:
         if len(patch.encode("utf-8")) > _PATCH_LIMIT_BYTES:
             raise ValueError("apply_patch.patch 不能超过 4 MiB")
         paths = validate_unified_diff(patch)
-        git = shutil.which("git", path=self.environment.get("PATH")) or "git"
+        git = resolve_executable("git", self.environment)
         check_command = self._wrap(
             [git, "-C", str(self.repository.workspace), "apply", "--check", "--whitespace=nowarn", "-"]
         )
@@ -273,7 +274,10 @@ class ModelToolExecutor:
         if not self.managed_sandbox:
             return inner_command
         return wrap_managed_sandbox_command(
-            codex_binary=self.config.runtime.codex_binary,
+            codex_binary=resolve_executable(
+                self.config.runtime.codex_binary,
+                self.environment,
+            ),
             workspace=self.repository.workspace,
             agent=self.agent,
             inner_command=inner_command,
@@ -293,8 +297,12 @@ class ModelToolExecutor:
 
         if self.cancel_check is not None and await self.cancel_check():
             raise asyncio.CancelledError
+        resolved_command = [
+            resolve_executable(command[0], self.environment),
+            *command[1:],
+        ]
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *resolved_command,
             stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -375,6 +383,7 @@ def shell_command(
     command: str,
     *,
     workdir: Path | None = None,
+    environment: Mapping[str, str] | None = None,
     platform_name: str | None = None,
     os_name: str | None = None,
 ) -> list[str]:
@@ -383,7 +392,10 @@ def shell_command(
     active_platform = platform_name or sys.platform
     active_os = os_name or os.name
     if active_os == "nt" or active_platform == "win32":
-        shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+        shell = _first_resolved_executable(
+            ("pwsh", "powershell", "powershell.exe"),
+            environment,
+        )
         script = command
         if workdir is not None:
             escaped = str(workdir).replace("'", "''")
@@ -396,11 +408,24 @@ def shell_command(
             "-Command",
             script,
         ]
-    shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell = _first_resolved_executable(("bash", "sh", "/bin/sh"), environment)
     script = command
     if workdir is not None:
         script = f"cd -- {shlex.quote(str(workdir))} && {command}"
     return [shell, "-lc", script]
+
+
+def _first_resolved_executable(
+    candidates: tuple[str, ...],
+    environment: Mapping[str, str] | None,
+) -> str:
+    """从最终子进程 PATH 选择第一个真实存在的 shell。"""
+
+    for candidate in candidates:
+        resolved = resolve_executable(candidate, environment)
+        if resolved != candidate or Path(resolved).is_file():
+            return resolved
+    return candidates[-1]
 
 
 def _resolve_workdir(workspace: Path, value: str) -> Path:

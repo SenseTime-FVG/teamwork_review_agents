@@ -6,7 +6,6 @@ import asyncio
 import html
 import os
 import re
-import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import Awaitable, Callable, Literal
 
 from .config import AppConfig, PreflightConfig
 from .environment import SecretRedactor, resolve_provider_token
+from .filesystem import temporary_directory
 from .models import ChangeEvent, PreflightResult, stable_hash
 from .preflight_cache import (
     build_repository_cache_environment,
@@ -22,6 +22,11 @@ from .preflight_cache import (
 from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
+from .subprocess_utils import (
+    WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
+    resolve_executable,
+    selected_environment,
+)
 from .workspace import GitProgressEvent, temporary_change_request_worktree
 
 
@@ -46,7 +51,7 @@ SAFE_HOST_ENVIRONMENT = {
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
     "UV_LINK_MODE",
-}
+} | WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PREFLIGHT_COMMENT_OUTPUT_CHARS = 12_000
 
@@ -99,14 +104,11 @@ def build_preflight_environment(
     *,
     home: Path | None = None,
     cache_environment: dict[str, str] | None = None,
+    windows: bool | None = None,
 ) -> dict[str, str]:
     """只继承运行工具所需的宿主机变量，不传递平台或模型凭据。"""
 
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name.upper() in SAFE_HOST_ENVIRONMENT
-    }
+    environment = selected_environment(SAFE_HOST_ENVIRONMENT)
     environment.update(
         {
             "CI": "true",
@@ -118,6 +120,18 @@ def build_preflight_environment(
     )
     if home is not None:
         environment["HOME"] = str(home)
+        active_windows = os.name == "nt" if windows is None else windows
+        if active_windows:
+            roaming = home / "AppData/Roaming"
+            local = home / "AppData/Local"
+            temporary = home / "tmp"
+            for directory in (roaming, local, temporary):
+                directory.mkdir(parents=True, exist_ok=True)
+            environment["USERPROFILE"] = str(home)
+            environment["APPDATA"] = str(roaming)
+            environment["LOCALAPPDATA"] = str(local)
+            environment["TEMP"] = str(temporary)
+            environment["TMP"] = str(temporary)
     if cache_environment:
         environment.update(cache_environment)
     return environment
@@ -225,8 +239,12 @@ async def execute_preflight_steps(
             ),
         )
         try:
+            command = [
+                resolve_executable(step.command[0], environment),
+                *step.command[1:],
+            ]
             process = await asyncio.create_subprocess_exec(
-                *step.command,
+                *command,
                 cwd=cwd,
                 env=environment,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -824,14 +842,14 @@ class PreflightExecutor:
                     "running_steps",
                     cache_path=cache_path,
                 )
-                with tempfile.TemporaryDirectory(
+                with temporary_directory(
                     prefix="teamwork-preflight-home-"
                 ) as home:
                     outcome = await execute_preflight_steps(
                         repository.preflight,
                         cwd=checkout,
                         environment=build_preflight_environment(
-                            home=Path(home),
+                            home=home,
                             cache_environment=cache_environment,
                         ),
                         on_step_update=record_step,

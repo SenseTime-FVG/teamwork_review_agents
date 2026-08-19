@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import time
 import uuid
 from contextlib import suppress
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .process_control import process_group_options, terminate_process
+from .subprocess_utils import resolve_executable
 
 
 APP_SERVER_TIMEOUT_SECONDS = 10.0
@@ -25,15 +25,15 @@ class CodexAccountError(RuntimeError):
     """表示无法安全完成 Codex 账户操作。"""
 
 
-def _resolve_binary(codex_binary: str) -> str:
+def _resolve_binary(
+    codex_binary: str,
+    environment: dict[str, str] | None = None,
+) -> str:
     """解析 Codex 命令，避免 App Server 启动时依赖不确定的工作目录。"""
 
-    resolved = shutil.which(codex_binary)
-    if resolved:
+    resolved = resolve_executable(codex_binary, environment)
+    if resolved != codex_binary or Path(resolved).expanduser().is_file():
         return resolved
-    candidate = Path(codex_binary).expanduser()
-    if candidate.is_file():
-        return str(candidate.resolve())
     raise CodexAccountError(f"找不到 Codex CLI：{codex_binary}")
 
 
@@ -71,7 +71,8 @@ class CodexAppServer:
     async def start(self) -> None:
         """启动 App Server 并完成协议初始化。"""
 
-        command = _resolve_binary(self.codex_binary)
+        environment = _codex_environment(self.home)
+        command = _resolve_binary(self.codex_binary, environment)
         try:
             self.process = await asyncio.create_subprocess_exec(
                 command,
@@ -80,7 +81,7 @@ class CodexAppServer:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=_codex_environment(self.home),
+                env=environment,
                 cwd=str(self.working_directory) if self.working_directory else None,
                 limit=APP_SERVER_STREAM_LIMIT_BYTES,
                 **process_group_options(),

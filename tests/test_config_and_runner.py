@@ -330,16 +330,21 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
     monkeypatch.setenv("CODEX_API_KEY", "Codex 自身凭据")
     monkeypatch.setenv("HOME", "/tmp/gh-keychain-home")
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setenv("ComSpec", "C:/Windows/System32/cmd.exe")
     environment = CodexRunner(config).child_environment(
         {
-            "GITHUB_TOKEN": "Agent 环境也不能重新注入",
+            "Github_Token": "Agent 环境也不能重新注入",
             "VISIBLE_AGENT_VALUE": "允许进入 Codex",
         }
     )
     assert "GITHUB_TOKEN" not in environment
+    assert "Github_Token" not in environment
     assert "GITLAB_TOKEN" not in environment
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
     assert environment["HOME"] == "/tmp/gh-keychain-home"
+    assert environment["SYSTEMROOT"] == "C:/Windows"
+    assert environment["COMSPEC"] == "C:/Windows/System32/cmd.exe"
     assert environment["VISIBLE_AGENT_VALUE"] == "允许进入 Codex"
 
 

@@ -36,6 +36,12 @@ from .managed_sandbox import (
 )
 from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
+from .subprocess_utils import (
+    WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
+    remove_environment_names,
+    resolve_executable,
+    selected_environment,
+)
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
@@ -76,7 +82,7 @@ BASE_ENVIRONMENT_NAMES = {
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
-}
+} | WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 
 
 def encode_invocation_context(context: InvocationContext) -> str:
@@ -177,8 +183,13 @@ class CodexRunner:
             if managed_sandbox is None
             else managed_sandbox
         )
-        command = [
+        active_environment = environment if environment is not None else os.environ
+        codex_binary = resolve_executable(
             self.config.runtime.codex_binary,
+            active_environment,
+        )
+        command = [
+            codex_binary,
             "exec",
             "--json",
             "--ephemeral",
@@ -271,11 +282,11 @@ class CodexRunner:
         command.append("-")
         if use_managed_sandbox:
             return wrap_managed_sandbox_command(
-                codex_binary=self.config.runtime.codex_binary,
+                codex_binary=codex_binary,
                 workspace=repository.workspace,
                 agent=agent,
                 inner_command=command,
-                environment=environment or os.environ,
+                environment=active_environment,
                 ipc_directory=mcp_bridge.directory if mcp_bridge is not None else None,
                 codex_runtime_directory=codex_runtime_directory,
             )
@@ -290,11 +301,7 @@ class CodexRunner:
     ) -> dict[str, str]:
         """只继承运行必需变量，再叠加 Agent 明确声明的环境。"""
 
-        environment = {
-            name: value
-            for name, value in os.environ.items()
-            if name in BASE_ENVIRONMENT_NAMES
-        }
+        environment = selected_environment(BASE_ENVIRONMENT_NAMES)
         environment.update(agent_environment or {})
         if self.config.runtime.codex_home is not None:
             environment["CODEX_HOME"] = str(self.config.runtime.codex_home)
@@ -306,8 +313,10 @@ class CodexRunner:
         if temporary_codex_home is not None:
             temporary_codex_home.apply_environment(environment)
         # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
-        for provider in self.config.providers.values():
-            environment.pop(provider.token_env, None)
+        remove_environment_names(
+            environment,
+            (provider.token_env for provider in self.config.providers.values()),
+        )
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
 

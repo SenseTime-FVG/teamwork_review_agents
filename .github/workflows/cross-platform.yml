@@ -32,7 +32,7 @@ jobs:
         run: python -m compileall -q src tests
 
   windows:
-    name: 原生 Windows CLI 与进程管理
+    name: 原生 Windows 生命周期与执行环境
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,9 +51,16 @@ jobs:
       - name: 验证 Windows CLI 与进程树
         run: >-
           python -m pytest
+          tests/test_filesystem.py
+          tests/test_subprocess_utils.py
+          tests/test_agent_home.py
+          tests/test_codex_account.py
           tests/test_process_control.py
           tests/test_process_manager.py
           tests/test_preflight.py
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
+          tests/test_config_and_runner.py::test_runner_scrubs_provider_tokens
+          tests/test_model_runtime.py::test_model_tool_environment_uses_empty_run_codex_home
+          tests/test_model_runtime.py::test_shell_command_uses_final_child_path
       - name: 检查 Python 编译
         run: python -m compileall -q src tests

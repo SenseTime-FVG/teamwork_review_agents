@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -284,6 +286,24 @@ def test_shell_command_covers_posix_and_native_windows(tmp_path) -> None:
     assert "Set-Location -LiteralPath" in windows[-1]
 
 
+def test_shell_command_uses_final_child_path(tmp_path) -> None:
+    """内嵌工具选择 PowerShell 时必须服从最终子进程 PATH。"""
+
+    shell = tmp_path / ("pwsh.cmd" if os.name == "nt" else "pwsh")
+    shell.write_text("@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+    if os.name != "nt":
+        shell.chmod(0o755)
+
+    command = shell_command(
+        "Get-Location",
+        environment={"PATH": str(tmp_path), "PATHEXT": ".COM;.EXE;.BAT;.CMD"},
+        platform_name="win32",
+        os_name="nt",
+    )
+
+    assert command[0] == str(shell.resolve())
+
+
 def test_unified_diff_rejects_escape_and_git_metadata() -> None:
     """apply_patch 不能用路径头越过工作区或修改 .git。"""
 
@@ -349,6 +369,37 @@ async def test_apply_patch_tool_updates_only_workspace(
 
     assert result["applied"] is True
     assert target.read_text(encoding="utf-8") == "new\n"
+
+
+def test_model_tool_resolves_managed_sandbox_binary_from_child_path(
+    configured_app_factory,
+    snapshot_factory,
+    tmp_path,
+) -> None:
+    """托管沙盒外层 Codex 必须按最终子进程 PATH 解析。"""
+
+    config = configured_app_factory()
+    config.runtime.codex_binary = "codex"
+    repository = config.repositories[0]
+    executable = tmp_path / ("codex.cmd" if os.name == "nt" else "codex")
+    executable.write_text("@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+    if os.name != "nt":
+        executable.chmod(0o755)
+    executor = ModelToolExecutor(
+        config=config,
+        agent=config.agents["code-reviewer"],
+        repository=repository,
+        context=_context(config, snapshot_factory),
+        environment={"PATH": str(tmp_path)},
+        managed_sandbox=True,
+        cancel_check=None,
+        progress_callback=lambda: None,
+        invoke_agent_callback=None,
+    )
+
+    command = executor._wrap([sys.executable, "-c", "pass"])
+
+    assert command[0].lower() == str(executable.resolve()).lower()
 
 
 @pytest.mark.asyncio
@@ -435,17 +486,20 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
 def test_model_tool_environment_uses_empty_run_codex_home(
     configured_app_factory,
     tmp_path,
+    monkeypatch,
 ) -> None:
     """真实 OAuth 目录不能通过 CODEX_HOME 暴露给工具子进程。"""
 
     config = configured_app_factory()
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setenv("ComSpec", "C:/Windows/System32/cmd.exe")
     tool_codex_home = tmp_path / "tool-codex-home"
     tool_codex_home.mkdir()
     environment = CodexModelRunner(config).child_environment(
         {
             "OPENAI_API_KEY": "do-not-forward",
             "CODEX_API_KEY": "do-not-forward",
-            "GITHUB_TOKEN": "do-not-forward",
+            "Github_Token": "do-not-forward",
         },
         temporary_home=None,
         tool_codex_home=tool_codex_home,
@@ -456,6 +510,9 @@ def test_model_tool_environment_uses_empty_run_codex_home(
     assert "OPENAI_API_KEY" not in environment
     assert "CODEX_API_KEY" not in environment
     assert "GITHUB_TOKEN" not in environment
+    assert "Github_Token" not in environment
+    assert environment["SYSTEMROOT"] == "C:/Windows"
+    assert environment["COMSPEC"] == "C:/Windows/System32/cmd.exe"
 
 
 def test_selected_skill_is_injected_into_model_instructions(

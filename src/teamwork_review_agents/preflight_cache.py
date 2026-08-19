@@ -64,7 +64,7 @@ def build_repository_cache_environment(root: Path) -> dict[str, str]:
         # Windows 等平台可能不支持 POSIX 权限位，目录隔离仍由用户身份保证。
         pass
 
-    maven_option = f"-Dmaven.repo.local={directories['maven']}"
+    maven_option = f'-Dmaven.repo.local="{directories["maven"]}"'
     return {
         "TEAMWORK_PREFLIGHT_CACHE_DIR": str(resolved),
         "XDG_CACHE_HOME": str(directories["xdg"]),

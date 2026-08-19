@@ -76,6 +76,7 @@ def test_temporary_agent_home_redirects_generic_user_directories(tmp_path) -> No
     assert not path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不验证 macOS 目录链接")
 def test_temporary_agent_home_bridges_macos_keychains(
     tmp_path, monkeypatch
 ) -> None:
@@ -122,6 +123,7 @@ def test_temporary_agent_home_bridges_macos_keychains(
     assert marker.read_text(encoding="utf-8") == "保留"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不验证 macOS 目录链接")
 def test_temporary_agent_home_rejects_occupied_macos_keychain_bridge(
     tmp_path, monkeypatch
 ) -> None:
@@ -152,6 +154,7 @@ def test_temporary_agent_home_rejects_occupied_macos_keychain_bridge(
     assert temporary_home.cleanup() is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不验证 macOS 目录链接")
 def test_temporary_agent_home_skips_missing_macos_keychains(
     tmp_path, monkeypatch
 ) -> None:
@@ -178,6 +181,7 @@ def test_temporary_agent_home_skips_missing_macos_keychains(
     assert temporary_home.cleanup() is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不验证 macOS 目录链接")
 def test_temporary_agent_home_does_not_bridge_keychains_on_other_platforms(
     tmp_path, monkeypatch
 ) -> None:
@@ -242,8 +246,45 @@ def test_temporary_agent_home_repeats_windows_user_directories(
     assert first_environment["LOCALAPPDATA"] == str(
         temporary_home.path / "AppData/Local"
     )
+    assert first_environment["TEMP"] == str(temporary_home.path / "tmp")
+    assert first_environment["TMP"] == str(temporary_home.path / "tmp")
     assert (temporary_home.path / "AppData/Roaming").is_dir()
     assert (temporary_home.path / "AppData/Local").is_dir()
+    assert temporary_home.cleanup() is None
+
+
+def test_temporary_agent_home_bridges_windows_cli_logins(
+    tmp_path, monkeypatch
+) -> None:
+    """Windows 临时用户目录应继续引用宿主 gh 与 glab 登录配置。"""
+
+    monkeypatch.setattr(agent_home_module, "_is_windows", lambda: True)
+    host_home = tmp_path / "windows-user"
+    host_appdata = host_home / "AppData/Roaming"
+    gh_config = host_appdata / "GitHub CLI"
+    glab_config = host_appdata / "glab-cli"
+    gh_config.mkdir(parents=True)
+    glab_config.mkdir(parents=True)
+    codex_home = host_home / ".codex"
+    codex_home.mkdir()
+    temporary_home = TemporaryAgentHome.create(
+        "run-windows-cli",
+        root=tmp_path / "homes",
+    )
+    environment: dict[str, str] = {}
+
+    bridges = temporary_home.apply_environment(
+        environment,
+        codex_home=codex_home,
+        host_environment={
+            "USERPROFILE": str(host_home),
+            "APPDATA": str(host_appdata),
+        },
+    )
+
+    assert environment["GH_CONFIG_DIR"] == str(gh_config)
+    assert environment["GLAB_CONFIG_DIR"] == str(glab_config)
+    assert {"GH_CONFIG_DIR", "GLAB_CONFIG_DIR"}.issubset(bridges)
     assert temporary_home.cleanup() is None
 
 
@@ -387,6 +428,7 @@ def test_stale_agent_home_cleanup_keeps_live_owner(tmp_path) -> None:
     assert unrelated.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 不验证 macOS 目录链接")
 def test_stale_agent_home_cleanup_does_not_follow_keychain_bridge(tmp_path) -> None:
     """回收异常退出的临时 HOME 时不得跟随链接删除真实钥匙串。"""
 

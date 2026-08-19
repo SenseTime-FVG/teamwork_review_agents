@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 import uuid
 from contextlib import suppress
 from pathlib import Path
 
 from .config import AppConfig, RepositoryConfig
 from .config_manager import ConfigManager
+from .filesystem import temporary_directory
 from .locks import LockCancelledError, ResourceLease
 from .models import PreflightResult
 from .preflight import (
@@ -254,14 +254,14 @@ class ManualPreflightManager:
                         event_type="output",
                     )
 
-                with tempfile.TemporaryDirectory(
+                with temporary_directory(
                     prefix="teamwork-manual-preflight-home-"
                 ) as home:
                     outcome = await execute_preflight_steps(
                         repository.preflight,
                         cwd=checkout,
                         environment=build_preflight_environment(
-                            home=Path(home),
+                            home=home,
                             cache_environment=cache_environment,
                         ),
                         on_step_update=record_step,

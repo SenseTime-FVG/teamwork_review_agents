@@ -412,6 +412,41 @@ def test_preflight_environment_excludes_host_credentials(monkeypatch, tmp_path) 
     assert "OPENAI_API_KEY" not in environment
 
 
+def test_preflight_environment_isolates_windows_user_directories(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Windows CI 保留系统启动变量，但所有可写用户目录必须逐轮隔离。"""
+
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setenv("ComSpec", "C:/Windows/System32/cmd.exe")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    home = tmp_path / "preflight-home"
+
+    environment = build_preflight_environment(home=home, windows=True)
+
+    assert environment["SYSTEMROOT"] == "C:/Windows"
+    assert environment["COMSPEC"] == "C:/Windows/System32/cmd.exe"
+    assert environment["PATHEXT"] == ".COM;.EXE;.BAT;.CMD"
+    assert environment["USERPROFILE"] == str(home)
+    assert environment["APPDATA"] == str(home / "AppData/Roaming")
+    assert environment["LOCALAPPDATA"] == str(home / "AppData/Local")
+    assert environment["TEMP"] == str(home / "tmp")
+    assert environment["TMP"] == str(home / "tmp")
+
+
+def test_repository_cache_quotes_maven_path_with_spaces(tmp_path) -> None:
+    """Maven 本地仓库参数必须兼容 Windows 用户目录中的空格。"""
+
+    root = tmp_path / "cache root"
+
+    environment = build_repository_cache_environment(root)
+
+    assert environment["MAVEN_OPTS"] == (
+        f'-Dmaven.repo.local="{root.resolve() / "maven"}"'
+    )
+
+
 async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     tmp_path,
     monkeypatch,

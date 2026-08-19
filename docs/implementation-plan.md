@@ -891,6 +891,18 @@
 
 验收：根目录 `data/` 及其全部内容不再出现在 Git 状态中；忽略来源明确指向统一目录规则；其他位置的同名目录不受影响；现有运行数据和服务不受影响。
 
+## 阶段七十九：原生 Windows 生命周期与执行环境修复
+
+- 新增统一的跨平台目录删除器，处理 Windows 只读文件和短暂占用；替换独立 clone、基础仓库暂存目录、Preflight worktree 根目录、Skill 投影、Agent/Codex 临时 HOME 和 MCP 通道的直接删除逻辑。
+- 建立共享的外部命令解析与 Windows 环境变量工具；Codex CLI、模型运行器、模型目录、沙盒诊断和 Preflight 在启动前按最终 `PATH` 解析可执行文件，Provider 与模型凭据继续按不区分大小写方式移除。
+- 完善 Windows 临时用户环境，把用户配置与临时写目录分开：本轮 `USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP` 全部隔离，同时从宿主 `%APPDATA%/GitHub CLI` 和 `%APPDATA%/glab-cli` 桥接已经存在的 CLI 登录配置。
+- 为每个配置增加绑定 PID 与启动时间的原子停止请求；受管 Uvicorn 服务轮询后进入 FastAPI lifespan 正常收尾，Windows `stop/restart` 只在超时后强杀完整进程树，POSIX 信号行为保持兼容。
+- 修正 Maven 缓存参数对空格路径的引用，补充 Windows `.cmd` / `.bat` shim、只读 Git 对象、临时目录、登录配置桥接、优雅停机与强制回退测试。
+- 扩展 GitHub Actions Windows 作业，运行目录清理、Agent HOME、Codex 运行器、模型运行器、Preflight、工作区和进程管理相关测试；保留导入、示例配置校验与编译检查。
+- 执行 Python 定向与全量测试、Python 编译检查和补丁检查；不启动、停止或重启用户服务。
+
+验收：原生 Windows CI 可删除已完成运行的独立 clone，不再因 Git 只读对象把成功运行误标为保留；Codex、`gh`、`glab` 与 Preflight 在隔离环境中仍找到正确的系统目录、登录配置和可执行文件；`stop/restart` 会先完成应用内取消和资源清理，超时后才强杀；macOS、Linux 与现有凭据隔离行为不回归。
+
 ## 阶段八十：运行时下拉框与账号模型目录同步
 
 - 把运行时配置中的原生枚举下拉替换为统一的页面内列表框，弹层与字段保持同宽同左边界，并按视口剩余空间选择向下或向上展开。

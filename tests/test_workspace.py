@@ -225,7 +225,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "removed"
+    assert cleanup.status == "removed", cleanup.reason
     assert not isolated.exists()
 
     cloned = ensure_isolated_clone(
@@ -259,7 +259,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "removed"
+    assert cleanup.status == "removed", cleanup.reason
     assert not cloned.exists()
 
     retained_clone = ensure_isolated_clone(

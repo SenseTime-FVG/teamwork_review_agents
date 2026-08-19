@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import tomllib
 from pathlib import Path
 from typing import Any
+
+from .subprocess_utils import resolve_executable
 
 from .config import (
     AgentConfig,
@@ -267,10 +268,9 @@ def inspect_codex_binary(
 ) -> dict[str, str | None]:
     """解析 Codex CLI 路径和版本，不执行任何 Agent 任务。"""
 
-    resolved = shutil.which(codex_binary)
-    if resolved is None and Path(codex_binary).expanduser().is_file():
-        resolved = str(Path(codex_binary).expanduser().resolve())
-    command = resolved or codex_binary
+    environment = _codex_environment(home)
+    command = resolve_executable(codex_binary, environment)
+    resolved = command if Path(command).is_file() else None
     try:
         result = subprocess.run(
             [command, "--version"],
@@ -280,7 +280,7 @@ def inspect_codex_binary(
             encoding="utf-8",
             errors="replace",
             timeout=5,
-            env=_codex_environment(home),
+            env=environment,
         )
         output = (result.stdout or result.stderr).strip()
     except (OSError, subprocess.SubprocessError) as exc:
@@ -412,16 +412,18 @@ def read_bundled_models(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """从本机 Codex CLI 读取模型目录；失败时保留手工填写能力。"""
 
+    environment = _codex_environment(home)
+    command = resolve_executable(codex_binary, environment)
     try:
         result = subprocess.run(
-            [codex_binary, "debug", "models", "--bundled"],
+            [command, "debug", "models", "--bundled"],
             check=True,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=8,
-            env=_codex_environment(home),
+            env=environment,
         )
         document = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:

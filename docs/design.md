@@ -132,7 +132,7 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 
 应用升级为 FastAPI 后台服务，HTTP API、配置管理、定时扫描和 Agent 队列在同一服务进程中运行。CLI 提供 `run` 前台运行，以及 `start`、`stop`、`end`、`restart` 本地后台进程管理；同一配置文件通过 PID 文件和进程锁保证只有一个服务实例。
 
-`start` 使用脱离终端的子进程运行服务，并将标准输出与错误写入配置目录旁的 `data/teamwork-review-agents.log`。`stop` 在 POSIX 上先发送 `SIGTERM` 等待优雅收尾，在 Windows 上结束已确认的受管进程树；超时后统一强制结束。PID 记录同时保存进程启动时间，防止 PID 被系统复用时误结束其他进程。
+`start` 使用脱离终端的子进程运行服务，并将标准输出与错误写入配置目录旁的 `data/teamwork-review-agents.log`。`stop` 先写入绑定 PID 与启动时间的停止请求，让服务进入应用生命周期收尾；POSIX 同时发送 `SIGTERM` 唤醒服务，Windows 则由服务内轮询接收请求。只有等待超时后才统一强制结束完整进程树。PID 记录同时保存进程启动时间，防止 PID 被系统复用时误结束其他进程。
 
 生产环境需要故障自动恢复和开机启动时，仍由 systemd、launchd、Windows 服务管理器、任务计划程序或容器平台运行 `run` 并负责保活。
 
@@ -461,7 +461,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 单实例锁使用跨平台文件锁库，不在模块导入阶段依赖 Windows 不存在的 `fcntl`。进程身份、启动时间、存活状态和托管进程发现统一使用跨平台进程库读取，不调用 `ps` 或解析平台相关命令行文本；PID 文件继续同时记录 PID 与启动时间，防止 PID 复用导致误停止。升级前生成的旧 PID 记录如果无法匹配新格式，进程发现仍应根据完整 Python 模块命令和配置绝对路径找回实例。
 
-所有需要携带后代进程的命令统一通过进程控制模块创建。POSIX 保持新会话和进程组语义，温和终止使用 `SIGTERM`，强制终止使用 `SIGKILL`；Windows 使用新的进程组，后台服务额外使用脱离终端标志，并通过系统父 PID 关系递归枚举服务、Codex、Git、SSH、`index-pack`、App Server 和 Preflight 后代，即使直接父进程刚刚退出也继续回收仍存活的后代。Windows 没有与 POSIX 完全等价且适用于脱离终端进程的 `SIGTERM`，因此停止阶段使用系统终止进程树并继续等待真实退出；状态恢复和工作区安全保留不得依赖信号名称。Git、Codex 诊断和 CLI 捕获的文本统一按 UTF-8 解码并安全替换非法字节；Preflight 为 Python 子命令显式设置 UTF-8 环境，避免 Windows 本地代码页把中文输出误判为命令失败。
+所有需要携带后代进程的命令统一通过进程控制模块创建。POSIX 保持新会话和进程组语义，温和终止使用 `SIGTERM`，强制终止使用 `SIGKILL`；Windows 使用新的进程组，后台服务额外使用脱离终端标志，并通过系统父 PID 关系递归枚举服务、Codex、Git、SSH、`index-pack`、App Server 和 Preflight 后代，即使直接父进程刚刚退出也继续回收仍存活的后代。Windows 没有与 POSIX 完全等价且适用于脱离终端进程的 `SIGTERM`，因此后台服务先通过配置专属停止请求进入应用生命周期收尾；等待超时后才使用系统终止进程树。状态恢复和工作区安全保留不得依赖信号名称。Git、Codex 诊断和 CLI 捕获的文本统一按 UTF-8 解码并安全替换非法字节；Preflight 为 Python 子命令显式设置 UTF-8 环境，避免 Windows 本地代码页把中文输出误判为命令失败。
 
 Windows CI 至少安装项目并在真实 Windows runner 上执行 CLI 导入、配置校验、后台启动、重复启动、停止、重启、进程发现和进程树终止测试。Linux/macOS 的现有全量测试继续验证 POSIX 行为。systemd 与 launchd 模板仍只适用于各自平台；Windows 长期部署可让 Windows 服务管理器或任务计划程序执行前台 `teamwork-review-agents run`，项目内置的 `start` 适用于本机后台运行。
 
@@ -768,6 +768,18 @@ Preflight 输出从“结束时一次写入”改为有界增量日志。步骤�
 根目录 `/data/` 用于保存 SQLite 数据库及其辅助文件、运行日志、PID、锁、临时 worktree 和 Preflight 依赖缓存。这些内容属于部署实例的本地运行状态或可再生数据，不进入版本控制。项目在根目录 `.gitignore` 中整体忽略该目录，避免运行数据持续污染工作区状态或被宽泛暂存操作误收入提交。
 
 该规则只匹配项目根目录的 `/data/`，不影响其他同名子目录。增加忽略规则不删除、移动或清理任何现有运行数据，也不影响运行中服务、历史状态或后续缓存复用。需要纳入版本控制的固定资源不得放入 `/data/`，应存放在用途明确的受版本控制目录中。
+
+## 81. 原生 Windows 生命周期与子进程兼容
+
+Windows 上 Git 对象、包缓存和工具生成文件可能带只读属性，直接调用 `shutil.rmtree` 会让已完成的 Agent 被误判为“工作区保留”，也会使 Skill 投影、临时 HOME、MCP 通道或 Preflight 临时目录无法回收。项目统一使用跨平台目录删除器：只在删除遇到权限错误时清除目标自身的只读属性并重试，对短暂占用执行有界重试，最终失败仍保留原异常。删除器不能跟随目录符号链接，也不能把清理失败静默改写成成功；工作区安全校验和“有未提交修改则保留”策略保持不变。
+
+后台 Agent 和 Preflight 不继承宿主机全部环境变量，但原生 Windows 创建进程所需的 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`APPDATA` 和 `LOCALAPPDATA` 必须进入允许列表。使用临时 HOME 时，`HOME`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP` 和 `TMP` 统一重定向到本轮目录；Codex 登录仍通过显式 `CODEX_HOME` 访问，Provider Token 仍在最终环境中按不区分大小写的变量名移除。Windows 的 GitHub CLI 默认配置目录 `%APPDATA%/GitHub CLI` 与 GitLab CLI 默认目录 `%APPDATA%/glab-cli` 在宿主目录实际存在时分别通过 `GH_CONFIG_DIR` 和 `GLAB_CONFIG_DIR` 只读桥接，不复制凭据，不把 Token 写入环境或日志。
+
+后台 `stop` / `restart` 在 Windows 不能把 `psutil.Process.terminate()` 当作优雅终止，因为该操作等价于强制结束进程。每个配置对应一个原子停止请求文件，内容绑定目标 PID 和进程启动时间；受管服务轮询到属于自己的请求后设置 Uvicorn 的退出标记，从而进入 FastAPI lifespan，依次停止扫描、取消 Agent、回收 Codex 与 Preflight 子进程并释放单实例锁。管理命令等待正常退出，超过既有停止超时后才强制结束完整进程树。POSIX 继续使用系统终止信号，同时写入同一请求以保持行为一致；陈旧请求在成功停止或取得新服务锁后清除，不能因 PID 重用误停新实例。
+
+所有由 Teamwork 直接启动的外部命令在创建子进程前使用当前子进程 `PATH` 解析实际可执行文件。该规则覆盖 Codex CLI、Codex 模型目录和沙盒诊断、Preflight 步骤及账户 App Server，保证 Windows 的 `.exe`、`.cmd` 和 `.bat` shim 与管理界面诊断使用同一目标；找不到命令时仍返回明确的启动错误，不启用 `shell=True`。Preflight 的 Maven 本地仓库参数对包含空格的 Windows 路径进行参数级引用。
+
+Windows CI 不再只验证一个工作区用例。它至少覆盖目录删除、独立 clone 清理、临时 HOME 与 `gh/glab` 桥接、Codex/模型子进程环境、Preflight 可执行文件解析、服务优雅停止和进程树强制回退；仍保留 macOS、Linux 全量测试和 Python 编译检查。测试不得依赖已安装的真实 Codex、`gh` 或 `glab`，而应使用临时 shim 和受控子进程验证路径解析及生命周期。
 
 ## 82. 运行时下拉框定位与账号模型目录
 

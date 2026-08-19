@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -85,12 +87,20 @@ for line in sys.stdin:
             "params": {"loginId": "login-test", "success": True},
         }), flush=True)
 """.replace("__CONFIG_PADDING_SIZE__", str(config_padding_size))
-    path.write_text(
+    script_path = path.with_suffix(".py") if os.name == "nt" else path
+    script_path.write_text(
         script,
         encoding="utf-8",
     )
-    path.chmod(0o755)
-    return path
+    if os.name == "nt":
+        launcher = path.with_suffix(".cmd")
+        launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script_path}"\r\n',
+            encoding="utf-8",
+        )
+        return launcher
+    script_path.chmod(0o755)
+    return script_path
 
 
 async def test_inspect_codex_account_returns_only_safe_fields(tmp_path) -> None:

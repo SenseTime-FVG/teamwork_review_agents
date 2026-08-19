@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from .subprocess_utils import resolve_executable
+
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -437,7 +439,7 @@ def _codex_client_version(codex_binary: str) -> str:
 
     try:
         completed = subprocess.run(
-            [codex_binary, "--version"],
+            [resolve_executable(codex_binary), "--version"],
             check=False,
             capture_output=True,
             text=True,

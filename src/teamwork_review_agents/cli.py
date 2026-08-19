@@ -6,8 +6,9 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import uvicorn
 
@@ -128,6 +129,8 @@ async def _serve(
     config_path: Path,
     host_override: str | None,
     port_override: int | None,
+    *,
+    stop_check: Callable[[], bool] | None = None,
 ) -> int:
     config_path = resolve_config_path(config_path)
     config = load_config(config_path)
@@ -148,7 +151,29 @@ async def _serve(
     server = uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="info")
     )
-    await server.serve()
+    watcher: asyncio.Task[None] | None = None
+    if stop_check is not None:
+
+        async def watch_stop_request() -> None:
+            """轮询配置专属请求，并让 Uvicorn 进入正常 lifespan 收尾。"""
+
+            while not server.should_exit:
+                if await asyncio.to_thread(stop_check):
+                    server.should_exit = True
+                    return
+                await asyncio.sleep(0.1)
+
+        watcher = asyncio.create_task(
+            watch_stop_request(),
+            name="teamwork-service-stop-watcher",
+        )
+    try:
+        await server.serve()
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
     return 0
 
 
@@ -201,7 +226,14 @@ def _run_server(
         return 3
     with lease:
         try:
-            return asyncio.run(_serve(resolved, host, port))
+            return asyncio.run(
+                _serve(
+                    resolved,
+                    host,
+                    port,
+                    stop_check=lease.stop_requested,
+                )
+            )
         except KeyboardInterrupt:
             # 终端 Ctrl+C 与服务管理命令发出的停止请求都视为正常停机。
             return 0
