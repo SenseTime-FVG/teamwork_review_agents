@@ -3274,6 +3274,8 @@ function RepositoriesView(props: {
   const [draftId, setDraftId] = useState("");
   const [saving, setSaving] = useState(false);
   const [startingPreflight, setStartingPreflight] = useState(false);
+  const [checkingManualPreflight, setCheckingManualPreflight] = useState(false);
+  const [activeManualPreflightRunId, setActiveManualPreflightRunId] = useState<string | null>(null);
   const [selectedPreflightRunId, setSelectedPreflightRunId] = useState<string | null>(null);
   const [togglingRepositoryId, setTogglingRepositoryId] = useState<string | null>(null);
   const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
@@ -3297,6 +3299,44 @@ function RepositoriesView(props: {
     const timer = window.setInterval(() => { void refreshWorkspaceItems(); }, 2000);
     return () => window.clearInterval(timer);
   }, [refreshWorkspaceItems]);
+
+  const findActiveManualPreflight = useCallback(async (repositoryId: string): Promise<string | null> => {
+    const parameters = new URLSearchParams({
+      limit: "20",
+      status: "running",
+      repository_id: repositoryId,
+    });
+    const runs = await api<PreflightRunSummary[]>(`/api/preflight-runs?${parameters.toString()}`);
+    return runs.find((run) => run.trigger_source === "manual")?.run_id ?? null;
+  }, []);
+
+  useEffect(() => {
+    if (!detailId || editing || creating) {
+      if (!detailId) setActiveManualPreflightRunId(null);
+      setCheckingManualPreflight(false);
+      return;
+    }
+    let disposed = false;
+    let firstLoad = true;
+    const refresh = async () => {
+      if (firstLoad) setCheckingManualPreflight(true);
+      try {
+        const runId = await findActiveManualPreflight(detailId);
+        if (!disposed) setActiveManualPreflightRunId(runId);
+      } catch {
+        // 后台轮询失败不覆盖页面操作错误；启动或查看时仍会返回明确反馈。
+      } finally {
+        if (!disposed && firstLoad) setCheckingManualPreflight(false);
+        firstLoad = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [creating, detailId, editing, findActiveManualPreflight]);
 
   const repositories = useMemo(
     () => [...props.document.repositories].sort((left, right) => left.id.localeCompare(right.id)),
@@ -3361,6 +3401,8 @@ function RepositoriesView(props: {
 
   function openDetail(repositoryId: string) {
     clearDraft();
+    setCheckingManualPreflight(true);
+    setActiveManualPreflightRunId(null);
     setDetailId(repositoryId);
   }
 
@@ -3370,6 +3412,7 @@ function RepositoriesView(props: {
       return;
     }
     clearDraft();
+    setActiveManualPreflightRunId(null);
     setDetailId(null);
   }
 
@@ -3393,6 +3436,7 @@ function RepositoriesView(props: {
     setDetailId(null);
     setCreating(true);
     setEditing(true);
+    setActiveManualPreflightRunId(null);
     setDraftId(repositoryId);
     setDraftDocument(nextDocument);
   }
@@ -3498,6 +3542,10 @@ function RepositoriesView(props: {
 
   async function startManualPreflight() {
     if (!detailId || startingPreflight || dirty) return;
+    if (activeManualPreflightRunId) {
+      setSelectedPreflightRunId(activeManualPreflightRunId);
+      return;
+    }
     setStartingPreflight(true);
     props.onError("");
     try {
@@ -3509,8 +3557,20 @@ function RepositoriesView(props: {
         method: "POST",
       });
       props.onNotice(result.reason);
+      setActiveManualPreflightRunId(result.run_id);
       setSelectedPreflightRunId(result.run_id);
     } catch (reason) {
+      try {
+        const runId = await findActiveManualPreflight(detailId);
+        if (runId) {
+          setActiveManualPreflightRunId(runId);
+          setSelectedPreflightRunId(runId);
+          props.onNotice("已打开该仓库正在运行的手动 CI");
+          return;
+        }
+      } catch {
+        // 保留原始启动错误，避免后续查询失败覆盖真正原因。
+      }
       props.onError(reason instanceof Error ? reason.message : "启动手动 CI 失败");
     } finally {
       setStartingPreflight(false);
@@ -3695,21 +3755,30 @@ function RepositoriesView(props: {
               type="button"
               className="button secondary"
               disabled={
-                startingPreflight
-                || gitActive
-                || originalRepository?.enabled === false
-                || !originalRepository?.preflight?.enabled
-                || !originalRepository?.preflight?.steps?.length
+                checkingManualPreflight
+                || (!activeManualPreflightRunId && (
+                  startingPreflight
+                  || gitActive
+                  || originalRepository?.enabled === false
+                  || !originalRepository?.preflight?.enabled
+                  || !originalRepository?.preflight?.steps?.length
+                ))
               }
               title={
-                originalRepository?.enabled === false
+                activeManualPreflightRunId
+                  ? "重新打开该仓库正在运行的手动 CI"
+                  : originalRepository?.enabled === false
                   ? "请先启用仓库"
                   : !originalRepository?.preflight?.enabled
                     ? "请先配置并启用本地 CI"
                     : "不限时执行远端默认分支最新提交，用于验证 CI 并预热仓库级缓存"
               }
               onClick={() => { void startManualPreflight(); }}
-            >{startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
+            >{checkingManualPreflight
+              ? "检查运行状态…"
+              : activeManualPreflightRunId
+                ? "查看运行中的 CI"
+                : startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
           ) : undefined}
           onIdChange={setDraftId}
           onChange={setDraftDocument}
@@ -3744,7 +3813,14 @@ function RepositoriesView(props: {
         <PreflightRunDetailDrawer
           runId={selectedPreflightRunId}
           depth={0}
-          onClose={() => setSelectedPreflightRunId(null)}
+          onClose={() => {
+            setSelectedPreflightRunId(null);
+            if (detailId) {
+              void findActiveManualPreflight(detailId)
+                .then(setActiveManualPreflightRunId)
+                .catch(() => undefined);
+            }
+          }}
         />
       )}
     </div>
