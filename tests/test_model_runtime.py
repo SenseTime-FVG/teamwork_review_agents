@@ -33,7 +33,7 @@ from teamwork_review_agents.model_tools import (
     validate_unified_diff,
 )
 from teamwork_review_agents.models import AgentResult, ChangeEvent, InvocationContext
-from teamwork_review_agents.state import StateStore
+from teamwork_review_agents.state import RunReservation, StateStore
 
 
 def _jwt(payload: dict[str, Any]) -> str:
@@ -101,9 +101,18 @@ async def test_embedded_sub_agent_reuses_whitelist_and_execution_context(
         update={"call_chain": ("code-reviewer",)}
     )
     captured: dict[str, Any] = {}
+    linked_runs: list[dict[str, Any]] = []
 
     async def fake_execute(**arguments):
         captured.update(arguments)
+        await arguments["run_started_callback"](
+            RunReservation(
+                run_id="run-child",
+                root_run_id=context.root_run_id,
+                parent_run_id=context.run_id,
+                attempts=1,
+            )
+        )
         return AgentResult(
             run_id="run-child",
             root_run_id=context.root_run_id,
@@ -114,11 +123,18 @@ async def test_embedded_sub_agent_reuses_whitelist_and_execution_context(
         )
 
     setattr(executor, "execute", fake_execute)
+
+    async def record_started(linked_run: dict[str, Any]) -> None:
+        """记录父运行应收到的子运行精确关联。"""
+
+        linked_runs.append(linked_run)
+
     result = await executor._invoke_embedded_agent(
         context,
         "security-reviewer",
         "检查依赖安全",
         {"scope": "dependencies"},
+        record_started,
     )
 
     assert result["status"] == "completed"
@@ -127,6 +143,15 @@ async def test_embedded_sub_agent_reuses_whitelist_and_execution_context(
     assert captured["parent_run_id"] == context.run_id
     assert captured["depth"] == 1
     assert captured["parent_workspace"] == Path(context.active_workspace)
+    assert linked_runs == [
+        {
+            "run_id": "run-child",
+            "root_run_id": context.root_run_id,
+            "parent_run_id": context.run_id,
+            "agent_name": "security-reviewer",
+            "status": "queued",
+        }
+    ]
 
     with pytest.raises(PermissionError):
         await executor._invoke_embedded_agent(
@@ -135,6 +160,128 @@ async def test_embedded_sub_agent_reuses_whitelist_and_execution_context(
             "不允许的委托",
             None,
         )
+
+
+@pytest.mark.asyncio
+async def test_model_runner_emits_live_sub_agent_link(
+    configured_app_factory,
+    snapshot_factory,
+    monkeypatch,
+) -> None:
+    """子运行创建后应立即写入可点击关联，不必等待工具调用完成。"""
+
+    config = configured_app_factory()
+    config.runtime.codex.model = "gpt-test"
+    config.agents["code-reviewer"] = config.agents["code-reviewer"].model_copy(
+        update={"sandbox": "danger-full-access"}
+    )
+    repository = config.repositories[0]
+    response_count = 0
+
+    async def fake_create_response(self, payload, *, event_callback=None):
+        nonlocal response_count
+        response_count += 1
+        if response_count == 1:
+            return {
+                "id": "resp-invoke-1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-sub-agent-1",
+                        "name": "invoke_agent",
+                        "arguments": json.dumps(
+                            {
+                                "agent_name": "security-reviewer",
+                                "task": "检查依赖安全",
+                            }
+                        ),
+                    }
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            }
+        return {
+            "id": "resp-invoke-2",
+            "output": [
+                {
+                    "id": "msg-invoke-2",
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "委托完成"}],
+                }
+            ],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }
+
+    monkeypatch.setattr(CodexResponsesClient, "create_response", fake_create_response)
+    logs: list[tuple[str, str, Any]] = []
+
+    async def log_callback(stream: str, event_type: str, payload: Any) -> None:
+        logs.append((stream, event_type, payload))
+
+    async def invoke_agent_callback(
+        context: InvocationContext,
+        agent_name: str,
+        task: str,
+        extra_context: dict[str, Any] | None,
+        started_callback,
+    ) -> dict[str, Any]:
+        assert started_callback is not None
+        await started_callback(
+            {
+                "run_id": "run-child-live",
+                "root_run_id": context.root_run_id,
+                "parent_run_id": context.run_id,
+                "agent_name": agent_name,
+                "status": "queued",
+            }
+        )
+        return {
+            "status": "completed",
+            "run_id": "run-child-live",
+            "agent_name": agent_name,
+            "final_message": "检查完成",
+            "usage": {},
+        }
+
+    result = await CodexModelRunner(
+        config,
+        invoke_agent_callback=invoke_agent_callback,
+    ).run(
+        run_id="run-parent-live",
+        root_run_id="run-parent-live",
+        parent_run_id=None,
+        agent_name="code-reviewer",
+        agent=config.agents["code-reviewer"],
+        repository=repository,
+        context=_context(config, snapshot_factory).model_copy(
+            update={
+                "run_id": "run-parent-live",
+                "root_run_id": "run-parent-live",
+            }
+        ),
+        prompt="请委托安全检查",
+        process_environment={},
+        redactor=SecretRedactor(()),
+        log_callback=log_callback,
+        cancel_check=None,
+    )
+
+    assert result.status == "completed"
+    tool_logs = [
+        (event_type, payload["item"])
+        for _, event_type, payload in logs
+        if event_type in {"item.started", "item.updated", "item.completed"}
+        and isinstance(payload, dict)
+        and isinstance(payload.get("item"), dict)
+        and payload["item"].get("tool") == "invoke_agent"
+    ]
+    assert [event_type for event_type, _ in tool_logs] == [
+        "item.started",
+        "item.updated",
+        "item.completed",
+    ]
+    assert {item["call_id"] for _, item in tool_logs} == {"call-sub-agent-1"}
+    assert tool_logs[1][1]["linked_run"]["run_id"] == "run-child-live"
+    assert tool_logs[2][1]["result"]["run_id"] == "run-child-live"
 
 
 @pytest.mark.asyncio

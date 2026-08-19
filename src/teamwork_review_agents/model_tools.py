@@ -21,8 +21,15 @@ from .subprocess_utils import resolve_executable
 
 CancelCheck = Callable[[], Awaitable[bool]]
 ProgressCallback = Callable[[], None]
+InvokeAgentStartedCallback = Callable[[dict[str, Any]], Awaitable[None]]
 InvokeAgentCallback = Callable[
-    [InvocationContext, str, str, dict[str, Any] | None],
+    [
+        InvocationContext,
+        str,
+        str,
+        dict[str, Any] | None,
+        InvokeAgentStartedCallback | None,
+    ],
     Awaitable[dict[str, Any]],
 ]
 
@@ -148,7 +155,13 @@ class ModelToolExecutor:
         self.invoke_agent_callback = invoke_agent_callback
         self.codex_runtime_directory = codex_runtime_directory
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        invoke_agent_started_callback: InvokeAgentStartedCallback | None = None,
+    ) -> dict[str, Any]:
         """按工具名分派调用并返回可序列化结果。"""
 
         if name == "execute_command":
@@ -156,7 +169,10 @@ class ModelToolExecutor:
         if name == "apply_patch":
             return await self._apply_patch(arguments)
         if name == "invoke_agent":
-            return await self._invoke_agent(arguments)
+            return await self._invoke_agent(
+                arguments,
+                started_callback=invoke_agent_started_callback,
+            )
         raise ValueError(f"未知 Teamwork 工具：{name}")
 
     async def _execute_command(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -244,7 +260,12 @@ class ModelToolExecutor:
             "timed_out": applied["timed_out"],
         }
 
-    async def _invoke_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _invoke_agent(
+        self,
+        arguments: dict[str, Any],
+        *,
+        started_callback: InvokeAgentStartedCallback | None,
+    ) -> dict[str, Any]:
         """直接进入 Teamwork 执行器，不经过 MCP 或外部 API。"""
 
         if self.invoke_agent_callback is None:
@@ -264,6 +285,7 @@ class ModelToolExecutor:
             agent_name.strip(),
             task.strip(),
             extra_context,
+            started_callback,
         )
         self.progress_callback()
         return result

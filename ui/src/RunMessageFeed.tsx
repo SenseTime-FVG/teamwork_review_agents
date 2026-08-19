@@ -27,7 +27,11 @@ export function MarkdownMessage(props: { children: string }) {
   );
 }
 
-export function RunMessageFeed(props: { logs: RunLog[] }) {
+export function RunMessageFeed(props: {
+  logs: RunLog[];
+  active?: boolean;
+  onOpenRun?: (runId: string) => void;
+}) {
   const messages = useMemo(() => presentRunLogs(props.logs), [props.logs]);
   const viewportRef = useRef<HTMLDivElement>(null);
   const previousLogCountRef = useRef(0);
@@ -45,12 +49,16 @@ export function RunMessageFeed(props: { logs: RunLog[] }) {
   useEffect(() => {
     if (props.logs.length === previousLogCountRef.current) return;
     previousLogCountRef.current = props.logs.length;
+    if (props.active === false) {
+      setHasNewMessages(true);
+      return;
+    }
     if (following) {
       window.requestAnimationFrame(() => scrollToLatest("auto"));
     } else {
       setHasNewMessages(true);
     }
-  }, [props.logs.length, following]);
+  }, [props.logs.length, following, props.active]);
 
   return (
     <div className="run-message-feed">
@@ -68,7 +76,7 @@ export function RunMessageFeed(props: { logs: RunLog[] }) {
         {messages.map((message) => (
           <article key={message.id} className={`run-message message-${message.kind}`}>
             <div className="run-message-rail"><span /></div>
-            <div className="run-message-card">
+            <div className={`run-message-card${message.linkedRunId ? " has-linked-run" : ""}`}>
               <header>
                 <strong>{message.title}</strong>
                 <span className="run-message-meta">
@@ -76,6 +84,17 @@ export function RunMessageFeed(props: { logs: RunLog[] }) {
                   <time>{messageTime(message.lastCreatedAt)}</time>
                 </span>
               </header>
+              {message.linkedRunId && props.onOpenRun && (
+                <button
+                  type="button"
+                  className="run-message-linked-run"
+                  onClick={() => props.onOpenRun?.(message.linkedRunId!)}
+                >
+                  <span>Sub-agent</span>
+                  <strong>{message.linkedAgentName ?? message.linkedRunId}</strong>
+                  <em>查看运行详情 ›</em>
+                </button>
+              )}
               {message.body && (
                 message.kind === "agent"
                   ? <MarkdownMessage>{message.body}</MarkdownMessage>

@@ -624,15 +624,47 @@ class CodexModelRunner:
                 if not name or not call_id:
                     raise RuntimeError("Codex 函数调用缺少 name 或 call_id")
                 arguments = _function_arguments(call.get("arguments"))
-                started_item = _tool_log_item(name, arguments, started=True)
+                started_item = _tool_log_item(
+                    name,
+                    arguments,
+                    started=True,
+                    call_id=call_id,
+                )
                 await emit("stdout", "item.started", {"item": started_item})
+
+                async def report_invoke_agent_started(
+                    linked_run: dict[str, Any],
+                ) -> None:
+                    """把运行中的 sub-agent 精确关联更新到同一工具调用。"""
+
+                    linked_item = _tool_log_item(
+                        name,
+                        arguments,
+                        started=True,
+                        call_id=call_id,
+                        linked_run=linked_run,
+                    )
+                    linked_event = {"type": "item.updated", "item": linked_item}
+                    if len(events) < self.config.runtime.max_jsonl_events:
+                        events.append(redactor.data(linked_event))
+                    await emit("stdout", "item.updated", {"item": linked_item})
+
                 try:
-                    tool_result = await tool_executor.execute(name, arguments)
+                    tool_result = await tool_executor.execute(
+                        name,
+                        arguments,
+                        invoke_agent_started_callback=(
+                            report_invoke_agent_started
+                            if name == "invoke_agent"
+                            else None
+                        ),
+                    )
                     output_text = json.dumps(tool_result, ensure_ascii=False)
                     completed_item = _tool_log_item(
                         name,
                         arguments,
                         started=False,
+                        call_id=call_id,
                         result=redactor.data(tool_result),
                     )
                 except asyncio.CancelledError:
@@ -647,6 +679,7 @@ class CodexModelRunner:
                         name,
                         arguments,
                         started=False,
+                        call_id=call_id,
                         error=error,
                     )
                 progress()
@@ -922,14 +955,17 @@ def _tool_log_item(
     arguments: dict[str, Any],
     *,
     started: bool,
+    call_id: str,
     result: dict[str, Any] | None = None,
     error: str | None = None,
+    linked_run: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把 Teamwork 工具映射为现有运行日志可展示的 Codex item。"""
 
     if name == "execute_command":
         item: dict[str, Any] = {
             "type": "command_execution",
+            "call_id": call_id,
             "command": arguments.get("command", ""),
             "status": "in_progress" if started else "failed" if error else "completed",
         }
@@ -951,15 +987,18 @@ def _tool_log_item(
     if name == "apply_patch":
         return {
             "type": "file_change",
+            "call_id": call_id,
             "status": "in_progress" if started else "failed" if error else "completed",
             "changes": [] if started else (result or {"error": error}),
         }
     return {
         "type": "mcp_tool_call",
+        "call_id": call_id,
         "server": "teamwork_runtime",
         "tool": name,
         "status": "in_progress" if started else "failed" if error else "completed",
         "arguments": arguments,
+        **({"linked_run": linked_run} if linked_run is not None else {}),
         **({"result": result} if result is not None else {}),
         **({"error": error} if error else {}),
     }

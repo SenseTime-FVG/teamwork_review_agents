@@ -5979,13 +5979,14 @@ function AgentRunDetailDrawer(props: {
   const [cancelling, setCancelling] = useState(false);
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
+  const [childRunId, setChildRunId] = useState<string | null>(null);
   const visibleMessageCount = useMemo(() => presentRunLogs(logs).length, [logs]);
 
   useBodyScrollLock(true);
 
   function openRun(runId: string) {
-    setSelectedId(runId);
-    setDrawerTab("messages");
+    setCancelConfirmationOpen(false);
+    setChildRunId(runId);
   }
 
   function closeDrawer() {
@@ -5993,12 +5994,14 @@ function AgentRunDetailDrawer(props: {
     setDetail(null);
     setLogs([]);
     setError("");
+    setChildRunId(null);
     props.onClose();
   }
 
   useEffect(() => {
     setSelectedId(props.initialRunId);
     setDrawerTab("messages");
+    setChildRunId(null);
   }, [props.initialRunId]);
 
   async function cancelSelectedRun() {
@@ -6071,7 +6074,12 @@ function AgentRunDetailDrawer(props: {
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !cancelConfirmationOpen && !cancelling) {
+      if (
+        event.key === "Escape"
+        && childRunId === null
+        && !cancelConfirmationOpen
+        && !cancelling
+      ) {
         closeDrawer();
       }
     };
@@ -6079,12 +6087,16 @@ function AgentRunDetailDrawer(props: {
     return () => {
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [cancelConfirmationOpen, cancelling, selectedId]);
+  }, [cancelConfirmationOpen, cancelling, selectedId, childRunId]);
 
   return (
     <>
-      <div className="run-drawer-layer" style={drawerLayerStyle(props.depth ?? 0)}>
-          <button className="run-drawer-backdrop" aria-label="关闭运行详情" onClick={closeDrawer} />
+      <div
+        className={`run-drawer-layer${childRunId ? " run-drawer-layer-inactive" : ""}`}
+        style={drawerLayerStyle(props.depth ?? 0)}
+        aria-hidden={childRunId !== null}
+      >
+          <button className="run-drawer-backdrop" aria-label="关闭运行详情" disabled={childRunId !== null} onClick={closeDrawer} />
           <aside className="run-drawer layered-detail-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
             <header className="run-drawer-head">
               <div>
@@ -6110,7 +6122,13 @@ function AgentRunDetailDrawer(props: {
             <div className="run-drawer-body">
               {error && <div className="alert error">{error}</div>}
               {!detail && !error && <div className="empty tall">正在加载运行详情…</div>}
-              {detail && drawerTab === "messages" && <RunMessageFeed logs={logs} />}
+              {detail && drawerTab === "messages" && (
+                <RunMessageFeed
+                  logs={logs}
+                  active={childRunId === null}
+                  onOpenRun={openRun}
+                />
+              )}
               {detail && drawerTab === "result" && (
                 <div className="run-result-panel">
                   <div className="run-result-summary">
@@ -6164,6 +6182,15 @@ function AgentRunDetailDrawer(props: {
         onCancel={() => { if (!cancelling) setCancelConfirmationOpen(false); }}
         onConfirm={() => { void cancelSelectedRun(); }}
       />
+      {childRunId && (
+        <AgentRunDetailDrawer
+          key={childRunId}
+          initialRunId={childRunId}
+          depth={(props.depth ?? 0) + 1}
+          onClose={() => setChildRunId(null)}
+          onRefresh={props.onRefresh}
+        />
+      )}
     </>
   );
 }

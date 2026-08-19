@@ -7,7 +7,7 @@ import json
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
@@ -20,9 +20,11 @@ from .environment import (
 )
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
+from .model_tools import InvokeAgentStartedCallback
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
     CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    RunReservation,
     StateStore,
 )
 from .workspace import (
@@ -126,6 +128,7 @@ class AgentExecutor:
         agent_name: str,
         task: str,
         extra_context: dict[str, Any] | None,
+        started_callback: InvokeAgentStartedCallback | None = None,
     ) -> dict[str, Any]:
         """复用现有执行器语义直接调度内嵌模式 sub-agent。"""
 
@@ -174,7 +177,25 @@ class AgentExecutor:
         }
         # Responses 明确关闭并行工具调用，同一父回合的委托天然串行；
         # 子 Agent 仍由资源租约处理跨运行写冲突，避免嵌套委托持锁死锁。
-        result = await self.execute(**execute_arguments)
+        async def report_started(reservation: RunReservation) -> None:
+            """在子运行占位完成后立即把精确关联交回父运行日志。"""
+
+            if started_callback is None:
+                return
+            await started_callback(
+                {
+                    "run_id": reservation.run_id,
+                    "root_run_id": reservation.root_run_id,
+                    "parent_run_id": reservation.parent_run_id,
+                    "agent_name": agent_name,
+                    "status": "queued",
+                }
+            )
+
+        result = await self.execute(
+            **execute_arguments,
+            run_started_callback=report_started,
+        )
         if result is None:
             return {
                 "status": "deduplicated",
@@ -336,6 +357,7 @@ class AgentExecutor:
         actions: Sequence[str] | None = None,
         inherit_workspace: bool = False,
         parent_workspace: Path | None = None,
+        run_started_callback: Callable[[RunReservation], Awaitable[None]] | None = None,
     ) -> AgentResult | None:
         """申请审计记录与写锁，然后运行所选 Codex 执行模式。"""
 
@@ -391,6 +413,8 @@ class AgentExecutor:
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
             )
+        if run_started_callback is not None:
+            await run_started_callback(reservation)
 
         async def cancellation_source() -> str | None:
             """读取持久化来源，并兜住停止请求与数据库写入之间的竞态。"""
