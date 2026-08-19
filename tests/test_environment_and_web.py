@@ -1031,6 +1031,23 @@ def test_overview_api_filters_status_repository_and_limit(
             max_attempts=2,
         )
         assert reservation is not None
+        store.initialize_preflight_steps(
+            reservation.run_id,
+            [{"name": "tests", "command": ["python", "-m", "pytest"]}],
+        )
+        store.update_preflight_step(
+            reservation.run_id,
+            0,
+            status="running",
+            timeout_seconds=120,
+        )
+        store.update_preflight_step(
+            reservation.run_id,
+            0,
+            status="failure",
+            timeout_seconds=120,
+            exit_code=1,
+        )
         store.finish_preflight_run(
             PreflightResult(
                 run_id=reservation.run_id,
@@ -1102,6 +1119,9 @@ def test_overview_api_filters_status_repository_and_limit(
             f"/api/preflight-runs/{reservation.run_id}"
         ).json()
         assert preflight_detail["output"] == "pytest failed"
+        assert preflight_detail["steps"][0]["name"] == "tests"
+        assert preflight_detail["steps"][0]["command"] == ["python", "-m", "pytest"]
+        assert preflight_detail["steps"][0]["status"] == "failure"
         assert preflight_detail["linked_events"][0]["event_id"] == first_event.id
         assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422

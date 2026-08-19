@@ -484,8 +484,21 @@ export type PreflightRunSummary = {
   reused_event_count: number;
 };
 
+export type PreflightStepRunDetail = {
+  step_index: number;
+  name: string;
+  command: string[];
+  status: "pending" | "running" | "success" | "failure" | "timed_out" | "error" | "skipped";
+  timeout_seconds?: number | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+};
+
 export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
   output: string;
+  steps: PreflightStepRunDetail[];
   linked_events: Array<{
     event_id: string;
     event_type: string;

@@ -23,6 +23,11 @@ async def test_preflight_stops_after_first_failed_step_and_preserves_output(tmp_
     """非零退出码必须记录失败步骤，并阻止后续命令执行。"""
 
     marker = tmp_path / "steps.txt"
+    updates = []
+
+    async def record_step(update) -> None:
+        updates.append(update)
+
     config = PreflightConfig.model_validate(
         {
             "enabled": True,
@@ -59,6 +64,7 @@ async def test_preflight_stops_after_first_failed_step_and_preserves_output(tmp_
         config,
         cwd=tmp_path,
         environment=build_preflight_environment(),
+        on_step_update=record_step,
     )
 
     assert outcome.status == "failure"
@@ -67,10 +73,22 @@ async def test_preflight_stops_after_first_failed_step_and_preserves_output(tmp_
     assert marker.read_text(encoding="utf-8") == "first\nfailing\n"
     assert "first output" in outcome.output
     assert "failure output" in outcome.output
+    assert [(update.step_index, update.status) for update in updates] == [
+        (0, "running"),
+        (0, "success"),
+        (1, "running"),
+        (1, "failure"),
+    ]
+    assert updates[-1].exit_code == 7
 
 
 async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
     """卡住的步骤必须被终止，持久化输出不能超过配置上限。"""
+
+    updates = []
+
+    async def record_step(update) -> None:
+        updates.append(update)
 
     config = PreflightConfig.model_validate(
         {
@@ -95,12 +113,18 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
         config,
         cwd=tmp_path,
         environment=build_preflight_environment(),
+        on_step_update=record_step,
     )
 
     assert outcome.status == "timed_out"
     assert outcome.failed_step == "slow"
     assert "测" in outcome.output
     assert len(outcome.output.encode("utf-8")) <= 62
+    assert [(update.step_index, update.status) for update in updates] == [
+        (0, "running"),
+        (0, "timed_out"),
+    ]
+    assert updates[-1].timeout_seconds == 1
 
 
 async def test_preflight_timeout_kills_background_process_holding_stdout(

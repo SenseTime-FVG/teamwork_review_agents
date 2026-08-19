@@ -964,6 +964,40 @@ def test_event_list_exposes_linked_preflight_summary(
     assert running["preflight_reused"] == 0
     assert running["preflight_failed_step"] is None
 
+    store.initialize_preflight_steps(
+        reservation.run_id,
+        [
+            {"name": "format", "command": ["python", "-m", "ruff"], "timeout_seconds": 30},
+            {"name": "tests", "command": ["python", "-m", "pytest"], "timeout_seconds": None},
+            {"name": "package", "command": ["python", "-m", "build"], "timeout_seconds": 60},
+        ],
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="running",
+        timeout_seconds=30,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="success",
+        timeout_seconds=30,
+        exit_code=0,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        1,
+        status="running",
+        timeout_seconds=45,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        1,
+        status="failure",
+        timeout_seconds=45,
+        exit_code=1,
+    )
     store.finish_preflight_run(
         PreflightResult(
             run_id=reservation.run_id,
@@ -1003,6 +1037,15 @@ def test_event_list_exposes_linked_preflight_summary(
     assert preflight_detail["event_type"] == event.type
     assert preflight_detail["output"] == "不应进入事件列表的完整输出"
     assert preflight_detail["linked_events"][0]["event_id"] == event.id
+    assert [step["status"] for step in preflight_detail["steps"]] == [
+        "success",
+        "failure",
+        "skipped",
+    ]
+    assert preflight_detail["steps"][0]["command"] == ["python", "-m", "ruff"]
+    assert preflight_detail["steps"][1]["timeout_seconds"] == 45
+    assert preflight_detail["steps"][1]["exit_code"] == 1
+    assert preflight_detail["steps"][2]["error"] == "前序步骤结束后未执行"
 
     reused_event = create_manual_activity_event(
         snapshot,
@@ -1053,12 +1096,30 @@ def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
         max_attempts=2,
     )
     assert reservation is not None
+    store.initialize_preflight_steps(
+        reservation.run_id,
+        [
+            {"name": "active", "command": ["python", "active.py"]},
+            {"name": "waiting", "command": ["python", "waiting.py"]},
+        ],
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="running",
+        timeout_seconds=120,
+    )
 
     store.recover_interrupted_work()
 
     recovered = store.load_preflight_result("demo:7:sha-a:revision-a")
     assert recovered is not None
     assert recovered.status == "error"
+    detail = store.get_preflight_run(reservation.run_id)
+    assert detail is not None
+    assert [step["status"] for step in detail["steps"]] == ["error", "skipped"]
+    assert detail["steps"][0]["error"] == "服务异常退出，CI 步骤未正常结束"
+    assert detail["steps"][1]["error"] == "服务异常退出，步骤未执行"
     retried = store.begin_preflight_run(
         proposed_run_id="unused-new-id",
         idempotency_key="demo:7:sha-a:revision-a",

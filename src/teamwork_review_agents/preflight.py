@@ -8,7 +8,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 from .config import AppConfig, PreflightConfig
 from .environment import resolve_provider_token
@@ -53,6 +53,30 @@ class StepExecutionOutcome:
     exit_code: int | None = None
     output: str = ""
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class PreflightStepUpdate:
+    """一次 CI 步骤状态变化。"""
+
+    step_index: int
+    status: Literal["running", "success", "failure", "timed_out", "error"]
+    timeout_seconds: float | None = None
+    exit_code: int | None = None
+    error: str | None = None
+
+
+StepUpdateCallback = Callable[[PreflightStepUpdate], Awaitable[None]]
+
+
+async def _emit_step_update(
+    callback: StepUpdateCallback | None,
+    update: PreflightStepUpdate,
+) -> None:
+    """存在记录器时串行持久化步骤变化。"""
+
+    if callback is not None:
+        await callback(update)
 
 
 def build_preflight_environment(*, home: Path | None = None) -> dict[str, str]:
@@ -116,26 +140,45 @@ async def execute_preflight_steps(
     *,
     cwd: Path,
     environment: dict[str, str],
+    on_step_update: StepUpdateCallback | None = None,
 ) -> StepExecutionOutcome:
     """按配置顺序执行 CI 步骤，并返回首个失败或最终成功。"""
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + config.timeout_seconds
     output = ""
-    for step in config.steps:
+    for step_index, step in enumerate(config.steps):
         remaining = deadline - loop.time()
         if remaining <= 0:
+            error = "Preflight 总运行时间超时"
+            await _emit_step_update(
+                on_step_update,
+                PreflightStepUpdate(
+                    step_index=step_index,
+                    status="timed_out",
+                    timeout_seconds=0,
+                    error=error,
+                ),
+            )
             return StepExecutionOutcome(
                 status="timed_out",
                 failed_step=step.name,
                 output=output,
-                error="Preflight 总运行时间超时",
+                error=error,
             )
         step_timeout = min(float(step.timeout_seconds or remaining), remaining)
         output = _append_bounded_output(
             output,
             f"\n[{step.name}]\n".encode("utf-8"),
             config.max_output_bytes,
+        )
+        await _emit_step_update(
+            on_step_update,
+            PreflightStepUpdate(
+                step_index=step_index,
+                status="running",
+                timeout_seconds=step_timeout,
+            ),
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -148,6 +191,15 @@ async def execute_preflight_steps(
                 **process_group_options(),
             )
         except (OSError, ValueError) as exc:
+            await _emit_step_update(
+                on_step_update,
+                PreflightStepUpdate(
+                    step_index=step_index,
+                    status="error",
+                    timeout_seconds=step_timeout,
+                    error=str(exc),
+                ),
+            )
             return StepExecutionOutcome(
                 status="error",
                 failed_step=step.name,
@@ -196,11 +248,21 @@ async def execute_preflight_steps(
                 step_output.encode("utf-8"),
                 config.max_output_bytes,
             )
+            error = f"步骤 {step.name} 超过 {step_timeout:.0f} 秒"
+            await _emit_step_update(
+                on_step_update,
+                PreflightStepUpdate(
+                    step_index=step_index,
+                    status="timed_out",
+                    timeout_seconds=step_timeout,
+                    error=error,
+                ),
+            )
             return StepExecutionOutcome(
                 status="timed_out",
                 failed_step=step.name,
                 output=output,
-                error=f"步骤 {step.name} 超过 {step_timeout:.0f} 秒",
+                error=error,
             )
 
         assert process_waiter in completed
@@ -212,12 +274,30 @@ async def execute_preflight_steps(
             config.max_output_bytes,
         )
         if process.returncode != 0:
+            await _emit_step_update(
+                on_step_update,
+                PreflightStepUpdate(
+                    step_index=step_index,
+                    status="failure",
+                    timeout_seconds=step_timeout,
+                    exit_code=process.returncode,
+                ),
+            )
             return StepExecutionOutcome(
                 status="failure",
                 failed_step=step.name,
                 exit_code=process.returncode,
                 output=output,
             )
+        await _emit_step_update(
+            on_step_update,
+            PreflightStepUpdate(
+                step_index=step_index,
+                status="success",
+                timeout_seconds=step_timeout,
+                exit_code=process.returncode,
+            ),
+        )
 
     return StepExecutionOutcome(status="success", output=output)
 
@@ -355,6 +435,32 @@ class PreflightExecutor:
 
         result: PreflightResult
         try:
+            await asyncio.to_thread(
+                self.store.initialize_preflight_steps,
+                reservation.run_id,
+                (
+                    {
+                        "name": step.name,
+                        "command": list(step.command),
+                        "timeout_seconds": step.timeout_seconds,
+                    }
+                    for step in repository.preflight.steps
+                ),
+            )
+
+            async def record_step(update: PreflightStepUpdate) -> None:
+                """把执行器产生的步骤变化写入共享状态库。"""
+
+                await asyncio.to_thread(
+                    self.store.update_preflight_step,
+                    reservation.run_id,
+                    update.step_index,
+                    status=update.status,
+                    timeout_seconds=update.timeout_seconds,
+                    exit_code=update.exit_code,
+                    error=update.error,
+                )
+
             await self._set_remote_status(
                 repository,
                 event.new.head_sha,
@@ -376,6 +482,7 @@ class PreflightExecutor:
                         repository.preflight,
                         cwd=checkout,
                         environment=build_preflight_environment(home=Path(home)),
+                        on_step_update=record_step,
                     )
             finally:
                 if checkout is not None:

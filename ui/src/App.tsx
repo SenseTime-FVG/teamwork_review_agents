@@ -5021,6 +5021,34 @@ function preflightStatusLabel(status?: string | null): string {
   return status ? labels[status] ?? status : "未执行";
 }
 
+function preflightStepStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "等待执行",
+    running: "执行中",
+    success: "通过",
+    failure: "未通过",
+    timed_out: "超时",
+    error: "执行异常",
+    skipped: "已跳过",
+  };
+  return labels[status] ?? status;
+}
+
+function preflightStepStatusClass(status: string): string {
+  if (status === "success") return "completed";
+  if (status === "running") return "processing";
+  if (status === "pending") return "queued";
+  if (status === "skipped") return "unmatched";
+  return "failed";
+}
+
+function eventDetailNeedsRefresh(detail: EventDetailRecord): boolean {
+  if (["pending", "processing"].includes(detail.status)) return true;
+  if (detail.preflights.some((preflight) => preflight.status === "running")) return true;
+  if (detail.agent_queued_count + detail.agent_preparing_count + detail.agent_running_count > 0) return true;
+  return detail.dispatches.some((dispatch) => ["queued", "preparing", "running"].includes(dispatch.run_status ?? ""));
+}
+
 function eventStatusExplanation(event: EventRecord): string {
   if (event.error?.includes("状态回写失败")) {
     return "事件处理已结束，但向平台回写状态时失败。";
@@ -5174,32 +5202,38 @@ function EventDetailDrawer(props: {
   useBodyScrollLock(event !== null);
 
   useEffect(() => {
-    if (!event) {
+    const eventId = event?.event_id;
+    if (!eventId) {
       setDetail(null);
       setError("");
       return undefined;
     }
     let disposed = false;
-    const load = async () => {
+    let timer: number | undefined;
+    const load = async (): Promise<void> => {
+      let refreshAgain = true;
       try {
-        const next = await api<EventDetailRecord>(`/api/events/${encodeURIComponent(event.event_id)}`);
+        const next = await api<EventDetailRecord>(`/api/events/${encodeURIComponent(eventId)}`);
         if (!disposed) {
           setDetail(next);
           setError("");
+          refreshAgain = eventDetailNeedsRefresh(next);
         }
       } catch (reason) {
         if (!disposed) setError(reason instanceof Error ? reason.message : "事件详情加载失败");
+      }
+      if (!disposed && refreshAgain) {
+        timer = window.setTimeout(() => { void load(); }, 3000);
       }
     };
     setDetail(null);
     setError("");
     void load();
-    const timer = window.setInterval(() => { void load(); }, 3000);
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [event]);
+  }, [event?.event_id]);
 
   useEffect(() => {
     if (!event || !active) return undefined;
@@ -5261,7 +5295,7 @@ function EventDetailDrawer(props: {
                     {preflights.map((preflight) => (
                       <button type="button" className="event-record-card" key={preflight.run_id} onClick={() => onOpenPreflight(preflight.run_id)}>
                         <span>
-                          <strong>{preflight.reused ? "复用本地 CI" : "本地 CI"}</strong>
+                          <strong>{preflight.reused ? "复用历史结果" : "本批次新执行"}</strong>
                           <small>{preflight.failed_step ? `失败步骤：${preflight.failed_step}` : `开始于 ${timeText(preflight.started_at)}`}</small>
                         </span>
                         <span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>
@@ -5317,24 +5351,29 @@ function PreflightRunDetailDrawer(props: {
 
   useEffect(() => {
     let disposed = false;
-    const load = async () => {
+    let timer: number | undefined;
+    const load = async (): Promise<void> => {
+      let refreshAgain = true;
       try {
         const next = await api<PreflightRunDetail>(`/api/preflight-runs/${encodeURIComponent(runId)}`);
         if (!disposed) {
           setDetail(next);
           setError("");
+          refreshAgain = next.status === "running";
         }
       } catch (reason) {
         if (!disposed) setError(reason instanceof Error ? reason.message : "本地 CI 详情加载失败");
+      }
+      if (!disposed && refreshAgain) {
+        timer = window.setTimeout(() => { void load(); }, 3000);
       }
     };
     setDetail(null);
     setError("");
     void load();
-    const timer = window.setInterval(() => { void load(); }, 3000);
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [runId]);
 
@@ -5380,6 +5419,29 @@ function PreflightRunDetailDrawer(props: {
                   <div><dt>平台状态回写</dt><dd>{detail.status_published ? "成功" : "未完成"}</dd></div>
                 </dl>
                 {detail.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{detail.error}</pre></>}
+                <h4>命令步骤</h4>
+                {(detail.steps ?? []).length === 0 ? (
+                  <div className="event-detail-empty">该记录没有步骤级快照，可能由旧版本服务创建。</div>
+                ) : (
+                  <div className="preflight-step-run-list">
+                    {detail.steps.map((step) => (
+                      <article className="preflight-step-run-card" key={`${step.step_index}:${step.name}`}>
+                        <header>
+                          <span><strong>{step.step_index + 1}. {step.name}</strong><small>参数数组按本次运行配置固化</small></span>
+                          <span className={`status-pill status-${preflightStepStatusClass(step.status)}`}>{preflightStepStatusLabel(step.status)}</span>
+                        </header>
+                        <pre className="preflight-step-command">{JSON.stringify(step.command, null, 2)}</pre>
+                        <dl>
+                          <div><dt>超时</dt><dd>{step.timeout_seconds === null || step.timeout_seconds === undefined ? "—" : `${step.timeout_seconds} 秒`}</dd></div>
+                          <div><dt>耗时</dt><dd>{step.started_at ? durationText(step.started_at, step.finished_at) : "—"}</dd></div>
+                          <div><dt>退出码</dt><dd>{step.exit_code ?? "—"}</dd></div>
+                          <div><dt>开始时间</dt><dd>{timeText(step.started_at)}</dd></div>
+                        </dl>
+                        {step.error && <pre className="preflight-step-error">{step.error}</pre>}
+                      </article>
+                    ))}
+                  </div>
+                )}
                 <h4>检查输出</h4>
                 <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(detail.status) ? "detail-error" : ""}`}>{detail.output || "暂无输出"}</pre>
               </section>
@@ -5390,7 +5452,7 @@ function PreflightRunDetailDrawer(props: {
                 </div>
                 <div className="event-linked-list">
                   {detail.linked_events.map((event) => (
-                    <div key={event.event_id}><strong>{event.event_type}</strong><span>{event.reused ? "复用" : "本次执行"} · {dateTimeText(event.occurred_at)}</span></div>
+                    <div key={event.event_id}><strong>{event.event_type}</strong><span>{event.reused ? "复用历史结果" : "本批次新执行"} · {dateTimeText(event.occurred_at)}</span></div>
                   ))}
                 </div>
               </section>
@@ -5859,7 +5921,7 @@ function RunsView(props: {
                 <button key={`preflight:${preflight.run_id}`} className={`run-row ${selected?.kind === "preflight" && selected.id === preflight.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "preflight", id: preflight.run_id })}>
                   <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
                   <span className="run-target-cell"><strong>{preflight.repository_id} · #{preflight.number}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
-                  <span className="run-source-cell"><strong>{preflight.event_type ?? "事件检查"}</strong><small>{preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本次执行"}</small></span>
+                  <span className="run-source-cell"><strong>{preflight.event_type ?? "事件检查"}</strong><small>{preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
                   <span className="run-status-cell"><span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
                   <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
                   <span className="run-duration-cell"><strong>{durationText(preflight.started_at, preflight.finished_at)}</strong></span>

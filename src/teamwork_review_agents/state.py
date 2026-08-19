@@ -186,6 +186,24 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_started
                 ON preflight_runs(started_at DESC);
 
+                CREATE TABLE IF NOT EXISTS preflight_step_runs (
+                    run_id TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timeout_seconds REAL,
+                    started_at REAL,
+                    finished_at REAL,
+                    exit_code INTEGER,
+                    error TEXT,
+                    PRIMARY KEY(run_id, step_index),
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_step_runs_status
+                ON preflight_step_runs(run_id, status, step_index);
+
                 CREATE TABLE IF NOT EXISTS event_preflight_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL,
@@ -425,6 +443,26 @@ class StateStore:
                     END,
                     finished_at = ?
                 WHERE status IN ('queued', 'preparing', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = 'error',
+                    error = COALESCE(error, '服务异常退出，CI 步骤未正常结束'),
+                    finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = 'skipped',
+                    error = COALESCE(error, '服务异常退出，步骤未执行'),
+                    finished_at = ?
+                WHERE status = 'pending'
                 """,
                 (now,),
             )
@@ -1202,6 +1240,80 @@ class StateStore:
                 ],
             )
 
+    def initialize_preflight_steps(
+        self,
+        run_id: str,
+        steps: Iterable[dict[str, Any]],
+    ) -> None:
+        """为当前 Preflight 尝试重建不可变的命令步骤快照。"""
+
+        records = tuple(steps)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM preflight_step_runs WHERE run_id = ?",
+                (run_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO preflight_step_runs (
+                    run_id, step_index, name, command, status, timeout_seconds
+                ) VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                [
+                    (
+                        run_id,
+                        index,
+                        str(step["name"]),
+                        json.dumps(list(step["command"]), ensure_ascii=False),
+                        step.get("timeout_seconds"),
+                    )
+                    for index, step in enumerate(records)
+                ],
+            )
+
+    def update_preflight_step(
+        self,
+        run_id: str,
+        step_index: int,
+        *,
+        status: str,
+        timeout_seconds: float | None = None,
+        exit_code: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """更新单个 CI 步骤的实时状态与最终结果。"""
+
+        now = time.time()
+        terminal = status in {"success", "failure", "timed_out", "error", "skipped"}
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = ?,
+                    timeout_seconds = COALESCE(?, timeout_seconds),
+                    started_at = CASE
+                        WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                        ELSE started_at
+                    END,
+                    finished_at = CASE WHEN ? THEN ? ELSE NULL END,
+                    exit_code = ?, error = ?
+                WHERE run_id = ? AND step_index = ?
+                """,
+                (
+                    status,
+                    timeout_seconds,
+                    status,
+                    now,
+                    int(terminal),
+                    now,
+                    exit_code,
+                    error,
+                    run_id,
+                    step_index,
+                ),
+            )
+
     def load_preflight_result(self, idempotency_key: str) -> PreflightResult | None:
         """按幂等键读取当前 CI 结果。"""
 
@@ -1232,7 +1344,9 @@ class StateStore:
     def finish_preflight_run(self, result: PreflightResult) -> None:
         """保存一次 CI 运行的终态与有界输出。"""
 
+        finished_at = time.time()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 UPDATE preflight_runs
@@ -1247,9 +1361,29 @@ class StateStore:
                     result.output,
                     result.error,
                     int(result.status_published),
-                    time.time(),
+                    finished_at,
                     result.run_id,
                 ),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = CASE
+                        WHEN status = 'running' THEN 'error'
+                        ELSE 'skipped'
+                    END,
+                    error = COALESCE(
+                        error,
+                        CASE
+                            WHEN status = 'running'
+                            THEN 'Preflight 已结束，但步骤未正常收尾'
+                            ELSE '前序步骤结束后未执行'
+                        END
+                    ),
+                    finished_at = ?
+                WHERE run_id = ? AND status IN ('pending', 'running')
+                """,
+                (finished_at, result.run_id),
             )
 
     def mark_preflight_status_published(self, run_id: str) -> None:
@@ -2361,9 +2495,29 @@ class StateStore:
                 """,
                 (run_id,),
             ).fetchall()
+            step_rows = connection.execute(
+                """
+                SELECT step_index, name, command, status, timeout_seconds,
+                       started_at, finished_at, exit_code, error
+                FROM preflight_step_runs
+                WHERE run_id = ?
+                ORDER BY step_index
+                """,
+                (run_id,),
+            ).fetchall()
+        steps: list[dict[str, Any]] = []
+        for step_row in step_rows:
+            step = dict(step_row)
+            try:
+                command = json.loads(str(step["command"]))
+            except (TypeError, ValueError):
+                command = []
+            step["command"] = command if isinstance(command, list) else []
+            steps.append(step)
         return {
             **dict(row),
             "linked_events": [dict(event_row) for event_row in event_rows],
+            "steps": steps,
         }
 
     def save_config_version(
