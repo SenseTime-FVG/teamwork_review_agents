@@ -2887,6 +2887,7 @@ function RepositoryDetailEditor(props: {
   } = {
     enabled: repository.preflight?.enabled ?? false,
     cache_enabled: repository.preflight?.cache_enabled ?? true,
+    publish_failure_comment: repository.preflight?.publish_failure_comment ?? false,
     status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
     timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
     max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
@@ -3012,6 +3013,14 @@ function RepositoryDetailEditor(props: {
                   onChange={(cache_enabled) => updatePreflight({ cache_enabled })}
                 />
                 <p>同一仓库的不同分支和 MR / PR 共享下载缓存；每次 CI 的工作区与安装结果仍保持隔离。覆盖 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer 和常见浏览器缓存。</p>
+              </div>
+              <div className="repository-preflight-cache-option">
+                <Toggle
+                  label={preflight.publish_failure_comment ? "失败时发布 PR 评论" : "失败时不发布 PR 评论"}
+                  checked={preflight.publish_failure_comment}
+                  onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
+                />
+                <p>仅自动 MR / PR CI 失败、超时或异常时创建或更新同一条评论；后续通过后删除。成功结果和手动仓库 CI 不发布评论。</p>
               </div>
               <div className="repository-preflight-steps-head">
                 <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>

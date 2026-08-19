@@ -222,6 +222,17 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_preflight_logs_cursor
                 ON preflight_logs(run_id, id);
 
+                CREATE TABLE IF NOT EXISTS preflight_failure_comments (
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    status_context TEXT NOT NULL,
+                    remote_comment_id TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(repository_id, number)
+                );
+
                 CREATE TABLE IF NOT EXISTS event_preflight_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL,
@@ -1608,6 +1619,78 @@ class StateStore:
                 WHERE run_id = ?
                 """,
                 (run_id,),
+            )
+
+    def get_preflight_failure_comment(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> dict[str, object] | None:
+        """读取一个 MR/PR 当前由服务维护的失败评论映射。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT repository_id, number, status_context, remote_comment_id,
+                       head_sha, content_hash, updated_at
+                FROM preflight_failure_comments
+                WHERE repository_id = ? AND number = ?
+                """,
+                (repository_id, number),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_preflight_failure_comment(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        status_context: str,
+        remote_comment_id: str,
+        head_sha: str,
+        content_hash: str,
+    ) -> None:
+        """保存或更新失败评论映射，确保后续失败复用同一条评论。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO preflight_failure_comments (
+                    repository_id, number, status_context, remote_comment_id,
+                    head_sha, content_hash, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository_id, number) DO UPDATE SET
+                    status_context = excluded.status_context,
+                    remote_comment_id = excluded.remote_comment_id,
+                    head_sha = excluded.head_sha,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    repository_id,
+                    number,
+                    status_context,
+                    remote_comment_id,
+                    head_sha,
+                    content_hash,
+                    time.time(),
+                ),
+            )
+
+    def delete_preflight_failure_comment(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> None:
+        """删除本地失败评论映射；远端删除应由调用方先完成。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM preflight_failure_comments
+                WHERE repository_id = ? AND number = ?
+                """,
+                (repository_id, number),
             )
 
     def begin_agent_run(

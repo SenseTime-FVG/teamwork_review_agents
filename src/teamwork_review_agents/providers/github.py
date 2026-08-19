@@ -63,6 +63,50 @@ class GitHubProvider(BaseProvider):
             },
         )
 
+    async def create_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        number: int,
+        body: str,
+    ) -> str:
+        """通过 GitHub Issue Comments API 创建 PR 评论。"""
+
+        payload = await self.post_json(
+            f"repos/{repository.project}/issues/{number}/comments",
+            {"body": body},
+        )
+        if not isinstance(payload, dict) or payload.get("id") is None:
+            raise ProviderError("GitHub PR 评论返回格式异常")
+        return str(payload["id"])
+
+    async def update_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+        body: str,
+    ) -> bool:
+        """更新已有 GitHub PR 评论；已被删除时交由调用方重建。"""
+
+        payload = await self.patch_optional_json(
+            "repos/"
+            f"{repository.project}/issues/comments/{quote(comment_id, safe='')}",
+            {"body": body},
+        )
+        return payload is not None
+
+    async def delete_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+    ) -> None:
+        """删除 GitHub PR 评论；评论已不存在时按成功处理。"""
+
+        await self.delete_resource(
+            "repos/"
+            f"{repository.project}/issues/comments/{quote(comment_id, safe='')}",
+            missing_ok=True,
+        )
+
     async def get_branch_head(
         self,
         repository: RepositoryConfig,

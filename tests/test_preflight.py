@@ -14,6 +14,7 @@ import pytest
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
 from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.models import PreflightResult
 from teamwork_review_agents.preflight import (
     PreflightExecutor,
     build_preflight_environment,
@@ -593,3 +594,146 @@ async def test_preflight_retries_only_final_status_delivery(
     assert second.status == "success"
     assert counter.read_text(encoding="utf-8") == "run\n"
     assert statuses == ["pending", "success", "success"]
+
+
+async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_success(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """自动 CI 只维护一条脱敏失败评论，通过后应删除且写回失败不改 CI 终态。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "publish_failure_comment": True,
+                        "steps": [
+                            {"name": "tests", "command": ["python", "-m", "pytest"]}
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    store.create_manual_preflight_run(
+        run_id="comment-run",
+        repository_id="demo",
+        config_revision=config.revision,
+    )
+    repository = config.repositories[0]
+    created: list[str] = []
+    updated: list[str] = []
+    deleted: list[str] = []
+    statuses: list[str] = []
+    reject_comment = False
+
+    class FakeProvider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def set_commit_status(self, _repository, _sha, *, state, **_kwargs):
+            statuses.append(state)
+
+        async def create_change_request_comment(
+            self,
+            _repository,
+            _number,
+            body,
+        ):
+            if reject_comment:
+                raise RuntimeError("评论权限不足 provider-token")
+            created.append(body)
+            return "101"
+
+        async def update_change_request_comment(
+            self,
+            _repository,
+            _comment_id,
+            body,
+        ):
+            updated.append(body)
+            return True
+
+        async def delete_change_request_comment(
+            self,
+            _repository,
+            comment_id,
+        ):
+            deleted.append(comment_id)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    executor = PreflightExecutor(config, store)
+    failure = PreflightResult(
+        run_id="comment-run",
+        repository_id="demo",
+        number=7,
+        head_sha="a" * 40,
+        status="failure",
+        failed_step="tests",
+        exit_code=1,
+        output="x" * 20_000 + " provider-token",
+        error="断言失败 provider-token",
+    )
+
+    published = await executor._publish_terminal_result(repository, failure)
+    assert published.status == "failure"
+    assert published.status_published is True
+    assert statuses == ["failure"]
+    assert len(created) == 1
+    assert "provider-token" not in created[0]
+    assert "********" in created[0]
+    assert "仅显示末尾 12000 个字符" in created[0]
+    assert store.get_preflight_failure_comment("demo", 7) is not None
+
+    await executor._sync_failure_comment_safely(repository, failure)
+    assert len(created) == 1
+    assert updated == []
+
+    changed_failure = failure.model_copy(update={"output": "另一条失败信息"})
+    await executor._sync_failure_comment_safely(repository, changed_failure)
+    assert len(updated) == 1
+
+    success = failure.model_copy(
+        update={"status": "success", "output": "全部通过", "error": None}
+    )
+    await executor._sync_failure_comment_safely(repository, success)
+    assert deleted == ["101"]
+    assert store.get_preflight_failure_comment("demo", 7) is None
+
+    reject_comment = True
+    comment_failure = await executor._publish_terminal_result(repository, failure)
+    assert comment_failure.status == "failure"
+    assert comment_failure.status_published is True
+    logs = store.list_preflight_logs("comment-run")
+    comment_errors = [log for log in logs if log["event_type"] == "comment_error"]
+    assert comment_errors
+    assert "provider-token" not in comment_errors[-1]["payload"]
+    assert "********" in comment_errors[-1]["payload"]
+
+    manual = failure.model_copy(update={"number": None})
+    await executor._sync_failure_comment_safely(repository, manual)
+    assert len(created) == 1

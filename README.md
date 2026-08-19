@@ -262,6 +262,8 @@ repositories:
       enabled: true
       # 按仓库共享多语言依赖下载缓存，不按分支重复下载。
       cache_enabled: true
+      # 可选：失败时维护一条 PR 评论，后续通过后自动删除；默认关闭。
+      publish_failure_comment: false
       status_context: teamwork/local-ci
       timeout_seconds: 1800
       max_output_bytes: 1000000
@@ -334,9 +336,11 @@ Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改
 
 默认启用的 `cache_enabled` 会为每个仓库建立稳定缓存根目录，并把 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer、Playwright、Puppeteer 和 Deno 等常见缓存定向到该目录。同一仓库跨分支、跨 PR 共享下载缓存，但临时 worktree、HOME 和安装产物仍按运行隔离。仓库详情中的“执行 CI / 预热缓存”会针对远端默认分支最新提交启动不限时、可取消的手动 CI；它不创建 MR / PR 事件、不触发 Agent，也不回写 Commit Status。运行概览、事件详情和运行与日志页使用同一个 CI 详情抽屉持续显示 Git 阶段、当前步骤与命令输出。
 
+可选的 `publish_failure_comment` 默认关闭。开启后，自动 MR / PR CI 首次失败会创建一条包含 Head SHA、失败步骤、退出码和有界末尾输出的评论，连续失败只更新同一条评论；后续 CI 通过时删除旧失败评论，不发布成功评论。手动仓库 CI 没有关联 PR，因此始终不评论。评论回写异常只记录在 CI 日志中，不会改变真实 CI 结论。
+
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 
 Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 

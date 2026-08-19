@@ -249,6 +249,7 @@ def test_repository_preflight_parses_ordered_commands(tmp_path) -> None:
 
     preflight = config.repositories[0].preflight
     assert preflight.enabled is True
+    assert preflight.publish_failure_comment is False
     assert preflight.status_context == "teamwork/local-ci"
     assert [step.name for step in preflight.steps] == ["install", "test"]
     assert preflight.steps[0].command == ["uv", "sync", "--frozen"]

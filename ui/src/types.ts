@@ -17,6 +17,7 @@ export type RepositoryPreflightStep = {
 export type RepositoryPreflight = {
   enabled?: boolean;
   cache_enabled?: boolean;
+  publish_failure_comment?: boolean;
   status_context?: string;
   timeout_seconds?: number;
   max_output_bytes?: number;

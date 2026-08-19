@@ -118,6 +118,41 @@ class BaseProvider(ABC):
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
 
+    async def patch_optional_json(
+        self,
+        path: str,
+        payload: dict[str, object],
+    ) -> object | None:
+        """执行 PATCH；远端资源不存在时返回空，其余错误保持显式失败。"""
+
+        try:
+            response = await self.client.patch(path, json=payload)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(
+                f"Provider {self.name} 请求失败：{exc.response.status_code} {path}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
+    async def delete_resource(self, path: str, *, missing_ok: bool = False) -> None:
+        """执行 DELETE；可选择把远端资源已不存在视为成功。"""
+
+        try:
+            response = await self.client.delete(path)
+            if missing_ok and response.status_code == 404:
+                return
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(
+                f"Provider {self.name} 请求失败：{exc.response.status_code} {path}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
     async def set_commit_status(
         self,
         repository: RepositoryConfig,
@@ -130,6 +165,35 @@ class BaseProvider(ABC):
         """写入提交状态；具体平台必须显式实现。"""
 
         raise ProviderError(f"Provider {self.name} 不支持提交状态回写")
+
+    async def create_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        number: int,
+        body: str,
+    ) -> str:
+        """创建 MR/PR 评论并返回远端 ID；具体平台必须显式实现。"""
+
+        raise ProviderError(f"Provider {self.name} 不支持创建 MR/PR 评论")
+
+    async def update_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+        body: str,
+    ) -> bool:
+        """更新 MR/PR 评论；评论已不存在时返回假。"""
+
+        raise ProviderError(f"Provider {self.name} 不支持更新 MR/PR 评论")
+
+    async def delete_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+    ) -> None:
+        """删除 MR/PR 评论；具体平台必须显式实现。"""
+
+        raise ProviderError(f"Provider {self.name} 不支持删除 MR/PR 评论")
 
     @abstractmethod
     async def list_change_requests(

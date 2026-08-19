@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
 from .config import AppConfig, PreflightConfig
-from .environment import resolve_provider_token
+from .environment import SecretRedactor, resolve_provider_token
 from .models import ChangeEvent, PreflightResult, stable_hash
 from .preflight_cache import (
     build_repository_cache_environment,
@@ -45,6 +47,8 @@ SAFE_HOST_ENVIRONMENT = {
     "CURL_CA_BUNDLE",
     "UV_LINK_MODE",
 }
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+PREFLIGHT_COMMENT_OUTPUT_CHARS = 12_000
 
 
 @dataclass(frozen=True)
@@ -395,6 +399,77 @@ def _status_description(result: PreflightResult) -> str:
     return "本地 CI 基础设施错误"
 
 
+def _bounded_comment_text(value: str, *, limit: int) -> str:
+    """移除终端控制字符，并只保留适合评论展示的尾部内容。"""
+
+    normalized = ANSI_ESCAPE_PATTERN.sub("", value).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return f"…（仅显示末尾 {limit} 个字符）\n{normalized[-limit:]}"
+
+
+def _failure_comment_body(
+    repository,
+    result: PreflightResult,
+    *,
+    redactor: SecretRedactor,
+) -> str:
+    """构造有界且脱敏的 GitHub PR 本地 CI 失败评论。"""
+
+    status_label = {
+        "failure": "未通过",
+        "timed_out": "超时",
+        "error": "执行异常",
+    }.get(result.status, result.status)
+    marker = stable_hash(
+        "preflight-failure-comment",
+        repository.id,
+        result.number,
+    )[:16]
+    failed_step = redactor.text(result.failed_step or "unknown")
+    error = _bounded_comment_text(
+        redactor.text(result.error or ""),
+        limit=2_000,
+    )
+    output = _bounded_comment_text(
+        redactor.text(result.output),
+        limit=PREFLIGHT_COMMENT_OUTPUT_CHARS,
+    )
+    sections = [
+        f"<!-- teamwork-preflight-failure:{marker} -->",
+        "## Teamwork 本地 CI 未通过",
+        "",
+        f"- 状态：**{html.escape(status_label)}**",
+        f"- Head SHA：`{html.escape(result.head_sha)}`",
+        f"- 失败步骤：`{html.escape(failed_step)}`",
+        "- 退出码："
+        + ("—" if result.exit_code is None else f"`{result.exit_code}`"),
+    ]
+    if error:
+        sections.extend([
+            "",
+            "<details open>",
+            "<summary>错误信息</summary>",
+            "",
+            f"<pre>{html.escape(error)}</pre>",
+            "</details>",
+        ])
+    if output:
+        sections.extend([
+            "",
+            "<details>",
+            "<summary>末尾输出</summary>",
+            "",
+            f"<pre>{html.escape(output)}</pre>",
+            "</details>",
+        ])
+    sections.extend([
+        "",
+        "> 后续同一 PR 再次失败会更新本评论；本地 CI 通过后会自动删除。",
+    ])
+    return "\n".join(sections)
+
+
 class PreflightExecutor:
     """准备隔离 worktree、执行 CI，并持久化可复用结果。"""
 
@@ -449,6 +524,127 @@ class PreflightExecutor:
                 description=description,
             )
 
+    async def _sync_failure_comment(
+        self,
+        repository,
+        result: PreflightResult,
+    ) -> None:
+        """按 CI 终态创建、更新或删除一条仓库级失败评论。"""
+
+        if (
+            not repository.preflight.publish_failure_comment
+            or result.number is None
+        ):
+            return
+        record = await asyncio.to_thread(
+            self.store.get_preflight_failure_comment,
+            repository.id,
+            result.number,
+        )
+        if result.status == "success":
+            if record is None:
+                return
+            provider_config = self.config.providers[repository.provider]
+            token = resolve_provider_token(self.config, provider_config)
+            async with create_provider(
+                repository.provider,
+                provider_config,
+                self.config.scanner,
+                token=token,
+            ) as remote:
+                await remote.delete_change_request_comment(
+                    repository,
+                    str(record["remote_comment_id"]),
+                )
+            await asyncio.to_thread(
+                self.store.delete_preflight_failure_comment,
+                repository.id,
+                result.number,
+            )
+            await self._append_log(
+                result.run_id,
+                "本地 CI 已通过，已删除此前发布的失败评论",
+                event_type="comment_deleted",
+            )
+            return
+        if result.status not in {"failure", "timed_out", "error"}:
+            return
+
+        provider_config = self.config.providers[repository.provider]
+        token = resolve_provider_token(self.config, provider_config)
+        body = _failure_comment_body(
+            repository,
+            result,
+            redactor=SecretRedactor((token,)),
+        )
+        content_hash = stable_hash(body)
+        if record is not None and record["content_hash"] == content_hash:
+            return
+
+        action = "创建"
+        async with create_provider(
+            repository.provider,
+            provider_config,
+            self.config.scanner,
+            token=token,
+        ) as remote:
+            remote_comment_id: str
+            if record is not None:
+                updated = await remote.update_change_request_comment(
+                    repository,
+                    str(record["remote_comment_id"]),
+                    body,
+                )
+                if updated:
+                    remote_comment_id = str(record["remote_comment_id"])
+                    action = "更新"
+                else:
+                    remote_comment_id = await remote.create_change_request_comment(
+                        repository,
+                        result.number,
+                        body,
+                    )
+            else:
+                remote_comment_id = await remote.create_change_request_comment(
+                    repository,
+                    result.number,
+                    body,
+                )
+        await asyncio.to_thread(
+            self.store.save_preflight_failure_comment,
+            repository_id=repository.id,
+            number=result.number,
+            status_context=repository.preflight.status_context,
+            remote_comment_id=remote_comment_id,
+            head_sha=result.head_sha,
+            content_hash=content_hash,
+        )
+        await self._append_log(
+            result.run_id,
+            f"已{action}本地 CI 失败评论",
+            event_type="comment_synced",
+        )
+
+    async def _sync_failure_comment_safely(
+        self,
+        repository,
+        result: PreflightResult,
+    ) -> None:
+        """隔离评论写回错误，确保平台权限问题不篡改 CI 真实终态。"""
+
+        try:
+            await self._sync_failure_comment(repository, result)
+        except Exception as exc:
+            provider_config = self.config.providers[repository.provider]
+            token = resolve_provider_token(self.config, provider_config)
+            error = SecretRedactor((token,)).text(str(exc))
+            await self._append_log(
+                result.run_id,
+                f"本地 CI 评论写回失败：{error}",
+                stream="stderr",
+                event_type="comment_error",
+            )
+
     async def _publish_terminal_result(
         self,
         repository,
@@ -462,6 +658,7 @@ class PreflightExecutor:
             "timed_out": "failure",
             "error": "error",
         }[result.status]
+        status_error: Exception | None = None
         try:
             await self._set_remote_status(
                 repository,
@@ -470,18 +667,22 @@ class PreflightExecutor:
                 description=_status_description(result),
             )
         except Exception as exc:
+            status_error = exc
+        else:
+            await asyncio.to_thread(
+                self.store.mark_preflight_status_published,
+                result.run_id,
+            )
+        await self._sync_failure_comment_safely(repository, result)
+        if status_error is not None:
             return PreflightResult(
                 run_id=result.run_id,
                 repository_id=result.repository_id,
                 number=result.number,
                 head_sha=result.head_sha,
                 status="error",
-                error=f"本地 CI 已完成，但 GitHub 状态回写失败：{exc}",
+                error=f"本地 CI 已完成，但 GitHub 状态回写失败：{status_error}",
             )
-        await asyncio.to_thread(
-            self.store.mark_preflight_status_published,
-            result.run_id,
-        )
         return result.model_copy(update={"status_published": True})
 
     async def ensure_passed(self, event: ChangeEvent) -> PreflightResult:
@@ -493,6 +694,7 @@ class PreflightExecutor:
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
             if cached.status_published:
+                await self._sync_failure_comment_safely(repository, cached)
                 return cached.model_copy(update={"reused": True})
             published = await self._publish_terminal_result(repository, cached)
             return published.model_copy(update={"reused": True})

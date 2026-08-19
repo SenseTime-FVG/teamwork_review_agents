@@ -188,6 +188,9 @@ web:
 #       enabled: true
 #       # 同一仓库的全部分支和 MR / PR 共享常用依赖下载缓存；工作区仍逐次隔离。
 #       cache_enabled: true
+#       # 自动 MR / PR CI 失败时创建或更新同一条评论；后续通过后删除。
+#       # 成功结果和手动仓库 CI 不发布评论。
+#       publish_failure_comment: false
 #       # 仅运行可信内部 PR；环境会过滤，但这不是容器或系统级安全沙箱。
 #       # 应同时将此名称配置为 GitHub Ruleset 的 required status check。
 #       status_context: teamwork/local-ci

@@ -933,6 +933,42 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert changed.run_id == "preflight-2"
 
 
+def test_preflight_failure_comment_mapping_has_one_record_per_change_request(
+    tmp_path,
+) -> None:
+    """同一 MR/PR 只能保存一条失败评论映射，并可在成功后删除。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.save_preflight_failure_comment(
+        repository_id="demo",
+        number=7,
+        status_context="teamwork/local-ci",
+        remote_comment_id="101",
+        head_sha="a" * 40,
+        content_hash="first",
+    )
+    first = store.get_preflight_failure_comment("demo", 7)
+    assert first is not None
+    assert first["remote_comment_id"] == "101"
+
+    store.save_preflight_failure_comment(
+        repository_id="demo",
+        number=7,
+        status_context="teamwork/local-ci",
+        remote_comment_id="101",
+        head_sha="b" * 40,
+        content_hash="second",
+    )
+    updated = store.get_preflight_failure_comment("demo", 7)
+    assert updated is not None
+    assert updated["head_sha"] == "b" * 40
+    assert updated["content_hash"] == "second"
+
+    store.delete_preflight_failure_comment("demo", 7)
+    assert store.get_preflight_failure_comment("demo", 7) is None
+
+
 def test_manual_preflight_supports_nullable_pr_live_logs_and_cancel(tmp_path) -> None:
     """手动 CI 不绑定事件或编号，并能持久化阶段、日志与取消终态。"""
 

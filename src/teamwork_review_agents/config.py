@@ -289,6 +289,7 @@ class PreflightConfig(BaseModel):
 
     enabled: bool = False
     cache_enabled: bool = True
+    publish_failure_comment: bool = False
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
     timeout_seconds: PositiveInt = 1800
     max_output_bytes: PositiveInt = 1_000_000
