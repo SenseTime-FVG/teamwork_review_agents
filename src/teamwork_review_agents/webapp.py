@@ -20,6 +20,11 @@ from .codex_account import (
     inspect_codex_account,
     read_codex_effective_config,
 )
+from .codex_connection import (
+    CodexConnectionTestError,
+    CodexConnectionTestTimeout,
+    test_codex_connection,
+)
 from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import codex_home, inspect_runtime_options
 from .environment import PromptRenderError, render_prompt
@@ -658,6 +663,17 @@ def create_app(
             effective_config_error,
             manager.config.runtime.managed_sandbox,
         )
+
+    @app.post("/api/codex/connection-test")
+    async def codex_connection_test() -> dict[str, Any]:
+        """使用当前已保存配置完成一次真实的最小 Codex 模型回合。"""
+
+        try:
+            return await test_codex_connection(manager.config)
+        except CodexConnectionTestTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except CodexConnectionTestError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/api/codex/account")
     async def codex_account() -> dict[str, Any]:

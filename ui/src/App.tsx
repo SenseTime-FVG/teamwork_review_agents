@@ -16,6 +16,7 @@ import type {
   ChangeRequestDetailRecord,
   ChangeRequestRecord,
   CodexAccountStatus,
+  CodexConnectionTestResult,
   CodexInheritedSetting,
   CodexLoginSession,
   CodexRuntimeConfig,
@@ -1956,8 +1957,12 @@ function reasoningLevels(
 function CodexRuntimeEditor(props: {
   document: ConfigDocument;
   options: CodexRuntimeOptions;
+  editable: boolean;
   onChange: (document: ConfigDocument) => void;
 }) {
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionResult, setConnectionResult] = useState<CodexConnectionTestResult | null>(null);
+  const [connectionError, setConnectionError] = useState("");
   const codex = props.document.runtime.codex ?? {};
   const inherited = effectiveInheritedModel(props.document, props.options);
   const selectedModel = codex.model || props.options.codex_model;
@@ -1982,6 +1987,20 @@ function CodexRuntimeEditor(props: {
     patchRuntime({ codex: { ...codex, ...patch } });
   }
 
+  async function testConnection() {
+    if (testingConnection) return;
+    setTestingConnection(true);
+    setConnectionResult(null);
+    setConnectionError("");
+    try {
+      setConnectionResult(await api<CodexConnectionTestResult>("/api/codex/connection-test", { method: "POST" }));
+    } catch (reason) {
+      setConnectionError(reason instanceof Error ? reason.message : "Codex 连接测试失败");
+    } finally {
+      setTestingConnection(false);
+    }
+  }
+
   return (
     <div className="page-stack">
       <section className="section-card">
@@ -1990,7 +2009,26 @@ function CodexRuntimeEditor(props: {
             <h2>Codex 运行方式与默认参数</h2>
             <p>选择由 Codex CLI 托管完整 Agent，或只使用 Codex 模型并由 Teamwork 提供工具和运行环境。</p>
           </div>
+          <div className="runtime-connection-test" aria-live="polite">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={testingConnection}
+              onClick={() => { void testConnection(); }}
+            >
+              {testingConnection ? "连接测试中…" : "连接测试"}
+            </button>
+            <small>测试当前已保存配置</small>
+            {connectionResult && (
+              <span className="runtime-connection-result success">
+                {connectionResult.mode === "model" ? "模型基座" : "Codex CLI"}
+                {` · ${connectionResult.model ?? "默认模型"} · ${connectionResult.elapsed_seconds.toFixed(2)} 秒 · 回复：${connectionResult.reply}`}
+              </span>
+            )}
+            {connectionError && <span className="runtime-connection-result error">{connectionError}</span>}
+          </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="runtime-mode-stack">
           <div className="rule-option runtime-mode-option">
             <Toggle
@@ -2168,6 +2206,7 @@ function CodexRuntimeEditor(props: {
             help={(codex.execution_mode ?? "cli") === "model" ? "模型基座模式不提供 Codex 托管搜索工具，此项仅用于 CLI 模式" : undefined}
           />
         </div>
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -2176,6 +2215,7 @@ function CodexRuntimeEditor(props: {
             <p>由 Teamwork 统一生成权限档案，再交给 Codex CLI 的 macOS、Linux / WSL 或 Windows 原生沙盒执行器。</p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="agent-workspace-note">
           <strong>当前能力</strong>
           <span>
@@ -2214,6 +2254,7 @@ function CodexRuntimeEditor(props: {
               : "关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。"}
           </small>
         </div>
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -2226,6 +2267,7 @@ function CodexRuntimeEditor(props: {
             </p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="toggle-grid">
           <Toggle
             label="继承全部用户 MCP（高风险）"
@@ -2242,6 +2284,7 @@ function CodexRuntimeEditor(props: {
             onChange={(allowed_user_mcp_servers) => patchRuntime({ allowed_user_mcp_servers })}
           />
         )}
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -2253,6 +2296,7 @@ function CodexRuntimeEditor(props: {
             </p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <JsonEditor
           label="额外配置（JSON）"
           value={codex.extra_config ?? {}}
@@ -2261,6 +2305,7 @@ function CodexRuntimeEditor(props: {
             extra_config: extra_config as CodexRuntimeConfig["extra_config"],
           })}
         />
+        </fieldset>
       </section>
     </div>
   );
@@ -6892,11 +6937,19 @@ export default function App() {
                     <span>{editing ? "编辑模式" : "只读模式"}</span>
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
-                  <fieldset className="config-editor-surface" disabled={!editing}>
-                    {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
-                    {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
-                    {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
-                  </fieldset>
+                  {tab === "runtime" ? (
+                    <CodexRuntimeEditor
+                      document={document}
+                      options={codexOptions}
+                      editable={editing}
+                      onChange={changeDocument}
+                    />
+                  ) : (
+                    <fieldset className="config-editor-surface" disabled={!editing}>
+                      {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
+                      {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
+                    </fieldset>
+                  )}
                   {tab === "runtime" && (
                     <CodexAccountCard
                       configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}

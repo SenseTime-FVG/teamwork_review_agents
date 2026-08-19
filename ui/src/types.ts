@@ -197,6 +197,14 @@ export type CodexRuntimeOptions = {
   };
 };
 
+export type CodexConnectionTestResult = {
+  success: true;
+  mode: "cli" | "model";
+  model?: string | null;
+  reply: string;
+  elapsed_seconds: number;
+};
+
 export type CodexRateLimitWindow = {
   usedPercent?: number;
   windowDurationMins?: number;

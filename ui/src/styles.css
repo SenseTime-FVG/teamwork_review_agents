@@ -116,6 +116,11 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .section-title-row { margin-bottom: 19px; }
 .section-title-row h2, .run-detail-head h2 { margin: 0 0 5px; color: var(--bright); font-size: 16px; letter-spacing: -.015em; }
 .section-title-row p, .sub-card-head p, .run-detail-head p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.runtime-connection-test { min-width: 210px; max-width: 380px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.runtime-connection-test > small { color: #68788d; font-size: 9px; }
+.runtime-connection-result { max-width: 380px; padding: 6px 8px; border: 1px solid; border-radius: 7px; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; text-align: left; }
+.runtime-connection-result.success { border-color: #315d43; background: #0e1c15; color: #7ed9a6; }
+.runtime-connection-result.error { border-color: #67373c; background: #241316; color: #ff9ca4; }
 .overview-section-tools { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; }
 .overview-selection-actions { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .overview-list-controls { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
@@ -774,6 +779,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .metric-card { min-height: 108px; padding: 15px; }
   .section-card { padding: 16px; }
   .section-title-row { flex-direction: column; }
+  .runtime-connection-test { width: 100%; min-width: 0; max-width: none; align-items: stretch; }
+  .runtime-connection-result { max-width: none; }
   .runtime-mode-option { flex-direction: column; gap: 11px; }
   .runtime-mode-option .toggle-row { white-space: normal; }
   .provider-card-head { align-items: stretch; }
