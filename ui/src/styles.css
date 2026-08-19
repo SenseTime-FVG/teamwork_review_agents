@@ -524,10 +524,14 @@ tbody tr:last-child td { border-bottom: 0; }
 .git-detail-safety { margin: 0; padding: 10px 12px; border: 1px solid #294739; border-radius: 8px; background: #0f1d16; color: #759785; font-size: 9px; line-height: 1.55; }
 
 .runs-list { min-height: calc(100vh - 150px); }
-.runs-list-actions { display: flex; align-items: flex-end; gap: 8px; }
-.runs-list-actions label { display: flex; min-width: 120px; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
-.runs-list-actions select { height: 34px; border: 1px solid #293647; border-radius: 7px; background: #0a111a; color: #aebccd; outline: none; padding: 0 9px; font-size: 10px; }
-.runs-list-actions select:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.runs-list .section-title-row { align-items: flex-end; }
+.runs-list-actions { display: flex; max-width: 76%; flex-wrap: wrap; align-items: flex-end; justify-content: flex-end; gap: 8px; }
+.runs-list-actions label { display: flex; min-width: 96px; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
+.runs-list-actions .runs-repository-filter { min-width: 210px; }
+.runs-list-actions .runs-number-filter { min-width: 82px; max-width: 98px; }
+.runs-list-actions .runs-custom-limit { min-width: 105px; }
+.runs-list-actions select, .runs-list-actions input { height: 34px; border: 1px solid #293647; border-radius: 7px; background: #0a111a; color: #aebccd; outline: none; padding: 0 9px; font-size: 10px; }
+.runs-list-actions select:focus, .runs-list-actions input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .run-table { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: #09101a; }
 .run-table-head, .run-row { display: grid; grid-template-columns: minmax(170px, 1.1fr) minmax(230px, 1.4fr) minmax(140px, .8fr) 165px 165px 90px 18px; gap: 14px; align-items: center; }
 .run-table-head { padding: 10px 14px; border-bottom: 1px solid var(--line); background: #0d1521; color: #627087; font-size: 9px; letter-spacing: .04em; }
@@ -815,8 +819,9 @@ tbody tr:last-child td { border-bottom: 0; }
   .env-row .mini-check { display: none; }
   .prompt-toolbar { align-items: flex-start; flex-direction: column; gap: 8px; }
   .runs-list { min-height: auto; }
-  .runs-list-actions { width: 100%; align-items: stretch; }
-  .runs-list-actions label { min-width: 0; flex: 1; }
+  .runs-list-actions { width: 100%; max-width: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; justify-content: stretch; }
+  .runs-list-actions label, .runs-list-actions .runs-repository-filter, .runs-list-actions .runs-number-filter, .runs-list-actions .runs-custom-limit { min-width: 0; max-width: none; }
+  .runs-list-actions .button { width: 100%; }
   .run-table { overflow: visible; border: 0; background: transparent; }
   .run-table-head { display: none; }
   .run-items { gap: 8px; }

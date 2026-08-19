@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 from .events import TARGET_COMMITS_CHANGED_EVENT, activity_event_type
 from .models import (
@@ -1969,27 +1969,52 @@ class StateStore:
 
     def list_runs(
         self,
-        limit: int = 20,
+        limit: int | None = 20,
         *,
         status: str | None = None,
+        statuses: Sequence[str] | None = None,
         agent_name: str | None = None,
         repository_id: str | None = None,
+        number: int | None = None,
     ) -> list[dict[str, Any]]:
         """按可选条件返回最近 Agent 运行摘要。"""
 
         conditions: list[str] = []
         parameters: list[Any] = []
-        if status:
+        if statuses is not None:
+            if not statuses:
+                conditions.append("1 = 0")
+            else:
+                placeholders = ", ".join("?" for _ in statuses)
+                conditions.append(f"agent_runs.status IN ({placeholders})")
+                parameters.extend(statuses)
+        elif status:
             conditions.append("agent_runs.status = ?")
             parameters.append(status)
         if agent_name:
             conditions.append("agent_runs.agent_name = ?")
             parameters.append(agent_name)
         if repository_id:
-            conditions.append("agent_runs.resource_key LIKE ?")
-            parameters.append(f"%:{repository_id}:%")
+            conditions.append(
+                "(agent_runs.repository_id = ? OR event_inbox.repository_id = ? "
+                "OR (agent_runs.repository_id IS NULL "
+                "AND event_inbox.repository_id IS NULL "
+                "AND agent_runs.resource_key LIKE ?))"
+            )
+            parameters.extend(
+                (repository_id, repository_id, f"%:{repository_id}:%")
+            )
+        if number is not None:
+            conditions.append(
+                "(agent_runs.change_request_number = ? "
+                "OR event_inbox.number = ?)"
+            )
+            parameters.extend((number, number))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.append(limit)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
 
         with self.connect() as connection:
             rows = connection.execute(
@@ -2012,7 +2037,9 @@ class StateStore:
                        event_inbox.payload AS event_payload
                 FROM agent_runs
                 LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
-                {where} ORDER BY agent_runs.started_at DESC LIMIT ?
+                {where}
+                ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()
@@ -2216,9 +2243,10 @@ class StateStore:
 
     def list_preflight_runs(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         *,
         status: str | None = None,
+        statuses: Sequence[str] | None = None,
         repository_id: str | None = None,
         number: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -2226,7 +2254,14 @@ class StateStore:
 
         conditions: list[str] = []
         parameters: list[Any] = []
-        if status:
+        if statuses is not None:
+            if not statuses:
+                conditions.append("1 = 0")
+            else:
+                placeholders = ", ".join("?" for _ in statuses)
+                conditions.append(f"preflight.status IN ({placeholders})")
+                parameters.extend(statuses)
+        elif status:
             conditions.append("preflight.status = ?")
             parameters.append(status)
         if repository_id:
@@ -2236,7 +2271,10 @@ class StateStore:
             conditions.append("preflight.number = ?")
             parameters.append(number)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.append(limit)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -2272,7 +2310,7 @@ class StateStore:
                 ) AS link_stats ON link_stats.run_id = preflight.run_id
                 {where}
                 ORDER BY preflight.started_at DESC, preflight.run_id DESC
-                LIMIT ?
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()

@@ -42,6 +42,34 @@ from .skill_files import (
 )
 
 
+ExecutionStatusGroup = Literal[
+    "waiting",
+    "running",
+    "success",
+    "failure",
+    "timed_out",
+    "cancelled",
+]
+
+AGENT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
+    "waiting": ("queued", "preparing"),
+    "running": ("running",),
+    "success": ("completed",),
+    "failure": ("failed",),
+    "timed_out": ("timed_out",),
+    "cancelled": ("cancelled",),
+}
+
+PREFLIGHT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
+    "waiting": (),
+    "running": ("running",),
+    "success": ("success",),
+    "failure": ("failure", "error"),
+    "timed_out": ("timed_out",),
+    "cancelled": (),
+}
+
+
 class ConfigDocumentRequest(BaseModel):
     """UI 提交的完整配置文档。"""
 
@@ -762,17 +790,33 @@ def create_app(
 
     @app.get("/api/runs")
     async def runs(
-        limit: int = Query(default=50, ge=1, le=500),
+        limit: int = Query(default=50, ge=1),
+        all_records: bool = False,
         status: str | None = None,
+        status_group: ExecutionStatusGroup | None = None,
         agent_name: str | None = None,
         repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
     ):
+        """返回支持统一状态分组的 Agent 运行摘要。"""
+
+        if status and status_group:
+            raise HTTPException(
+                status_code=422,
+                detail="status 与 status_group 不能同时使用",
+            )
         return await asyncio.to_thread(
             manager.store.list_runs,
-            limit,
+            None if all_records else limit,
             status=status,
+            statuses=(
+                AGENT_EXECUTION_STATUS_GROUPS[status_group]
+                if status_group
+                else None
+            ),
             agent_name=agent_name,
             repository_id=repository_id,
+            number=number,
         )
 
     @app.get("/api/runs/{run_id}")
@@ -784,7 +828,8 @@ def create_app(
 
     @app.get("/api/preflight-runs")
     async def preflight_runs(
-        limit: int = Query(default=100, ge=1, le=500),
+        limit: int = Query(default=100, ge=1),
+        all_records: bool = False,
         status: Literal[
             "running",
             "success",
@@ -793,15 +838,26 @@ def create_app(
             "error",
         ]
         | None = None,
+        status_group: ExecutionStatusGroup | None = None,
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
     ):
         """返回本地 Preflight / CI 运行摘要，不包含完整输出。"""
 
+        if status and status_group:
+            raise HTTPException(
+                status_code=422,
+                detail="status 与 status_group 不能同时使用",
+            )
         return await asyncio.to_thread(
             manager.store.list_preflight_runs,
-            limit,
+            None if all_records else limit,
             status=status,
+            statuses=(
+                PREFLIGHT_EXECUTION_STATUS_GROUPS[status_group]
+                if status_group
+                else None
+            ),
             repository_id=repository_id,
             number=number,
         )

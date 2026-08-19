@@ -1043,10 +1043,61 @@ def test_overview_api_filters_status_repository_and_limit(
                 output="pytest failed",
             )
         )
+        agent_reservation = store.begin_agent_run(
+            proposed_run_id="web-filter-agent",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key="web-filter-agent-key",
+            event_id=first_event.id,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key=first_event.resource_key,
+            prompt="筛选测试",
+            max_attempts=1,
+        )
+        assert agent_reservation is not None
+        store.finish_agent_run(
+            AgentResult(
+                run_id=agent_reservation.run_id,
+                root_run_id=agent_reservation.root_run_id,
+                agent_name="reviewer",
+                status="completed",
+            )
+        )
+
+        filtered_runs = client.get(
+            "/api/runs?repository_id=first&number=1&status_group=success&limit=10"
+        ).json()
+        assert [item["run_id"] for item in filtered_runs] == [
+            agent_reservation.run_id
+        ]
+        assert client.get("/api/runs?status_group=failure").json() == []
+        assert len(client.get("/api/runs?all_records=true").json()) == 1
+        assert client.get("/api/runs?status_group=unknown").status_code == 422
+        assert client.get(
+            "/api/runs?status=completed&status_group=success"
+        ).status_code == 422
+
         preflight_summaries = client.get("/api/preflight-runs").json()
         assert preflight_summaries[0]["run_id"] == reservation.run_id
         assert preflight_summaries[0]["event_type"] == first_event.type
         assert "output" not in preflight_summaries[0]
+        filtered_preflights = client.get(
+            "/api/preflight-runs?repository_id=first&number=1"
+            "&status_group=failure&limit=10"
+        ).json()
+        assert [item["run_id"] for item in filtered_preflights] == [
+            reservation.run_id
+        ]
+        assert client.get(
+            "/api/preflight-runs?status_group=waiting"
+        ).json() == []
+        assert len(
+            client.get("/api/preflight-runs?all_records=true").json()
+        ) == 1
+        assert client.get(
+            "/api/preflight-runs?status=failure&status_group=failure"
+        ).status_code == 422
         preflight_detail = client.get(
             f"/api/preflight-runs/{reservation.run_id}"
         ).json()

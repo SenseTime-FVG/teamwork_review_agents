@@ -518,6 +518,14 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     assert summary["change_request_number"] == new.number
     assert summary["change_request_title"] == new.title
     assert summary["change_request_url"] == new.web_url
+    filtered_runs = store.list_runs(
+        statuses=("completed",),
+        repository_id=new.repository_id,
+        number=new.number,
+    )
+    assert [item["run_id"] for item in filtered_runs] == [reservation.run_id]
+    assert store.list_runs(statuses=()) == []
+    assert len(store.list_runs(limit=None)) == 1
     assert detail is not None
     assert detail["change_request_title"] == new.title
 
@@ -1020,6 +1028,11 @@ def test_event_list_exposes_linked_preflight_summary(
     assert store.list_preflight_runs(number=event.number)[0][
         "reused_event_count"
     ] == 1
+    assert store.list_preflight_runs(statuses=("failure",))[0][
+        "run_id"
+    ] == reservation.run_id
+    assert store.list_preflight_runs(statuses=()) == []
+    assert len(store.list_preflight_runs(limit=None)) == 1
     assert store.list_preflight_runs(number=999) == []
     assert store.get_preflight_run("missing-preflight") is None
 

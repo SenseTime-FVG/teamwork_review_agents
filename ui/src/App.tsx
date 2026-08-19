@@ -50,6 +50,18 @@ type OverviewFilter = {
   limit: OverviewLimit;
 };
 
+type ExecutionTypeFilter = "all" | "agent" | "preflight";
+
+type ExecutionStatusFilter = "" | "waiting" | "running" | "success" | "failure" | "timed_out" | "cancelled";
+
+type ExecutionFilter = {
+  repositoryId: string;
+  number: string;
+  type: ExecutionTypeFilter;
+  status: ExecutionStatusFilter;
+  limit: number | null;
+};
+
 type OverviewConfirmation = {
   kind: "discovered" | "latest" | "latest-batch";
   items: ChangeRequestRecord[];
@@ -81,6 +93,26 @@ const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   status: "",
   limit: 10,
 };
+
+const DEFAULT_EXECUTION_FILTER: ExecutionFilter = {
+  repositoryId: "",
+  number: "",
+  type: "all",
+  status: "",
+  limit: 20,
+};
+
+const EXECUTION_STATUS_OPTIONS: Array<{
+  value: Exclude<ExecutionStatusFilter, "">;
+  label: string;
+}> = [
+  { value: "waiting", label: "等待中" },
+  { value: "running", label: "执行中" },
+  { value: "success", label: "成功" },
+  { value: "failure", label: "失败" },
+  { value: "timed_out", label: "超时" },
+  { value: "cancelled", label: "已取消" },
+];
 
 const CHANGE_REQUEST_STATUS_OPTIONS = [
   { value: "opened", label: "打开" },
@@ -285,6 +317,47 @@ function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   }
   if (filter.status) parameters.set("status", filter.status);
   return parameters.toString();
+}
+
+function executionQuery(filter: ExecutionFilter): string {
+  const parameters = new URLSearchParams();
+  if (filter.limit === null) {
+    parameters.set("all_records", "true");
+  } else {
+    parameters.set("limit", String(filter.limit));
+  }
+  if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
+  if (/^\d+$/.test(filter.number) && Number(filter.number) > 0) {
+    parameters.set("number", filter.number);
+  }
+  if (filter.status) parameters.set("status_group", filter.status);
+  return parameters.toString();
+}
+
+function executionStatusMatches(
+  kind: "agent" | "preflight",
+  status: string,
+  filter: ExecutionStatusFilter,
+): boolean {
+  if (!filter) return true;
+  const groups: Record<Exclude<ExecutionStatusFilter, "">, string[]> = kind === "agent"
+    ? {
+        waiting: ["queued", "preparing"],
+        running: ["running"],
+        success: ["completed"],
+        failure: ["failed"],
+        timed_out: ["timed_out"],
+        cancelled: ["cancelled"],
+      }
+    : {
+        waiting: [],
+        running: ["running"],
+        success: ["success"],
+        failure: ["failure", "error"],
+        timed_out: ["timed_out"],
+        cancelled: [],
+      };
+  return groups[filter].includes(status);
 }
 
 function shortRevision(revision?: string): string {
@@ -5550,12 +5623,44 @@ type ExecutionSelection = { kind: "agent" | "preflight"; id: string };
 function RunsView(props: {
   runs: RunSummary[];
   preflightRuns: PreflightRunSummary[];
+  repositories: Repository[];
+  filter: ExecutionFilter;
   requestedRunId?: string | null;
   onRequestedRunOpened: () => void;
+  onFilterChange: (filter: ExecutionFilter) => void;
   onRefresh: () => void;
 }) {
   const [selected, setSelected] = useState<ExecutionSelection | null>(null);
-  const [typeFilter, setTypeFilter] = useState<"all" | "agent" | "preflight">("all");
+  const predefinedLimits = [10, 20, 50];
+  const limitMode = props.filter.limit === null
+    ? "all"
+    : predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "custom";
+  const [customLimit, setCustomLimit] = useState(
+    props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "100",
+  );
+
+  useEffect(() => {
+    if (props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)) {
+      setCustomLimit(String(props.filter.limit));
+    }
+  }, [props.filter.limit]);
+
+  function applyCustomLimit() {
+    const parsed = Number(customLimit);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      props.onFilterChange({ ...props.filter, limit: parsed });
+      return;
+    }
+    const fallback = props.filter.limit !== null && props.filter.limit > 0
+      ? props.filter.limit
+      : 100;
+    setCustomLimit(String(fallback));
+  }
+
   const records = useMemo<Array<{
     kind: "agent" | "preflight";
     id: string;
@@ -5576,9 +5681,30 @@ function RunsView(props: {
       preflight,
     }));
     return [...agentRecords, ...preflightRecords]
-      .filter((record) => typeFilter === "all" || record.kind === typeFilter)
-      .sort((left, right) => right.startedAt - left.startedAt);
-  }, [props.preflightRuns, props.runs, typeFilter]);
+      .filter((record) => props.filter.type === "all" || record.kind === props.filter.type)
+      .filter((record) => {
+        const repositoryId = record.kind === "agent"
+          ? record.agent.repository_id
+          : record.preflight.repository_id;
+        return !props.filter.repositoryId || repositoryId === props.filter.repositoryId;
+      })
+      .filter((record) => {
+        if (!/^\d+$/.test(props.filter.number) || Number(props.filter.number) <= 0) {
+          return true;
+        }
+        const number = record.kind === "agent"
+          ? record.agent.change_request_number
+          : record.preflight.number;
+        return number === Number(props.filter.number);
+      })
+      .filter((record) => executionStatusMatches(
+        record.kind,
+        record.kind === "agent" ? record.agent.status : record.preflight.status,
+        props.filter.status,
+      ))
+      .sort((left, right) => right.startedAt - left.startedAt)
+      .slice(0, props.filter.limit ?? Number.MAX_SAFE_INTEGER);
+  }, [props.filter, props.preflightRuns, props.runs]);
 
   useEffect(() => {
     if (!props.requestedRunId) return;
@@ -5592,7 +5718,115 @@ function RunsView(props: {
         <div className="section-title-row">
           <div><h2>执行记录</h2><p>按开始时间统一查看 Agent 与本地 Preflight / CI；点击一行打开详情。</p></div>
           <div className="runs-list-actions">
-            <label><span>类型</span><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as typeof typeFilter)}><option value="all">全部</option><option value="agent">Agent</option><option value="preflight">本地 CI</option></select></label>
+            <label className="runs-repository-filter">
+              <span>仓库</span>
+              <select
+                value={props.filter.repositoryId}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  repositoryId: event.target.value,
+                })}
+              >
+                <option value="">全部仓库</option>
+                {props.repositories.map((repository) => (
+                  <option key={repository.id} value={repository.id}>
+                    {repository.id} · {repository.project}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="runs-number-filter">
+              <span>编号</span>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                inputMode="numeric"
+                placeholder="全部"
+                value={props.filter.number}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  number: event.target.value,
+                })}
+              />
+            </label>
+            <label>
+              <span>类型</span>
+              <select
+                value={props.filter.type}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  type: event.target.value as ExecutionTypeFilter,
+                })}
+              >
+                <option value="all">全部</option>
+                <option value="agent">Agent</option>
+                <option value="preflight">本地 CI</option>
+              </select>
+            </label>
+            <label>
+              <span>状态</span>
+              <select
+                value={props.filter.status}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  status: event.target.value as ExecutionStatusFilter,
+                })}
+              >
+                <option value="">全部状态</option>
+                {EXECUTION_STATUS_OPTIONS.map((status) => (
+                  <option key={status.value} value={status.value}>{status.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>展示</span>
+              <select
+                value={limitMode}
+                onChange={(event) => {
+                  if (event.target.value === "all") {
+                    props.onFilterChange({ ...props.filter, limit: null });
+                  } else if (event.target.value === "custom") {
+                    const parsed = Number(customLimit);
+                    props.onFilterChange({
+                      ...props.filter,
+                      limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
+                    });
+                  } else {
+                    props.onFilterChange({
+                      ...props.filter,
+                      limit: Number(event.target.value),
+                    });
+                  }
+                }}
+              >
+                <option value="10">10 条</option>
+                <option value="20">20 条</option>
+                <option value="50">50 条</option>
+                <option value="all">全部</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            {limitMode === "custom" && (
+              <label className="runs-custom-limit">
+                <span>自定义条数</span>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  inputMode="numeric"
+                  value={customLimit}
+                  onChange={(event) => setCustomLimit(event.target.value)}
+                  onBlur={applyCustomLimit}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      applyCustomLimit();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+              </label>
+            )}
             <button className="button secondary" onClick={props.onRefresh}>刷新</button>
           </div>
         </div>
@@ -5654,6 +5888,11 @@ export default function App() {
   const [eventFilter, setEventFilter] = useState<OverviewFilter>(
     DEFAULT_OVERVIEW_FILTER,
   );
+  const [executionFilter, setExecutionFilter] = useState<ExecutionFilter>(
+    DEFAULT_EXECUTION_FILTER,
+  );
+  const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
+  const operationalRequestSequence = useRef(0);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
@@ -5680,11 +5919,22 @@ export default function App() {
   const [token, setToken] = useState(getToken());
 
   const refreshOperationalData = useCallback(async () => {
+    const requestSequence = operationalRequestSequence.current + 1;
+    operationalRequestSequence.current = requestSequence;
+    const filter = { ...executionFilterRef.current };
+    const query = executionQuery(filter);
+    const runsRequest = filter.type === "preflight"
+      ? Promise.resolve<RunSummary[]>([])
+      : api<RunSummary[]>(`/api/runs?${query}`);
+    const preflightRunsRequest = filter.type === "agent"
+      ? Promise.resolve<PreflightRunSummary[]>([])
+      : api<PreflightRunSummary[]>(`/api/preflight-runs?${query}`);
     const [nextStatus, nextRuns, nextPreflightRuns] = await Promise.all([
       api<RuntimeStatus>("/api/status"),
-      api<RunSummary[]>("/api/runs?limit=100"),
-      api<PreflightRunSummary[]>("/api/preflight-runs?limit=100"),
+      runsRequest,
+      preflightRunsRequest,
     ]);
+    if (requestSequence !== operationalRequestSequence.current) return;
     setStatus(nextStatus);
     setRuns(nextRuns);
     setPreflightRuns(nextPreflightRuns);
@@ -5731,6 +5981,10 @@ export default function App() {
   }, [refreshOperationalData]);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    executionFilterRef.current = executionFilter;
+    void refreshOperationalData().catch(() => undefined);
+  }, [executionFilter, refreshOperationalData]);
   useEffect(() => {
     const timer = window.setInterval(() => { void refreshOperationalData().catch(() => undefined); }, 3000);
     return () => window.clearInterval(timer);
@@ -6059,6 +6313,11 @@ export default function App() {
         ? { ...current, repositoryId: "" }
         : current
     ));
+    setExecutionFilter((current) => (
+      current.repositoryId && !enabledIds.has(current.repositoryId)
+        ? { ...current, repositoryId: "" }
+        : current
+    ));
   }, [enabledRepositories]);
 
   const tabs = useMemo<Array<{ id: Tab; label: string; mark: string }>>(() => [
@@ -6212,8 +6471,11 @@ export default function App() {
                 <RunsView
                   runs={runs}
                   preflightRuns={preflightRuns}
+                  repositories={enabledRepositories}
+                  filter={executionFilter}
                   requestedRunId={requestedRunId}
                   onRequestedRunOpened={() => setRequestedRunId(null)}
+                  onFilterChange={setExecutionFilter}
                   onRefresh={() => { void refreshOperationalData(); }}
                 />
               )}
