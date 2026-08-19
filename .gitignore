@@ -21,4 +21,6 @@ data/*.pid
 data/*.lock
 data/*.log
 /data/worktrees/
+# Preflight 依赖缓存属于可再生的本地运行数据，不纳入版本控制。
+/data/preflight-cache/
 tmp/
