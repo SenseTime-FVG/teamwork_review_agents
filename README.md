@@ -170,7 +170,7 @@ GitHub 历史 PR 的列表行会展示 Timeline 中最新一条可转换为规�
 
 ## Agent 运行状态与 Git 超时
 
-Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，因此 Codex 可在沙箱内安全执行 fetch、建分支和提交；只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
+Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，Teamwork 外层沙盒会允许该 clone 及其独立 `.git` 写入，因此 Agent 可以执行 fetch、建分支和提交；Codex 的工作区权限档案还允许系统临时目录写入，用于每轮临时 HOME 和工具缓存，但基础仓库不在可写范围内。只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
 不同 PR / MR 的事件批次可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。全局环境页的 `runtime.max_concurrent_agents` 和运行时配置页的 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
 
@@ -186,6 +186,32 @@ Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktre
 Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库中的 Git 对象并执行增量 fetch；可写 Agent 创建拥有独立 `.git` 的运行 clone，只读 Agent 创建 linked worktree。这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件或共享 Git 元数据。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
+
+## Teamwork 跨平台外层沙盒
+
+受限 Agent 默认不再直接依赖 `codex exec --sandbox` 保护本地文件。Teamwork 先根据 Agent 的文件与网络权限生成本轮权限档案，再调用当前 `runtime.codex_binary` 提供的 `codex sandbox` 建立操作系统级外层沙盒：macOS 使用 Seatbelt，Linux 和 WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。外层沙盒建立成功后，内层 `codex exec` 才关闭自己的重复沙盒，避免 Codex 对 `.git` 的额外保护阻止本次独立 clone 执行正常 Git 写操作。
+
+```yaml
+runtime:
+  managed_sandbox:
+    enabled: true
+    fail_closed: true
+
+agents:
+  general-reviewer:
+    # 允许写本次运行 clone、它自己的 .git 和系统临时目录。
+    sandbox: workspace-write
+    # 文件权限与命令联网分别控制。
+    network_access: true
+    # 留空表示允许普通网络；也可以只允许指定域名。
+    network_domains: [api.github.com, github.com]
+```
+
+`read-only` 使用只读外层档案；`workspace-write` 允许写当前独立运行 clone（含它自己的 `.git`）和 Codex 权限档案定义的系统临时目录，后者承载每轮临时 HOME 与工具缓存；基础仓库和真实 HOME 不会因此变成可写。`danger-full-access` 会绕过受限外层沙盒，属于明确的高风险配置。网络关闭和普通联网由外层档案执行；域名白名单非空时，Teamwork 还会显式启用 Codex 网络代理，确保规则不只是配置声明。Provider Token 仍会从 Codex 环境中移除。
+
+sub-agent 不需要为此获得配置文件或数据库权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行原有白名单、深度、幂等和并发校验。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、基础仓库或其他 Agent 工作区；通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
+
+`fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时才回退到原来的 Codex 内层同级沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“运行时配置”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
 
 ## GitHub 本地 CI 门禁
 

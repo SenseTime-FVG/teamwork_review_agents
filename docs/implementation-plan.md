@@ -654,3 +654,20 @@
 - 执行 Python 全量测试、前端生产构建、Python 编译与补丁检查；不自动重启服务。
 
 验收：任意 PR / MR 的 Agent 长时间运行时，其他资源的失败事件能按短暂退避独立重试；失败达到上限后，该资源后续批次无需等待全局调度周期结束；页面明确显示前序事件重试原因；并发额度和同资源顺序不回归。
+
+## 阶段六十：Teamwork 托管的三平台外层沙盒
+
+- 新增运行时托管沙盒配置，默认启用并失败关闭；提供显式的安全回退开关，但绝不把回退实现为宿主机完整权限直启。
+- 增加跨平台能力诊断，识别 macOS、Linux、WSL 和原生 Windows，校验当前配置的 Codex CLI 是否提供独立 `codex sandbox` 执行器，并通过管理 API 与运行时页面展示后端和错误。
+- 由 Teamwork 为每次受限 Agent 生成命名权限档案：只读任务保持仓库只读；工作区可写任务放行本次运行目录、其独立 `.git` 及 Codex 内置档案要求的系统临时目录；网络关闭、域名白名单和普通联网分别映射到外层网络策略，域名白名单额外强制启用网络代理。
+- 将 `CodexRunner` 改为外层 `codex sandbox` 包裹内层 `codex exec --dangerously-bypass-approvals-and-sandbox`；外层建立前完成版本和能力检查，失败时不启动模型。
+- 保留临时 HOME 的 Codex、GitHub CLI、GitLab CLI、Git 和 macOS Keychain 桥接；按具体路径放行必要的 Unix Socket，Provider Token 继续从 Agent 环境移除。
+- 将完整 MCP Broker 留在外层沙盒之外，沙盒内只启动暴露 `invoke_agent` 的最小代理；两端通过每轮独立、`0700` 权限和随机令牌保护的临时文件通道通信，权限档案只放行该通道目录，不能暴露配置、SQLite、基础仓库或其他工作区。
+- 让可写运行 clone 解除共享对象库依赖，使工作区开始运行后不需要读取或修改基础仓库 Git 元数据；只读 linked worktree 和继承父工作区语义保持不变。
+- 将外层沙盒与外部 MCP Broker 纳入既有跨平台进程树取消、超时、服务停止和重启收尾；Broker 停止前先持久化取消未完成的 sub-agent，宽限期后再强杀残留后代，并记录不含凭据、通道令牌与完整策略的结构化诊断日志。
+- 禁止 Agent 自定义 CLI 参数覆盖沙盒、审批策略、权限档案、工作目录和相关安全配置，确保显式回退仍保持同级隔离。
+- 更新 `config_example.yaml`、README、运行时配置 UI 和 Agent 权限说明；明确 `danger-full-access` 是管理员主动绕过受限外层沙盒的高风险模式。
+- 补充 macOS、Linux/WSL、Windows 命令构造、能力缺失失败关闭、显式安全回退、`.git` 写权限、网络三种模式、临时 HOME、MCP 文件桥接、进程取消和工作区自包含测试。
+- 执行 Python 全量测试、前端生产构建、Python 编译检查与补丁检查；不自动重启用户服务，也不在未获授权时提交或推送。
+
+验收：macOS、Linux/WSL 和原生 Windows 的 `read-only` 与 `workspace-write` 都由 Teamwork 策略控制；工作区可写 Agent 能在本次独立 clone 内执行 `git fetch`、建分支和提交，同时不能写基础仓库；系统临时目录可以承载本轮临时 HOME；禁网与启用代理后的域名白名单在外层生效；沙盒内可以受控调用白名单 sub-agent，但不能读取配置、SQLite 和其他工作区；外层能力不可用时默认在 Codex 启动前失败；取消、超时、`stop` 和 `restart` 不遗留 Codex、Broker、sub-agent 或命令后代；临时 HOME、平台 CLI 登录和清理行为不回归。

@@ -588,3 +588,17 @@ Agent 的 `cancelled` 终态必须记录取消来源。管理员在运行详情�
 失败事件仍使用 SQLite 中的 `attempts` 和运行幂等键决定是否可以重试。前序失败尚有剩余次数时，当前资源的待处理事件显示“等待前序事件重试”；达到重试上限后，失败事件保留为失败终态，调度器立即重新评估该资源并继续处理后续批次，不再增加无意义的退避。不同 PR / MR 继续并发，同一 PR / MR 仍按创建顺序执行。
 
 退避状态只用于当前进程的短时节流，SQLite 仍是可靠事实来源。服务停止或异常退出不需要恢复内存截止时间；重启后调度器根据事件状态和尝试次数重新判断。扫描期间写入的新资源仍可立即填补并发额度，既有全局、运行时和 Agent 级并发限制保持不变。
+
+## 62. Teamwork 托管的三平台外层沙盒
+
+Agent 的本地文件权限不能继续只依赖内层 `codex exec --sandbox`。即使可写 Agent 已经使用包含独立 `.git` 的本地 clone，Codex 的 `workspace-write` 仍会额外保护 Git 元数据，导致正常的 `git fetch`、建分支和提交无法更新本次运行目录中的 `.git/FETCH_HEAD`、引用或索引。Teamwork 改为拥有沙盒策略：先生成本轮唯一的权限配置，再使用已配置 Codex CLI 的独立 `codex sandbox` 执行器建立外层操作系统沙盒；只有外层沙盒成功建立后，内层 `codex exec` 才使用 `--dangerously-bypass-approvals-and-sandbox`。该参数只能出现在 Teamwork 已成功建立外层沙盒的命令中，不能作为普通直启回退。
+
+三平台使用同一策略模型，由 Codex CLI 的原生沙盒执行器完成平台落地：macOS 使用 Seatbelt，Linux 与 WSL 使用 Linux 沙盒，原生 Windows 使用 Windows 沙盒。Teamwork 不维护三份互相漂移的底层规则文本，而是显式指定工作目录、权限档案、网络策略和允许的 Unix Socket；运行时诊断必须展示当前平台、预期后端、CLI 是否支持 `codex sandbox` 及失败原因。外层能力默认启用并失败关闭：能力检查失败、权限档案无法解析或外层进程无法启动时，本轮 Agent 在模型启动前失败。管理员只有显式关闭失败关闭时，才允许退回原有的 Codex 内层沙盒；回退必须写入结构化日志，不能静默把内层 Codex 以完整宿主权限启动。
+
+`read-only` 使用外层只读档案，内层命令不能写仓库；`workspace-write` 使用 Codex 内置工作区档案，并对本次运行工作区显式增加 Git 元数据写权限，使独立 clone 中的普通文件与 `.git` 同属本轮可写边界。该内置档案还允许写系统临时目录，用于本轮临时 HOME 与工具缓存；不能把它表述为“机器上只有 clone 可写”，但基础仓库和真实 HOME 仍不加入可写根。可写 clone 创建时必须解除对基础仓库对象库的 alternates 借用，确保运行开始后 Git 元数据和对象都自包含。`danger-full-access` 的定义就是不受文件或网络沙盒限制，因此不套用受限外层档案，继续作为管理员明确选择的高风险模式直接执行。
+
+命令联网仍由 Agent 的 `network_access` 与 `network_domains` 控制。关闭联网时外层沙盒禁用网络；开启且白名单非空时，外层只允许列出的域名，并必须同时注入 `features.network_proxy=true`，因为权限档案的 `network.enabled` 只允许联网，不会自行启动负责强制域名规则的代理；开启且白名单为空时允许普通网络访问。内层 Codex 不再拥有第二份可能冲突的网络策略。macOS 的 `SSH_AUTH_SOCK` 等确有需要的 Unix Socket 只能按已继承的具体路径加入外层允许列表，不能开放任意 Socket 根目录。Provider Token 继续从 Codex 环境移除；`gh`、`glab`、Git、SSH 和 Codex 登录继续通过既有临时 HOME 安全桥接使用宿主用户登录态，不复制整个真实 HOME。
+
+外层沙盒进程是 Codex、沙盒内 MCP 代理、shell、Git 和其他 Agent 命令的共同祖先进程。完整 MCP Broker 作为 Teamwork 管理的同级进程运行在外层沙盒之外，继续读取配置与 SQLite 并复用既有 sub-agent 白名单、调用深度、幂等和并发校验；沙盒内代理只暴露 `invoke_agent`，通过本轮专属、权限为 `0700`、带随机令牌的临时文件通道交换请求与响应。权限档案只额外放行这一个通道目录，不能由此读取配置、数据库、基础仓库或其他 Agent 工作区。通道在 Broker 和全部委托退出后删除。
+
+页面取消、总超时、无进展超时、`stop` 与 `restart` 仍要覆盖完整执行树：Codex 外层进程树直接终止；若 MCP 工具调用仍有 sub-agent，Broker 先把当前运行及后代写为持久化取消并等待它们自行清理，超过宽限期再终止 Broker 的完整后代树。临时 HOME、Skill 投影、文件通道和运行 clone 必须等对应进程退出后再清理。Agent 的 `extra_codex_args` 不能覆盖沙盒、审批策略、权限档案、工作目录或相关安全配置，确保外层能力不可用时的内层回退仍保持原 Agent 权限级别。结构化运行日志在启动模型前记录外层沙盒模式、平台后端、网络模式、域名数量、MCP 桥接方式、是否回退和工作区类型，但不记录完整权限档案、通道令牌、认证文件内容或 Provider Token。

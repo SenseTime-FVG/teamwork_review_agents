@@ -236,6 +236,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
     )
     assert run_workspace_kind(cloned) == "clone"
     assert (cloned / ".git").is_dir()
+    assert not (cloned / ".git/objects/info/alternates").exists()
     assert validate_isolated_clone(workspace, cloned) == cloned
     assert validate_run_workspace(workspace, cloned) == cloned
     assert run_git("rev-parse", "HEAD", cwd=cloned) == head_sha
@@ -353,6 +354,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
 
     config = configured_app_factory()
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.clone_url = str(origin)
     repository.workspace = tmp_path / "base-repository"

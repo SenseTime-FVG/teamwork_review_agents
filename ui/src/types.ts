@@ -113,6 +113,11 @@ export type CodexRuntimeConfig = {
   extra_config?: Record<string, CodexConfigValue>;
 };
 
+export type ManagedSandboxConfig = {
+  enabled?: boolean;
+  fail_closed?: boolean;
+};
+
 export type CodexInheritedSetting = {
   value?: string | null;
   source: "codex" | "user" | "model" | "builtin" | "runtime" | "unknown";
@@ -130,6 +135,7 @@ export type RuntimeConfig = Record<string, unknown> & {
   repository_initialization_timeout_seconds?: number;
   git_timeout_seconds?: number;
   agent_idle_timeout_seconds?: number;
+  managed_sandbox?: ManagedSandboxConfig;
   codex?: CodexRuntimeConfig;
 };
 
@@ -177,6 +183,14 @@ export type CodexRuntimeOptions = {
   version_warning?: string | null;
   user_mcp_servers: string[];
   user_mcp_error?: string | null;
+  managed_sandbox: {
+    enabled: boolean;
+    fail_closed: boolean;
+    available: boolean;
+    platform: string;
+    backend?: string | null;
+    error?: string | null;
+  };
 };
 
 export type CodexRateLimitWindow = {

@@ -54,6 +54,35 @@ CODEX_MANAGED_CONFIG_PREFIXES = (
     "shell_environment_policy.",
 )
 
+CODEX_SECURITY_CLI_OPTIONS = {
+    "--ask-for-approval",
+    "--cd",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--full-auto",
+    "--permission-profile",
+    "--profile",
+    "--sandbox",
+    "--yolo",
+    "-C",
+    "-a",
+    "-p",
+    "-s",
+}
+CODEX_SECURITY_CONFIG_KEYS = {
+    "approval_policy",
+    "default_permissions",
+    "features.network_proxy",
+    "profile",
+    "sandbox_mode",
+    "sandbox_workspace_write",
+}
+CODEX_SECURITY_CONFIG_PREFIXES = (
+    "features.network_proxy.",
+    "permissions.",
+    "profiles.",
+    "sandbox_workspace_write.",
+)
+
 
 class DatabaseConfig(BaseModel):
     """状态数据库配置。"""
@@ -133,6 +162,13 @@ class CodexRuntimeConfig(BaseModel):
         return value
 
 
+class ManagedSandboxConfig(BaseModel):
+    """Teamwork 托管的跨平台外层沙盒配置。"""
+
+    enabled: bool = True
+    fail_closed: bool = True
+
+
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
@@ -152,6 +188,9 @@ class RuntimeConfig(BaseModel):
     repository_initialization_timeout_seconds: PositiveInt = 1800
     git_timeout_seconds: PositiveInt = 600
     agent_idle_timeout_seconds: PositiveInt = 300
+    managed_sandbox: ManagedSandboxConfig = Field(
+        default_factory=ManagedSandboxConfig,
+    )
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
     mcp_tool_timeout_seconds: PositiveInt = 1800
@@ -353,6 +392,42 @@ class AgentConfig(BaseModel):
                 seen.add(domain)
                 domains.append(domain)
         return domains
+
+    @field_validator("extra_codex_args")
+    @classmethod
+    def validate_extra_codex_args(cls, value: list[str]) -> list[str]:
+        """禁止自定义 CLI 参数绕过 Teamwork 托管的执行边界。"""
+
+        index = 0
+        while index < len(value):
+            argument = value[index]
+            option = argument.split("=", 1)[0]
+            attached_short_option = argument.startswith(("-C", "-a", "-p", "-s"))
+            if option in CODEX_SECURITY_CLI_OPTIONS or (
+                attached_short_option and not argument.startswith("--")
+            ):
+                raise ValueError(
+                    "Agent extra_codex_args 不能覆盖沙盒、审批、权限档案或工作目录："
+                    f"{argument}"
+                )
+            config_value: str | None = None
+            if argument in {"--config", "-c"}:
+                if index + 1 < len(value):
+                    config_value = value[index + 1]
+                index += 1
+            elif argument.startswith("--config="):
+                config_value = argument.removeprefix("--config=")
+            if config_value and "=" in config_value:
+                key = config_value.split("=", 1)[0].strip()
+                if key in CODEX_SECURITY_CONFIG_KEYS or key.startswith(
+                    CODEX_SECURITY_CONFIG_PREFIXES
+                ):
+                    raise ValueError(
+                        "Agent extra_codex_args 不能覆盖 Teamwork 托管的安全配置："
+                        f"{key}"
+                    )
+            index += 1
+        return value
 
     @model_validator(mode="after")
     def validate_prompt_source(self) -> "AgentConfig":

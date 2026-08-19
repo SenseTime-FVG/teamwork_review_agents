@@ -23,7 +23,13 @@ from .codex_settings import (
     validate_codex_version,
 )
 from .environment import SecretRedactor
+from .mcp_bridge import ManagedMcpBroker, McpBridgeChannel
 from .models import AgentResult, InvocationContext
+from .managed_sandbox import (
+    ManagedSandboxInspection,
+    inspect_managed_sandbox,
+    wrap_managed_sandbox_command,
+)
 from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
 
@@ -146,20 +152,31 @@ class CodexRunner:
         repository: RepositoryConfig,
         context: InvocationContext,
         skill_files: Mapping[str, Path] | None = None,
+        *,
+        managed_sandbox: bool | None = None,
+        environment: Mapping[str, str] | None = None,
+        mcp_bridge: McpBridgeChannel | None = None,
     ) -> list[str]:
         """构造显式叠加 Teamwork 默认和 Agent 覆盖的 Codex 命令。"""
 
         server_name = "teamwork_agent_gateway"
+        use_managed_sandbox = (
+            self.config.runtime.managed_sandbox.enabled
+            and agent.sandbox != "danger-full-access"
+            if managed_sandbox is None
+            else managed_sandbox
+        )
         command = [
             self.config.runtime.codex_binary,
             "exec",
             "--json",
             "--ephemeral",
-            "--sandbox",
-            agent.sandbox,
-            "--cd",
-            str(repository.workspace),
         ]
+        if use_managed_sandbox:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            command.extend(["--sandbox", agent.sandbox])
+        command.extend(["--cd", str(repository.workspace)])
         if agent.model:
             command.extend(["--model", agent.model])
         if agent.skip_git_repo_check:
@@ -167,12 +184,20 @@ class CodexRunner:
         if agent.output_schema:
             command.extend(["--output-schema", str(agent.output_schema)])
 
-        mcp_args = ["-m", "teamwork_review_agents.mcp_server"]
-        context_value = encode_invocation_context(context)
+        # 托管模式即使尚未拿到通道，也绝不能退回会读取配置和数据库的完整 MCP。
+        use_mcp_bridge = use_managed_sandbox
+        mcp_args = [
+            "-m",
+            (
+                "teamwork_review_agents.mcp_proxy"
+                if use_mcp_bridge
+                else "teamwork_review_agents.mcp_server"
+            ),
+        ]
         overrides = [
             *runtime_overrides(self.config.runtime.codex),
             *agent_overrides(agent),
-            *agent_network_overrides(agent),
+            *([] if use_managed_sandbox else agent_network_overrides(agent)),
             f"mcp_servers.{server_name}.command={_toml_string(sys.executable)}",
             f"mcp_servers.{server_name}.args={json.dumps(mcp_args)}",
             f"mcp_servers.{server_name}.required=true",
@@ -187,15 +212,26 @@ class CodexRunner:
             ),
             f"mcp_servers.{server_name}.enabled_tools=[\"invoke_agent\"]",
             f"mcp_servers.{server_name}.default_tools_approval_mode=\"approve\"",
-            (
-                f"mcp_servers.{server_name}.env.TEAMWORK_CONFIG_PATH="
-                f"{_toml_string(str(self.config.config_path))}"
-            ),
-            (
-                f"mcp_servers.{server_name}.env.TEAMWORK_INVOCATION_CONTEXT="
-                f"{_toml_string(context_value)}"
-            ),
         ]
+        if use_mcp_bridge and mcp_bridge is not None:
+            for name, value in mcp_bridge.environment_overrides().items():
+                overrides.append(
+                    f"mcp_servers.{server_name}.env.{name}={_toml_string(value)}"
+                )
+        elif not use_mcp_bridge:
+            context_value = encode_invocation_context(context)
+            overrides.extend(
+                [
+                    (
+                        f"mcp_servers.{server_name}.env.TEAMWORK_CONFIG_PATH="
+                        f"{_toml_string(str(self.config.config_path))}"
+                    ),
+                    (
+                        f"mcp_servers.{server_name}.env.TEAMWORK_INVOCATION_CONTEXT="
+                        f"{_toml_string(context_value)}"
+                    ),
+                ]
+            )
         if not self.config.runtime.inherit_user_mcp_servers:
             allowed = set(self.config.runtime.allowed_user_mcp_servers)
             user_servers, _ = read_user_mcp_servers(
@@ -215,6 +251,15 @@ class CodexRunner:
         # 仓库属于被处理对象，必须在全部自定义参数之后关闭项目指令发现。
         command.extend(["--config", "project_doc_max_bytes=0"])
         command.append("-")
+        if use_managed_sandbox:
+            return wrap_managed_sandbox_command(
+                codex_binary=self.config.runtime.codex_binary,
+                workspace=repository.workspace,
+                agent=agent,
+                inner_command=command,
+                environment=environment or os.environ,
+                ipc_directory=mcp_bridge.directory if mcp_bridge is not None else None,
+            )
         return command
 
     def child_environment(
@@ -264,6 +309,7 @@ class CodexRunner:
 
         temporary_home: TemporaryAgentHome | None = None
         projection: SkillProjection | None = None
+        mcp_broker: ManagedMcpBroker | None = None
         try:
             if agent.home_mode == "temporary":
                 temporary_home = TemporaryAgentHome.create(run_id)
@@ -275,6 +321,41 @@ class CodexRunner:
                 },
                 self.config.revision,
             ).prepare()
+            managed_requested = (
+                self.config.runtime.managed_sandbox.enabled
+                and agent.sandbox != "danger-full-access"
+            )
+            managed_inspection: ManagedSandboxInspection | None = None
+            mcp_bridge_error: str | None = None
+            if managed_requested:
+                managed_inspection = await asyncio.to_thread(
+                    inspect_managed_sandbox,
+                    self.config.runtime.codex_binary,
+                    self.config.runtime.codex_home,
+                )
+                if managed_inspection.available:
+                    try:
+                        mcp_broker = await ManagedMcpBroker.start(
+                            run_id=run_id,
+                            config_path=self.config.config_path,
+                            encoded_context=encode_invocation_context(context),
+                            base_environment=self.child_environment(
+                                process_environment,
+                                temporary_home=temporary_home,
+                            ),
+                            response_timeout_seconds=max(
+                                1.0,
+                                float(
+                                    self.config.runtime.mcp_tool_timeout_seconds
+                                )
+                                - 1.0,
+                            ),
+                        )
+                    except Exception as exc:
+                        mcp_bridge_error = (
+                            "Teamwork 托管沙盒的 MCP Bridge 启动失败："
+                            f"{type(exc).__name__}: {exc}"
+                        )
             return await self._run_with_projection(
                 run_id=run_id,
                 root_run_id=root_run_id,
@@ -291,33 +372,40 @@ class CodexRunner:
                 skill_files=projection.skill_files,
                 git_excludes_file=projection.marker if self.config.skills else None,
                 temporary_home=temporary_home,
+                managed_inspection=managed_inspection,
+                mcp_bridge=mcp_broker.channel if mcp_broker is not None else None,
+                mcp_bridge_error=mcp_bridge_error,
             )
         finally:
             try:
-                if projection is not None:
-                    projection.cleanup()
+                if mcp_broker is not None:
+                    await mcp_broker.close()
             finally:
-                if temporary_home is not None:
-                    home_path = str(temporary_home.path)
-                    cleanup_error = temporary_home.cleanup()
-                    if log_callback is not None:
-                        event_type = (
-                            "run.home_cleanup_failed"
-                            if cleanup_error
-                            else "run.home_cleaned"
-                        )
-                        payload: dict[str, Any] = {
-                            "mode": "temporary",
-                            "path": home_path,
-                            "cleaned": cleanup_error is None,
-                        }
-                        if cleanup_error:
-                            payload["error"] = cleanup_error
-                        try:
-                            await log_callback("system", event_type, payload)
-                        except Exception:
-                            # 临时目录已经完成清理尝试，日志失败不能覆盖任务结果。
-                            pass
+                try:
+                    if projection is not None:
+                        projection.cleanup()
+                finally:
+                    if temporary_home is not None:
+                        home_path = str(temporary_home.path)
+                        cleanup_error = temporary_home.cleanup()
+                        if log_callback is not None:
+                            event_type = (
+                                "run.home_cleanup_failed"
+                                if cleanup_error
+                                else "run.home_cleaned"
+                            )
+                            payload: dict[str, Any] = {
+                                "mode": "temporary",
+                                "path": home_path,
+                                "cleaned": cleanup_error is None,
+                            }
+                            if cleanup_error:
+                                payload["error"] = cleanup_error
+                            try:
+                                await log_callback("system", event_type, payload)
+                            except Exception:
+                                # 临时目录已经完成清理尝试，日志失败不能覆盖任务结果。
+                                pass
 
     async def _run_with_projection(
         self,
@@ -337,10 +425,12 @@ class CodexRunner:
         skill_files: Mapping[str, Path],
         git_excludes_file: Path | None,
         temporary_home: TemporaryAgentHome | None,
+        managed_inspection: ManagedSandboxInspection | None,
+        mcp_bridge: McpBridgeChannel | None,
+        mcp_bridge_error: str | None,
     ) -> AgentResult:
         """流式执行 Codex CLI；超时后终止整个进程组。"""
 
-        command = self.build_command(agent, repository, context, skill_files)
         active_redactor = redactor or SecretRedactor(())
 
         async def emit(
@@ -389,6 +479,98 @@ class CodexRunner:
                 status="failed",
                 error=version_error,
             )
+        managed_requested = (
+            self.config.runtime.managed_sandbox.enabled
+            and agent.sandbox != "danger-full-access"
+        )
+        use_managed_sandbox = False
+        if managed_requested:
+            inspection = managed_inspection or await asyncio.to_thread(
+                inspect_managed_sandbox,
+                self.config.runtime.codex_binary,
+                self.config.runtime.codex_home,
+            )
+            unavailable_error = inspection.error
+            if inspection.available and mcp_bridge is None:
+                unavailable_error = (
+                    mcp_bridge_error
+                    or "Teamwork 托管沙盒的 MCP Bridge 未能准备完成"
+                )
+            if inspection.available and mcp_bridge is not None:
+                use_managed_sandbox = True
+                await emit(
+                    "system",
+                    "run.sandbox_prepared",
+                    {
+                        "mode": agent.sandbox,
+                        "managed": True,
+                        "platform": inspection.platform,
+                        "backend": inspection.backend,
+                        "network_mode": (
+                            "disabled"
+                            if not agent.network_access
+                            else "allowlist"
+                            if agent.network_domains
+                            else "full"
+                        ),
+                        "network_domain_count": len(agent.network_domains),
+                        "mcp_bridge": "file-channel",
+                    },
+                )
+            elif self.config.runtime.managed_sandbox.fail_closed:
+                error = unavailable_error or "Teamwork 外层沙盒能力不可用"
+                await emit(
+                    "system",
+                    "run.sandbox_unavailable",
+                    {
+                        "platform": inspection.platform,
+                        "backend": inspection.backend,
+                        "error": error,
+                        "fail_closed": True,
+                    },
+                )
+                return AgentResult(
+                    run_id=run_id,
+                    root_run_id=root_run_id,
+                    parent_run_id=parent_run_id,
+                    agent_name=agent_name,
+                    status="failed",
+                    error=error,
+                )
+            else:
+                await emit(
+                    "system",
+                    "run.sandbox_fallback",
+                    {
+                        "mode": agent.sandbox,
+                        "managed": False,
+                        "platform": inspection.platform,
+                        "backend": inspection.backend,
+                        "error": unavailable_error,
+                        "fallback": "codex_internal_sandbox",
+                    },
+                )
+        elif agent.sandbox == "danger-full-access":
+            await emit(
+                "system",
+                "run.sandbox_prepared",
+                {
+                    "mode": agent.sandbox,
+                    "managed": False,
+                    "backend": None,
+                    "network_mode": "full",
+                    "network_domain_count": 0,
+                },
+            )
+        command = self.build_command(
+            agent,
+            repository,
+            context,
+            skill_files,
+            managed_sandbox=use_managed_sandbox,
+            environment=child_environment,
+            mcp_bridge=mcp_bridge if use_managed_sandbox else None,
+        )
         if cancel_check is not None and await cancel_check():
             error = "运行在 Codex CLI 启动前被管理员取消"
             await emit("system", "run.cancelled", error)

@@ -53,12 +53,22 @@ database:
 #   inherit_user_mcp_servers: false
 #   # 在保持隔离时，可按 ~/.codex/config.toml 中的 MCP 名称显式放行所需服务。
 #   allowed_user_mcp_servers: []
-#   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   # 基础仓库首次克隆的超时，默认 30 分钟。
 #   repository_initialization_timeout_seconds: 1800
 #   # 基础仓库就绪后，fetch、运行 clone 和 worktree 等单次 Git 操作的超时，默认 10 分钟。
 #   git_timeout_seconds: 600
+#   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   agent_idle_timeout_seconds: 300
+#   # 默认由 Teamwork 使用当前 Codex CLI 的原生平台执行器建立外层沙盒：
+#   # macOS 使用 Seatbelt，Linux / WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。
+#   managed_sandbox:
+#     # 关闭后，受限 Agent 回退到 codex exec 自己的 sandbox 参数。
+#     enabled: true
+#     # 外层能力不可用时默认在启动模型前失败；改为 false 才允许安全回退到 Codex 内层沙盒。
+#     # 无论如何都不会把受限 Agent 自动降级为完全访问。
+#     fail_closed: true
+#     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
+#     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。
 #   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
 #   codex:
 #     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
@@ -201,8 +211,9 @@ agents:
     prompt_file: ./prompts/general-review.md
     # 可选：model、model_reasoning_effort、fast_mode、model_verbosity、personality
     # 和 web_search 可以覆盖 runtime.codex；省略时继承运行时或 Codex 默认设置。
-    # read-only：本地只读；workspace-write：工作区可写；
-    # danger-full-access：完全访问。
+    # read-only：本地只读；workspace-write：允许写本次独立运行 clone（含其 .git）
+    # 以及 Codex 权限档案定义的系统临时目录；基础仓库与真实 HOME 不会因此可写；
+    # danger-full-access：完全访问，会绕过受限的 Teamwork 外层沙盒。
     sandbox: workspace-write
     # 可写沙箱可为每次运行创建独立临时 HOME；缓存和用户级配置在结束后删除。
     # Codex Home 与已有 gh / glab / Git / SSH 登录入口会单独桥接。

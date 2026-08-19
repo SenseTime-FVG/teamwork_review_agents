@@ -429,6 +429,12 @@ def validate_isolated_clone(
         timeout_seconds=timeout_seconds,
     ) != git_directory.resolve():
         raise WorkspaceError("候选 clone 的 Git 元数据不在运行目录内")
+    alternates = git_directory / "objects/info/alternates"
+    if alternates.is_file() and alternates.read_text(
+        encoding="utf-8",
+        errors="replace",
+    ).strip():
+        raise WorkspaceError("候选 clone 仍依赖基础仓库对象库，不是自包含运行仓库")
     if _git_remote_url(
         source,
         timeout_seconds=timeout_seconds,
@@ -585,16 +591,30 @@ def ensure_isolated_clone(
             progress_callback=progress_callback,
         )
         _run_git(
-            ["-C", str(staged), "remote", "set-url", "origin", origin_url],
-            timeout_seconds=timeout_seconds,
-            cancel_check=cancel_check,
-        )
-        _run_git(
             ["-C", str(staged), "update-ref", change_ref, revision_head],
             timeout_seconds=timeout_seconds,
             operation="写入变更请求引用",
             cancel_check=cancel_check,
             progress_callback=progress_callback,
+        )
+        # 共享克隆完成后复制全部可达对象，再移除 alternates，避免运行仓库
+        # 在基础仓库清理对象后损坏，也避免外层沙盒必须读取基础对象库。
+        _run_git(
+            ["-C", str(staged), "repack", "-a", "-d"],
+            timeout_seconds=timeout_seconds,
+            operation="解除基础仓库对象依赖",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        alternates = staged / ".git" / "objects" / "info" / "alternates"
+        try:
+            alternates.unlink(missing_ok=True)
+        except OSError as exc:
+            raise WorkspaceError("无法解除运行 clone 的基础对象库依赖") from exc
+        _run_git(
+            ["-C", str(staged), "remote", "set-url", "origin", origin_url],
+            timeout_seconds=timeout_seconds,
+            cancel_check=cancel_check,
         )
         _run_git(
             ["-C", str(staged), "checkout", "--detach", revision_head],

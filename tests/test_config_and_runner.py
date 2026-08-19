@@ -372,6 +372,40 @@ def test_agent_network_domains_are_normalized_and_validated() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--sandbox", "danger-full-access"],
+        ["--dangerously-bypass-approvals-and-sandbox"],
+        ["--config", "sandbox_mode=\"danger-full-access\""],
+        ["--config=permissions.teamwork={filesystem={\":root\"=\"write\"}}"],
+        ["--profile", "unsafe"],
+        ["--cd", "/tmp"],
+    ],
+)
+def test_agent_extra_codex_args_cannot_override_security_boundary(
+    arguments: list[str],
+) -> None:
+    """Agent 自定义参数不能把安全回退静默改成完全权限。"""
+
+    with pytest.raises(ValueError, match="不能覆盖"):
+        AgentConfig(prompt="测试", extra_codex_args=arguments)
+
+
+def test_agent_extra_codex_args_keep_non_security_overrides() -> None:
+    """普通自定义参数和最终强制的项目指令隔离仍可共存。"""
+
+    agent = AgentConfig(
+        prompt="测试",
+        extra_codex_args=["--config", "project_doc_max_bytes=32768"],
+    )
+
+    assert agent.extra_codex_args == [
+        "--config",
+        "project_doc_max_bytes=32768",
+    ]
+
+
 def test_agent_network_access_rejects_unsupported_sandbox_combinations() -> None:
     """只读模式不能开放命令联网，完全访问也不能伪装成域名隔离。"""
 
@@ -423,7 +457,7 @@ def test_runner_builds_agent_network_overrides(
     snapshot_factory,
     configured_app_factory,
 ) -> None:
-    """Runner 应把命令联网和可选域名白名单转换为应用托管覆盖。"""
+    """Runner 应把联网设置转换为 Teamwork 外层权限档案。"""
 
     config = configured_app_factory()
     agent = config.agents["code-reviewer"]
@@ -446,38 +480,44 @@ def test_runner_builds_agent_network_overrides(
         event=event,
     )
     command = CodexRunner(config).build_command(agent, repository, context)
-    overrides = [
+    profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
         if value == "--config"
-    ]
+        and command[index + 1].startswith("permissions.teamwork_managed=")
+    )
 
-    assert "sandbox_workspace_write.network_access=true" in overrides
-    assert "features.network_proxy.enabled=true" in overrides
-    assert (
-        'features.network_proxy.domains={ "api.github.com" = "allow", '
-        '"*.github.com" = "allow" }'
-    ) in overrides
+    assert command[1] == "sandbox"
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert 'extends=":workspace"' in profile
+    assert 'filesystem={":workspace_roots"={".git"="write"}}' in profile
+    assert 'network={enabled=true,mode="limited"' in profile
+    assert '"api.github.com"="allow"' in profile
+    assert '"*.github.com"="allow"' in profile
+    assert "features.network_proxy=true" in command
+    assert "sandbox_workspace_write.network_access=true" not in command
 
     agent.network_domains = []
     command = CodexRunner(config).build_command(agent, repository, context)
-    overrides = [
+    profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
         if value == "--config"
-    ]
-    assert "sandbox_workspace_write.network_access=true" in overrides
-    assert "features.network_proxy.enabled=false" in overrides
+        and command[index + 1].startswith("permissions.teamwork_managed=")
+    )
+    assert 'network={enabled=true,mode="full"}' in profile
+    assert "features.network_proxy=true" not in command
 
     agent.network_access = False
     command = CodexRunner(config).build_command(agent, repository, context)
-    overrides = [
+    profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
         if value == "--config"
-    ]
-    assert "sandbox_workspace_write.network_access=false" in overrides
-    assert "features.network_proxy.enabled=false" in overrides
+        and command[index + 1].startswith("permissions.teamwork_managed=")
+    )
+    assert "network={enabled=false}" in profile
+    assert "features.network_proxy=true" not in command
 
 
 def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_factory) -> None:
@@ -982,6 +1022,7 @@ for item in items:
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.workspace = workspace
     agent = config.agents["code-reviewer"]
@@ -1046,6 +1087,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     config.runtime.codex_home = codex_home
     repository = config.repositories[0]
     repository.workspace = workspace
@@ -1143,6 +1185,7 @@ time.sleep(30)
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.workspace = workspace
     agent = config.agents["code-reviewer"]
@@ -1210,6 +1253,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.workspace = workspace
     agent = config.agents["code-reviewer"]
@@ -1272,6 +1316,7 @@ time.sleep(30)
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.workspace = workspace
     agent = config.agents["code-reviewer"]
@@ -1377,6 +1422,7 @@ time.sleep(30)
     )
     fake_codex.chmod(0o755)
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.workspace = workspace
     agent = config.agents["code-reviewer"]

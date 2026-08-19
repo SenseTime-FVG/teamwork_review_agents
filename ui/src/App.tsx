@@ -150,6 +150,14 @@ const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   binary: {},
   model_cache: { path: "~/.codex/models_cache.json" },
   user_mcp_servers: [],
+  managed_sandbox: {
+    enabled: true,
+    fail_closed: true,
+    available: false,
+    platform: "未知",
+    backend: null,
+    error: "尚未读取运行时能力",
+  },
 };
 
 const REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -190,6 +198,11 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       git_timeout_seconds: 600,
       agent_idle_timeout_seconds: 300,
       ...runtimeInput,
+      managed_sandbox: {
+        enabled: true,
+        fail_closed: true,
+        ...(runtimeInput.managed_sandbox ?? {}),
+      },
       codex: {
         fast_mode: "inherit",
         extra_config: {},
@@ -1660,6 +1673,48 @@ function CodexRuntimeEditor(props: {
               { value: "live", label: "实时搜索" },
             ]}
           />
+        </div>
+      </section>
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>Teamwork 外层沙盒</h2>
+            <p>由 Teamwork 统一生成权限档案，再交给 Codex CLI 的 macOS、Linux / WSL 或 Windows 原生沙盒执行器。</p>
+          </div>
+        </div>
+        <div className="agent-workspace-note">
+          <strong>当前能力</strong>
+          <span>
+            {props.options.managed_sandbox.platform}
+            {props.options.managed_sandbox.backend ? ` · ${props.options.managed_sandbox.backend}` : ""}
+            {props.options.managed_sandbox.available ? " · 可用" : " · 不可用"}
+            {props.options.managed_sandbox.error ? ` · ${props.options.managed_sandbox.error}` : ""}
+          </span>
+        </div>
+        <div className="toggle-grid">
+          <Toggle
+            label="启用 Teamwork 托管外层沙盒"
+            checked={props.document.runtime.managed_sandbox?.enabled ?? true}
+            onChange={(enabled) => patchRuntime({
+              managed_sandbox: {
+                ...(props.document.runtime.managed_sandbox ?? {}),
+                enabled,
+              },
+            })}
+          />
+          <small>受限 Agent 使用外层原生沙盒；完全访问模式仍是管理员主动选择的高风险直通模式。</small>
+          <Toggle
+            label="能力不可用时失败关闭"
+            checked={props.document.runtime.managed_sandbox?.fail_closed ?? true}
+            disabled={!(props.document.runtime.managed_sandbox?.enabled ?? true)}
+            onChange={(fail_closed) => patchRuntime({
+              managed_sandbox: {
+                ...(props.document.runtime.managed_sandbox ?? {}),
+                fail_closed,
+              },
+            })}
+          />
+          <small>关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。</small>
         </div>
       </section>
       <section className="section-card">
@@ -3348,7 +3403,7 @@ function AgentsEditor(props: {
                         : agent.network_access ?? false,
                     network_domains: sandbox === "workspace-write" ? agent.network_domains ?? [] : [],
                   });
-                }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件</option><option value="danger-full-access">完全访问：高风险</option></select><small>切换为可写模式时会自动启用“本地仓库写操作”</small></label>
+                }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件和独立 .git</option><option value="danger-full-access">完全访问：绕过受限外层沙盒（高风险）</option></select><small>可写模式放行本次独立 clone（含 .git）和系统临时目录，基础仓库不在可写范围；切换时会自动启用“本地仓库写操作”</small></label>
                 <label className="field"><span>HOME 目录</span><select value={agent.home_mode ?? "inherit"} disabled={agent.sandbox === "read-only"} onChange={(event) => update(name, { home_mode: event.target.value as Agent["home_mode"] })}><option value="inherit">继承系统 HOME</option><option value="temporary">每次运行使用临时 HOME</option></select><small>{agent.sandbox === "read-only" ? "只读沙箱不能提供可写的临时 HOME" : agent.home_mode === "temporary" ? "缓存与用户级配置写入本次运行目录，结束后清理" : "命令继续直接使用启动服务用户的 HOME"}</small></label>
                 <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />

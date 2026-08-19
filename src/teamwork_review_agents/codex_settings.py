@@ -11,7 +11,13 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .config import AgentConfig, CodexConfigValue, CodexRuntimeConfig
+from .config import (
+    AgentConfig,
+    CodexConfigValue,
+    CodexRuntimeConfig,
+    ManagedSandboxConfig,
+)
+from .managed_sandbox import inspect_managed_sandbox
 
 
 def toml_value(value: CodexConfigValue) -> str:
@@ -390,6 +396,7 @@ def inspect_runtime_options(
     expected_version: str | None = None,
     effective_config: dict[str, Any] | None = None,
     effective_config_error: str | None = None,
+    managed_sandbox: ManagedSandboxConfig | None = None,
 ) -> dict[str, Any]:
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
@@ -399,6 +406,8 @@ def inspect_runtime_options(
     binary = inspect_codex_binary(codex_binary, home)
     cache = inspect_model_cache(home)
     user_mcp_servers, user_mcp_error = read_user_mcp_servers(home)
+    sandbox_settings = managed_sandbox or ManagedSandboxConfig()
+    sandbox_inspection = inspect_managed_sandbox(codex_binary, configured_home)
     if effective_config is not None:
         inherited_settings = _inherited_settings_from_document(
             effective_config,
@@ -475,4 +484,9 @@ def inspect_runtime_options(
         "inherited_settings": inherited_settings,
         "inherited_settings_error": inherited_settings_error,
         "effective_config_error": effective_config_error,
+        "managed_sandbox": {
+            **sandbox_inspection.as_dict(),
+            "enabled": sandbox_settings.enabled,
+            "fail_closed": sandbox_settings.fail_closed,
+        },
     }

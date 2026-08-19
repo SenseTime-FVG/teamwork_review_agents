@@ -537,6 +537,7 @@ def create_app(
             manager.config.runtime.expected_codex_version,
             effective_config,
             effective_config_error,
+            manager.config.runtime.managed_sandbox,
         )
 
     @app.get("/api/codex/account")
