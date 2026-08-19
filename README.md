@@ -194,6 +194,19 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 ## Teamwork 跨平台外层沙盒
 
+运行时配置中的“Codex 仅作为模型基座”默认关闭。关闭时继续使用完整的 `codex exec` 运行时，包括 Codex CLI 自己的 Agent 循环、内置工具和允许的 MCP；开启后，Teamwork 不再启动 `codex exec`，而是直接读取 `runtime.codex_home`（或 `CODEX_HOME` / `~/.codex`）中的现有 ChatGPT OAuth 登录，并在进程内访问 Codex Responses 模型。该模式不启动或请求本机、外部的 `codex-api-service`，只把 Codex 用作模型基座。
+
+模型基座模式由 Teamwork 提供 `execute_command`、`apply_patch` 和白名单 `invoke_agent`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它不会继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`；模型必须在 Agent、`runtime.codex.model` 或用户 `config.toml` 顶层明确配置。OAuth token 只用于宿主模型请求，不进入 Prompt、工具环境和运行日志。
+
+受限 Agent 在模型基座模式下没有 Codex 内层沙盒可回退，因此 `read-only` 和 `workspace-write` 的每个命令、补丁进程都必须成功进入 Teamwork 外层沙盒；即使 `fail_closed` 配成 `false`，该模式仍失败关闭。`danger-full-access` 继续表示管理员明确允许工具直接访问宿主环境。配置文件等价写法如下：
+
+```yaml
+runtime:
+  codex:
+    execution_mode: model  # 默认 cli
+    model: gpt-5.6-sol
+```
+
 受限 Agent 默认不再直接依赖 `codex exec --sandbox` 保护本地文件。Teamwork 先根据 Agent 的文件与网络权限生成本轮权限档案，再调用当前 `runtime.codex_binary` 提供的 `codex sandbox` 建立操作系统级外层沙盒：macOS 使用 Seatbelt，Linux 和 WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。外层沙盒建立成功后，内层 `codex exec` 才关闭自己的重复沙盒，避免 Codex 对 `.git` 的额外保护阻止本次独立 clone 执行正常 Git 写操作。
 
 ```yaml

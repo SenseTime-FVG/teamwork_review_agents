@@ -98,7 +98,7 @@ class ChangeEvent(BaseModel):
 
 
 class AgentResult(BaseModel):
-    """Codex CLI 单次运行的结构化结果。"""
+    """Codex CLI 或内嵌模型单次运行的结构化结果。"""
 
     run_id: str
     root_run_id: str

@@ -660,3 +660,17 @@ Prompt 模板需要在保留现有 `${{ENV_NAME}}` 环境变量替换语义的�
 `general-review` 使用 `REVIEW_AUTO_MERGE | as_bool` 在渲染阶段形成互斥的审核策略。真分支保留现有完整审核、最终门禁、评论和自动合并流程；假分支执行相同的 SHA、CI、设计、历史变更、目标分支一致性和合并门禁检查，但通过后只发布“审核通过，未启用自动合并”的评论并结束，禁止调用任何合并 API 或 CLI。变量缺失、未开放给 Prompt 或值无效时进入假分支，避免配置错误触发意外合并。渲染后的 Prompt 不能同时包含两套行为，也不能把开关值交给模型自行解释。
 
 Prompt 预览接口与 Agent 执行必须复用同一个渲染函数。Jinja 语法错误或渲染错误在模型启动前以脱敏的配置错误失败；预览接口返回可识别的客户端错误，不能返回半渲染模板。测试覆盖旧语法兼容、原生变量、真假与缺失条件、嵌套条件、变量内容不被二次执行、预览接口和 `general-review` 两种最终策略。
+
+## 69. Codex 模型基座与 Teamwork 内嵌 Agent 运行时
+
+运行时配置在既有 Codex CLI 模式之外增加 `runtime.codex.execution_mode`。默认值 `cli` 完整保留当前行为，由 `codex exec` 提供模型、Agent 循环、内置工具与执行环境；值为 `model` 时，Codex 只作为模型基座，Teamwork 自己负责上下文、函数工具、工具执行、sub-agent 调度、日志、取消和超时。管理界面以“Codex 仅作为模型基座”开关表达该枚举，关闭即为 `cli`，开启即为 `model`。两种模式在同一 Agent 执行入口选择，不静默互相回退。
+
+内嵌模式只迁移和适配 `codex-api-service` 中必要的 Codex OAuth 凭据读取、令牌刷新、上游 Responses SSE 请求与函数调用解析逻辑，不启动、导入或请求现有 `codex-api-service` 的本地 HTTP API，也不继承其 FastAPI 兼容层、API Key、账户池、管理页面或请求日志。Teamwork 直接读取 `runtime.codex_home` 中已有的 Codex 登录状态，并由进程内客户端访问 Codex 上游 Responses 后端。认证令牌只存在于客户端内存和请求头中，不能写入运行日志、Prompt、Agent 环境或工具输出；认证、协议和上游错误均输出脱敏摘要。
+
+Teamwork 为模型公开 `execute_command`、`apply_patch` 和 `invoke_agent` 三个函数工具。模型返回函数调用后，Teamwork 校验参数、执行工具并把 `function_call_output` 加入下一次 Responses 输入；每轮返回的 reasoning、message 和 function call 项一并保留，直到获得最终消息或达到工具轮次上限。`execute_command` 在本轮工作区内执行跨平台 shell 命令，`apply_patch` 只接受目标位于工作区内的统一 diff，`invoke_agent` 直接复用现有 Agent 白名单、调用深度、循环检测、幂等键、并发、工作区继承和持久化取消规则，不再经过 MCP。内嵌模式不继承 Codex CLI 内置工具或用户 MCP；Teamwork 选择的 Skill 由既有 Skill 投影准备，并把选中 `SKILL.md` 的完整指令注入模型上下文，引用文件仍相对于投影目录读取。
+
+`read-only` 和 `workspace-write` Agent 在内嵌模式下失去了 `codex exec` 的内层沙盒，因此每次本地命令和补丁子进程都必须成功进入既有 Teamwork 托管外层沙盒。`read-only` 使用只读档案，`workspace-write` 只允许本轮工作区、Git 元数据和必要临时目录；网络继续由 `network_access` 与 `network_domains` 控制。受限模式下即使全局允许安全回退，也不能把 Teamwork 工具无沙盒直启，能力探测或包装失败必须在模型调用前失败关闭。`danger-full-access` 是管理员显式选择的不受限模式，工具直接在本轮工作区运行。模型 HTTP 请求属于 Teamwork 宿主控制面，不放进 Agent 文件沙盒，也不向工具子进程暴露 OAuth 凭据。
+
+两种运行器共用工作区准备、环境变量过滤、临时 HOME、Prompt 渲染、Agent 级模型参数、最终结果、用量统计和运行记录。内嵌模式以结构化事件记录模型回合、工具开始、工具完成、sub-agent 结果、超时和取消，但对命令输出设置大小上限，并继续经过既有脱敏器。页面取消、Agent 总超时和无进展超时必须终止当前工具完整进程树，并阻止后续模型回合；sub-agent 继续使用根运行取消传播。输出 Schema 在请求与最终结果校验路径中保持有效，不能因为切换运行器而绕过。
+
+实现和测试覆盖 macOS、Linux/WSL 与原生 Windows 的 shell 选择、路径约束、进程树终止和托管沙盒命令构造；覆盖配置默认兼容、OAuth 加载与刷新、SSE 分帧、函数调用多轮循环、Skill 注入、工具参数拒绝、补丁越界防护、sub-agent 调度、日志脱敏、取消、超时、用量归并和禁止 CLI 静默回退。CLI 模式的现有命令、MCP、临时 Codex HOME 与沙盒行为保持原样。

@@ -221,6 +221,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
         ...(runtimeInput.managed_sandbox ?? {}),
       },
       codex: {
+        execution_mode: "cli",
         fast_mode: "inherit",
         extra_config: {},
         ...codexInput,
@@ -1541,16 +1542,38 @@ function CodexRuntimeEditor(props: {
       <section className="section-card">
         <div className="section-title-row">
           <div>
-            <h2>Codex CLI 默认参数</h2>
-            <p>只影响 Teamwork 发起的 Codex 进程，不会修改你的 Codex 用户配置文件。</p>
+            <h2>Codex 运行方式与默认参数</h2>
+            <p>选择由 Codex CLI 托管完整 Agent，或只使用 Codex 模型并由 Teamwork 提供工具和运行环境。</p>
           </div>
         </div>
+        <div className="rule-option">
+          <Toggle
+            label="Codex 仅作为模型基座"
+            checked={(codex.execution_mode ?? "cli") === "model"}
+            onChange={(enabled) => patchCodex({ execution_mode: enabled ? "model" : "cli" })}
+          />
+          <p>
+            开启后不启动 <code>codex exec</code>，Teamwork 直接复用当前 Codex OAuth 登录并提供命令、补丁和 sub-agent 工具；
+            关闭后保持现有 Codex CLI 工具、MCP 与运行环境。
+          </p>
+        </div>
+        {(codex.execution_mode ?? "cli") === "model" && (
+          <div className="alert warning">
+            模型基座模式不会请求外部或本机 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
+            受限 Agent 必须成功启用下方 Teamwork 外层沙盒；默认模型需在本页、Agent 或 Codex config.toml 中明确配置。
+          </div>
+        )}
         <div className="agent-workspace-note">
           <strong>当前模型来源</strong>
-          <span>{inherited.label}。下面展示的是没有单一仓库上下文时的后台全局继承值；Agent 可以单独覆盖，仓库中的 `.codex/config.toml` 仍可能参与 Codex 原生合并。</span>
+          <span>
+            {inherited.label}。下面展示的是后台全局继承值；Agent 可以单独覆盖。
+            {(codex.execution_mode ?? "cli") === "cli"
+              ? "仓库中的 .codex/config.toml 仍可能参与 Codex 原生合并。"
+              : "模型基座模式只读取配置的顶层模型默认值，不执行仓库 Codex 配置。"}
+          </span>
         </div>
         <div className="agent-workspace-note">
-          <strong>实际后台 CLI</strong>
+          <strong>{(codex.execution_mode ?? "cli") === "model" ? "认证与沙盒 CLI" : "实际后台 CLI"}</strong>
           <span>
             {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
             {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
@@ -1689,6 +1712,7 @@ function CodexRuntimeEditor(props: {
               { value: "cached", label: "缓存搜索" },
               { value: "live", label: "实时搜索" },
             ]}
+            help={(codex.execution_mode ?? "cli") === "model" ? "模型基座模式不提供 Codex 托管搜索工具，此项仅用于 CLI 模式" : undefined}
           />
         </div>
       </section>
@@ -1731,14 +1755,22 @@ function CodexRuntimeEditor(props: {
               },
             })}
           />
-          <small>关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。</small>
+          <small>
+            {(codex.execution_mode ?? "cli") === "model"
+              ? "模型基座模式没有 Codex 内层沙盒，因此受限 Agent 始终失败关闭，此开关只影响 CLI 模式。"
+              : "关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。"}
+          </small>
         </div>
       </section>
       <section className="section-card">
         <div className="section-title-row">
           <div>
             <h2>后台 MCP 能力隔离</h2>
-            <p>默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。</p>
+            <p>
+              {(codex.execution_mode ?? "cli") === "model"
+                ? "模型基座模式不加载任何用户 MCP，sub-agent 由 Teamwork 内部执行器直接调度；以下设置留给 CLI 模式。"
+                : "默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。"}
+            </p>
           </div>
         </div>
         <div className="toggle-grid">
@@ -1762,7 +1794,10 @@ function CodexRuntimeEditor(props: {
         <div className="section-title-row">
           <div>
             <h2>高级 Codex 配置</h2>
-            <p>使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。</p>
+            <p>
+              使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。
+              {(codex.execution_mode ?? "cli") === "model" ? " 模型基座模式不解释这些 CLI 高级项。" : ""}
+            </p>
           </div>
         </div>
         <JsonEditor
@@ -3308,7 +3343,7 @@ function AgentsEditor(props: {
   return (
     <section className={`section-card ${props.showOverview === false ? "agent-detail-form" : ""}`}>
       {props.showOverview !== false && <div className="section-title-row">
-        <div><h2>Agent</h2><p>每个 Agent 由 Codex CLI 执行，并可通过白名单调用其他 Agent。</p></div>
+        <div><h2>Agent</h2><p>每个 Agent 使用当前 Codex 运行模式执行，并可通过白名单调用其他 Agent。</p></div>
         <button className="button primary" onClick={() => {
           let index = allNames.length + 1;
           let name = `agent-${index}`;

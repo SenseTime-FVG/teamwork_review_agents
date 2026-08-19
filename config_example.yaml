@@ -69,8 +69,12 @@ database:
 #     fail_closed: true
 #     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
 #     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。
-#   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
+#   # Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认参数；不会修改 config.toml。
 #   codex:
+#     # cli：保持当前 codex exec 完整运行时；model：Codex 只作为模型基座，
+#     # Teamwork 直接使用现有 OAuth 登录并负责命令、补丁和 sub-agent 工具。
+#     # model 不请求本机或外部 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
+#     execution_mode: cli
 #     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
 #     model: gpt-5.6-sol
 #     # 可选：默认推理强度。具体可用值取决于模型，常见值如下。

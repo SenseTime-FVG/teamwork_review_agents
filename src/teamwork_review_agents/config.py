@@ -18,6 +18,7 @@ CodexConfigPrimitive = str | int | float | bool
 CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
 
 CODEX_STRUCTURED_CONFIG_KEYS = {
+    "execution_mode",
     "model",
     "model_reasoning_effort",
     "model_verbosity",
@@ -121,8 +122,9 @@ class ScannerConfig(BaseModel):
 
 
 class CodexRuntimeConfig(BaseModel):
-    """Teamwork 启动 Codex CLI 时注入的默认运行参数。"""
+    """Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认运行参数。"""
 
+    execution_mode: Literal["cli", "model"] = "cli"
     model: str | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"

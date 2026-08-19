@@ -104,6 +104,7 @@ export type Agent = {
 export type CodexConfigValue = string | number | boolean | Array<string | number | boolean>;
 
 export type CodexRuntimeConfig = {
+  execution_mode?: "cli" | "model";
   model?: string;
   model_reasoning_effort?: string;
   fast_mode?: "inherit" | "standard" | "fast";

@@ -741,3 +741,17 @@
 - 执行相关定向测试、Python 全量测试、编译检查和补丁检查；不自动重启用户服务。
 
 验收：现有 Prompt 无需修改即可获得与升级前一致的环境变量结果；Jinja 条件可以稳定渲染且不能读取文件或二次执行变量内容；`REVIEW_AUTO_MERGE=true` 保持当前自动合并流程，其他情况只完成审核与评论；渲染后的 Prompt 只包含所选策略；预览和执行行为一致。
+
+## 阶段六十七：Codex 模型基座与 Teamwork 内嵌 Agent 运行时
+
+- 在 `runtime.codex` 增加默认值为 `cli` 的 `execution_mode` 枚举，并在运行时配置页面增加“Codex 仅作为模型基座”开关；关闭保持当前 `codex exec` 行为，开启选择 Teamwork 内嵌运行器。
+- 从 `codex-api-service` 迁移并收敛必要的 Codex OAuth 凭据加载、刷新、上游 Responses SSE 和函数调用解析代码；不依赖、启动或请求现有服务的 HTTP API，不迁移兼容 API、账户池和管理功能。
+- 实现内嵌模型回合循环，传递模型、reasoning、verbosity、fast mode、输出 Schema 和选中 Skill 指令，累计 Responses 输出与 `function_call_output`，归并最终文本与用量并限制最大工具轮次。
+- 实现 Teamwork 自有 `execute_command`、`apply_patch`、`invoke_agent` 工具；约束工作目录和补丁路径，限制输出大小，直接复用既有 sub-agent 白名单、深度、循环、幂等、并发、工作区和取消语义。
+- 对 `read-only` 与 `workspace-write` 的每个工具子进程强制套用 Teamwork 托管沙盒，并在能力不可用时失败关闭；`danger-full-access` 维持管理员显式直启语义。保持网络域名策略、临时 HOME、凭据隔离和跨平台进程树清理。
+- 将模型回合与工具生命周期接入现有结构化日志、脱敏、Agent 总超时、无进展超时、页面取消、最终结果和 Token 用量；内嵌模式失败时禁止静默回退 CLI。
+- 更新 README、配置示例、类型定义和前端说明，明确两种运行器边界、内嵌模式不提供 Codex CLI 内置工具或用户 MCP，以及 Codex 登录态和模型配置要求。
+- 补充配置兼容、OAuth、SSE、函数调用循环、Skill、命令、补丁、sub-agent、输出 Schema、日志脱敏、取消和超时测试；覆盖 macOS、Linux/WSL 与原生 Windows 的 shell、路径、沙盒和进程终止构造。
+- 执行 Python 定向与全量测试、编译检查、前端生产构建和补丁检查；不自动启动或重启用户服务。按用户授权生成规范提交并推送当前分支。
+
+验收：默认配置和既有部署继续使用完全相同的 Codex CLI 运行时；开启开关后不再启动 `codex exec` 或请求本地 `codex-api-service`，Teamwork 可用现有 Codex 登录态直接完成模型请求、命令、补丁和白名单 sub-agent 多轮调用；受限 Agent 的全部本地执行均进入三平台托管沙盒且不能越过工作区权限，OAuth 凭据不进入工具环境或日志；取消、超时、结果、用量和输出 Schema 行为不回归；测试、构建和静态检查通过。
