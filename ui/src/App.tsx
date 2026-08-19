@@ -5045,8 +5045,12 @@ function eventStatusExplanation(event: EventRecord): string {
   return "事件处理流程已结束，本次没有产生 Agent 调度或本地 CI 记录。";
 }
 
-function drawerLayerStyle(depth: number): { zIndex: number } {
-  return { zIndex: 80 + depth * 2 };
+function drawerLayerStyle(depth: number): { zIndex: number; "--drawer-width": string } {
+  const width = Math.max(44, 60 - depth * 4);
+  return {
+    zIndex: 80 + depth * 2,
+    "--drawer-width": `${width}vw`,
+  };
 }
 
 function ChangeRequestDetailDrawer(props: {
@@ -5535,7 +5539,7 @@ function AgentRunDetailDrawer(props: {
     <>
       <div className="run-drawer-layer" style={drawerLayerStyle(props.depth ?? 0)}>
           <button className="run-drawer-backdrop" aria-label="关闭运行详情" onClick={closeDrawer} />
-          <aside className="run-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
+          <aside className="run-drawer layered-detail-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
             <header className="run-drawer-head">
               <div>
                 <span className="eyebrow">{detail?.run_id ?? selectedId}</span>

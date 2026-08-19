@@ -577,7 +577,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-drawer-tabs button.active::after { background: var(--accent); }
 .run-drawer-tabs span { margin-left: 4px; padding: 1px 5px; border-radius: 8px; background: #182333; color: #8493a8; font-size: 8px; }
 .run-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 18px 24px 24px; }
-.event-detail-drawer { width: min(720px, 82vw); }
+.layered-detail-drawer { width: var(--drawer-width, 60vw); }
+.event-detail-drawer { width: var(--drawer-width, 60vw); }
 .event-detail-body { display: flex; flex-direction: column; gap: 13px; }
 .event-detail-section { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #0c1420; }
 .event-detail-section-title { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 12px; }
