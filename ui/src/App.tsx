@@ -3016,7 +3016,7 @@ function RepositoryDetailEditor(props: {
               </div>
               <div className="repository-preflight-cache-option">
                 <Toggle
-                  label={preflight.publish_failure_comment ? "失败时发布 PR 评论" : "失败时不发布 PR 评论"}
+                  label="失败时发布 PR 评论"
                   checked={preflight.publish_failure_comment}
                   onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
                 />
