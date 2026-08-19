@@ -183,6 +183,10 @@ def _apply_activity(
 ) -> tuple[ChangeRequestSnapshot, str, tuple[str, ...], Any, Any] | None:
     """把一条离散活动应用到事件发生时的中间快照。"""
 
+    if activity.type == "closed" and before.state == "merged":
+        # GitHub 会在 merged 后追加自动 closed；合并终态不能被降级。
+        return None
+
     occurred_at = activity.occurred_at or current.updated_at
     updates: dict[str, Any] = {"updated_at": occurred_at}
     event_type: str

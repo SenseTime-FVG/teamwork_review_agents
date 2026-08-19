@@ -186,6 +186,47 @@ def test_timeline_recovers_close_and_reopen_between_snapshots(snapshot_factory) 
     assert [item.id for item in events] == [item.id for item in repeated]
 
 
+def test_first_seen_merge_ignores_following_automatic_close(snapshot_factory) -> None:
+    """GitHub 合并后的自动关闭不能降级终态或重复产生合并事件。"""
+
+    current = snapshot_factory(
+        state="merged",
+        created_at="2026-08-17T08:00:00Z",
+        updated_at="2026-08-17T08:00:02Z",
+    )
+    activities = (
+        ChangeRequestActivity(
+            id="timeline-merged",
+            type="merged",
+            occurred_at="2026-08-17T08:00:01Z",
+        ),
+        ChangeRequestActivity(
+            id="timeline-automatic-closed",
+            type="closed",
+            occurred_at="2026-08-17T08:00:01Z",
+        ),
+    )
+
+    events = detect_first_seen_events(
+        current,
+        activities,
+        event_window_start=datetime(2026, 8, 17, 7, 59, tzinfo=UTC),
+        emit_discovered=True,
+        batch_id="scan-merge",
+    )
+
+    assert [item.type for item in events] == [
+        "change_request.discovered",
+        "change_request.opened",
+        "change_request.updated",
+        "change_request.merged",
+        "change_request.updated",
+    ]
+    assert sum(item.type == "change_request.merged" for item in events) == 1
+    assert all(item.type != "change_request.closed" for item in events)
+    assert events[-1].new.state == "merged"
+
+
 def test_timeline_commits_and_snapshot_only_fields_are_combined(snapshot_factory) -> None:
     """Timeline 提交与快照中的审批变化应同时产生且不重复。"""
 
