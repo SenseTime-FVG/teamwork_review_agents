@@ -430,6 +430,13 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
                 "id": "resp_1",
                 "output": [
                     {
+                        "id": "msg_1",
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "先检查命令"}
+                        ],
+                    },
+                    {
                         "type": "function_call",
                         "call_id": "call_1",
                         "name": "execute_command",
@@ -443,6 +450,7 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
                 "id": "resp_2",
                 "output": [
                     {
+                        "id": "msg_2",
                         "type": "message",
                         "content": [{"type": "output_text", "text": "工具验证完成"}],
                     }
@@ -450,9 +458,10 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
                 "usage": {"input_tokens": 3, "output_tokens": 4},
             }
         if event_callback is not None:
-            await event_callback(
-                {"type": "response.output_item.done", "item": response["output"][0]}
-            )
+            for item in response["output"]:
+                await event_callback(
+                    {"type": "response.output_item.done", "item": item}
+                )
             await event_callback(
                 {
                     "type": "response.completed",
@@ -497,7 +506,15 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
     ]
     assert len(outputs) == 1
     assert "model-tool" in outputs[0]["output"]
-    assert any(event_type == "item.completed" for _, event_type, _ in logs)
+    agent_messages = [
+        payload["item"]["text"]
+        for _, event_type, payload in logs
+        if event_type == "item.completed"
+        and isinstance(payload, dict)
+        and isinstance(payload.get("item"), dict)
+        and payload["item"].get("type") == "agent_message"
+    ]
+    assert agent_messages == ["先检查命令", "工具验证完成"]
     assert sum(event_type == "thread.started" for _, event_type, _ in logs) == 1
     assert all(not event_type.startswith("response.") for _, event_type, _ in logs)
     assert [
@@ -506,6 +523,7 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
         if str(event.get("type", "")).startswith("response.")
     ] == [
         "response.created",
+        "response.output_item.done",
         "response.output_item.done",
         "response.completed",
         "response.created",

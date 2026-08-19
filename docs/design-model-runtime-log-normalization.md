@@ -6,8 +6,8 @@ Codex CLI 会直接输出 `thread.started`、`item.started`、`item.completed` �
 
 ## 设计
 
-模型基座运行器继续用 Responses SSE 为无进展看门狗续期，并把经过脱敏和裁剪的协议事件保存在 `AgentResult.events` 中，供结果诊断和审计使用。运行日志只写统一的 Agent 语义事件：第一个 `response.created` 转换为一次 `thread.started`；Teamwork 工具执行沿用 `item.started` 与 `item.completed`；最终模型文本转换为 `item.completed / agent_message`；用量转换为 `turn.completed`；失败继续转换为安全的 `error`。
+模型基座运行器继续用 Responses SSE 为无进展看门狗续期，并把经过脱敏和裁剪的协议事件保存在 `AgentResult.events` 中，供结果诊断和审计使用。运行日志只写统一的 Agent 语义事件：第一个 `response.created` 转换为一次 `thread.started`；每个 `response.output_item.done / message` 在到达时立即转换为 `item.completed / agent_message`；Teamwork 工具执行沿用 `item.started` 与 `item.completed`；用量转换为 `turn.completed`；失败继续转换为安全的 `error`。
 
-一个 Agent 运行可能因为函数工具循环产生多个 Responses 请求，但只展示一次逻辑会话创建事件，避免把每个模型回合误表示为新的 Agent 会话。最终运行详情继续保存最后一个有效 Response ID，保持现有接口兼容。
+一个 Agent 运行可能因为函数工具循环产生多个 Responses 请求，但只展示一次逻辑会话创建事件，避免把每个模型回合误表示为新的 Agent 会话。每轮单独记录已实时转换的模型消息；回合完成后仅在 SSE 没有提供对应消息时补写最终 Agent 消息，防止最终输出重复。这样模型在工具调用前后的阶段性说明也能在运行过程中出现，而不必等待整个 Agent 结束。最终运行详情继续保存最后一个有效 Response ID，保持现有接口兼容。
 
 前端消息展示对历史运行做兼容：所有 `response.*` 底层协议日志不再生成消息卡片，消息页签数量按归一化后的可见消息计算。历史记录的原始日志仍保存在后端，不执行数据库迁移或删除；CLI 模式和其他系统、工具、文件、命令消息不受影响。

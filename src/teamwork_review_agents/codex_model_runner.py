@@ -499,6 +499,8 @@ class CodexModelRunner:
         events: list[dict[str, Any]] = []
         response_id: str | None = None
         thread_started = False
+        round_message_keys: set[str] = set()
+        round_message_parts: list[str] = []
 
         await emit(
             "system",
@@ -523,6 +525,24 @@ class CodexModelRunner:
                 if created_id and not thread_started:
                     thread_started = True
                     await emit("stdout", "thread.started", {"thread_id": created_id})
+            if event_type == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict):
+                    message_text = _response_item_text(item)
+                    message_key = str(item.get("id") or message_text)
+                    if message_text and message_key not in round_message_keys:
+                        round_message_keys.add(message_key)
+                        round_message_parts.append(message_text)
+                        message_event = {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": message_text,
+                            },
+                        }
+                        if len(events) < self.config.runtime.max_jsonl_events:
+                            events.append(redactor.data(message_event))
+                        await emit("stdout", "item.completed", message_event)
             if event_type in {
                 "response.created",
                 "response.output_item.done",
@@ -552,6 +572,8 @@ class CodexModelRunner:
                 payload["service_tier"] = "priority"
             if text_config:
                 payload["text"] = text_config
+            round_message_keys.clear()
+            round_message_parts.clear()
             response = await client.create_response(
                 payload,
                 event_callback=receive_event,
@@ -575,13 +597,14 @@ class CodexModelRunner:
                     raise RuntimeError("Codex 模型回合没有返回最终消息或函数调用")
                 if schema is not None:
                     _validate_output_schema(final_message, schema)
-                final_event = {
-                    "type": "item.completed",
-                    "item": {"type": "agent_message", "text": final_message},
-                }
-                if len(events) < self.config.runtime.max_jsonl_events:
-                    events.append(redactor.data(final_event))
-                await emit("stdout", "item.completed", final_event)
+                if final_message != "".join(round_message_parts):
+                    final_event = {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": final_message},
+                    }
+                    if len(events) < self.config.runtime.max_jsonl_events:
+                        events.append(redactor.data(final_event))
+                    await emit("stdout", "item.completed", final_event)
                 await emit("stdout", "turn.completed", {"usage": usage})
                 return AgentResult(
                     run_id=run_id,
@@ -814,18 +837,27 @@ def _response_text(response: dict[str, Any]) -> str:
     if not isinstance(output, list):
         return ""
     for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if isinstance(item, dict):
+            parts.append(_response_item_text(item))
+    return "".join(parts)
+
+
+def _response_item_text(item: dict[str, Any]) -> str:
+    """从 Responses message item 中提取可展示的 Agent 文本。"""
+
+    if item.get("type") != "message":
+        return ""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
             continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") in {"output_text", "text"} and isinstance(
-                block.get("text"), str
-            ):
-                parts.append(block["text"])
+        if block.get("type") in {"output_text", "text"} and isinstance(
+            block.get("text"), str
+        ):
+            parts.append(block["text"])
     return "".join(parts)
 
 
