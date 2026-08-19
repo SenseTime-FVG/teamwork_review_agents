@@ -286,8 +286,10 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .repository-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
 .repository-detail-form { padding: 22px; }
 .repository-detail-card { margin: 0; }
+.repository-detail-config-group { min-width: 0; margin: 0; padding: 0; border: 0; }
 .repository-preflight-section { margin-top: 18px; padding: 16px; border: 1px solid #294052; border-radius: 9px; background: #09131d; }
 .repository-preflight-head, .repository-preflight-steps-head, .repository-preflight-step-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.repository-preflight-head-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 12px; }
 .repository-preflight-head strong, .repository-preflight-steps-head strong { color: var(--bright); font-size: 12px; }
 .repository-preflight-head p, .repository-preflight-steps-head p { margin: 5px 0 0; color: #6e7d91; font-size: 10px; line-height: 1.55; }
 .repository-preflight-content { margin-top: 16px; padding-top: 16px; border-top: 1px solid #233446; }
@@ -802,6 +804,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .agent-detail-actions .button { flex: 1; }
   .agent-detail-form, .rule-detail-form { padding: 16px; }
   .repository-detail-form { padding: 16px; }
+  .repository-preflight-head { flex-direction: column; }
+  .repository-preflight-head-actions { width: 100%; flex-wrap: wrap; justify-content: space-between; }
   .repository-preflight-cache-option { grid-template-columns: 1fr; align-items: start; }
   .repository-reference-warning { flex-direction: column; gap: 6px; }
   .overview-section-tools { width: 100%; flex-direction: column; align-items: stretch; }

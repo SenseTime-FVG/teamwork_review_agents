@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import {
   api,
   getToken,
@@ -2874,6 +2875,8 @@ function RepositoryDetailEditor(props: {
   document: ConfigDocument;
   repositoryIndex: number;
   creating: boolean;
+  disabled: boolean;
+  preflightAction?: ReactNode;
   onIdChange: (repositoryId: string) => void;
   onChange: (document: ConfigDocument) => void;
 }) {
@@ -2941,100 +2944,108 @@ function RepositoryDetailEditor(props: {
   return (
     <section className="section-card repository-detail-form">
       <article className="sub-card repository-detail-card">
-        <div className="sub-card-head">
-          <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
-          <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
-        </div>
-        <div className="form-grid two">
-          {props.creating ? (
-            <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
-          ) : (
+        <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+          <div className="sub-card-head">
+            <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
+            <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
+          </div>
+          <div className="form-grid two">
+            {props.creating ? (
+              <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
+            ) : (
+              <label className="field">
+                <span>仓库 ID</span>
+                <input value={repository.id} disabled />
+                <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
+              </label>
+            )}
             <label className="field">
-              <span>仓库 ID</span>
-              <input value={repository.id} disabled />
-              <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
+              <span>所属 GitHub / GitLab 连接</span>
+              <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
+                {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
+              </select>
+              <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
             </label>
-          )}
-          <label className="field">
-            <span>所属 GitHub / GitLab 连接</span>
-            <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
-              {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
-            </select>
-            <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
-          </label>
-          <Field
-            label="远端仓库地址 / 项目路径"
-            value={repository.clone_url ?? repository.project}
-            onChange={(project) => update({ project, clone_url: undefined })}
-            placeholder="git@github.com:owner/repository.git"
-            help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后自动解析平台项目路径"
-          />
-          <Field
-            label="基础 Git 仓库目录（自动管理）"
-            value={repository.workspace}
-            onChange={(workspace) => update({ workspace })}
-            help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
-          />
-        </div>
+            <Field
+              label="远端仓库地址 / 项目路径"
+              value={repository.clone_url ?? repository.project}
+              onChange={(project) => update({ project, clone_url: undefined })}
+              placeholder="git@github.com:owner/repository.git"
+              help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后自动解析平台项目路径"
+            />
+            <Field
+              label="基础 Git 仓库目录（自动管理）"
+              value={repository.workspace}
+              onChange={(workspace) => update({ workspace })}
+              help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
+            />
+          </div>
+        </fieldset>
         <section className="repository-preflight-section">
           <div className="repository-preflight-head">
             <div>
               <strong>本地 CI 门禁</strong>
               <p>声明此仓库可执行的本地 CI，当前仅支持 GitHub。只有明确选择“执行仓库 CI”的触发规则才会使用；未配置时对应 Agent 仍会直接运行。</p>
             </div>
-            <Toggle label={preflight.enabled ? "已启用" : "未启用"} checked={preflight.enabled} onChange={togglePreflight} />
+            <div className="repository-preflight-head-actions">
+              {props.preflightAction}
+              <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+                <Toggle label={preflight.enabled ? "已启用" : "未启用"} checked={preflight.enabled} onChange={togglePreflight} />
+              </fieldset>
+            </div>
           </div>
           {preflight.enabled && (
-            <div className="repository-preflight-content">
-              <div className="form-grid three">
-                <Field
-                  label="GitHub 状态名称"
-                  value={preflight.status_context}
-                  onChange={(status_context) => updatePreflight({ status_context })}
-                  help="建议同时配置为仓库 Ruleset 的 required status check"
-                />
-                <Field
-                  label="CI 总超时（秒）"
-                  type="number"
-                  value={preflight.timeout_seconds}
-                  onChange={(value) => updatePreflight({ timeout_seconds: Number(value) })}
-                />
-                <Field
-                  label="最大日志字节数"
-                  type="number"
-                  value={preflight.max_output_bytes}
-                  onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
-                />
-              </div>
-              <div className="repository-preflight-cache-option">
-                <Toggle
-                  label={preflight.cache_enabled ? "仓库级依赖缓存已启用" : "仓库级依赖缓存已停用"}
-                  checked={preflight.cache_enabled}
-                  onChange={(cache_enabled) => updatePreflight({ cache_enabled })}
-                />
-                <p>同一仓库的不同分支和 MR / PR 共享下载缓存；每次 CI 的工作区与安装结果仍保持隔离。覆盖 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer 和常见浏览器缓存。</p>
-              </div>
-              <div className="repository-preflight-cache-option">
-                <Toggle
-                  label="失败时发布 PR 评论"
-                  checked={preflight.publish_failure_comment}
-                  onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
-                />
-                <p>仅自动 MR / PR CI 失败、超时或异常时创建或更新同一条评论；后续通过后删除。成功结果和手动仓库 CI 不发布评论。</p>
-              </div>
-              <div className="repository-preflight-steps-head">
-                <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
-                <button
-                  type="button"
-                  className="button secondary compact"
-                  onClick={() => updatePreflight({
-                    steps: [...preflight.steps, { name: `step-${preflight.steps.length + 1}`, command: ["bash", "ci/preflight.sh"] }],
-                  })}
-                >+ 添加步骤</button>
-              </div>
-              <div className="repository-preflight-steps">
-                {preflight.steps.map((step, index) => (
-                  <article className="repository-preflight-step" key={index}>
+            <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+              <div className="repository-preflight-content">
+                <div className="form-grid three">
+                  <Field
+                    label="GitHub 状态名称"
+                    value={preflight.status_context}
+                    onChange={(status_context) => updatePreflight({ status_context })}
+                    help="建议同时配置为仓库 Ruleset 的 required status check"
+                  />
+                  <Field
+                    label="CI 总超时（秒）"
+                    type="number"
+                    value={preflight.timeout_seconds}
+                    onChange={(value) => updatePreflight({ timeout_seconds: Number(value) })}
+                  />
+                  <Field
+                    label="最大日志字节数"
+                    type="number"
+                    value={preflight.max_output_bytes}
+                    onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
+                  />
+                </div>
+                <div className="repository-preflight-cache-option">
+                  <Toggle
+                    label={preflight.cache_enabled ? "仓库级依赖缓存已启用" : "仓库级依赖缓存已停用"}
+                    checked={preflight.cache_enabled}
+                    onChange={(cache_enabled) => updatePreflight({ cache_enabled })}
+                  />
+                  <p>同一仓库的不同分支和 MR / PR 共享下载缓存；每次 CI 的工作区与安装结果仍保持隔离。覆盖 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer 和常见浏览器缓存。</p>
+                </div>
+                <div className="repository-preflight-cache-option">
+                  <Toggle
+                    label="失败时发布 PR 评论"
+                    checked={preflight.publish_failure_comment}
+                    onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
+                  />
+                  <p>仅自动 MR / PR CI 失败、超时或异常时创建或更新同一条评论；后续通过后删除。成功结果和手动仓库 CI 不发布评论。</p>
+                </div>
+                <div className="repository-preflight-steps-head">
+                  <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
+                  <button
+                    type="button"
+                    className="button secondary compact"
+                    onClick={() => updatePreflight({
+                      steps: [...preflight.steps, { name: `step-${preflight.steps.length + 1}`, command: ["bash", "ci/preflight.sh"] }],
+                    })}
+                  >+ 添加步骤</button>
+                </div>
+                <div className="repository-preflight-steps">
+                  {preflight.steps.map((step, index) => (
+                    <article className="repository-preflight-step" key={index}>
                     <div className="repository-preflight-step-title">
                       <strong>步骤 {index + 1}</strong>
                       <div className="button-group">
@@ -3072,20 +3083,23 @@ function RepositoryDetailEditor(props: {
                       />
                       <small>每一行作为一个独立参数；例如 bash + ci/preflight.sh 等价于执行仓库脚本。</small>
                     </label>
-                  </article>
-                ))}
-                {preflight.steps.length === 0 && <div className="choice-empty">启用本地 CI 时至少需要添加一个命令步骤。</div>}
+                    </article>
+                  ))}
+                  {preflight.steps.length === 0 && <div className="choice-empty">启用本地 CI 时至少需要添加一个命令步骤。</div>}
+                </div>
               </div>
-            </div>
+            </fieldset>
           )}
         </section>
-        <EnvironmentEditor
-          compact
-          title="仓库环境变量"
-          value={repository.environment ?? {}}
-          protectedNames={protectedNames}
-          onChange={(environment) => update({ environment })}
-        />
+        <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+          <EnvironmentEditor
+            compact
+            title="仓库环境变量"
+            value={repository.environment ?? {}}
+            protectedNames={protectedNames}
+            onChange={(environment) => update({ environment })}
+          />
+        </fieldset>
       </article>
     </section>
   );
@@ -3503,25 +3517,6 @@ function RepositoriesView(props: {
             <>
               <button
                 type="button"
-                className="button secondary"
-                disabled={
-                  startingPreflight
-                  || gitActive
-                  || originalRepository?.enabled === false
-                  || !originalRepository?.preflight?.enabled
-                  || !originalRepository?.preflight?.steps?.length
-                }
-                title={
-                  originalRepository?.enabled === false
-                    ? "请先启用仓库"
-                    : !originalRepository?.preflight?.enabled
-                      ? "请先配置并启用本地 CI"
-                      : "不限时执行远端默认分支最新提交，用于验证 CI 并预热仓库级缓存"
-                }
-                onClick={() => { void startManualPreflight(); }}
-              >{startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
-              <button
-                type="button"
                 className="button danger"
                 disabled={gitActive || referencingRules.length > 0}
                 title={gitActive ? "仓库正在执行 Git 操作" : referencingRules.length > 0 ? `仍被规则引用：${referencingRules.map((rule) => rule.name).join("、")}` : "删除仓库配置"}
@@ -3538,17 +3533,37 @@ function RepositoriesView(props: {
           <span>仍被触发规则引用：{referencingRules.map((rule) => rule.name).join("、")}。请先修改这些规则的仓库范围。</span>
         </div>
       )}
-      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving || gitActive}>
-        {activeRepository && (
-          <RepositoryDetailEditor
-            document={activeDocument}
-            repositoryIndex={detailIndex}
-            creating={creating}
-            onIdChange={setDraftId}
-            onChange={setDraftDocument}
-          />
-        )}
-      </fieldset>
+      {activeRepository && (
+        <RepositoryDetailEditor
+          document={activeDocument}
+          repositoryIndex={detailIndex}
+          creating={creating}
+          disabled={!editing || saving || gitActive}
+          preflightAction={!editing ? (
+            <button
+              type="button"
+              className="button secondary"
+              disabled={
+                startingPreflight
+                || gitActive
+                || originalRepository?.enabled === false
+                || !originalRepository?.preflight?.enabled
+                || !originalRepository?.preflight?.steps?.length
+              }
+              title={
+                originalRepository?.enabled === false
+                  ? "请先启用仓库"
+                  : !originalRepository?.preflight?.enabled
+                    ? "请先配置并启用本地 CI"
+                    : "不限时执行远端默认分支最新提交，用于验证 CI 并预热仓库级缓存"
+              }
+              onClick={() => { void startManualPreflight(); }}
+            >{startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
+          ) : undefined}
+          onIdChange={setDraftId}
+          onChange={setDraftDocument}
+        />
+      )}
       {creating ? (
         <section className="section-card repository-workspace-manager">
           <div className="section-title-row"><div><h2>基础仓库状态</h2><p>保存仓库配置后才能初始化基础 Git 仓库。</p></div></div>
