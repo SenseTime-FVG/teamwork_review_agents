@@ -177,6 +177,9 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_change_request
                 ON preflight_runs(repository_id, number, head_sha);
 
+                CREATE INDEX IF NOT EXISTS idx_preflight_runs_event_started
+                ON preflight_runs(event_id, started_at DESC);
+
                 CREATE TABLE IF NOT EXISTS run_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL,
@@ -1958,6 +1961,10 @@ class StateStore:
                            AS source_activity_type,
                        json_extract(event_inbox.payload, '$.source_occurred_at')
                            AS source_occurred_at,
+                       preflight.status AS preflight_status,
+                       preflight.failed_step AS preflight_failed_step,
+                       preflight.error AS preflight_error,
+                       preflight.status_published AS preflight_status_published,
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
@@ -2001,6 +2008,14 @@ class StateStore:
                     GROUP BY dispatch.event_id
                 ) AS dispatch_stats
                     ON dispatch_stats.event_id = event_inbox.event_id
+                LEFT JOIN preflight_runs AS preflight
+                    ON preflight.run_id = (
+                        SELECT candidate.run_id
+                        FROM preflight_runs AS candidate
+                        WHERE candidate.event_id = event_inbox.event_id
+                        ORDER BY candidate.started_at DESC, candidate.run_id DESC
+                        LIMIT 1
+                    )
                 {where}
                 ORDER BY julianday(
                              json_extract(event_inbox.payload, '$.occurred_at')

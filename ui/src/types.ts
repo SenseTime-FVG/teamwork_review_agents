@@ -411,6 +411,10 @@ export type EventRecord = {
   source_activity_id?: string | null;
   source_activity_type?: string | null;
   source_occurred_at?: string | null;
+  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | null;
+  preflight_failed_step?: string | null;
+  preflight_error?: string | null;
+  preflight_status_published?: number | boolean | null;
   created_at: number;
   updated_at: number;
 };

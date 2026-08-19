@@ -563,12 +563,16 @@ class Orchestrator:
                     for invocation in direct_invocations
                     for event in invocation.events
                 ]
-                matched_event_ids.update(item[0] for item in direct_dispatches)
-                await asyncio.to_thread(
-                    self.store.record_event_dispatches,
-                    tuple(event.id for event in claimed_events),
-                    direct_dispatches,
+                direct_event_ids = tuple(
+                    dict.fromkeys(item[0] for item in direct_dispatches)
                 )
+                if direct_event_ids:
+                    matched_event_ids.update(direct_event_ids)
+                    await asyncio.to_thread(
+                        self.store.record_event_dispatches,
+                        direct_event_ids,
+                        direct_dispatches,
+                    )
                 task_items.extend(
                     (invocation, asyncio.create_task(self._run_agent(invocation)))
                     for invocation in direct_invocations
@@ -705,6 +709,11 @@ class Orchestrator:
                     continue
                 error = "; ".join(errors_by_event[event.id]) or None
                 if event.id not in matched_event_ids and error is None:
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="unmatched",
+                    )
                     await asyncio.to_thread(
                         self.store.cleanup_terminal_transient_event,
                         event.id,

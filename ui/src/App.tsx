@@ -4614,9 +4614,28 @@ function EventStatusPill({ event }: { event: EventRecord }) {
     failed: "处理失败",
     cancelled: "已取消",
   };
+  let label = labels[event.status] ?? event.status;
+  let visualStatus = event.status;
+  if (event.error?.includes("状态回写失败")) {
+    label = "状态回写失败";
+    visualStatus = "failed";
+  } else if (event.status === "processing" && event.preflight_status === "running") {
+    label = "本地 CI 中";
+  } else if (event.status === "completed" && event.preflight_status === "failure") {
+    label = "本地 CI 未通过";
+    visualStatus = "failed";
+  } else if (event.status === "completed" && event.preflight_status === "timed_out") {
+    label = "本地 CI 超时";
+    visualStatus = "failed";
+  } else if (event.status === "failed" && event.preflight_status === "error") {
+    label = "本地 CI 异常";
+  }
+  const details = event.error
+    ?? event.preflight_error
+    ?? (event.preflight_failed_step ? `失败步骤：${event.preflight_failed_step}` : undefined);
   return (
-    <span className={`status-pill status-${event.status}`}>
-      {labels[event.status] ?? event.status}
+    <span className={`status-pill status-${visualStatus}`} title={details}>
+      {label}
       {event.status === "pending" && queueReasonLabel(event.queue_reason)
         ? ` · ${queueReasonLabel(event.queue_reason)}`
         : ""}

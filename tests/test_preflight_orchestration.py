@@ -187,6 +187,69 @@ async def test_successful_preflight_allows_matching_review_agents(
     assert summary.agent_runs == 1
 
 
+async def test_matching_event_stays_processing_while_preflight_is_running(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """等待本地 CI 的匹配事件不能提前显示为未触发。"""
+
+    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
+    event = enqueue_discovered(orchestrator, snapshot_factory)
+    agents = FakeAgentExecutor()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class WaitingRecordedPreflightExecutor:
+        async def ensure_passed(self, current_event):
+            reservation = orchestrator.store.begin_preflight_run(
+                proposed_run_id="preflight-waiting",
+                idempotency_key="demo:7:waiting-preflight",
+                event_id=current_event.id,
+                repository_id=current_event.repository_id,
+                number=current_event.number,
+                head_sha=current_event.new.head_sha,
+                config_revision=orchestrator.config.revision,
+                max_attempts=2,
+            )
+            assert reservation is not None
+            started.set()
+            await release.wait()
+            completed = PreflightResult(
+                run_id=reservation.run_id,
+                repository_id=current_event.repository_id,
+                number=current_event.number,
+                head_sha=current_event.new.head_sha,
+                status="success",
+                status_published=True,
+            )
+            orchestrator.store.finish_preflight_run(completed)
+            return completed
+
+    orchestrator.executor = agents
+    orchestrator.preflight = WaitingRecordedPreflightExecutor()
+    summary = CycleSummary()
+    processing = asyncio.create_task(orchestrator.process_events(summary))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    record = next(
+        item for item in orchestrator.store.list_events() if item["event_id"] == event.id
+    )
+    assert record["status"] == "processing"
+    assert record["preflight_status"] == "running"
+    assert record["trigger_count"] == 0
+
+    release.set()
+    await asyncio.wait_for(processing, timeout=1)
+
+    completed = next(
+        item for item in orchestrator.store.list_events() if item["event_id"] == event.id
+    )
+    assert completed["status"] == "completed"
+    assert completed["preflight_status"] == "success"
+    assert completed["trigger_count"] == 1
+    assert agents.calls == ["reviewer"]
+
+
 async def test_rule_without_preflight_does_not_wait_for_enabled_repository_ci(
     tmp_path,
     snapshot_factory,

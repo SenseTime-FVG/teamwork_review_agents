@@ -914,6 +914,55 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert changed.run_id == "preflight-2"
 
 
+def test_event_list_exposes_linked_preflight_summary(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """事件列表只暴露关联 CI 摘要，不携带完整命令输出。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store.save_snapshot_and_events(snapshot, [event])
+    assert store.claim_event(event.id, max_attempts=2) is True
+    reservation = store.begin_preflight_run(
+        proposed_run_id="preflight-event-summary",
+        idempotency_key="demo:7:event-summary",
+        event_id=event.id,
+        repository_id="demo",
+        number=event.number,
+        head_sha=event.new.head_sha,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+
+    running = store.list_events()[0]
+    assert running["status"] == "processing"
+    assert running["preflight_status"] == "running"
+    assert running["preflight_failed_step"] is None
+
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id=reservation.run_id,
+            repository_id="demo",
+            number=event.number,
+            head_sha=event.new.head_sha,
+            status="failure",
+            failed_step="tests",
+            exit_code=1,
+            output="不应进入事件列表的完整输出",
+        )
+    )
+    failed = store.list_events()[0]
+    assert failed["preflight_status"] == "failure"
+    assert failed["preflight_failed_step"] == "tests"
+    assert failed["preflight_error"] is None
+    assert failed["preflight_status_published"] == 0
+    assert "output" not in failed
+
+
 def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
     """服务异常退出后的 CI 应转成 error，并允许按次数限制复用运行记录。"""
 
