@@ -180,6 +180,20 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_event_started
                 ON preflight_runs(event_id, started_at DESC);
 
+                CREATE TABLE IF NOT EXISTS event_preflight_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    reused INTEGER NOT NULL DEFAULT 0,
+                    linked_at REAL NOT NULL,
+                    UNIQUE(event_id, run_id),
+                    FOREIGN KEY(event_id) REFERENCES event_inbox(event_id) ON DELETE CASCADE,
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_preflight_links_event
+                ON event_preflight_links(event_id, linked_at DESC);
+
                 CREATE TABLE IF NOT EXISTS run_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL,
@@ -275,6 +289,18 @@ class StateStore:
                 "preflight_runs",
                 "status_published",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT preflight.event_id, preflight.run_id, 0,
+                       preflight.started_at
+                FROM preflight_runs AS preflight
+                JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                """
             )
             if cancel_source_added:
                 self._recover_legacy_shutdown_cancellations(connection)
@@ -1059,6 +1085,18 @@ class StateStore:
                         now,
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO event_preflight_links (
+                        event_id, run_id, reused, linked_at
+                    )
+                    SELECT ?, ?, 0, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM event_inbox WHERE event_id = ?
+                    )
+                    """,
+                    (event_id, proposed_run_id, now, event_id),
+                )
                 connection.commit()
                 return PreflightReservation(proposed_run_id, 1)
 
@@ -1076,8 +1114,58 @@ class StateStore:
                 """,
                 (attempts, event_id, now, row["run_id"]),
             )
+            connection.execute(
+                """
+                INSERT INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT ?, ?, 0, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM event_inbox WHERE event_id = ?
+                )
+                ON CONFLICT(event_id, run_id) DO UPDATE SET
+                    reused = 0,
+                    linked_at = excluded.linked_at
+                """,
+                (event_id, row["run_id"], now, event_id),
+            )
             connection.commit()
             return PreflightReservation(str(row["run_id"]), attempts)
+
+    def link_events_to_preflight(
+        self,
+        event_ids: Iterable[str],
+        run_id: str,
+        *,
+        reused: bool,
+    ) -> None:
+        """把一次新执行或复用的 CI 结果关联到当前匹配事件。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return
+        now = time.time()
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM event_inbox WHERE event_id = ?
+                ) AND EXISTS (
+                    SELECT 1 FROM preflight_runs WHERE run_id = ?
+                )
+                ON CONFLICT(event_id, run_id) DO UPDATE SET
+                    reused = excluded.reused,
+                    linked_at = excluded.linked_at
+                """,
+                [
+                    (event_id, run_id, int(reused), now, event_id, run_id)
+                    for event_id in ids
+                ],
+            )
 
     def load_preflight_result(self, idempotency_key: str) -> PreflightResult | None:
         """按幂等键读取当前 CI 结果。"""
@@ -1924,6 +2012,7 @@ class StateStore:
         *,
         status: str | None = None,
         repository_id: str | None = None,
+        event_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
 
@@ -1935,6 +2024,9 @@ class StateStore:
         if repository_id:
             conditions.append("event_inbox.repository_id = ?")
             parameters.append(repository_id)
+        if event_id:
+            conditions.append("event_inbox.event_id = ?")
+            parameters.append(event_id)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
@@ -1962,9 +2054,12 @@ class StateStore:
                        json_extract(event_inbox.payload, '$.source_occurred_at')
                            AS source_occurred_at,
                        preflight.status AS preflight_status,
+                       preflight.run_id AS preflight_run_id,
+                       preflight.exit_code AS preflight_exit_code,
                        preflight.failed_step AS preflight_failed_step,
                        preflight.error AS preflight_error,
                        preflight.status_published AS preflight_status_published,
+                       preflight_link.reused AS preflight_reused,
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
@@ -2008,14 +2103,16 @@ class StateStore:
                     GROUP BY dispatch.event_id
                 ) AS dispatch_stats
                     ON dispatch_stats.event_id = event_inbox.event_id
-                LEFT JOIN preflight_runs AS preflight
-                    ON preflight.run_id = (
-                        SELECT candidate.run_id
-                        FROM preflight_runs AS candidate
+                LEFT JOIN event_preflight_links AS preflight_link
+                    ON preflight_link.id = (
+                        SELECT candidate.id
+                        FROM event_preflight_links AS candidate
                         WHERE candidate.event_id = event_inbox.event_id
-                        ORDER BY candidate.started_at DESC, candidate.run_id DESC
+                        ORDER BY candidate.linked_at DESC, candidate.id DESC
                         LIMIT 1
                     )
+                LEFT JOIN preflight_runs AS preflight
+                    ON preflight.run_id = preflight_link.run_id
                 {where}
                 ORDER BY julianday(
                              json_extract(event_inbox.payload, '$.occurred_at')
@@ -2027,6 +2124,54 @@ class StateStore:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
+        """按需返回单个事件、Agent 调度和完整 CI 详情。"""
+
+        records = self.list_events(None, event_id=event_id)
+        if not records:
+            return None
+        with self.connect() as connection:
+            dispatch_rows = connection.execute(
+                """
+                SELECT dispatch.idempotency_key, dispatch.rule_name,
+                       dispatch.agent_name, dispatch.created_at,
+                       run.run_id, run.status AS run_status,
+                       run.error AS run_error, run.started_at,
+                       run.finished_at
+                FROM event_agent_dispatches AS dispatch
+                LEFT JOIN agent_runs AS run
+                    ON run.idempotency_key = dispatch.idempotency_key
+                WHERE dispatch.event_id = ?
+                ORDER BY dispatch.created_at, dispatch.rule_name,
+                         dispatch.agent_name
+                """,
+                (event_id,),
+            ).fetchall()
+            preflight_row = connection.execute(
+                """
+                SELECT preflight.run_id, preflight.repository_id,
+                       preflight.number, preflight.head_sha,
+                       preflight.config_revision, preflight.status,
+                       preflight.attempts, preflight.failed_step,
+                       preflight.exit_code, preflight.output,
+                       preflight.error, preflight.status_published,
+                       preflight.started_at, preflight.finished_at,
+                       link.reused, link.linked_at
+                FROM event_preflight_links AS link
+                JOIN preflight_runs AS preflight
+                    ON preflight.run_id = link.run_id
+                WHERE link.event_id = ?
+                ORDER BY link.linked_at DESC, link.id DESC
+                LIMIT 1
+                """,
+                (event_id,),
+            ).fetchone()
+        return {
+            **records[0],
+            "dispatches": [dict(row) for row in dispatch_rows],
+            "preflight": dict(preflight_row) if preflight_row is not None else None,
+        }
 
     def save_config_version(
         self,

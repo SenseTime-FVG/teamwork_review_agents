@@ -166,6 +166,50 @@ async def test_failed_preflight_completes_event_without_starting_review_agent(
     assert summary.agent_runs == 0
 
 
+async def test_reused_preflight_result_is_linked_to_current_event(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """复用 CI 时当前事件仍应能展示对应失败详情。"""
+
+    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
+    event = enqueue_discovered(orchestrator, snapshot_factory)
+    reservation = orchestrator.store.begin_preflight_run(
+        proposed_run_id="preflight-reused",
+        idempotency_key="demo:7:reused-preflight",
+        event_id=event.id,
+        repository_id=event.repository_id,
+        number=event.number,
+        head_sha=event.new.head_sha,
+        config_revision=orchestrator.config.revision,
+        max_attempts=2,
+    )
+    assert reservation is not None
+    reused = PreflightResult(
+        run_id=reservation.run_id,
+        repository_id=event.repository_id,
+        number=event.number,
+        head_sha=event.new.head_sha,
+        status="failure",
+        failed_step="tests",
+        exit_code=1,
+        output="断言失败",
+        status_published=True,
+        reused=True,
+    )
+    orchestrator.store.finish_preflight_run(reused)
+    orchestrator.executor = FakeAgentExecutor()
+    orchestrator.preflight = FakePreflightExecutor(reused)
+
+    await orchestrator.process_events(CycleSummary())
+
+    detail = orchestrator.store.get_event_detail(event.id)
+    assert detail is not None
+    assert detail["preflight"]["run_id"] == reservation.run_id
+    assert detail["preflight"]["reused"] == 1
+    assert detail["preflight"]["output"] == "断言失败"
+
+
 async def test_successful_preflight_allows_matching_review_agents(
     tmp_path,
     snapshot_factory,

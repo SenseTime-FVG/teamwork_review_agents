@@ -460,6 +460,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-opened { color: #7de5ad; border-color: #28553c; background: #10271b; }
 .status-closed { color: #a8b2c0; border-color: #3c4756; background: #171e27; }
 .status-merged { color: #c9a7ff; border-color: #564078; background: #241936; }
+.event-status-trigger { padding: 2px; border: 0; border-radius: 12px; background: transparent; color: inherit; cursor: pointer; }
+.event-status-trigger:hover .status-pill, .event-status-trigger:focus-visible .status-pill { border-color: #6e829d; box-shadow: 0 0 0 3px rgba(126, 151, 184, .1); }
+.event-status-trigger:focus-visible { outline: none; }
 
 .repository-workspace-manager { overflow: hidden; }
 .repository-workspace-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
@@ -560,6 +563,27 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-drawer-tabs button.active::after { background: var(--accent); }
 .run-drawer-tabs span { margin-left: 4px; padding: 1px 5px; border-radius: 8px; background: #182333; color: #8493a8; font-size: 8px; }
 .run-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 18px 24px 24px; }
+.event-detail-drawer { width: min(720px, 82vw); }
+.event-detail-body { display: flex; flex-direction: column; gap: 13px; }
+.event-detail-section { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #0c1420; }
+.event-detail-section-title { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 12px; }
+.event-detail-section-title h3 { margin: 4px 0 0; color: #d8e2ef; font-size: 14px; }
+.event-detail-section h4 { margin: 14px 0 8px; color: #93a3b7; font-size: 10px; }
+.event-detail-explanation { margin: 0 0 13px; padding: 11px 12px; border-left: 3px solid #47775d; border-radius: 6px; background: #0e1d17; color: #9fbead; font-size: 10px; line-height: 1.65; }
+.event-detail-empty { padding: 17px; border: 1px dashed #293648; border-radius: 8px; color: #66758a; text-align: center; font-size: 10px; }
+.event-detail-reused { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #4f4328; border-radius: 8px; background: #211b10; color: #e1bb76; font-size: 10px; line-height: 1.6; }
+.event-detail-count { display: inline-grid; min-width: 24px; height: 24px; place-items: center; border: 1px solid #344052; border-radius: 12px; background: #141c27; color: #9aa8b9; font-size: 9px; }
+.event-dispatch-list { display: flex; flex-direction: column; gap: 8px; }
+.event-dispatch-card { padding: 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: #09101a; }
+.event-dispatch-card header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.event-dispatch-card header strong, .event-dispatch-card header small { display: block; }
+.event-dispatch-card header strong { color: #c8d3e1; font-size: 11px; }
+.event-dispatch-card header small { margin-top: 4px; color: #65748a; font-size: 9px; }
+.event-dispatch-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 12px 0 0; }
+.event-dispatch-card dl div { min-width: 0; }
+.event-dispatch-card dt { color: #607087; font-size: 8px; }
+.event-dispatch-card dd { margin: 4px 0 0; overflow-wrap: anywhere; color: #9dacbf; font: 400 8px "SFMono-Regular", Consolas, monospace; }
+.event-dispatch-card .detail-pre { margin: 12px 0 0; }
 .detail-tabs details { border-bottom: 1px solid var(--line-soft); }
 .detail-tabs summary { padding: 13px 2px; color: #aebaca; cursor: pointer; font-size: 11px; }
 .detail-tabs summary span { float: right; color: #647287; }
@@ -779,6 +803,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .run-row-arrow { position: absolute; top: 50%; right: 10px; transform: translateY(-50%); }
   .run-row:hover .run-row-arrow { transform: translate(2px, -50%); }
   .run-drawer { width: 100%; border-left: 0; }
+  .event-detail-drawer { width: 100%; }
   .run-drawer-head { min-height: 95px; padding: 17px 15px 14px; }
   .run-drawer-head h2 { font-size: 17px; }
   .run-drawer-head .eyebrow, .run-drawer-head p { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -789,4 +814,5 @@ tbody tr:last-child td { border-bottom: 0; }
   .run-message-meta em { display: none; }
   .run-result-summary { grid-template-columns: 1fr; }
   .run-metadata div { grid-template-columns: 90px minmax(0, 1fr); }
+  .event-dispatch-card dl { grid-template-columns: 1fr; }
 }

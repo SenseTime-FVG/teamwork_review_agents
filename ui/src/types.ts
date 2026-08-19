@@ -412,9 +412,48 @@ export type EventRecord = {
   source_activity_type?: string | null;
   source_occurred_at?: string | null;
   preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | null;
+  preflight_run_id?: string | null;
+  preflight_exit_code?: number | null;
   preflight_failed_step?: string | null;
   preflight_error?: string | null;
   preflight_status_published?: number | boolean | null;
+  preflight_reused?: number | boolean | null;
   created_at: number;
   updated_at: number;
+};
+
+export type EventDispatchDetail = {
+  idempotency_key: string;
+  rule_name: string;
+  agent_name: string;
+  created_at: number;
+  run_id?: string | null;
+  run_status?: string | null;
+  run_error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+};
+
+export type EventPreflightDetail = {
+  run_id: string;
+  repository_id: string;
+  number: number;
+  head_sha: string;
+  config_revision: string;
+  status: "running" | "success" | "failure" | "timed_out" | "error";
+  attempts: number;
+  failed_step?: string | null;
+  exit_code?: number | null;
+  output: string;
+  error?: string | null;
+  status_published: number | boolean;
+  started_at: number;
+  finished_at?: number | null;
+  reused: number | boolean;
+  linked_at: number;
+};
+
+export type EventDetailRecord = EventRecord & {
+  dispatches: EventDispatchDetail[];
+  preflight?: EventPreflightDetail | null;
 };

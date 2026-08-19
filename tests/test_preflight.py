@@ -286,7 +286,9 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     second = await executor.ensure_passed(event)
 
     assert first.status == "success"
+    assert first.reused is False
     assert second.status == "success"
+    assert second.reused is True
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
     assert statuses == ["pending", "success"]

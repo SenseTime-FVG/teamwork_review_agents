@@ -552,6 +552,13 @@ class Orchestrator:
                     for invocation in invocations
                     if invocation.rule.run_preflight
                 ]
+                preflight_matched_event_ids = tuple(
+                    dict.fromkeys(
+                        event.id
+                        for invocation in preflight_invocations
+                        for event in invocation.events
+                    )
+                )
                 representative = claimed_events[0]
                 direct_dispatches = [
                     (
@@ -595,6 +602,12 @@ class Orchestrator:
                                 matched_event_ids.add(event.id)
                                 errors_by_event[event.id].append(str(exc))
                     else:
+                        await asyncio.to_thread(
+                            self.store.link_events_to_preflight,
+                            preflight_matched_event_ids,
+                            preflight_result.run_id,
+                            reused=preflight_result.reused,
+                        )
                         if preflight_result.status in {"failure", "timed_out"}:
                             summary.preflight_failures += 1
                             ready_preflight_invocations = []

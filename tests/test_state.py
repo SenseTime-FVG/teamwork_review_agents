@@ -941,6 +941,8 @@ def test_event_list_exposes_linked_preflight_summary(
     running = store.list_events()[0]
     assert running["status"] == "processing"
     assert running["preflight_status"] == "running"
+    assert running["preflight_run_id"] == reservation.run_id
+    assert running["preflight_reused"] == 0
     assert running["preflight_failed_step"] is None
 
     store.finish_preflight_run(
@@ -957,10 +959,36 @@ def test_event_list_exposes_linked_preflight_summary(
     )
     failed = store.list_events()[0]
     assert failed["preflight_status"] == "failure"
+    assert failed["preflight_exit_code"] == 1
     assert failed["preflight_failed_step"] == "tests"
     assert failed["preflight_error"] is None
     assert failed["preflight_status_published"] == 0
     assert "output" not in failed
+
+    detail = store.get_event_detail(event.id)
+    assert detail is not None
+    assert detail["dispatches"] == []
+    assert detail["preflight"]["output"] == "不应进入事件列表的完整输出"
+    assert detail["preflight"]["reused"] == 0
+
+    reused_event = create_manual_activity_event(
+        snapshot,
+        ChangeRequestActivity(
+            id="manual-reuse",
+            type="committed",
+            occurred_at="2026-08-18T10:00:00Z",
+        ),
+    )
+    store.save_snapshot_and_events(snapshot, [reused_event])
+    store.link_events_to_preflight(
+        [reused_event.id],
+        reservation.run_id,
+        reused=True,
+    )
+    reused_detail = store.get_event_detail(reused_event.id)
+    assert reused_detail is not None
+    assert reused_detail["preflight"]["run_id"] == reservation.run_id
+    assert reused_detail["preflight"]["reused"] == 1
 
 
 def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
@@ -998,3 +1026,36 @@ def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
     assert retried is not None
     assert retried.run_id == "preflight-1"
     assert retried.attempts == 2
+
+
+def test_initialize_backfills_legacy_event_preflight_links(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """升级旧数据库时应恢复原事件与 CI 运行的详情关联。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store.save_snapshot_and_events(snapshot, [event])
+    reservation = store.begin_preflight_run(
+        proposed_run_id="legacy-preflight",
+        idempotency_key="demo:7:legacy-preflight",
+        event_id=event.id,
+        repository_id="demo",
+        number=event.number,
+        head_sha=event.new.head_sha,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+    with store.connect() as connection:
+        connection.execute("DROP TABLE event_preflight_links")
+
+    store.initialize()
+
+    detail = store.get_event_detail(event.id)
+    assert detail is not None
+    assert detail["preflight"]["run_id"] == reservation.run_id
+    assert detail["preflight"]["reused"] == 0

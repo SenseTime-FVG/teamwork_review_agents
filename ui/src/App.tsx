@@ -20,6 +20,7 @@ import type {
   ConfigDocument,
   EnvironmentMap,
   EnvironmentVariable,
+  EventDetailRecord,
   EventRecord,
   ManualLatestEventBatchResponse,
   Repository,
@@ -1250,6 +1251,7 @@ function Overview(props: {
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
 }) {
+  const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
@@ -1435,7 +1437,12 @@ function Overview(props: {
                   </td>
                   <td>{event.repository_id}</td>
                   <td>#{event.number}</td>
-                  <td><EventStatusPill event={event} /></td>
+                  <td>
+                    <EventStatusPill
+                      event={event}
+                      onClick={() => setSelectedEvent(event)}
+                    />
+                  </td>
                   <td><EventAgentProgress event={event} /></td>
                   <td>{dateTimeText(event.occurred_at)}</td>
                 </tr>
@@ -1451,6 +1458,10 @@ function Overview(props: {
           )}
         </div>
       </section>
+      <EventDetailDrawer
+        event={selectedEvent}
+        onClose={() => setSelectedEvent(null)}
+      />
     </div>
   );
 }
@@ -4732,13 +4743,17 @@ function queueReasonLabel(reason?: string | null): string | null {
   return labels[reason] ?? reason;
 }
 
-function EventStatusPill({ event }: { event: EventRecord }) {
+function eventStatusPresentation(event: EventRecord): {
+  label: string;
+  visualStatus: string;
+  details?: string;
+} {
   const labels: Record<string, string> = {
     pending: "待处理",
     processing: "规则匹配中",
     unmatched: "未触发",
     triggered: "已触发",
-    completed: event.trigger_count > 0 ? "已处理" : "历史已处理",
+    completed: event.trigger_count > 0 ? "已处理" : "已结束",
     failed: "处理失败",
     cancelled: "已取消",
   };
@@ -4761,13 +4776,39 @@ function EventStatusPill({ event }: { event: EventRecord }) {
   const details = event.error
     ?? event.preflight_error
     ?? (event.preflight_failed_step ? `失败步骤：${event.preflight_failed_step}` : undefined);
-  return (
-    <span className={`status-pill status-${visualStatus}`} title={details}>
-      {label}
+  return { label, visualStatus, details };
+}
+
+function EventStatusPill({
+  event,
+  onClick,
+}: {
+  event: EventRecord;
+  onClick?: () => void;
+}) {
+  const presentation = eventStatusPresentation(event);
+  const content = (
+    <span
+      className={`status-pill status-${presentation.visualStatus}`}
+      title={presentation.details}
+    >
+      {presentation.label}
       {event.status === "pending" && queueReasonLabel(event.queue_reason)
         ? ` · ${queueReasonLabel(event.queue_reason)}`
         : ""}
     </span>
+  );
+  if (!onClick) return content;
+  return (
+    <button
+      type="button"
+      className="event-status-trigger"
+      aria-label={`查看事件状态详情：${presentation.label}`}
+      title="查看事件状态详情"
+      onClick={onClick}
+    >
+      {content}
+    </button>
   );
 }
 
@@ -4815,6 +4856,201 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
     <span className="event-agent-progress completed">
       已完成 {event.agent_completed_count}/{total}
     </span>
+  );
+}
+
+function preflightStatusLabel(status?: string | null): string {
+  const labels: Record<string, string> = {
+    running: "执行中",
+    success: "通过",
+    failure: "未通过",
+    timed_out: "超时",
+    error: "执行异常",
+  };
+  return status ? labels[status] ?? status : "未执行";
+}
+
+function eventStatusExplanation(event: EventRecord): string {
+  if (event.error?.includes("状态回写失败")) {
+    return "事件处理已结束，但向平台回写状态时失败。";
+  }
+  if (event.preflight_status === "running") {
+    return "本地 Preflight / CI 正在执行，规则将在检查结束后继续处理。";
+  }
+  if (["failure", "timed_out", "error"].includes(event.preflight_status ?? "")) {
+    return event.preflight_reused
+      ? "本事件复用了相同提交与配置的历史 Preflight / CI 结果，因此没有重复运行 Agent。"
+      : "本地 Preflight / CI 未通过，因此没有继续启动 Agent。";
+  }
+  if (event.status === "pending") {
+    return queueReasonLabel(event.queue_reason) ?? "事件正在等待调度。";
+  }
+  if (event.status === "processing") return "正在匹配触发规则并准备后续处理。";
+  if (event.status === "unmatched") return "没有启用的触发规则匹配这个事件。";
+  if (event.status === "triggered") return "规则已匹配，Agent 正在排队或运行。";
+  if (event.status === "failed") return "事件处理发生异常，详情见错误信息。";
+  if (event.status === "cancelled") return "事件关联的运行已被取消。";
+  if (event.trigger_count > 0) return "事件已完成规则匹配，关联的 Agent 调度已经结束。";
+  return "事件处理流程已结束，本次没有产生 Agent 调度或本地 CI 记录。";
+}
+
+function EventDetailDrawer(props: {
+  event: EventRecord | null;
+  onClose: () => void;
+}) {
+  const { event, onClose } = props;
+  const [detail, setDetail] = useState<EventDetailRecord | null>(null);
+  const [error, setError] = useState("");
+
+  useBodyScrollLock(event !== null);
+
+  useEffect(() => {
+    if (!event) {
+      setDetail(null);
+      setError("");
+      return undefined;
+    }
+    let disposed = false;
+    const load = async () => {
+      try {
+        const next = await api<EventDetailRecord>(`/api/events/${encodeURIComponent(event.event_id)}`);
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+        }
+      } catch (reason) {
+        if (!disposed) {
+          setError(reason instanceof Error ? reason.message : "事件详情加载失败");
+        }
+      }
+    };
+    setDetail(null);
+    setError("");
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 3000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [event]);
+
+  useEffect(() => {
+    if (!event) return undefined;
+    const closeOnEscape = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [event, onClose]);
+
+  if (!event) return null;
+  const current = detail ?? event;
+  const preflight = detail?.preflight;
+  const preflightVisualStatus = preflight && ["failure", "timed_out", "error"].includes(preflight.status)
+    ? "failed"
+    : preflight?.status === "success" ? "completed" : "processing";
+  return (
+    <div className="run-drawer-layer">
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭事件详情" onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal="true" aria-label="事件状态详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{current.event_id}</span>
+            <h2>{current.event_type}</h2>
+            <p>{current.repository_id} · #{current.number} · {dateTimeText(current.occurred_at)}</p>
+          </div>
+          <div className="run-drawer-actions">
+            <EventStatusPill event={current} />
+            <button className="run-drawer-close" aria-label="关闭" onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载事件详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENT</span><h3>处理结论</h3></div>
+                  <EventStatusPill event={detail} />
+                </div>
+                <p className="event-detail-explanation">{eventStatusExplanation(detail)}</p>
+                <dl className="run-metadata">
+                  <div><dt>来源</dt><dd>{detail.origin === "manual" ? "手动触发" : "扫描器"}</dd></div>
+                  <div><dt>事件状态</dt><dd>{detail.status}</dd></div>
+                  <div><dt>尝试次数</dt><dd>{detail.attempts}</dd></div>
+                  <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
+                  <div><dt>平台活动</dt><dd>{detail.source_activity_type ?? "—"}</dd></div>
+                  <div><dt>平台活动时间</dt><dd>{dateTimeText(detail.source_occurred_at)}</dd></div>
+                </dl>
+                {detail.error && <pre className="detail-pre detail-error">{detail.error}</pre>}
+              </section>
+
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">PREFLIGHT / CI</span><h3>本地检查</h3></div>
+                  {preflight && <span className={`status-pill status-${preflightVisualStatus}`}>{preflightStatusLabel(preflight.status)}</span>}
+                </div>
+                {!preflight ? (
+                  <div className="event-detail-empty">本事件没有关联的 Preflight / CI 记录。</div>
+                ) : (
+                  <>
+                    {Boolean(preflight.reused) && (
+                      <div className="event-detail-reused">
+                        复用历史结果：本事件没有重新执行 CI，复用了 {timeText(preflight.started_at)} 开始的检查结果。
+                      </div>
+                    )}
+                    <dl className="run-metadata">
+                      <div><dt>结果来源</dt><dd>{preflight.reused ? "复用历史结果" : "本事件执行"}</dd></div>
+                      <div><dt>失败步骤</dt><dd>{preflight.failed_step ?? "—"}</dd></div>
+                      <div><dt>退出码</dt><dd>{preflight.exit_code ?? "—"}</dd></div>
+                      <div><dt>Head SHA</dt><dd>{preflight.head_sha}</dd></div>
+                      <div><dt>配置版本</dt><dd>{preflight.config_revision}</dd></div>
+                      <div><dt>执行次数</dt><dd>{preflight.attempts}</dd></div>
+                      <div><dt>开始时间</dt><dd>{timeText(preflight.started_at)}</dd></div>
+                      <div><dt>结束时间</dt><dd>{timeText(preflight.finished_at)}</dd></div>
+                      <div><dt>平台状态回写</dt><dd>{preflight.status_published ? "成功" : "未完成"}</dd></div>
+                    </dl>
+                    {preflight.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{preflight.error}</pre></>}
+                    <h4>检查输出</h4>
+                    <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(preflight.status) ? "detail-error" : ""}`}>
+                      {preflight.output || "暂无输出"}
+                    </pre>
+                  </>
+                )}
+              </section>
+
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">AGENT</span><h3>规则与运行</h3></div>
+                  <span className="event-detail-count">{detail.dispatches.length}</span>
+                </div>
+                {detail.dispatches.length === 0 ? (
+                  <div className="event-detail-empty">本事件没有产生 Agent 调度。</div>
+                ) : (
+                  <div className="event-dispatch-list">
+                    {detail.dispatches.map((dispatch) => (
+                      <article className="event-dispatch-card" key={`${dispatch.idempotency_key}:${dispatch.agent_name}`}>
+                        <header>
+                          <div><strong>{dispatch.agent_name}</strong><small>{dispatch.rule_name}</small></div>
+                          <StatusPill value={dispatch.run_status ?? "queued"} />
+                        </header>
+                        <dl>
+                          <div><dt>运行 ID</dt><dd>{dispatch.run_id ?? "尚未创建"}</dd></div>
+                          <div><dt>创建时间</dt><dd>{timeText(dispatch.created_at)}</dd></div>
+                          <div><dt>结束时间</dt><dd>{timeText(dispatch.finished_at)}</dd></div>
+                        </dl>
+                        {dispatch.run_error && <pre className="detail-pre detail-error">{dispatch.run_error}</pre>}
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
   );
 }
 

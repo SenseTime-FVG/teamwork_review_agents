@@ -899,6 +899,15 @@ def create_app(
             repository_id=repository_id,
         )
 
+    @app.get("/api/events/{event_id}")
+    async def event_detail(event_id: str):
+        """按需返回事件处理、Agent 调度和本地 CI 详情。"""
+
+        detail = await asyncio.to_thread(manager.store.get_event_detail, event_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="事件不存在")
+        return detail
+
     @app.get("/api/change-requests")
     async def change_requests(
         limit: int = Query(default=100, ge=1),

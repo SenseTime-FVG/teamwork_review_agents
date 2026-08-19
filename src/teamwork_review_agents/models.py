@@ -125,6 +125,7 @@ class PreflightResult(BaseModel):
     output: str = ""
     error: str | None = None
     status_published: bool = False
+    reused: bool = False
 
 
 class InvocationContext(BaseModel):

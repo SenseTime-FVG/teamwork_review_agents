@@ -324,8 +324,9 @@ class PreflightExecutor:
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
             if cached.status_published:
-                return cached
-            return await self._publish_terminal_result(repository, cached)
+                return cached.model_copy(update={"reused": True})
+            published = await self._publish_terminal_result(repository, cached)
+            return published.model_copy(update={"reused": True})
 
         proposed_run_id = str(uuid.uuid4())
         reservation = await asyncio.to_thread(
@@ -342,7 +343,7 @@ class PreflightExecutor:
         if reservation is None:
             current = await asyncio.to_thread(self.store.load_preflight_result, key)
             if current is not None:
-                return current
+                return current.model_copy(update={"reused": True})
             return PreflightResult(
                 run_id=proposed_run_id,
                 repository_id=repository.id,
