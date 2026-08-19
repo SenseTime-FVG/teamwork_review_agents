@@ -671,3 +671,73 @@
 - 执行 Python 全量测试、前端生产构建、Python 编译检查与补丁检查；不自动重启用户服务，也不在未获授权时提交或推送。
 
 验收：macOS、Linux/WSL 和原生 Windows 的 `read-only` 与 `workspace-write` 都由 Teamwork 策略控制；工作区可写 Agent 能在本次独立 clone 内执行 `git fetch`、建分支和提交，同时不能写基础仓库；系统临时目录可以承载本轮临时 HOME；禁网与启用代理后的域名白名单在外层生效；沙盒内可以受控调用白名单 sub-agent，但不能读取配置、SQLite 和其他工作区；外层能力不可用时默认在 Codex 启动前失败；取消、超时、`stop` 和 `restart` 不遗留 Codex、Broker、sub-agent 或命令后代；临时 HOME、平台 CLI 登录和清理行为不回归。
+
+## 阶段六十一：Codex App Server 大消息与管理界面降级
+
+- 为 Codex App Server 子进程配置显式 JSONL 流上限，覆盖 `config/read` 等超过 asyncio 默认 64 KiB 的合法单条响应。
+- 将超限、读取失败和协议流异常统一转换为不包含原始响应内容的 `CodexAccountError`，向等待请求传播安全摘要，并保证连接关闭不会再次抛出读取任务的底层异常。
+- 保持 `/api/codex/runtime-options` 的诊断降级语义：App Server 读取失败时返回 `200` 和 `effective_config_error`，继续使用安全回退信息生成运行时选项。
+- 将管理界面初始加载中的 Codex 运行时诊断从配置文档、配置选项和运行状态等必要接口中隔离；诊断失败只显示局部错误，不阻断页面主体。
+- 配置保存成功后单独刷新 Codex 诊断；刷新失败不能把已成功保存的操作报告为失败，也不能恢复旧配置。
+- 补充超过默认 64 KiB 的合法 App Server 响应、安全上限错误、运行时接口降级和前端可选接口失败回归测试。
+- 执行 Python 全量测试、前端生产构建、Python 编译检查与补丁检查；不自动重启服务，也不在未获授权时提交或推送。
+
+验收：大于 64 KiB 且低于安全上限的 App Server JSONL 可以正常解析；超限或读取异常只产生脱敏的诊断错误；运行时诊断失败时接口保持 `200`，管理页面仍能查看概览与编辑配置；配置成功保存后诊断失败有独立提示；测试、构建和编译检查通过。
+
+## 阶段六十二：临时 HOME 重复初始化修复
+
+- 让 macOS Keychain 桥接支持同一临时 HOME 重复初始化；已存在且指向正确宿主目录的链接直接复用。
+- 对普通文件、目录、断裂链接或错误目标占用桥接路径的情况安全失败，不自动删除或覆盖任何对象。
+- 核验 Linux 的 XDG 环境目录和 Windows 的用户目录重定向均可重复应用，且不引入平台专用的重复创建错误。
+- 补充通用重复初始化、macOS Keychain 重复桥接和异常占用路径回归测试。
+- 执行相关测试、Python 全量测试、前端生产构建、编译检查和补丁检查；不自动重启用户服务，也不在未获授权时提交或推送。
+
+验收：托管沙盒为 MCP Broker 与 Codex 先后构造环境时不再因 `Library/Keychains` 已存在而失败；三平台重复初始化得到稳定环境；异常桥接目标不会被覆盖；临时 HOME 与真实认证目录的清理边界不变。
+
+## 阶段六十三：托管沙盒 Codex 运行目录隔离
+
+- 新增每轮独立的 `TemporaryCodexHome`，默认根目录按平台落在 Teamwork 专属用户缓存目录：macOS 使用 `~/Library/Caches`，Linux / WSL 使用 `XDG_CACHE_HOME` 或 `~/.cache`，原生 Windows 使用 `LOCALAPPDATA` 或 `USERPROFILE/AppData/Local`。
+- 只把存在的 Codex 顶层认证与配置文件复制到本轮目录，权限尽力收紧为仅当前用户可读写；不复制真实状态数据库、日志、会话、Skill、插件缓存或整个 Codex 目录，也不把本轮变更回写真实目录。
+- 让 MCP Broker 与 Codex 重复构造环境时稳定复用同一运行目录；未使用托管外层沙盒以及 `danger-full-access` 保持既有真实 `CODEX_HOME` 语义。
+- 将本轮 Codex 运行目录作为精确绝对路径加入 `read-only` 与 `workspace-write` 的外层权限档案，不允许把真实 Codex 目录、缓存根或其他运行目录加入写权限。
+- 在 Codex、MCP Broker 和全部后代退出后清理本轮目录；启动遗留回收同时覆盖系统临时 HOME 根与平台缓存中的 Codex 运行根，只处理符合 Teamwork 命名且属主 PID 已不存在的目录。
+- 补充 macOS、Linux / WSL、Windows 缓存根解析、文件快照白名单、重复环境应用、沙盒命令构造、真实目录保护、正常清理和遗留回收测试。
+- 在 macOS 使用当前 Codex CLI 执行不访问模型的 App Server 初始化探针，确认 PATH helper、状态数据库和安装标识可以写入本轮目录；执行 Python 定向测试、全量测试、编译检查、前端生产构建和补丁检查。
+- 不自动重启用户服务，不执行 Git 暂存、提交或推送。
+
+验收：macOS、Linux / WSL 和原生 Windows 的受限 Agent 都使用每轮独立且可写的 Codex 运行目录；真实 `CODEX_HOME` 不获得外层写权限且不被本轮状态污染；Codex 初始化不再因 PATH helper、状态数据库或安装标识写入被拒而失败；三平台重复准备、清理和异常恢复行为稳定；现有临时 HOME、Keychain、CLI 登录、MCP Bridge、网络策略与工作区权限不回归。
+
+## 阶段六十四：Teamwork MCP 工具直接暴露
+
+- 在平台无关的内层 `codex exec` 命令中强制设置 `features.code_mode.direct_only_tool_namespaces=["mcp__teamwork_agent_gateway"]`，让 `invoke_agent` 作为直接工具提供给模型。
+- 将该覆盖放在 Agent `extra_codex_args` 之后，与仓库项目指令隔离共同作为 Teamwork 最终不变量，避免自定义参数把网关重新降为延迟工具。
+- 继续保留 MCP Server 的 `enabled`、`required`、`enabled_tools=["invoke_agent"]` 和审批配置，不扩大 Server 工具白名单，不改变 MCP 文件 Bridge 与 Broker 权限边界。
+- 不主动设置实验性的 `features.code_mode.enabled`；运行时高级配置禁止声明 Teamwork 托管的直接工具命名空间项。
+- 补充普通命令、相反自定义参数覆盖顺序，以及 macOS、Linux / WSL、原生 Windows 外层沙盒命令回归测试。
+- 使用当前 Codex CLI 和临时 Codex 运行目录执行真实直接工具可见性探针，确认工具名称以 `invoke_agent` 结尾且无实验功能警告。
+- 执行 Python 定向测试、全量测试、编译检查、前端生产构建和补丁检查；不自动重启用户服务，不执行 Git 暂存、提交或推送。
+
+验收：增量文档 Runner 和其他允许调用 sub-agent 的父 Agent 不再把已注册的 Teamwork MCP 工具误判为缺失；macOS、Linux / WSL 与原生 Windows 生成相同的直接工具约束；Agent 自定义参数不能覆盖该约束；现有 MCP 白名单、托管沙盒、临时 Codex 目录、用户其他工具和运行清理行为不回归。
+
+## 阶段六十五：GitHub 合并活动去重
+
+- 在活动归并层将 `merged` 视为终态；中间快照已经是 `merged` 时忽略随后到达的 `closed` 活动。
+- 不为该自动关闭活动生成 `change_request.closed` 或配套的 `change_request.updated`，避免最终快照校正再次生成 `change_request.merged`。
+- 保留没有前序合并的普通关闭、关闭后重新打开、Timeline 游标、事件稳定 ID 和 SQLite 幂等语义。
+- 补充首次扫描窗口内 `merged → closed` 的真实 GitHub 顺序回归测试，断言一次合并只产生一条合并事件。
+- 执行事件与 Timeline 定向测试、Python 全量测试、编译检查和补丁检查；不自动重启用户服务。
+
+验收：GitHub 一次合并即使同时返回 `merged` 和自动 `closed`，事件历史也只包含一条 `change_request.merged`，规则只启动一次 Agent；普通关闭与关闭后重开事件不受影响。
+
+## 阶段六十六：Jinja Prompt 条件渲染与 Review 自动合并开关
+
+- 将 Jinja2 作为直接运行依赖，使用无文件加载器的 `SandboxedEnvironment` 渲染 Prompt，并限制上下文为允许进入 Prompt 的变量。
+- 支持 Jinja 原生变量与条件语法，增加严格的 `as_bool` 过滤器；缺失、未暴露或非 `true` 值均按假处理。
+- 兼容既有 `${{ENV_NAME}}`，保持变量存在时替换、缺失时为空的行为，并确保变量内容不会被再次解释为 Jinja 模板。
+- 将 `general-review` 的成功结论、自动合并章节和完成条件改成 `REVIEW_AUTO_MERGE` 控制的互斥分支；关闭时保留完整审核与最终门禁，只评论而不合并。
+- 让管理 API 的 Prompt 预览与 Agent 执行复用同一渲染器；模板语法错误返回明确且不包含模板内容或敏感值的错误。
+- 更新 README 和配置示例，说明 Jinja 语法、旧语法兼容、安全默认值，以及 `REVIEW_AUTO_MERGE` 只需开放给 Prompt。
+- 补充旧变量、Jinja 条件、嵌套条件、缺失值、模板注入防护、预览接口和 Review 两种策略的回归测试。
+- 执行相关定向测试、Python 全量测试、编译检查和补丁检查；不自动重启用户服务。
+
+验收：现有 Prompt 无需修改即可获得与升级前一致的环境变量结果；Jinja 条件可以稳定渲染且不能读取文件或二次执行变量内容；`REVIEW_AUTO_MERGE=true` 保持当前自动合并流程，其他情况只完成审核与评论；渲染后的 Prompt 只包含所选策略；预览和执行行为一致。

@@ -18,8 +18,11 @@ def configured_app_factory(tmp_path):
     def create():
         workspace = tmp_path / "configured-workspace"
         workspace.mkdir(exist_ok=True)
+        codex_home = tmp_path / "configured-codex-home"
+        codex_home.mkdir(exist_ok=True)
         document = {
             "database": {"path": str(tmp_path / "state.db")},
+            "runtime": {"codex_home": str(codex_home)},
             "providers": {
                 "github-main": {
                     "kind": "github",

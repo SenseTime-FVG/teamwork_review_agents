@@ -160,6 +160,23 @@ const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   },
 };
 
+async function loadCodexRuntimeOptions(): Promise<{
+  options: CodexRuntimeOptions;
+  error: string;
+}> {
+  try {
+    return {
+      options: await api<CodexRuntimeOptions>("/api/codex/runtime-options"),
+      error: "",
+    };
+  } catch (reason) {
+    return {
+      options: EMPTY_CODEX_OPTIONS,
+      error: `Codex 运行时诊断不可用：${reason instanceof Error ? reason.message : "加载失败"}`,
+    };
+  }
+}
+
 const REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
@@ -4805,10 +4822,10 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const [config, options, nextCodexOptions] = await Promise.all([
+      const [config, options, codexResult] = await Promise.all([
         api<{ revision: string; document: ConfigDocument; error?: string }>("/api/config"),
         api<{ events: string[] }>("/api/options"),
-        api<CodexRuntimeOptions>("/api/codex/runtime-options"),
+        loadCodexRuntimeOptions(),
         refreshOperationalData(),
       ]);
       const normalized = normalizeDocument(config.document);
@@ -4816,14 +4833,15 @@ export default function App() {
       setSavedDocument(structuredClone(normalized));
       setRevision(config.revision);
       setEventOptions(options.events);
-      setCodexOptions(nextCodexOptions);
+      setCodexOptions(codexResult.options);
       setDirty(false);
       setEditing(false);
       setAgentDetailDirty(false);
       setRuleDetailDirty(false);
       setRepositoryDetailDirty(false);
       setRepositoryDetailOpen(false);
-      if (config.error) setError(config.error);
+      const diagnosticErrors = [config.error, codexResult.error].filter(Boolean);
+      if (diagnosticErrors.length > 0) setError(diagnosticErrors.join("；"));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
     } finally {
@@ -4920,10 +4938,16 @@ export default function App() {
       setDocument(normalized);
       setSavedDocument(structuredClone(normalized));
       setRevision(result.revision);
-      setCodexOptions(await api<CodexRuntimeOptions>("/api/codex/runtime-options"));
+      const codexResult = await loadCodexRuntimeOptions();
+      setCodexOptions(codexResult.options);
       setDirty(false);
       setEditing(false);
-      setNotice("配置已校验、保存并通知后台热加载");
+      if (codexResult.error) setError(codexResult.error);
+      setNotice(
+        codexResult.error
+          ? "配置已校验、保存并通知后台热加载；Codex 运行时诊断刷新失败"
+          : "配置已校验、保存并通知后台热加载",
+      );
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "保存失败");

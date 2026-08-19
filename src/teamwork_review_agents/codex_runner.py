@@ -12,7 +12,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
-from .agent_home import TemporaryAgentHome, cleanup_stale_agent_homes_once
+from .agent_home import (
+    TemporaryAgentHome,
+    TemporaryCodexHome,
+    cleanup_stale_agent_homes_once,
+)
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .codex_settings import (
     agent_network_overrides,
@@ -43,6 +47,12 @@ _PROCESS_KILL_GRACE_SECONDS = 1.0
 _STREAM_DRAIN_TIMEOUT_SECONDS = 5.0
 _STREAM_CANCEL_TIMEOUT_SECONDS = 1.0
 _STREAM_ERROR_DETAIL_LIMIT = 500
+_TEAMWORK_MCP_SERVER_NAME = "teamwork_agent_gateway"
+_TEAMWORK_MCP_TOOL_NAMESPACE = f"mcp__{_TEAMWORK_MCP_SERVER_NAME}"
+_TEAMWORK_MCP_DIRECT_TOOL_OVERRIDE = (
+    "features.code_mode.direct_only_tool_namespaces="
+    f'["{_TEAMWORK_MCP_TOOL_NAMESPACE}"]'
+)
 
 BASE_ENVIRONMENT_NAMES = {
     "PATH",
@@ -156,10 +166,11 @@ class CodexRunner:
         managed_sandbox: bool | None = None,
         environment: Mapping[str, str] | None = None,
         mcp_bridge: McpBridgeChannel | None = None,
+        codex_runtime_directory: Path | None = None,
     ) -> list[str]:
         """构造显式叠加 Teamwork 默认和 Agent 覆盖的 Codex 命令。"""
 
-        server_name = "teamwork_agent_gateway"
+        server_name = _TEAMWORK_MCP_SERVER_NAME
         use_managed_sandbox = (
             self.config.runtime.managed_sandbox.enabled
             and agent.sandbox != "danger-full-access"
@@ -248,8 +259,15 @@ class CodexRunner:
         for override in overrides:
             command.extend(["--config", override])
         command.extend(agent.extra_codex_args)
-        # 仓库属于被处理对象，必须在全部自定义参数之后关闭项目指令发现。
-        command.extend(["--config", "project_doc_max_bytes=0"])
+        # Teamwork 的直接 MCP 工具和项目指令隔离必须覆盖全部自定义参数。
+        command.extend(
+            [
+                "--config",
+                _TEAMWORK_MCP_DIRECT_TOOL_OVERRIDE,
+                "--config",
+                "project_doc_max_bytes=0",
+            ]
+        )
         command.append("-")
         if use_managed_sandbox:
             return wrap_managed_sandbox_command(
@@ -259,6 +277,7 @@ class CodexRunner:
                 inner_command=command,
                 environment=environment or os.environ,
                 ipc_directory=mcp_bridge.directory if mcp_bridge is not None else None,
+                codex_runtime_directory=codex_runtime_directory,
             )
         return command
 
@@ -267,6 +286,7 @@ class CodexRunner:
         agent_environment: dict[str, str] | None = None,
         *,
         temporary_home: TemporaryAgentHome | None = None,
+        temporary_codex_home: TemporaryCodexHome | None = None,
     ) -> dict[str, str]:
         """只继承运行必需变量，再叠加 Agent 明确声明的环境。"""
 
@@ -283,6 +303,8 @@ class CodexRunner:
                 environment,
                 codex_home=codex_home(self.config.runtime.codex_home),
             )
+        if temporary_codex_home is not None:
+            temporary_codex_home.apply_environment(environment)
         # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
         for provider in self.config.providers.values():
             environment.pop(provider.token_env, None)
@@ -308,11 +330,21 @@ class CodexRunner:
         """准备 Skill 与临时 HOME，并保证 Codex 退出后立即清理。"""
 
         temporary_home: TemporaryAgentHome | None = None
+        temporary_codex_home: TemporaryCodexHome | None = None
         projection: SkillProjection | None = None
         mcp_broker: ManagedMcpBroker | None = None
+        managed_requested = (
+            self.config.runtime.managed_sandbox.enabled
+            and agent.sandbox != "danger-full-access"
+        )
         try:
             if agent.home_mode == "temporary":
                 temporary_home = TemporaryAgentHome.create(run_id)
+            if managed_requested:
+                temporary_codex_home = TemporaryCodexHome.create(
+                    run_id,
+                    source_home=codex_home(self.config.runtime.codex_home),
+                )
             projection = SkillProjection(
                 repository.workspace,
                 {
@@ -321,10 +353,6 @@ class CodexRunner:
                 },
                 self.config.revision,
             ).prepare()
-            managed_requested = (
-                self.config.runtime.managed_sandbox.enabled
-                and agent.sandbox != "danger-full-access"
-            )
             managed_inspection: ManagedSandboxInspection | None = None
             mcp_bridge_error: str | None = None
             if managed_requested:
@@ -342,6 +370,7 @@ class CodexRunner:
                             base_environment=self.child_environment(
                                 process_environment,
                                 temporary_home=temporary_home,
+                                temporary_codex_home=temporary_codex_home,
                             ),
                             response_timeout_seconds=max(
                                 1.0,
@@ -372,6 +401,7 @@ class CodexRunner:
                 skill_files=projection.skill_files,
                 git_excludes_file=projection.marker if self.config.skills else None,
                 temporary_home=temporary_home,
+                temporary_codex_home=temporary_codex_home,
                 managed_inspection=managed_inspection,
                 mcp_bridge=mcp_broker.channel if mcp_broker is not None else None,
                 mcp_bridge_error=mcp_bridge_error,
@@ -385,27 +415,50 @@ class CodexRunner:
                     if projection is not None:
                         projection.cleanup()
                 finally:
-                    if temporary_home is not None:
-                        home_path = str(temporary_home.path)
-                        cleanup_error = temporary_home.cleanup()
-                        if log_callback is not None:
-                            event_type = (
-                                "run.home_cleanup_failed"
-                                if cleanup_error
-                                else "run.home_cleaned"
-                            )
-                            payload: dict[str, Any] = {
-                                "mode": "temporary",
-                                "path": home_path,
-                                "cleaned": cleanup_error is None,
-                            }
-                            if cleanup_error:
-                                payload["error"] = cleanup_error
-                            try:
-                                await log_callback("system", event_type, payload)
-                            except Exception:
-                                # 临时目录已经完成清理尝试，日志失败不能覆盖任务结果。
-                                pass
+                    try:
+                        if temporary_codex_home is not None:
+                            codex_path = str(temporary_codex_home.path)
+                            cleanup_error = temporary_codex_home.cleanup()
+                            if log_callback is not None:
+                                event_type = (
+                                    "run.codex_home_cleanup_failed"
+                                    if cleanup_error
+                                    else "run.codex_home_cleaned"
+                                )
+                                payload: dict[str, Any] = {
+                                    "mode": "temporary",
+                                    "path": codex_path,
+                                    "cleaned": cleanup_error is None,
+                                }
+                                if cleanup_error:
+                                    payload["error"] = cleanup_error
+                                try:
+                                    await log_callback("system", event_type, payload)
+                                except Exception:
+                                    # 清理已经完成尝试，日志失败不能覆盖任务结果。
+                                    pass
+                    finally:
+                        if temporary_home is not None:
+                            home_path = str(temporary_home.path)
+                            cleanup_error = temporary_home.cleanup()
+                            if log_callback is not None:
+                                event_type = (
+                                    "run.home_cleanup_failed"
+                                    if cleanup_error
+                                    else "run.home_cleaned"
+                                )
+                                payload = {
+                                    "mode": "temporary",
+                                    "path": home_path,
+                                    "cleaned": cleanup_error is None,
+                                }
+                                if cleanup_error:
+                                    payload["error"] = cleanup_error
+                                try:
+                                    await log_callback("system", event_type, payload)
+                                except Exception:
+                                    # 清理已经完成尝试，日志失败不能覆盖任务结果。
+                                    pass
 
     async def _run_with_projection(
         self,
@@ -425,6 +478,7 @@ class CodexRunner:
         skill_files: Mapping[str, Path],
         git_excludes_file: Path | None,
         temporary_home: TemporaryAgentHome | None,
+        temporary_codex_home: TemporaryCodexHome | None,
         managed_inspection: ManagedSandboxInspection | None,
         mcp_bridge: McpBridgeChannel | None,
         mcp_bridge_error: str | None,
@@ -450,6 +504,7 @@ class CodexRunner:
         child_environment = self.child_environment(
             process_environment,
             temporary_home=temporary_home,
+            temporary_codex_home=temporary_codex_home,
         )
         if temporary_home is not None:
             await emit(
@@ -459,6 +514,16 @@ class CodexRunner:
                     "mode": "temporary",
                     "path": str(temporary_home.path),
                     "bridges": list(temporary_home.bridges),
+                },
+            )
+        if temporary_codex_home is not None:
+            await emit(
+                "system",
+                "run.codex_home_prepared",
+                {
+                    "mode": "temporary",
+                    "path": str(temporary_codex_home.path),
+                    "bridges": list(temporary_codex_home.bridges),
                 },
             )
         if git_excludes_file is not None:
@@ -570,6 +635,11 @@ class CodexRunner:
             managed_sandbox=use_managed_sandbox,
             environment=child_environment,
             mcp_bridge=mcp_bridge if use_managed_sandbox else None,
+            codex_runtime_directory=(
+                temporary_codex_home.path
+                if use_managed_sandbox and temporary_codex_home is not None
+                else None
+            ),
         )
         if cancel_check is not None and await cancel_check():
             error = "运行在 Codex CLI 启动前被管理员取消"

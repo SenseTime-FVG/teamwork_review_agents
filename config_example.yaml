@@ -244,7 +244,12 @@ agents:
     # 可选：当前 Agent 独立装载的 Skill ID，不继承给 sub-agent。
     # skills: []
     # 可选：output_schema、skip_git_repo_check 和 extra_codex_args 仍可按需配置。
-    environment: {}
+    environment:
+      REVIEW_AUTO_MERGE:
+        value: 'false'
+        secret: false
+        expose_to_prompt: true
+        expose_to_process: false
 
   incremental-doc-update-runner:
     prompt_file: ./prompts/增量文档更新入口.md

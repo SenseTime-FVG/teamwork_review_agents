@@ -65,6 +65,28 @@ def test_managed_sandbox_profile_only_adds_the_run_ipc_directory(
     assert "TEAMWORK_CONFIG_PATH" not in profile
 
 
+@pytest.mark.parametrize("sandbox_mode", ["read-only", "workspace-write"])
+def test_managed_sandbox_profile_adds_only_current_codex_runtime(
+    sandbox_mode: str,
+    tmp_path: Path,
+) -> None:
+    """Codex 宿主写权限必须限制在当前运行目录。"""
+
+    runtime_directory = tmp_path / "codex-runtime"
+    runtime_directory.mkdir()
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    agent = AgentConfig(prompt="测试", sandbox=sandbox_mode)
+
+    profile = permission_profile_override(
+        agent,
+        codex_runtime_directory=runtime_directory,
+    )
+
+    assert f'{json.dumps(str(runtime_directory.resolve()))}="write"' in profile
+    assert str(real_codex_home.resolve()) not in profile
+
+
 def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -79,6 +101,8 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
         network_domains=["api.github.com"],
     )
     inner = ["codex", "exec", "--json", "-"]
+    codex_runtime_directory = tmp_path / "codex-runtime"
+    codex_runtime_directory.mkdir()
 
     command = wrap_managed_sandbox_command(
         codex_binary="codex",
@@ -86,6 +110,7 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
         agent=agent,
         inner_command=inner,
         environment={"SSH_AUTH_SOCK": "/tmp/test-ssh-agent.sock"},
+        codex_runtime_directory=codex_runtime_directory,
     )
 
     separator = command.index("--")
@@ -95,6 +120,10 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
         "/tmp/test-ssh-agent.sock"
     )
     assert "features.network_proxy=true" in command[:separator]
+    assert (
+        f'{json.dumps(str(codex_runtime_directory.resolve()))}="write"'
+        in " ".join(command[:separator])
+    )
     assert command[separator + 1 :] == inner
 
 
@@ -144,6 +173,74 @@ def test_runner_uses_sandbox_proxy_without_exposing_service_paths(
     assert "TEAMWORK_INVOCATION_CONTEXT" not in joined
     assert str(config.config_path) not in joined
     assert f'{json.dumps(str(channel_directory.resolve()))}="write"' in joined
+
+
+@pytest.mark.parametrize(
+    ("platform_value", "wsl_name", "expected_platform"),
+    [
+        ("darwin", None, "macOS"),
+        ("linux", None, "Linux"),
+        ("linux", "Ubuntu", "WSL"),
+        ("win32", None, "Windows"),
+    ],
+)
+def test_managed_runner_exposes_gateway_directly_on_supported_platforms(
+    platform_value: str,
+    wsl_name: str | None,
+    expected_platform: str,
+    snapshot_factory,
+    configured_app_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三平台外层沙盒都应保留内层 Teamwork MCP 直接工具约束。"""
+
+    monkeypatch.setattr(sys, "platform", platform_value)
+    if wsl_name is None:
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    else:
+        monkeypatch.setenv("WSL_DISTRO_NAME", wsl_name)
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    agent.extra_codex_args = [
+        "--config",
+        'features.code_mode.direct_only_tool_namespaces=["mcp__other"]',
+    ]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id=f"run-direct-mcp-{expected_platform.lower()}",
+        root_run_id=f"run-direct-mcp-{expected_platform.lower()}",
+        event=event,
+    )
+
+    command = CodexRunner(config).build_command(
+        agent,
+        repository,
+        context,
+        managed_sandbox=True,
+        environment={},
+    )
+    separator = command.index("--")
+    inner_command = command[separator + 1 :]
+    custom_override = (
+        'features.code_mode.direct_only_tool_namespaces=["mcp__other"]'
+    )
+    managed_override = (
+        'features.code_mode.direct_only_tool_namespaces='
+        '["mcp__teamwork_agent_gateway"]'
+    )
+
+    assert _platform_backend()[0] == expected_platform
+    assert custom_override in inner_command
+    assert managed_override in inner_command
+    assert inner_command.index(custom_override) < inner_command.index(managed_override)
+    assert "features.code_mode.enabled=true" not in inner_command
 
 
 def test_managed_command_without_bridge_still_never_exposes_service_paths(

@@ -39,6 +39,7 @@ CODEX_MANAGED_CONFIG_KEYS = {
     "sandbox_workspace_write",
     "shell_environment_policy",
     "features.network_proxy",
+    "features.code_mode.direct_only_tool_namespaces",
 }
 CODEX_MANAGED_CONFIG_PREFIXES = (
     "agents.",

@@ -17,6 +17,7 @@ from .process_control import process_group_options, terminate_process
 
 
 APP_SERVER_TIMEOUT_SECONDS = 10.0
+APP_SERVER_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
 LOGIN_TIMEOUT_SECONDS = 600.0
 
 
@@ -81,6 +82,7 @@ class CodexAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=_codex_environment(self.home),
                 cwd=str(self.working_directory) if self.working_directory else None,
+                limit=APP_SERVER_STREAM_LIMIT_BYTES,
                 **process_group_options(),
             )
             self._reader_task = asyncio.create_task(self._read_stdout())
@@ -106,6 +108,7 @@ class CodexAppServer:
         process = self.process
         if process is None or process.stdout is None:
             return
+        stream_error: CodexAccountError | None = None
         try:
             while line := await process.stdout.readline():
                 try:
@@ -124,8 +127,18 @@ class CodexAppServer:
                     continue
                 if isinstance(message.get("method"), str):
                     await self._notifications.put(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                stream_error = CodexAccountError(
+                    "Codex App Server 单条响应超过安全上限（8 MiB）"
+                )
+            else:
+                stream_error = CodexAccountError("读取 Codex App Server 响应失败")
+            stream_error.__cause__ = exc
         finally:
-            error = CodexAccountError("Codex App Server 已退出")
+            error = stream_error or CodexAccountError("Codex App Server 已退出")
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(error)
@@ -136,8 +149,11 @@ class CodexAppServer:
         process = self.process
         if process is None or process.stderr is None:
             return
-        while await process.stderr.readline():
-            pass
+        try:
+            while await process.stderr.readline():
+                pass
+        except (OSError, ValueError):
+            return
 
     async def _send(self, message: dict[str, Any]) -> None:
         """发送一条换行分隔的 JSON-RPC 消息。"""
@@ -219,7 +235,7 @@ class CodexAppServer:
                 task.cancel()
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, Exception):
                     await task
         self.process = None
 

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
+
+import pytest
 
 import teamwork_review_agents.agent_home as agent_home_module
 from teamwork_review_agents.agent_home import (
     TemporaryAgentHome,
+    TemporaryCodexHome,
+    agent_codex_home_root,
     cleanup_stale_agent_homes,
 )
 
@@ -54,6 +59,19 @@ def test_temporary_agent_home_redirects_generic_user_directories(tmp_path) -> No
         "GIT_CONFIG_GLOBAL",
         "SSH_AUTH_SOCK",
     }
+
+    repeated_environment: dict[str, str] = {}
+    repeated_bridges = temporary_home.apply_environment(
+        repeated_environment,
+        codex_home=codex_home,
+        host_environment={
+            "HOME": str(host_home),
+            "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
+        },
+    )
+
+    assert repeated_environment == environment
+    assert repeated_bridges == bridges
     assert temporary_home.cleanup() is None
     assert not path.exists()
 
@@ -88,9 +106,50 @@ def test_temporary_agent_home_bridges_macos_keychains(
     assert keychain_bridge.is_symlink()
     assert keychain_bridge.resolve() == host_keychains.resolve()
     assert "MACOS_KEYCHAINS" in bridges
+
+    repeated_environment: dict[str, str] = {}
+    repeated_bridges = temporary_home.apply_environment(
+        repeated_environment,
+        codex_home=codex_home,
+        host_environment={"HOME": str(host_home)},
+    )
+
+    assert repeated_bridges == bridges
+    assert keychain_bridge.is_symlink()
+    assert keychain_bridge.resolve() == host_keychains.resolve()
     assert temporary_home.cleanup() is None
     assert not path.exists()
     assert marker.read_text(encoding="utf-8") == "保留"
+
+
+def test_temporary_agent_home_rejects_occupied_macos_keychain_bridge(
+    tmp_path, monkeypatch
+) -> None:
+    """异常对象占用钥匙串桥接路径时不得自动覆盖或删除。"""
+
+    monkeypatch.setattr(agent_home_module.sys, "platform", "darwin")
+    host_home = tmp_path / "host-home"
+    (host_home / "Library/Keychains").mkdir(parents=True)
+    codex_home = host_home / ".codex"
+    codex_home.mkdir()
+    temporary_home = TemporaryAgentHome.create(
+        "run-occupied-keychain",
+        root=tmp_path / "homes",
+    )
+    occupied = temporary_home.path / "Library/Keychains"
+    occupied.mkdir(parents=True)
+    marker = occupied / "unexpected"
+    marker.write_text("保留", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Keychain 桥接路径已被占用"):
+        temporary_home.apply_environment(
+            {},
+            codex_home=codex_home,
+            host_environment={"HOME": str(host_home)},
+        )
+
+    assert marker.read_text(encoding="utf-8") == "保留"
+    assert temporary_home.cleanup() is None
 
 
 def test_temporary_agent_home_skips_missing_macos_keychains(
@@ -143,6 +202,168 @@ def test_temporary_agent_home_does_not_bridge_keychains_on_other_platforms(
 
     assert "MACOS_KEYCHAINS" not in bridges
     assert not (temporary_home.path / "Library/Keychains").exists()
+    assert temporary_home.cleanup() is None
+
+
+def test_temporary_agent_home_repeats_windows_user_directories(
+    tmp_path, monkeypatch
+) -> None:
+    """原生 Windows 用户目录重定向应可连续应用且结果稳定。"""
+
+    monkeypatch.setattr(agent_home_module, "_is_windows", lambda: True)
+    monkeypatch.setattr(agent_home_module.sys, "platform", "win32")
+    host_home = tmp_path / "windows-user"
+    codex_home = host_home / ".codex"
+    codex_home.mkdir(parents=True)
+    temporary_home = TemporaryAgentHome.create(
+        "run-windows",
+        root=tmp_path / "homes",
+    )
+
+    first_environment: dict[str, str] = {}
+    first_bridges = temporary_home.apply_environment(
+        first_environment,
+        codex_home=codex_home,
+        host_environment={"USERPROFILE": str(host_home)},
+    )
+    second_environment: dict[str, str] = {}
+    second_bridges = temporary_home.apply_environment(
+        second_environment,
+        codex_home=codex_home,
+        host_environment={"USERPROFILE": str(host_home)},
+    )
+
+    assert first_environment == second_environment
+    assert first_bridges == second_bridges
+    assert first_environment["USERPROFILE"] == str(temporary_home.path)
+    assert first_environment["APPDATA"] == str(
+        temporary_home.path / "AppData/Roaming"
+    )
+    assert first_environment["LOCALAPPDATA"] == str(
+        temporary_home.path / "AppData/Local"
+    )
+    assert (temporary_home.path / "AppData/Roaming").is_dir()
+    assert (temporary_home.path / "AppData/Local").is_dir()
+    assert temporary_home.cleanup() is None
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "os_name", "environment", "expected"),
+    [
+        (
+            "darwin",
+            "posix",
+            {"HOME": "/Users/tester"},
+            Path(
+                "/Users/tester/Library/Caches/"
+                "teamwork-review-agents/agent-codex-homes"
+            ),
+        ),
+        (
+            "linux",
+            "posix",
+            {"HOME": "/home/tester", "XDG_CACHE_HOME": "/cache/tester"},
+            Path("/cache/tester/teamwork-review-agents/agent-codex-homes"),
+        ),
+        (
+            "linux",
+            "posix",
+            {"HOME": "/home/tester", "WSL_DISTRO_NAME": "Ubuntu"},
+            Path("/home/tester/.cache/teamwork-review-agents/agent-codex-homes"),
+        ),
+        (
+            "win32",
+            "nt",
+            {
+                "USERPROFILE": "/windows/users/tester",
+                "LOCALAPPDATA": "/windows/local/tester",
+            },
+            Path("/windows/local/tester/teamwork-review-agents/agent-codex-homes"),
+        ),
+    ],
+)
+def test_agent_codex_home_root_is_platform_specific(
+    platform_name: str,
+    os_name: str,
+    environment: dict[str, str],
+    expected: Path,
+) -> None:
+    """三平台运行目录应落在宿主缓存而不是系统临时目录。"""
+
+    assert agent_codex_home_root(
+        environment,
+        platform_name=platform_name,
+        os_name=os_name,
+    ) == expected
+
+
+def test_temporary_codex_home_copies_only_runtime_inputs(tmp_path) -> None:
+    """每轮 Codex 目录只复制认证与配置，不复制共享状态。"""
+
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    expected_files = {
+        "auth.json": "测试认证",
+        ".credentials.json": "测试凭据",
+        "config.toml": 'model = "test"',
+        "requirements.toml": "allowed = true",
+    }
+    for name, content in expected_files.items():
+        (source_home / name).write_text(content, encoding="utf-8")
+    (source_home / "state_5.sqlite").write_text("不得复制", encoding="utf-8")
+    (source_home / "skills").mkdir()
+    (source_home / "skills/marker").write_text("不得复制", encoding="utf-8")
+
+    temporary_home = TemporaryCodexHome.create(
+        "run-codex-runtime",
+        source_home=source_home,
+        root=tmp_path / "runtime-roots",
+    )
+    environment: dict[str, str] = {}
+    bridges = temporary_home.apply_environment(environment)
+
+    assert environment["CODEX_HOME"] == str(temporary_home.path)
+    assert set(bridges) == {
+        "CODEX_AUTH",
+        "CODEX_CREDENTIALS",
+        "CODEX_CONFIG",
+        "CODEX_REQUIREMENTS",
+    }
+    assert {
+        path.name for path in temporary_home.path.iterdir()
+    } == set(expected_files)
+    for name, content in expected_files.items():
+        assert (temporary_home.path / name).read_text(encoding="utf-8") == content
+        if os.name != "nt":
+            assert stat.S_IMODE((temporary_home.path / name).stat().st_mode) == 0o600
+    assert not (temporary_home.path / "state_5.sqlite").exists()
+    assert not (temporary_home.path / "skills").exists()
+
+    repeated_environment: dict[str, str] = {}
+    assert temporary_home.apply_environment(repeated_environment) == bridges
+    assert repeated_environment == environment
+
+    (temporary_home.path / "auth.json").write_text("本轮更新", encoding="utf-8")
+
+    runtime_path = temporary_home.path
+    assert temporary_home.cleanup() is None
+    assert not runtime_path.exists()
+    assert (source_home / "auth.json").read_text(encoding="utf-8") == "测试认证"
+
+
+def test_temporary_codex_home_supports_missing_auth_and_config(tmp_path) -> None:
+    """API Key 或平台认证场景不要求宿主 Codex 文件一定存在。"""
+
+    source_home = tmp_path / "empty-codex"
+    source_home.mkdir()
+    temporary_home = TemporaryCodexHome.create(
+        "run-empty-codex",
+        source_home=source_home,
+        root=tmp_path / "runtime-roots",
+    )
+
+    assert temporary_home.bridges == ()
+    assert list(temporary_home.path.iterdir()) == []
     assert temporary_home.cleanup() is None
 
 

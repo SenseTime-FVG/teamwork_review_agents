@@ -10,6 +10,8 @@ import yaml
 from fastapi.testclient import TestClient
 
 from teamwork_review_agents.codex_account import (
+    APP_SERVER_STREAM_LIMIT_BYTES,
+    CodexAccountError,
     CodexLoginManager,
     inspect_codex_account,
     read_codex_effective_config,
@@ -17,11 +19,10 @@ from teamwork_review_agents.codex_account import (
 from teamwork_review_agents.webapp import create_app
 
 
-def _write_fake_codex(path: Path) -> Path:
+def _write_fake_codex(path: Path, *, config_padding_size: int = 0) -> Path:
     """创建只实现测试所需 App Server 协议的 Codex 命令。"""
 
-    path.write_text(
-        """#!/usr/bin/env python3
+    script = """#!/usr/bin/env python3
 import json
 import sys
 
@@ -72,6 +73,7 @@ for line in sys.stdin:
             "config": {
                 "model": "gpt-effective",
                 "service_tier": "fast",
+                "padding": "x" * __CONFIG_PADDING_SIZE__,
             }
         }
     else:
@@ -82,7 +84,9 @@ for line in sys.stdin:
             "method": "account/login/completed",
             "params": {"loginId": "login-test", "success": True},
         }), flush=True)
-""",
+""".replace("__CONFIG_PADDING_SIZE__", str(config_padding_size))
+    path.write_text(
+        script,
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -129,7 +133,49 @@ async def test_read_codex_effective_config_uses_app_server(tmp_path) -> None:
 
     result = await read_codex_effective_config(str(fake_codex), codex_home)
 
-    assert result == {"model": "gpt-effective", "service_tier": "fast"}
+    assert result == {
+        "model": "gpt-effective",
+        "service_tier": "fast",
+        "padding": "",
+    }
+
+
+async def test_read_codex_effective_config_accepts_large_jsonl_message(
+    tmp_path,
+) -> None:
+    """App Server 的合法大响应不应受 asyncio 默认 64 KiB 限制。"""
+
+    padding_size = 96 * 1024
+    fake_codex = _write_fake_codex(
+        tmp_path / "fake-codex",
+        config_padding_size=padding_size,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    result = await read_codex_effective_config(str(fake_codex), codex_home)
+
+    assert result["padding"] == "x" * padding_size
+
+
+async def test_read_codex_effective_config_rejects_oversized_jsonl_message(
+    tmp_path,
+) -> None:
+    """超过安全上限的响应应转换为不包含原文的账户诊断错误。"""
+
+    fake_codex = _write_fake_codex(
+        tmp_path / "fake-codex",
+        config_padding_size=APP_SERVER_STREAM_LIMIT_BYTES + 1024,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    try:
+        await read_codex_effective_config(str(fake_codex), codex_home)
+    except CodexAccountError as exc:
+        assert str(exc) == "Codex App Server 单条响应超过安全上限（8 MiB）"
+    else:
+        raise AssertionError("超过安全上限的 App Server 响应未被拒绝")
 
 
 async def test_missing_independent_home_is_signed_out_without_creation(tmp_path) -> None:

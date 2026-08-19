@@ -602,3 +602,61 @@ Agent 的本地文件权限不能继续只依赖内层 `codex exec --sandbox`。
 外层沙盒进程是 Codex、沙盒内 MCP 代理、shell、Git 和其他 Agent 命令的共同祖先进程。完整 MCP Broker 作为 Teamwork 管理的同级进程运行在外层沙盒之外，继续读取配置与 SQLite 并复用既有 sub-agent 白名单、调用深度、幂等和并发校验；沙盒内代理只暴露 `invoke_agent`，通过本轮专属、权限为 `0700`、带随机令牌的临时文件通道交换请求与响应。权限档案只额外放行这一个通道目录，不能由此读取配置、数据库、基础仓库或其他 Agent 工作区。通道在 Broker 和全部委托退出后删除。
 
 页面取消、总超时、无进展超时、`stop` 与 `restart` 仍要覆盖完整执行树：Codex 外层进程树直接终止；若 MCP 工具调用仍有 sub-agent，Broker 先把当前运行及后代写为持久化取消并等待它们自行清理，超过宽限期再终止 Broker 的完整后代树。临时 HOME、Skill 投影、文件通道和运行 clone 必须等对应进程退出后再清理。Agent 的 `extra_codex_args` 不能覆盖沙盒、审批策略、权限档案、工作目录或相关安全配置，确保外层能力不可用时的内层回退仍保持原 Agent 权限级别。结构化运行日志在启动模型前记录外层沙盒模式、平台后端、网络模式、域名数量、MCP 桥接方式、是否回退和工作区类型，但不记录完整权限档案、通道令牌、认证文件内容或 Provider Token。
+
+## 63. Codex App Server 大消息与管理界面诊断降级
+
+Codex 账户和运行时配置诊断通过 App Server 的 stdio JSONL 协议工作。`config/read` 的单条响应可能包含完成分层后的大体积配置，不能使用 asyncio 默认 64 KiB 单行限制。App Server 客户端为 stdout 和 stderr 设置明确的安全上限；默认允许正常的大消息，超过上限、读取失败或协议流异常时统一转换为不包含原始配置内容的 `CodexAccountError`，并向所有等待中的请求传播同一安全错误。关闭连接时必须回收读写任务和进程树，不能让后台读取任务的原始 `ValueError` 穿透异步上下文。
+
+运行时选项接口中的 App Server 有效配置属于辅助诊断，而不是管理页面加载配置的必要依赖。诊断失败时，后端继续返回 `200`，通过 `effective_config_error` 说明降级原因，并使用已有的用户配置与公开默认值生成可用结果。模型目录、二进制或其他独立诊断仍按各自字段报告错误，不能因为可选诊断失败而让 `/api/config`、运行概览或配置编辑失效。
+
+前端初始加载把配置文档、配置选项和运行状态视为必要数据，把 Codex 运行时诊断视为可选数据。可选接口失败时使用安全的空诊断模型并展示局部提示，页面主体和其他配置仍需正常渲染。保存配置成功后刷新诊断失败也不能反向显示为“保存失败”；页面应保留已保存的新配置，并明确区分“配置已保存”和“诊断刷新失败”。
+
+## 64. 临时 HOME 重复初始化与跨平台桥接
+
+同一次受限 Agent 运行可能先为外部 MCP Broker 构造子进程环境，随后再为 Codex 和外层沙盒构造环境。`TemporaryAgentHome.apply_environment` 因此必须是可重复调用的初始化操作：重复调用只能重新写入相同的环境变量和桥接摘要，不能重复创建文件系统对象而使本轮运行在模型启动前失败。
+
+macOS 的 `Library/Keychains` 是当前唯一需要在临时 HOME 中创建符号链接的认证桥接。目标链接已经指向同一宿主钥匙串目录时视为初始化成功并直接复用；如果同一路径被普通文件、目录、断裂链接或指向其他位置的链接占用，则安全失败并报告明确错误，不能删除、覆盖或跟随该对象。Linux 的 XDG 目录与认证入口继续只通过临时目录骨架和环境变量表达，Windows 的 `USERPROFILE`、`APPDATA` 与 `LOCALAPPDATA` 目录创建保持幂等。
+
+三平台都必须覆盖同一临时 HOME 连续准备环境的回归场景。清理仍只删除本轮临时 HOME 及链接本身，不读取、复制或删除真实钥匙串、CLI 配置和用户 HOME 内容。
+
+## 65. 托管沙盒中的 Codex 运行目录隔离
+
+Teamwork 托管外层沙盒包裹的是完整 `codex exec` 进程，而不是只包裹 Codex 发起的 shell 命令。Codex 在初始化内置 App Server 客户端时仍需要创建 PATH helper、安装标识、状态数据库及其 WAL / SHM、日志数据库和 shell snapshot。即使使用 `--ephemeral`，这些运行时写入也不会全部消失。权限档案如果只允许写工作区、系统临时目录和 MCP 文件通道，而 `CODEX_HOME` 仍指向真实用户配置目录，macOS Seatbelt、Linux 沙盒和 Windows 沙盒都会在模型启动前拒绝这些写入。
+
+受限 Agent 每次运行新增独立的 `TemporaryCodexHome`。它与通用临时 HOME 分离：通用 HOME 继续位于系统临时目录；Codex 运行目录位于宿主用户缓存目录下的 Teamwork 专属根目录，避免 Codex 出于安全原因拒绝在系统临时目录创建 PATH helper。macOS 使用 `~/Library/Caches`，Linux 与 WSL 优先使用宿主 `XDG_CACHE_HOME`、否则使用 `~/.cache`，原生 Windows 优先使用宿主 `LOCALAPPDATA`、否则使用 `USERPROFILE/AppData/Local`。根目录和每轮子目录都只允许当前用户访问，目录名继续包含服务 PID、实例标识和脱敏后的运行标识，以便异常退出后按存活进程安全回收。
+
+真实 `CODEX_HOME` 不加入外层写权限。Teamwork 在启动沙盒前只把 Codex 登录和配置所需的顶层文件复制为本轮私有快照，包括存在时的 `auth.json`、`.credentials.json`、`config.toml` 和 `requirements.toml`；不复制状态数据库、日志、会话、Skill、插件缓存或整个真实 Codex 目录。快照文件使用仅当前用户可读写的权限，不记录内容，也不在运行结束时回写真实目录。Codex 运行时生成或更新的状态和凭据只作用于本轮，避免 Agent 或 Codex 污染真实配置、共享数据库和其他并发运行。宿主认证文件不存在时保持为空，由显式继承的 `CODEX_API_KEY`、`OPENAI_API_KEY` 或平台认证机制决定是否能够登录。
+
+外层权限档案对 `read-only` 和 `workspace-write` 都额外放行本轮 `TemporaryCodexHome` 整个目录，因为这是 Codex 宿主进程自身的运行需求，不代表仓库获得写权限。该例外必须使用已规范化的本轮绝对路径，不能放行缓存根目录、真实 `CODEX_HOME` 或其他运行目录。MCP Broker 可以复用同一环境快照，但只有外层 Codex 进程需要该写例外。`danger-full-access` 和未启用托管外层沙盒的运行继续使用既有真实 Codex 配置目录，不产生额外快照。
+
+临时 Codex 目录准备和环境应用必须幂等，供 MCP Broker 与 Codex 两次构造环境。清理顺序是先终止 Codex、Broker 和全部后代，再删除 Skill 投影、本轮 Codex 运行目录和通用临时 HOME；清理失败只记录脱敏错误，不能覆盖 Agent 原始终态。启动回收同时扫描通用临时 HOME 根和平台缓存中的 Codex 运行根，但只删除符合 Teamwork 命名格式且属主服务 PID 已不存在的目录。
+
+三平台测试必须覆盖缓存根解析、认证与配置快照白名单、重复应用、文件权限尽力收紧、外层权限档案只放行本轮目录、真实 Codex 目录不进入写规则、运行结束清理以及异常退出后的遗留回收。macOS 额外执行真实 Seatbelt 初始化探针，确认不再出现 `could not create PATH aliases: Operation not permitted` 和 `failed to initialize in-process app-server client`；Linux / WSL 与原生 Windows 通过同一平台无关实现和定向平台模拟测试验证路径与命令构造。
+
+## 66. Teamwork MCP 工具的直接暴露
+
+Codex 可以把 MCP 工具作为顶层直接工具提供，也可以把它们收进统一执行器的延迟工具目录。Teamwork 的父 Agent Prompt 使用 `invoke_agent` 表达强制委托语义；如果 `teamwork_agent_gateway` 只存在于延迟目录，模型可能仅检查顶层工具后误判为“没有 Agent 工具”，即使 MCP Server、工具白名单和文件 Bridge 都已成功初始化。
+
+所有根 Agent 和 sub-agent 的 Codex 命令都必须把 `mcp__teamwork_agent_gateway` 加入 `features.code_mode.direct_only_tool_namespaces`，使 `invoke_agent` 始终以直接 MCP 工具参与模型回合。该覆盖放在 Agent `extra_codex_args` 之后，避免自定义参数重新把 Teamwork 网关降为延迟工具；同时继续保留 `mcp_servers.teamwork_agent_gateway.enabled_tools=["invoke_agent"]`，不能因此开放同一 Server 的其他工具。Teamwork 不主动启用实验性的 `features.code_mode.enabled`，避免产生不稳定功能警告；只声明当前 Codex 已支持的直接工具命名空间策略。
+
+运行时高级配置不能覆盖 Teamwork 网关的直接暴露项。用户允许继承的其他 MCP Server、插件和内置工具不加入该强制列表，继续遵循其原有直接或延迟加载策略。这个约束位于平台无关的内层 `codex exec` 命令，因此 macOS Seatbelt、Linux / WSL 沙盒和原生 Windows 沙盒使用相同配置；外层权限档案、临时 Codex 目录与 MCP 文件通道不发生变化。
+
+回归测试必须覆盖普通命令、Agent 自定义相反参数后的最终顺序，以及 macOS、Linux / WSL、Windows 外层命令中的内层配置。真实 Codex 探针需要确认模型直接工具列表包含名称以 `invoke_agent` 结尾的 Teamwork MCP 工具，并且不出现实验功能警告。
+
+## 67. 合并活动的终态归并
+
+GitHub 合并 PR 时会在 Timeline 中先后记录 `merged` 与自动 `closed`。后一个 `closed` 只是合并动作带来的平台关闭记录，不能把已经进入 `merged` 的中间快照降级为普通 `closed`，也不能再由最终 PR 快照补出第二条 `change_request.merged`。
+
+事件归并层把 `merged` 视为单向终态：活动流已经进入 `merged` 后，后续 `closed` 作为同一次合并的附属活动忽略，不生成 `change_request.closed` 或对应的通用 `change_request.updated`。没有前序合并的普通 `closed`、以及 `closed → reopened` 等真实状态变化继续按原语义记录。最终快照仍负责补齐 Timeline 未覆盖的状态，但不得因此为一次平台合并生成第二条合并事件。
+
+事件 ID、Timeline 游标、首次扫描窗口回看和 SQLite 幂等写入方式保持不变。回归测试必须覆盖 GitHub 的 `merged → closed` 原始顺序，包括首次建立快照时刚创建并立即合并的 PR，确认只产生一条 `change_request.merged`，且同一条规则只调度一次 Agent。
+
+## 68. 沙盒化 Jinja Prompt 渲染与审核合并开关
+
+Prompt 模板需要在保留现有 `${{ENV_NAME}}` 环境变量替换语义的同时支持条件分支。项目直接依赖 Jinja2，并使用不配置文件加载器的 `SandboxedEnvironment` 渲染内置、内联和管理界面导入的 Prompt。模板上下文只包含本轮允许进入 Prompt 的变量；Provider 凭据和未开启 `expose_to_prompt` 的值仍不可见。Jinja 不提供宿主对象、文件读取函数或项目自定义全局对象，环境变量值只作为数据参与一次渲染，不能作为模板源码再次执行。
+
+旧语法 `${{NAME}}` 在解析模板前只转换为等价的 Jinja 变量节点，再由同一次 Jinja 渲染求值。这样已有 Prompt 保持“存在则替换、缺失则为空字符串”的行为，同时变量内容中的 `{{ ... }}` 或 `{% ... %}` 只作为普通文本输出，不会形成二次模板注入。新模板可以使用原生 `{{ NAME }}`、`{% if %}`、`{% else %}` 和 `{% endif %}`。项目提供 `as_bool` 过滤器；只有布尔真或去除空白后不区分大小写等于 `true` 的字符串为真，其余值均为假。缺失变量使用 Jinja 的安全空值语义，字符串输出为空、条件判断为假。
+
+`general-review` 使用 `REVIEW_AUTO_MERGE | as_bool` 在渲染阶段形成互斥的审核策略。真分支保留现有完整审核、最终门禁、评论和自动合并流程；假分支执行相同的 SHA、CI、设计、历史变更、目标分支一致性和合并门禁检查，但通过后只发布“审核通过，未启用自动合并”的评论并结束，禁止调用任何合并 API 或 CLI。变量缺失、未开放给 Prompt 或值无效时进入假分支，避免配置错误触发意外合并。渲染后的 Prompt 不能同时包含两套行为，也不能把开关值交给模型自行解释。
+
+Prompt 预览接口与 Agent 执行必须复用同一个渲染函数。Jinja 语法错误或渲染错误在模型启动前以脱敏的配置错误失败；预览接口返回可识别的客户端错误，不能返回半渲染模板。测试覆盖旧语法兼容、原生变量、真假与缺失条件、嵌套条件、变量内容不被二次执行、预览接口和 `general-review` 两种最终策略。

@@ -22,6 +22,12 @@ _DIRECTORY_PATTERN = re.compile(
 )
 _STALE_CLEANUP_LOCK = threading.Lock()
 _STALE_CLEANUP_COMPLETED = False
+_CODEX_RUNTIME_INPUTS = {
+    "auth.json": "CODEX_AUTH",
+    ".credentials.json": "CODEX_CREDENTIALS",
+    "config.toml": "CODEX_CONFIG",
+    "requirements.toml": "CODEX_REQUIREMENTS",
+}
 
 
 def _owner_key() -> str:
@@ -41,12 +47,40 @@ def agent_home_root() -> Path:
     return Path(tempfile.gettempdir()) / f"teamwork-agent-homes-{_owner_key()}"
 
 
+def agent_codex_home_root(
+    host_environment: Mapping[str, str] | None = None,
+    *,
+    platform_name: str | None = None,
+    os_name: str | None = None,
+) -> Path:
+    """返回不会触发 Codex 临时目录保护的每轮运行根目录。"""
+
+    host = host_environment or os.environ
+    active_platform = platform_name or sys.platform
+    active_os = os_name or os.name
+    host_home_value = host.get("HOME") or host.get("USERPROFILE")
+    host_home = (
+        Path(host_home_value).expanduser() if host_home_value else Path.home()
+    )
+    if active_os == "nt" or active_platform == "win32":
+        cache_root = _environment_path(host, "LOCALAPPDATA")
+        if cache_root is None:
+            cache_root = host_home / "AppData/Local"
+    elif active_platform == "darwin":
+        cache_root = host_home / "Library/Caches"
+    else:
+        cache_root = _environment_path(host, "XDG_CACHE_HOME")
+        if cache_root is None:
+            cache_root = host_home / ".cache"
+    return cache_root / "teamwork-review-agents/agent-codex-homes"
+
+
 def _ensure_root(path: Path) -> Path:
-    """安全创建临时 HOME 根目录，并拒绝固定根路径被替换为符号链接。"""
+    """安全创建临时运行根目录，并拒绝固定根路径被替换为符号链接。"""
 
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
-        raise RuntimeError(f"Agent 临时 HOME 根目录不安全：{path}")
+        raise RuntimeError(f"Agent 临时运行根目录不安全：{path}")
     try:
         path.chmod(0o700)
     except OSError:
@@ -90,11 +124,12 @@ def cleanup_stale_agent_homes_once() -> None:
     with _STALE_CLEANUP_LOCK:
         if _STALE_CLEANUP_COMPLETED:
             return
-        try:
-            cleanup_stale_agent_homes()
-        except OSError:
-            # 遗留目录回收是尽力而为，不能阻断新的 Agent 运行。
-            pass
+        for root in (agent_home_root(), agent_codex_home_root()):
+            try:
+                cleanup_stale_agent_homes(root)
+            except OSError:
+                # 遗留目录回收是尽力而为，不能阻断新的 Agent 运行。
+                pass
         _STALE_CLEANUP_COMPLETED = True
 
 
@@ -114,6 +149,12 @@ def _environment_path(environment: Mapping[str, str], name: str) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def _is_windows() -> bool:
+    """返回当前进程是否运行在原生 Windows。"""
+
+    return os.name == "nt"
+
+
 def _bridge_macos_keychains(temporary_home: Path, host_home: Path) -> bool:
     """让临时 HOME 继续使用当前 macOS 用户的系统钥匙串搜索入口。"""
 
@@ -125,7 +166,28 @@ def _bridge_macos_keychains(temporary_home: Path, host_home: Path) -> bool:
     bridge_parent = temporary_home / "Library"
     bridge_parent.mkdir(parents=True, exist_ok=True)
     bridge = bridge_parent / "Keychains"
-    bridge.symlink_to(host_keychains.resolve(), target_is_directory=True)
+    host_target = host_keychains.resolve()
+
+    def reuse_existing_bridge() -> bool:
+        """只复用目标完全一致的链接，拒绝覆盖异常占用路径。"""
+
+        try:
+            matches = bridge.is_symlink() and bridge.resolve(strict=True) == host_target
+        except OSError:
+            matches = False
+        if matches:
+            return True
+        raise RuntimeError(
+            f"Agent 临时 HOME 的 macOS Keychain 桥接路径已被占用：{bridge}"
+        )
+
+    if bridge.is_symlink() or bridge.exists():
+        return reuse_existing_bridge()
+    try:
+        bridge.symlink_to(host_target, target_is_directory=True)
+    except FileExistsError:
+        # 防止两个环境准备步骤恰好同时创建同一桥接。
+        return reuse_existing_bridge()
     return True
 
 
@@ -186,7 +248,7 @@ class TemporaryAgentHome:
         environment["XDG_CONFIG_HOME"] = str(self.path / ".config")
         environment["XDG_DATA_HOME"] = str(self.path / ".local/share")
         environment["XDG_STATE_HOME"] = str(self.path / ".local/state")
-        if os.name == "nt":
+        if _is_windows():
             appdata = self.path / "AppData/Roaming"
             local_appdata = self.path / "AppData/Local"
             appdata.mkdir(parents=True, exist_ok=True)
@@ -238,6 +300,74 @@ class TemporaryAgentHome:
 
     def cleanup(self) -> str | None:
         """清理当前运行目录，失败时返回可记录但不覆盖任务结果的错误。"""
+
+        try:
+            self._manager.cleanup()
+        except OSError as exc:
+            return str(exc)
+        return None
+
+
+@dataclass
+class TemporaryCodexHome:
+    """外层沙盒内供 Codex 宿主进程写入的每轮运行目录。"""
+
+    path: Path
+    _manager: tempfile.TemporaryDirectory[str] = field(repr=False)
+    bridges: tuple[str, ...] = ()
+
+    @classmethod
+    def create(
+        cls,
+        run_id: str,
+        *,
+        source_home: Path,
+        root: Path | None = None,
+        host_environment: Mapping[str, str] | None = None,
+    ) -> "TemporaryCodexHome":
+        """创建独立运行目录，并复制必要的登录与配置快照。"""
+
+        target_root = _ensure_root(
+            root or agent_codex_home_root(host_environment)
+        )
+        safe_run_id = re.sub(r"[^A-Za-z0-9_-]+", "-", run_id).strip("-")[:24]
+        safe_run_id = safe_run_id or "run"
+        manager = tempfile.TemporaryDirectory(
+            prefix=f"{os.getpid()}-{_INSTANCE_ID}-{safe_run_id}-",
+            dir=target_root,
+        )
+        path = Path(manager.name)
+        bridges: list[str] = []
+        try:
+            for name, bridge_name in _CODEX_RUNTIME_INPUTS.items():
+                source = source_home / name
+                if not source.is_file():
+                    continue
+                target = path / name
+                shutil.copy2(source, target)
+                try:
+                    target.chmod(0o600)
+                except OSError:
+                    # Windows 等平台可能无法完整表达 POSIX 文件权限。
+                    pass
+                bridges.append(bridge_name)
+        except Exception:
+            manager.cleanup()
+            raise
+        return cls(
+            path=path,
+            _manager=manager,
+            bridges=tuple(bridges),
+        )
+
+    def apply_environment(self, environment: dict[str, str]) -> tuple[str, ...]:
+        """幂等地把 Codex 状态与临时产物定向到本轮目录。"""
+
+        environment["CODEX_HOME"] = str(self.path)
+        return self.bridges
+
+    def cleanup(self) -> str | None:
+        """清理本轮 Codex 运行目录，不回写任何宿主文件。"""
 
         try:
             self._manager.cleanup()

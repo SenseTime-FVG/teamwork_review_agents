@@ -542,6 +542,10 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
     joined = " ".join(command)
     assert "--ignore-user-config" not in command
     assert "enabled_tools=[\"invoke_agent\"]" in joined
+    assert (
+        'features.code_mode.direct_only_tool_namespaces=["mcp__teamwork_agent_gateway"]'
+        in command
+    )
     assert command[-1] == "-"
 
 
@@ -553,7 +557,12 @@ def test_runner_forces_project_instruction_isolation_after_extra_args(
 
     config = configured_app_factory()
     agent = config.agents["code-reviewer"]
-    agent.extra_codex_args = ["--config", "project_doc_max_bytes=32768"]
+    agent.extra_codex_args = [
+        "--config",
+        'features.code_mode.direct_only_tool_namespaces=["mcp__other"]',
+        "--config",
+        "project_doc_max_bytes=32768",
+    ]
     repository = config.repositories[0]
     snapshot = snapshot_factory(
         repository_id=repository.id,
@@ -573,6 +582,11 @@ def test_runner_forces_project_instruction_isolation_after_extra_args(
     command = CodexRunner(config).build_command(agent, repository, context)
 
     assert command[-3:] == ["--config", "project_doc_max_bytes=0", "-"]
+    assert command.index(
+        'features.code_mode.direct_only_tool_namespaces=["mcp__other"]'
+    ) < command.index(
+        'features.code_mode.direct_only_tool_namespaces=["mcp__teamwork_agent_gateway"]'
+    )
     assert command.index("project_doc_max_bytes=32768") < command.index(
         "project_doc_max_bytes=0"
     )
@@ -702,6 +716,7 @@ def test_codex_advanced_config_protects_managed_keys() -> None:
         "sandbox_workspace_write",
         "features.network_proxy",
         "features.network_proxy.enabled",
+        "features.code_mode.direct_only_tool_namespaces",
         "shell_environment_policy.include_only",
         "skills.config",
     ):

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from teamwork_review_agents.config import load_config
 from teamwork_review_agents.config_manager import ConfigManager, ConfigRevisionConflict
+from teamwork_review_agents.codex_account import CodexAccountError
 from teamwork_review_agents.codex_settings import read_user_inherited_settings
 from teamwork_review_agents.environment import (
     MASK,
@@ -996,6 +997,43 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     }
     assert "credential" not in result
     assert "不得返回的配置" not in str(result)
+
+
+def test_codex_runtime_options_degrades_when_app_server_diagnostics_fail(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """App Server 诊断失败时运行时选项接口仍应返回可用响应。"""
+
+    config_path = write_config(tmp_path)
+
+    async def effective_config(*_args):
+        raise CodexAccountError("Codex App Server 单条响应超过安全上限（8 MiB）")
+
+    def runtime_options(*args):
+        return {
+            "effective_config": args[4],
+            "effective_config_error": args[5],
+        }
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.read_codex_effective_config",
+        effective_config,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.inspect_runtime_options",
+        runtime_options,
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        response = client.get("/api/codex/runtime-options")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "effective_config": None,
+        "effective_config_error": "Codex App Server 单条响应超过安全上限（8 MiB）",
+    }
 
 
 def test_codex_runtime_options_use_known_defaults_and_unknown_markers(

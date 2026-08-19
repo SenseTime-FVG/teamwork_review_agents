@@ -160,25 +160,29 @@ def permission_profile_override(
     agent: AgentConfig,
     *,
     ipc_directory: Path | None = None,
+    codex_runtime_directory: Path | None = None,
 ) -> str:
     """生成只描述当前 Agent 文件与网络边界的命名权限档案。"""
 
-    ipc_entry = (
-        f"{_toml_string(str(ipc_directory.resolve()))}=\"write\""
-        if ipc_directory is not None
-        else None
-    )
+    extra_filesystem_entries = [
+        f"{_toml_string(str(path.resolve()))}=\"write\""
+        for path in (ipc_directory, codex_runtime_directory)
+        if path is not None
+    ]
     if agent.sandbox == "read-only":
         fields = [
             'description="Teamwork 托管的只读 Agent 外层沙盒"',
             'extends=":read-only"',
-            *([f"filesystem={{{ipc_entry}}}"] if ipc_entry else []),
+            *(
+                [f"filesystem={{{','.join(extra_filesystem_entries)}}}"]
+                if extra_filesystem_entries
+                else []
+            ),
             _network_policy(agent),
         ]
     elif agent.sandbox == "workspace-write":
         filesystem_entries = ['":workspace_roots"={".git"="write"}']
-        if ipc_entry:
-            filesystem_entries.append(ipc_entry)
+        filesystem_entries.extend(extra_filesystem_entries)
         fields = [
             'description="Teamwork 托管的可写 Agent 外层沙盒"',
             'extends=":workspace"',
@@ -198,6 +202,7 @@ def wrap_managed_sandbox_command(
     inner_command: list[str],
     environment: Mapping[str, str],
     ipc_directory: Path | None = None,
+    codex_runtime_directory: Path | None = None,
 ) -> list[str]:
     """用 Codex 原生平台沙盒包裹已关闭内层沙盒的执行命令。"""
 
@@ -209,7 +214,11 @@ def wrap_managed_sandbox_command(
         "--cd",
         str(workspace),
         "--config",
-        permission_profile_override(agent, ipc_directory=ipc_directory),
+        permission_profile_override(
+            agent,
+            ipc_directory=ipc_directory,
+            codex_runtime_directory=codex_runtime_directory,
+        ),
     ]
     if agent.network_access and agent.network_domains:
         # 权限档案只声明域名规则；必须启用网络代理才能真正强制执行白名单。
