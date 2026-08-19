@@ -130,6 +130,10 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .overview-list-controls select:focus, .overview-list-controls input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .overview-list-controls .overview-number-filter { min-width: 92px; max-width: 112px; }
 .overview-list-controls .overview-custom-limit { min-width: 105px; }
+.overview-list-controls-numbered { width: min(100%, 880px); max-width: 880px; display: grid; flex: 1 1 700px; grid-template-columns: minmax(220px, 1fr) 92px 118px 118px; align-items: end; flex-wrap: nowrap; }
+.overview-list-controls-numbered.overview-list-controls-custom-limit { width: min(100%, 1000px); max-width: 1000px; grid-template-columns: minmax(190px, 1fr) 92px 112px 112px 118px; }
+.overview-list-controls-numbered label, .overview-list-controls-numbered label:first-child, .overview-list-controls-numbered .overview-number-filter, .overview-list-controls-numbered .overview-custom-limit { min-width: 0; max-width: none; }
+.overview-list-controls-numbered select, .overview-list-controls-numbered input { width: 100%; min-width: 0; }
 .latest-event-reference { min-width: 150px; display: flex; flex-direction: column; gap: 4px; }
 .latest-event-reference strong { color: #91d9b1; font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; font-weight: 600; white-space: nowrap; }
 .latest-event-reference small, .latest-event-empty { color: #66758a; font-size: 8px; white-space: nowrap; }
@@ -831,8 +835,9 @@ tbody tr:last-child td { border-bottom: 0; }
   .repository-reference-warning { flex-direction: column; gap: 6px; }
   .overview-section-tools { width: 100%; flex-direction: column; align-items: stretch; }
   .overview-selection-actions { width: 100%; }
-  .overview-list-controls { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
+  .overview-list-controls, .overview-list-controls-numbered, .overview-list-controls-numbered.overview-list-controls-custom-limit { width: 100%; max-width: none; display: grid; flex: none; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
   .overview-list-controls label, .overview-list-controls label:first-child, .overview-list-controls .overview-number-filter, .overview-list-controls .overview-custom-limit { min-width: 0; max-width: none; }
+  .overview-list-controls-numbered > label:first-child { grid-column: 1 / -1; }
   .overview-confirmation-layer { align-items: end; padding: 10px; }
   .overview-confirmation { width: 100%; max-height: calc(100vh - 20px); padding: 0 17px 17px; border-radius: 14px; }
   .overview-confirmation-head { grid-template-columns: 38px minmax(0, 1fr) 30px; gap: 11px; padding: 19px 0 16px; }

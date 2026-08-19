@@ -1203,8 +1203,14 @@ function OverviewListControls(props: {
     setCustomLimit(String(fallback));
   }
 
+  const controlClassName = [
+    "overview-list-controls",
+    props.showNumber ? "overview-list-controls-numbered" : "",
+    limitMode === "custom" ? "overview-list-controls-custom-limit" : "",
+  ].filter(Boolean).join(" ");
+
   return (
-    <div className="overview-list-controls">
+    <div className={controlClassName}>
       <label>
         <span>仓库</span>
         <select
