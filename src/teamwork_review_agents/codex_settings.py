@@ -335,6 +335,77 @@ def inspect_model_cache(home: Path) -> dict[str, Any]:
     }
 
 
+def _normalize_model_catalog(
+    raw_models: Any,
+    *,
+    visible_only: bool = False,
+) -> list[dict[str, Any]]:
+    """把 Codex 的账号缓存或内置目录收敛为管理界面需要的字段。"""
+
+    if not isinstance(raw_models, list):
+        return []
+    models: list[dict[str, Any]] = []
+    for item in raw_models:
+        if not isinstance(item, dict) or not item.get("slug"):
+            continue
+        if visible_only and item.get("visibility") != "list":
+            continue
+        reasoning = item.get("supported_reasoning_levels", [])
+        levels = (
+            [
+                str(level.get("effort") if isinstance(level, dict) else level)
+                for level in reasoning
+                if (isinstance(level, dict) and level.get("effort"))
+                or (isinstance(level, str) and level)
+            ]
+            if isinstance(reasoning, list)
+            else []
+        )
+        speed_tiers = item.get("additional_speed_tiers", [])
+        service_tiers = item.get("service_tiers", [])
+        supports_fast = (isinstance(speed_tiers, list) and "fast" in speed_tiers) or (
+            isinstance(service_tiers, list)
+            and any(
+                isinstance(tier, dict)
+                and (
+                    tier.get("id") in {"fast", "priority"}
+                    or tier.get("name") == "Fast"
+                )
+                for tier in service_tiers
+            )
+        )
+        models.append(
+            {
+                "slug": str(item["slug"]),
+                "display_name": str(item.get("display_name") or item["slug"]),
+                "default_reasoning_level": item.get("default_reasoning_level"),
+                "supported_reasoning_levels": levels,
+                "supports_fast_mode": supports_fast,
+            }
+        )
+    return models
+
+
+def read_account_models(
+    home: Path,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """读取当前 Codex Home 的账号可见模型；缓存缺失不是错误。"""
+
+    path = home / "models_cache.json"
+    if not path.is_file():
+        return [], None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], str(exc)
+    if not isinstance(document, dict):
+        return [], "模型缓存根节点不是对象"
+    return _normalize_model_catalog(
+        document.get("models", []),
+        visible_only=True,
+    ), None
+
+
 def read_bundled_models(
     codex_binary: str,
     home: Path | None = None,
@@ -357,36 +428,7 @@ def read_bundled_models(
         return [], str(exc)
 
     raw_models = document.get("models", []) if isinstance(document, dict) else []
-    models: list[dict[str, Any]] = []
-    for item in raw_models:
-        if not isinstance(item, dict) or not item.get("slug"):
-            continue
-        reasoning = item.get("supported_reasoning_levels", [])
-        levels = [
-            str(level.get("effort"))
-            for level in reasoning
-            if isinstance(level, dict) and level.get("effort")
-        ]
-        speed_tiers = item.get("additional_speed_tiers", [])
-        service_tiers = item.get("service_tiers", [])
-        supports_fast = "fast" in speed_tiers or any(
-            isinstance(tier, dict)
-            and (
-                tier.get("id") in {"fast", "priority"}
-                or tier.get("name") == "Fast"
-            )
-            for tier in service_tiers
-        )
-        models.append(
-            {
-                "slug": str(item["slug"]),
-                "display_name": str(item.get("display_name") or item["slug"]),
-                "default_reasoning_level": item.get("default_reasoning_level"),
-                "supported_reasoning_levels": levels,
-                "supports_fast_mode": supports_fast,
-            }
-        )
-    return models, None
+    return _normalize_model_catalog(raw_models), None
 
 
 def inspect_runtime_options(
@@ -401,7 +443,18 @@ def inspect_runtime_options(
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
     home = codex_home(configured_home)
-    models, catalog_error = read_bundled_models(codex_binary, home)
+    models, account_catalog_error = read_account_models(home)
+    if models:
+        catalog_source = "account_cache"
+        catalog_error = None
+    else:
+        models, catalog_error = read_bundled_models(codex_binary, home)
+        catalog_source = "bundled" if catalog_error is None else "unavailable"
+        if catalog_error and account_catalog_error:
+            catalog_error = (
+                f"账号模型缓存：{account_catalog_error}；"
+                f"Codex CLI 内置目录：{catalog_error}"
+            )
     user_model, user_error, user_config_path = read_user_model(home)
     binary = inspect_codex_binary(codex_binary, home)
     cache = inspect_model_cache(home)
@@ -467,6 +520,7 @@ def inspect_runtime_options(
         }
     return {
         "models": models,
+        "catalog_source": catalog_source,
         "inherited_model": inherited_model,
         "codex_model": codex_model,
         "codex_model_source": codex_model_source,

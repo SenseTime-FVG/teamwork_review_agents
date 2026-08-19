@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   api,
@@ -170,6 +170,7 @@ const EMPTY_STATUS: RuntimeStatus = {
 
 const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   models: [],
+  catalog_source: "unavailable",
   inherited_model: {
     value: null,
     source: "builtin",
@@ -428,14 +429,158 @@ function SelectField(props: {
   options: Array<{ value: string; label: string }>;
   help?: string;
 }) {
+  const fieldId = useId();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [openUpward, setOpenUpward] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const listboxId = `${fieldId}-options`;
+  const selectedIndex = props.options.findIndex((option) => option.value === props.value);
+  const selectedOption = selectedIndex >= 0 ? props.options[selectedIndex] : props.options[0];
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    const updatePlacement = () => {
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const bounds = trigger.getBoundingClientRect();
+      const spaceAbove = bounds.top;
+      const spaceBelow = window.innerHeight - bounds.bottom;
+      setOpenUpward(spaceBelow < menu.offsetHeight + 8 && spaceAbove > spaceBelow);
+    };
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    window.addEventListener("scroll", updatePlacement, true);
+    return () => {
+      window.removeEventListener("resize", updatePlacement);
+      window.removeEventListener("scroll", updatePlacement, true);
+    };
+  }, [open, props.options.length]);
+
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    document.getElementById(`${fieldId}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, fieldId, open]);
+
+  function openOptions(direction: "first" | "last" = "first") {
+    const fallbackIndex = direction === "last" ? props.options.length - 1 : 0;
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : fallbackIndex);
+    setOpen(true);
+  }
+
+  function selectOption(index: number) {
+    const option = props.options[index];
+    if (!option) return;
+    props.onChange(option.value);
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <select value={props.value} onChange={(event) => props.onChange(event.target.value)}>
-        {props.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-      </select>
+    <div className={`field select-field ${open ? "open" : ""}`} ref={containerRef}>
+      <span id={`${fieldId}-label`}>{props.label}</span>
+      <div className="select-combobox">
+        <button
+          ref={triggerRef}
+          className="select-combobox-trigger"
+          type="button"
+          role="combobox"
+          aria-labelledby={`${fieldId}-label`}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-haspopup="listbox"
+          aria-activedescendant={open && activeIndex >= 0 ? `${fieldId}-option-${activeIndex}` : undefined}
+          onClick={() => {
+            if (open) setOpen(false);
+            else openOptions();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setOpen(false);
+              return;
+            }
+            if (event.key === "Tab") {
+              setOpen(false);
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) {
+                openOptions(event.key === "ArrowUp" ? "last" : "first");
+                return;
+              }
+              if (!props.options.length) return;
+              const offset = event.key === "ArrowDown" ? 1 : -1;
+              setActiveIndex((current) => (
+                current < 0
+                  ? 0
+                  : (current + offset + props.options.length) % props.options.length
+              ));
+              return;
+            }
+            if (open && event.key === "Home") {
+              event.preventDefault();
+              setActiveIndex(0);
+              return;
+            }
+            if (open && event.key === "End") {
+              event.preventDefault();
+              setActiveIndex(props.options.length - 1);
+              return;
+            }
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              if (open) selectOption(activeIndex);
+              else openOptions();
+            }
+          }}
+        >
+          <span>{selectedOption?.label ?? props.value}</span>
+          <span className="select-combobox-chevron" aria-hidden="true">⌄</span>
+        </button>
+        {open && (
+          <div
+            ref={menuRef}
+            id={listboxId}
+            className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
+            role="listbox"
+            aria-labelledby={`${fieldId}-label`}
+          >
+            {props.options.map((option, index) => (
+              <button
+                id={`${fieldId}-option-${index}`}
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={option.value === props.value}
+                className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${option.value === props.value ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => selectOption(index)}
+              >
+                <span className="select-combobox-check" aria-hidden="true">{option.value === props.value ? "✓" : ""}</span>
+                <span>{option.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
       {props.help && <small>{props.help}</small>}
-    </label>
+    </div>
   );
 }
 
@@ -1944,7 +2089,13 @@ function CodexRuntimeEditor(props: {
             placeholder={inherited.label}
             models={props.options.models}
             onChange={(model) => patchCodex({ model: model || undefined })}
-            help={props.options.catalog_error ? "无法读取本机模型目录，仍可手工填写模型 ID" : "候选项来自当前服务使用的 Codex CLI"}
+            help={
+              props.options.catalog_error
+                ? "无法读取模型目录，仍可手工填写模型 ID"
+                : props.options.catalog_source === "account_cache"
+                  ? "候选项来自当前 Codex 账号模型缓存"
+                  : "候选项来自当前服务使用的 Codex CLI 内置目录"
+            }
           />
           <SelectField
             label="默认推理强度"

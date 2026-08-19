@@ -1206,6 +1206,7 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     assert result["models"][0]["slug"] == "gpt-test"
     assert result["models"][0]["supported_reasoning_levels"] == ["low", "medium"]
     assert result["models"][0]["supports_fast_mode"] is True
+    assert result["catalog_source"] == "bundled"
     assert result["user_model"] == "gpt-user"
     assert result["inherited_model"] == {
         "value": "gpt-user",
@@ -1235,6 +1236,64 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     }
     assert "credential" not in result
     assert "不得返回的配置" not in str(result)
+
+
+def test_codex_runtime_options_prefer_visible_account_models(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """账号缓存存在时应优先返回可见模型，并过滤隐藏模型。"""
+
+    config_path = write_config(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        '{"client_version":"0.148.0","models":['
+        '{"slug":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark",'
+        '"visibility":"list","default_reasoning_level":"medium",'
+        '"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},'
+        '{"slug":"hidden-model","display_name":"Hidden",'
+        '"visibility":"hide","supported_reasoning_levels":[]}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"models\":[{\"slug\":\"legacy-bundled\"}]}'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["runtime"] = {"codex_binary": str(fake_codex)}
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    async def effective_config(*_args):
+        return {}
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.read_codex_effective_config",
+        effective_config,
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        result = client.get("/api/codex/runtime-options").json()
+
+    assert result["catalog_source"] == "account_cache"
+    assert result["catalog_error"] is None
+    assert result["models"] == [
+        {
+            "slug": "gpt-5.3-codex-spark",
+            "display_name": "GPT-5.3-Codex-Spark",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": ["low", "high"],
+            "supports_fast_mode": False,
+        }
+    ]
 
 
 def test_codex_runtime_options_degrades_when_app_server_diagnostics_fail(

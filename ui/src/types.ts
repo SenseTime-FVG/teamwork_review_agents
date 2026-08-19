@@ -150,6 +150,7 @@ export type CodexRuntimeOptions = {
     supported_reasoning_levels: string[];
     supports_fast_mode: boolean;
   }>;
+  catalog_source: "account_cache" | "bundled" | "unavailable";
   inherited_model: {
     value?: string | null;
     source: "runtime" | "codex" | "user" | "builtin";
