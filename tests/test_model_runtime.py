@@ -420,12 +420,13 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
 
     async def fake_create_response(self, payload, *, event_callback=None):
         payloads.append(payload)
+        response_number = len(payloads)
         if event_callback is not None:
             await event_callback(
-                {"type": "response.created", "response": {"id": f"resp_{len(payloads)}"}}
+                {"type": "response.created", "response": {"id": f"resp_{response_number}"}}
             )
-        if len(payloads) == 1:
-            return {
+        if response_number == 1:
+            response = {
                 "id": "resp_1",
                 "output": [
                     {
@@ -437,16 +438,32 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
                 ],
                 "usage": {"input_tokens": 5, "output_tokens": 2},
             }
-        return {
-            "id": "resp_2",
-            "output": [
+        else:
+            response = {
+                "id": "resp_2",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "工具验证完成"}],
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 4},
+            }
+        if event_callback is not None:
+            await event_callback(
+                {"type": "response.output_item.done", "item": response["output"][0]}
+            )
+            await event_callback(
                 {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "工具验证完成"}],
+                    "type": "response.completed",
+                    "response": {
+                        "id": response["id"],
+                        "status": "completed",
+                        "usage": response["usage"],
+                    },
                 }
-            ],
-            "usage": {"input_tokens": 3, "output_tokens": 4},
-        }
+            )
+        return response
 
     monkeypatch.setattr(CodexResponsesClient, "create_response", fake_create_response)
     logs: list[tuple[str, str, Any]] = []
@@ -481,6 +498,20 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
     assert len(outputs) == 1
     assert "model-tool" in outputs[0]["output"]
     assert any(event_type == "item.completed" for _, event_type, _ in logs)
+    assert sum(event_type == "thread.started" for _, event_type, _ in logs) == 1
+    assert all(not event_type.startswith("response.") for _, event_type, _ in logs)
+    assert [
+        event["type"]
+        for event in result.events
+        if str(event.get("type", "")).startswith("response.")
+    ] == [
+        "response.created",
+        "response.output_item.done",
+        "response.completed",
+        "response.created",
+        "response.output_item.done",
+        "response.completed",
+    ]
 
 
 def test_model_tool_environment_uses_empty_run_codex_home(

@@ -197,6 +197,8 @@ function toRunMessage(log: RunLog): RunMessage {
 export function presentRunLogs(logs: RunLog[]): RunMessage[] {
   const messages: RunMessage[] = [];
   for (const log of logs) {
+    // Responses SSE 属于模型基座的底层协议，用户时间线只展示统一 Agent 语义事件。
+    if (log.event_type.startsWith("response.")) continue;
     const message = toRunMessage(log);
     const previous = messages.at(-1);
     if (previous && previous.eventType === message.eventType && previous.raw === message.raw) {

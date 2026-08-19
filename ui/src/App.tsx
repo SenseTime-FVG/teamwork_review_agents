@@ -11,6 +11,7 @@ import {
 } from "./api";
 import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
+import { presentRunLogs } from "./runLogPresentation";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -5978,6 +5979,7 @@ function AgentRunDetailDrawer(props: {
   const [cancelling, setCancelling] = useState(false);
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
+  const visibleMessageCount = useMemo(() => presentRunLogs(logs).length, [logs]);
 
   useBodyScrollLock(true);
 
@@ -6101,7 +6103,7 @@ function AgentRunDetailDrawer(props: {
               </div>
             </header>
             <nav className="run-drawer-tabs" aria-label="运行详情分类">
-              <button className={drawerTab === "messages" ? "active" : ""} onClick={() => setDrawerTab("messages")}>消息 <span>{logs.length}</span></button>
+              <button className={drawerTab === "messages" ? "active" : ""} onClick={() => setDrawerTab("messages")}>消息 <span>{visibleMessageCount}</span></button>
               <button className={drawerTab === "result" ? "active" : ""} onClick={() => setDrawerTab("result")}>最终结果</button>
               <button className={drawerTab === "context" ? "active" : ""} onClick={() => setDrawerTab("context")}>运行详情</button>
             </nav>

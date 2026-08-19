@@ -498,6 +498,7 @@ class CodexModelRunner:
         usage: dict[str, Any] = {}
         events: list[dict[str, Any]] = []
         response_id: str | None = None
+        thread_started = False
 
         await emit(
             "system",
@@ -513,12 +514,14 @@ class CodexModelRunner:
         async def receive_event(event: dict[str, Any]) -> None:
             """用 SSE 事件续期，并只持久化不含加密思维链的安全摘要。"""
 
+            nonlocal thread_started
             progress()
             event_type = str(event.get("type") or "response.event")
             if event_type == "response.created":
                 response = event.get("response")
                 created_id = response.get("id") if isinstance(response, dict) else None
-                if created_id:
+                if created_id and not thread_started:
+                    thread_started = True
                     await emit("stdout", "thread.started", {"thread_id": created_id})
             if event_type in {
                 "response.created",
@@ -528,8 +531,6 @@ class CodexModelRunner:
                 safe = _safe_response_event(event)
                 if len(events) < self.config.runtime.max_jsonl_events:
                     events.append(redactor.data(safe))
-                if event_type != "response.completed":
-                    await emit("stdout", event_type, safe)
 
         for round_index in range(_MAX_TOOL_ROUNDS):
             payload: dict[str, Any] = {
