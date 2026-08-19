@@ -14,13 +14,6 @@ config.yaml
 /workspaces/
 ui/node_modules/
 ui/*.tsbuildinfo
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.pid
-data/*.lock
-data/*.log
-/data/worktrees/
-# Preflight 依赖缓存属于可再生的本地运行数据，不纳入版本控制。
-/data/preflight-cache/
+# data 目录保存本地数据库、日志、锁、工作树和缓存，不纳入版本控制。
+/data/
 tmp/
