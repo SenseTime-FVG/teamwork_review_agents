@@ -176,6 +176,22 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .field input:focus, .field select:focus, .field textarea:focus, .prompt-editor textarea:focus, .env-row input:focus, .env-row select:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .field input:disabled { color: #718096; background: #0b111a; cursor: not-allowed; }
 .field small { color: #5f6d80; font-size: 9px; }
+.model-combobox { position: relative; min-width: 0; }
+.model-combobox > input { padding-right: 36px; }
+.model-combobox-toggle { position: absolute; z-index: 2; top: 1px; right: 1px; width: 34px; height: calc(100% - 2px); display: grid; place-items: center; padding: 0; border: 0; border-left: 1px solid #202c3a; border-radius: 0 6px 6px 0; outline: none; background: #0c131d; color: #7f8da0; cursor: pointer; font-size: 16px; transition: .15s ease; }
+.model-combobox-toggle:hover, .model-combobox-toggle:focus-visible, .model-combobox.open .model-combobox-toggle { background: #111d1a; color: var(--accent); }
+.model-combobox-toggle > span { transition: transform .15s ease; }
+.model-combobox.open > input { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.model-combobox.open .model-combobox-toggle > span { transform: rotate(180deg); }
+.model-combobox-options { position: absolute; z-index: 60; top: calc(100% + 6px); right: 0; left: 0; max-height: 250px; padding: 6px; overflow-y: auto; border: 1px solid #334256; border-radius: 9px; background: #0b121c; box-shadow: 0 18px 45px rgba(0, 0, 0, .5), inset 0 1px rgba(255, 255, 255, .025); }
+.model-combobox-option { width: 100%; display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #aab7c8; cursor: pointer; text-align: left; }
+.model-combobox-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 650; }
+.model-combobox-option > small { overflow: hidden; color: #607086; font: 400 9px "SFMono-Regular", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.model-combobox-option:hover, .model-combobox-option.active { border-color: #344558; background: #121c29; color: var(--bright); }
+.model-combobox-option.selected { border-color: #346448; background: #102119; color: #d9f4e5; }
+.model-combobox-option.selected > small { color: #72ae8a; }
+.model-combobox-empty { padding: 18px 12px; color: #68778b; font-size: 9px; line-height: 1.55; text-align: center; }
+.config-editor-surface[disabled] .model-combobox-options { display: none; }
 .multi-choice-field { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
 .multi-choice-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
 .multi-choice-head small { color: #5f6d80; font-size: 9px; white-space: nowrap; }

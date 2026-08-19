@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   getToken,
@@ -364,20 +364,156 @@ function ModelField(props: {
   onChange: (value: string) => void;
   help?: string;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const listboxId = `${props.id}-options`;
+  const filteredModels = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return props.models;
+    return props.models.filter((model) => (
+      model.slug.toLowerCase().includes(normalized)
+      || model.display_name.toLowerCase().includes(normalized)
+    ));
+  }, [props.models, query]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const currentIndex = filteredModels.findIndex((model) => model.slug === props.value);
+    setActiveIndex(currentIndex >= 0 ? currentIndex : filteredModels.length ? 0 : -1);
+  }, [filteredModels, open, props.value]);
+
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    document.getElementById(`${props.id}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, open, props.id]);
+
+  function openAllModels() {
+    setQuery("");
+    setOpen(true);
+  }
+
+  function selectModel(model: CodexRuntimeOptions["models"][number]) {
+    props.onChange(model.slug);
+    setOpen(false);
+    setQuery("");
+  }
+
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <input
-        list={props.id}
-        value={props.value}
-        placeholder={props.placeholder}
-        onChange={(event) => props.onChange(event.target.value)}
-      />
-      <datalist id={props.id}>
-        {props.models.map((model) => <option key={model.slug} value={model.slug}>{model.display_name}</option>)}
-      </datalist>
+    <div className="field model-field" ref={containerRef}>
+      <span id={`${props.id}-label`}>{props.label}</span>
+      <div className={`model-combobox ${open ? "open" : ""}`}>
+        <input
+          ref={inputRef}
+          id={props.id}
+          value={props.value}
+          placeholder={props.placeholder}
+          role="combobox"
+          aria-labelledby={`${props.id}-label`}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-autocomplete="list"
+          aria-activedescendant={open && activeIndex >= 0 ? `${props.id}-option-${activeIndex}` : undefined}
+          autoComplete="off"
+          onFocus={openAllModels}
+          onClick={() => {
+            if (!open) openAllModels();
+          }}
+          onChange={(event) => {
+            props.onChange(event.target.value);
+            setQuery(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setOpen(false);
+              setQuery("");
+              return;
+            }
+            if (event.key === "Tab") {
+              setOpen(false);
+              setQuery("");
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) {
+                openAllModels();
+                return;
+              }
+              if (!filteredModels.length) return;
+              const offset = event.key === "ArrowDown" ? 1 : -1;
+              setActiveIndex((current) => (
+                current < 0
+                  ? 0
+                  : (current + offset + filteredModels.length) % filteredModels.length
+              ));
+              return;
+            }
+            if (event.key === "Enter" && open && activeIndex >= 0) {
+              event.preventDefault();
+              const model = filteredModels[activeIndex];
+              if (model) selectModel(model);
+            }
+          }}
+        />
+        <button
+          className="model-combobox-toggle"
+          type="button"
+          aria-label={open ? "关闭模型候选" : "展开全部模型候选"}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          onClick={() => {
+            if (open) {
+              setOpen(false);
+              setQuery("");
+            } else {
+              openAllModels();
+              inputRef.current?.focus();
+            }
+          }}
+        ><span aria-hidden="true">⌄</span></button>
+        {open && (
+          <div className="model-combobox-options" id={listboxId} role="listbox" aria-labelledby={`${props.id}-label`}>
+            {filteredModels.length ? filteredModels.map((model, index) => (
+              <button
+                id={`${props.id}-option-${index}`}
+                key={model.slug}
+                type="button"
+                role="option"
+                aria-selected={model.slug === props.value}
+                className={`model-combobox-option ${index === activeIndex ? "active" : ""} ${model.slug === props.value ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => selectModel(model)}
+              >
+                <span>{model.display_name}</span>
+                <small>{model.slug}</small>
+              </button>
+            )) : (
+              <div className="model-combobox-empty">
+                {props.models.length ? "没有匹配模型，可继续手工填写模型 ID" : "没有可用候选，可继续手工填写模型 ID"}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
       {props.help && <small>{props.help}</small>}
-    </label>
+    </div>
   );
 }
 
