@@ -207,7 +207,10 @@ async def test_reused_preflight_result_is_linked_to_current_event(
     assert detail is not None
     assert detail["preflight"]["run_id"] == reservation.run_id
     assert detail["preflight"]["reused"] == 1
-    assert detail["preflight"]["output"] == "断言失败"
+    assert "output" not in detail["preflight"]
+    preflight_detail = orchestrator.store.get_preflight_run(reservation.run_id)
+    assert preflight_detail is not None
+    assert preflight_detail["output"] == "断言失败"
 
 
 async def test_successful_preflight_allows_matching_review_agents(

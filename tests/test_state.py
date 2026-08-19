@@ -315,6 +315,10 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         item["snapshot_key"]
         for item in store.list_snapshots(None, status="opened")
     ] == [newest.key]
+    assert [
+        item["snapshot_key"]
+        for item in store.list_snapshots(None, number=2)
+    ] == [older.key]
 
     assert [item["event_id"] for item in store.list_events(None)] == [
         newest_event.id,
@@ -322,9 +326,16 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
     ]
     assert store.list_events(1)[0]["event_id"] == newest_event.id
     assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
+    assert store.list_events(None, number=2)[0]["event_id"] == older_event.id
     assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id
     assert store.list_events(None, status="pending")[0]["event_id"] == newest_event.id
     assert store.list_events(None)[0]["occurred_at"].startswith("2026-08-18T10:00:00")
+
+    detail = store.get_change_request_detail("second", 2)
+    assert detail is not None
+    assert detail["snapshot_key"] == older.key
+    assert [item["event_id"] for item in detail["events"]] == [older_event.id]
+    assert store.get_change_request_detail("second", 999) is None
 
 
 def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
@@ -968,8 +979,22 @@ def test_event_list_exposes_linked_preflight_summary(
     detail = store.get_event_detail(event.id)
     assert detail is not None
     assert detail["dispatches"] == []
-    assert detail["preflight"]["output"] == "不应进入事件列表的完整输出"
+    assert "output" not in detail["preflight"]
     assert detail["preflight"]["reused"] == 0
+    assert detail["preflights"][0]["run_id"] == reservation.run_id
+
+    summaries = store.list_preflight_runs()
+    assert summaries[0]["run_id"] == reservation.run_id
+    assert summaries[0]["event_type"] == event.type
+    assert summaries[0]["linked_event_count"] == 1
+    assert summaries[0]["reused_event_count"] == 0
+    assert "output" not in summaries[0]
+
+    preflight_detail = store.get_preflight_run(reservation.run_id)
+    assert preflight_detail is not None
+    assert preflight_detail["event_type"] == event.type
+    assert preflight_detail["output"] == "不应进入事件列表的完整输出"
+    assert preflight_detail["linked_events"][0]["event_id"] == event.id
 
     reused_event = create_manual_activity_event(
         snapshot,
@@ -989,6 +1014,14 @@ def test_event_list_exposes_linked_preflight_summary(
     assert reused_detail is not None
     assert reused_detail["preflight"]["run_id"] == reservation.run_id
     assert reused_detail["preflight"]["reused"] == 1
+    assert store.list_preflight_runs(number=event.number)[0][
+        "linked_event_count"
+    ] == 2
+    assert store.list_preflight_runs(number=event.number)[0][
+        "reused_event_count"
+    ] == 1
+    assert store.list_preflight_runs(number=999) == []
+    assert store.get_preflight_run("missing-preflight") is None
 
 
 def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:

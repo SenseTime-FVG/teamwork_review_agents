@@ -782,6 +782,39 @@ def create_app(
             raise HTTPException(status_code=404, detail="运行记录不存在")
         return run
 
+    @app.get("/api/preflight-runs")
+    async def preflight_runs(
+        limit: int = Query(default=100, ge=1, le=500),
+        status: Literal[
+            "running",
+            "success",
+            "failure",
+            "timed_out",
+            "error",
+        ]
+        | None = None,
+        repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
+    ):
+        """返回本地 Preflight / CI 运行摘要，不包含完整输出。"""
+
+        return await asyncio.to_thread(
+            manager.store.list_preflight_runs,
+            limit,
+            status=status,
+            repository_id=repository_id,
+            number=number,
+        )
+
+    @app.get("/api/preflight-runs/{run_id}")
+    async def preflight_run_detail(run_id: str):
+        """按需返回本地 Preflight / CI 完整结果。"""
+
+        run = await asyncio.to_thread(manager.store.get_preflight_run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        return run
+
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:
         """持久化取消指定运行及其全部后代。"""
@@ -881,6 +914,7 @@ def create_app(
         limit: int = Query(default=50, ge=1),
         all_records: bool = False,
         repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
         status: Literal[
             "pending",
             "processing",
@@ -897,6 +931,7 @@ def create_app(
             None if all_records else limit,
             status=status,
             repository_id=repository_id,
+            number=number,
         )
 
     @app.get("/api/events/{event_id}")
@@ -930,6 +965,26 @@ def create_app(
                 provider is not None and provider.kind == "github"
             )
         return records
+
+    @app.get("/api/change-request-detail")
+    async def change_request_detail(
+        repository_id: str,
+        number: int = Query(ge=1),
+    ):
+        """按需返回 MR/PR 当前快照与关联事件摘要。"""
+
+        detail = await asyncio.to_thread(
+            manager.store.get_change_request_detail,
+            repository_id,
+            number,
+        )
+        if detail is None:
+            raise HTTPException(status_code=404, detail="MR/PR 快照不存在")
+        provider = manager.config.providers.get(str(detail.get("provider") or ""))
+        detail["latest_event_supported"] = bool(
+            provider is not None and provider.kind == "github"
+        )
+        return detail
 
     @app.post("/api/change-requests/{repository_id}/{number}/emit-discovered")
     async def emit_discovered(repository_id: str, number: int):

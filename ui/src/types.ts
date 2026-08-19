@@ -327,6 +327,10 @@ export type ChangeRequestRecord = {
   } | null;
 };
 
+export type ChangeRequestDetailRecord = ChangeRequestRecord & {
+  events: EventRecord[];
+};
+
 export type ManualLatestEventBatchResult = {
   repository_id: string;
   number: number;
@@ -434,7 +438,7 @@ export type EventDispatchDetail = {
   finished_at?: number | null;
 };
 
-export type EventPreflightDetail = {
+export type EventPreflightSummary = {
   run_id: string;
   repository_id: string;
   number: number;
@@ -444,7 +448,6 @@ export type EventPreflightDetail = {
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;
-  output: string;
   error?: string | null;
   status_published: number | boolean;
   started_at: number;
@@ -455,5 +458,40 @@ export type EventPreflightDetail = {
 
 export type EventDetailRecord = EventRecord & {
   dispatches: EventDispatchDetail[];
-  preflight?: EventPreflightDetail | null;
+  preflights: EventPreflightSummary[];
+  preflight?: EventPreflightSummary | null;
+};
+
+export type PreflightRunSummary = {
+  run_id: string;
+  event_id: string;
+  repository_id: string;
+  number: number;
+  head_sha: string;
+  config_revision: string;
+  status: "running" | "success" | "failure" | "timed_out" | "error";
+  attempts: number;
+  failed_step?: string | null;
+  exit_code?: number | null;
+  error?: string | null;
+  status_published: number | boolean;
+  started_at: number;
+  finished_at?: number | null;
+  event_type?: string | null;
+  change_request_title?: string | null;
+  change_request_url?: string | null;
+  linked_event_count: number;
+  reused_event_count: number;
+};
+
+export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
+  output: string;
+  linked_events: Array<{
+    event_id: string;
+    event_type: string;
+    status: string;
+    occurred_at: string;
+    reused: number | boolean;
+    linked_at: number;
+  }>;
 };

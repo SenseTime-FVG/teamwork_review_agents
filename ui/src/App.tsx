@@ -11,6 +11,7 @@ import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import type {
   Agent,
+  ChangeRequestDetailRecord,
   ChangeRequestRecord,
   CodexAccountStatus,
   CodexInheritedSetting,
@@ -23,6 +24,8 @@ import type {
   EventDetailRecord,
   EventRecord,
   ManualLatestEventBatchResponse,
+  PreflightRunDetail,
+  PreflightRunSummary,
   Repository,
   RepositoryGitDetail,
   RepositoryPreflight,
@@ -42,6 +45,7 @@ type OverviewLimit = number | null;
 
 type OverviewFilter = {
   repositoryId: string;
+  number: string;
   status: string;
   limit: OverviewLimit;
 };
@@ -73,6 +77,7 @@ type AgentActionConfirmation = {
 
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   repositoryId: "",
+  number: "",
   status: "",
   limit: 10,
 };
@@ -267,7 +272,7 @@ function dateTimeText(value?: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
 }
 
-function overviewQuery(filter: OverviewFilter): string {
+function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   const parameters = new URLSearchParams();
   if (filter.limit === null) {
     parameters.set("all_records", "true");
@@ -275,6 +280,9 @@ function overviewQuery(filter: OverviewFilter): string {
     parameters.set("limit", String(filter.limit));
   }
   if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
+  if (includeNumber && /^\d+$/.test(filter.number) && Number(filter.number) > 0) {
+    parameters.set("number", filter.number);
+  }
   if (filter.status) parameters.set("status", filter.status);
   return parameters.toString();
 }
@@ -941,6 +949,7 @@ function OverviewListControls(props: {
   repositories: Repository[];
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
+  showNumber?: boolean;
   onChange: (filter: OverviewFilter) => void;
 }) {
   const predefinedLimits = [10, 20, 50];
@@ -989,6 +998,20 @@ function OverviewListControls(props: {
           ))}
         </select>
       </label>
+      {props.showNumber && (
+        <label className="overview-number-filter">
+          <span>编号</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            inputMode="numeric"
+            placeholder="全部"
+            value={props.filter.number}
+            onChange={(event) => props.onChange({ ...props.filter, number: event.target.value })}
+          />
+        </label>
+      )}
       <label>
         <span>状态</span>
         <select
@@ -1251,7 +1274,12 @@ function Overview(props: {
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
 }) {
+  const [selectedChangeRequest, setSelectedChangeRequest] = useState<ChangeRequestRecord | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
+  const [selectedExecution, setSelectedExecution] = useState<{
+    kind: "agent" | "preflight";
+    id: string;
+  } | null>(null);
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
@@ -1337,7 +1365,15 @@ function Overview(props: {
               {props.changeRequests.map((item) => (
                 <tr
                   key={item.snapshot_key}
-                  className={props.selectedSnapshotKeys.includes(item.snapshot_key) ? "overview-row-selected" : ""}
+                  className={`overview-detail-row ${props.selectedSnapshotKeys.includes(item.snapshot_key) ? "overview-row-selected" : ""}`}
+                  tabIndex={0}
+                  onClick={() => setSelectedChangeRequest(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedChangeRequest(item);
+                    }
+                  }}
                 >
                   {props.selectionMode && (
                     <td className="overview-selection-column">
@@ -1347,12 +1383,13 @@ function Overview(props: {
                         checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
                         disabled={!item.latest_event || props.triggeringKeys.length > 0}
                         title={item.latest_event ? "加入批量手动触发" : "尚无可触发的最新事件"}
+                        onClick={(event) => event.stopPropagation()}
                         onChange={() => props.onToggleSelection(item.snapshot_key)}
                       />
                     </td>
                   )}
                   <td>
-                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer">
+                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
                       <strong>#{item.number} {item.title}</strong>
                       <small>{item.source_branch} → {item.target_branch}</small>
                     </a>
@@ -1368,7 +1405,10 @@ function Overview(props: {
                       <button
                         className="button secondary compact"
                         disabled={props.emittingKey === item.snapshot_key}
-                        onClick={() => props.onEmitDiscovered(item)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          props.onEmitDiscovered(item);
+                        }}
                       >
                         {props.emittingKey === item.snapshot_key ? "补发中…" : "补发首次事件"}
                       </button>
@@ -1395,7 +1435,10 @@ function Overview(props: {
                       className="button secondary compact"
                       disabled={!item.latest_event || props.triggeringKeys.includes(item.snapshot_key)}
                       title={item.latest_event ? `手动发送 ${item.latest_event.event_type}` : "尚无可触发的最新事件"}
-                      onClick={() => props.onTriggerLatestEvent(item)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        props.onTriggerLatestEvent(item);
+                      }}
                     >
                       {props.triggeringKeys.includes(item.snapshot_key) ? "发送中…" : "手动触发"}
                     </button>
@@ -1420,6 +1463,7 @@ function Overview(props: {
             repositories={props.repositories}
             filter={props.eventFilter}
             statuses={EVENT_STATUS_OPTIONS}
+            showNumber
             onChange={props.onEventFilterChange}
           />
         </div>
@@ -1428,7 +1472,18 @@ function Overview(props: {
             <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th></tr></thead>
             <tbody>
               {props.events.map((event) => (
-                <tr key={event.event_id}>
+                <tr
+                  key={event.event_id}
+                  className="overview-detail-row"
+                  tabIndex={0}
+                  onClick={() => setSelectedEvent(event)}
+                  onKeyDown={(keyboardEvent) => {
+                    if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                      keyboardEvent.preventDefault();
+                      setSelectedEvent(event);
+                    }
+                  }}
+                >
                   <td className="mono">
                     <span className="event-type-with-origin">
                       {event.event_type}
@@ -1438,10 +1493,7 @@ function Overview(props: {
                   <td>{event.repository_id}</td>
                   <td>#{event.number}</td>
                   <td>
-                    <EventStatusPill
-                      event={event}
-                      onClick={() => setSelectedEvent(event)}
-                    />
+                    <EventStatusPill event={event} />
                   </td>
                   <td><EventAgentProgress event={event} /></td>
                   <td>{dateTimeText(event.occurred_at)}</td>
@@ -1451,17 +1503,43 @@ function Overview(props: {
           </table>
           {props.events.length === 0 && (
             <div className="empty">
-              {props.eventFilter.repositoryId || props.eventFilter.status
+              {props.eventFilter.repositoryId || props.eventFilter.number || props.eventFilter.status
                 ? "当前筛选条件下没有变化事件。"
                 : "尚未产生事件"}
             </div>
           )}
         </div>
       </section>
+      <ChangeRequestDetailDrawer
+        changeRequest={selectedChangeRequest}
+        active={selectedEvent === null && selectedExecution === null}
+        depth={0}
+        onOpenEvent={setSelectedEvent}
+        onClose={() => setSelectedChangeRequest(null)}
+      />
       <EventDetailDrawer
         event={selectedEvent}
+        active={selectedExecution === null}
+        depth={selectedChangeRequest ? 1 : 0}
+        onOpenAgent={(runId) => setSelectedExecution({ kind: "agent", id: runId })}
+        onOpenPreflight={(runId) => setSelectedExecution({ kind: "preflight", id: runId })}
         onClose={() => setSelectedEvent(null)}
       />
+      {selectedExecution?.kind === "agent" && (
+        <AgentRunDetailDrawer
+          initialRunId={selectedExecution.id}
+          depth={(selectedChangeRequest ? 1 : 0) + (selectedEvent ? 1 : 0)}
+          onClose={() => setSelectedExecution(null)}
+          onRefresh={() => undefined}
+        />
+      )}
+      {selectedExecution?.kind === "preflight" && (
+        <PreflightRunDetailDrawer
+          runId={selectedExecution.id}
+          depth={(selectedChangeRequest ? 1 : 0) + (selectedEvent ? 1 : 0)}
+          onClose={() => setSelectedExecution(null)}
+        />
+      )}
     </div>
   );
 }
@@ -4894,11 +4972,125 @@ function eventStatusExplanation(event: EventRecord): string {
   return "事件处理流程已结束，本次没有产生 Agent 调度或本地 CI 记录。";
 }
 
-function EventDetailDrawer(props: {
-  event: EventRecord | null;
+function drawerLayerStyle(depth: number): { zIndex: number } {
+  return { zIndex: 80 + depth * 2 };
+}
+
+function ChangeRequestDetailDrawer(props: {
+  changeRequest: ChangeRequestRecord | null;
+  active: boolean;
+  depth: number;
+  onOpenEvent: (event: EventRecord) => void;
   onClose: () => void;
 }) {
-  const { event, onClose } = props;
+  const { changeRequest, active, depth, onClose, onOpenEvent } = props;
+  const [detail, setDetail] = useState<ChangeRequestDetailRecord | null>(null);
+  const [error, setError] = useState("");
+
+  useBodyScrollLock(changeRequest !== null);
+
+  useEffect(() => {
+    if (!changeRequest) {
+      setDetail(null);
+      setError("");
+      return undefined;
+    }
+    let disposed = false;
+    const parameters = new URLSearchParams({
+      repository_id: changeRequest.repository_id,
+      number: String(changeRequest.number),
+    });
+    void api<ChangeRequestDetailRecord>(`/api/change-request-detail?${parameters.toString()}`)
+      .then((next) => {
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "MR/PR 详情加载失败");
+      });
+    return () => { disposed = true; };
+  }, [changeRequest]);
+
+  useEffect(() => {
+    if (!changeRequest || !active) return undefined;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [active, changeRequest, onClose]);
+
+  if (!changeRequest) return null;
+  const current = detail ?? changeRequest;
+  return (
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭 MR/PR 详情" disabled={!active} onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal={active} aria-label="MR/PR 详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{current.repository_id} · #{current.number}</span>
+            <h2>{current.title}</h2>
+            <p>{current.source_branch} → {current.target_branch}</p>
+          </div>
+          <div className="run-drawer-actions">
+            <StatusPill value={current.state} />
+            <button className="run-drawer-close" aria-label="关闭" disabled={!active} onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载 MR/PR 详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title"><div><span className="eyebrow">CHANGE REQUEST</span><h3>当前快照</h3></div></div>
+                <dl className="run-metadata">
+                  <div><dt>仓库</dt><dd>{detail.repository_id}</dd></div>
+                  <div><dt>编号</dt><dd>#{detail.number}</dd></div>
+                  <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
+                  <div><dt>远端更新</dt><dd>{dateTimeText(detail.updated_at)}</dd></div>
+                  <div><dt>最近扫描</dt><dd>{timeText(detail.scanned_at)}</dd></div>
+                  <div><dt>平台地址</dt><dd><a href={detail.web_url} target="_blank" rel="noreferrer">打开 MR / PR</a></dd></div>
+                </dl>
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENTS</span><h3>关联事件</h3></div>
+                  <span className="event-detail-count">{detail.events.length}</span>
+                </div>
+                {detail.events.length === 0 ? (
+                  <div className="event-detail-empty">当前 MR/PR 尚无关联事件。</div>
+                ) : (
+                  <div className="event-dispatch-list">
+                    {detail.events.map((event) => (
+                      <button type="button" className="event-record-card" key={event.event_id} onClick={() => onOpenEvent(event)}>
+                        <span><strong>{event.event_type}</strong><small>{dateTimeText(event.occurred_at)}</small></span>
+                        <EventStatusPill event={event} />
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function EventDetailDrawer(props: {
+  event: EventRecord | null;
+  active: boolean;
+  depth: number;
+  onOpenAgent: (runId: string) => void;
+  onOpenPreflight: (runId: string) => void;
+  onClose: () => void;
+}) {
+  const { event, active, depth, onClose, onOpenAgent, onOpenPreflight } = props;
   const [detail, setDetail] = useState<EventDetailRecord | null>(null);
   const [error, setError] = useState("");
 
@@ -4919,9 +5111,7 @@ function EventDetailDrawer(props: {
           setError("");
         }
       } catch (reason) {
-        if (!disposed) {
-          setError(reason instanceof Error ? reason.message : "事件详情加载失败");
-        }
+        if (!disposed) setError(reason instanceof Error ? reason.message : "事件详情加载失败");
       }
     };
     setDetail(null);
@@ -4935,24 +5125,21 @@ function EventDetailDrawer(props: {
   }, [event]);
 
   useEffect(() => {
-    if (!event) return undefined;
+    if (!event || !active) return undefined;
     const closeOnEscape = (keyboardEvent: KeyboardEvent) => {
       if (keyboardEvent.key === "Escape") onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [event, onClose]);
+  }, [active, event, onClose]);
 
   if (!event) return null;
   const current = detail ?? event;
-  const preflight = detail?.preflight;
-  const preflightVisualStatus = preflight && ["failure", "timed_out", "error"].includes(preflight.status)
-    ? "failed"
-    : preflight?.status === "success" ? "completed" : "processing";
+  const preflights = detail?.preflights ?? (detail?.preflight ? [detail.preflight] : []);
   return (
-    <div className="run-drawer-layer">
-      <button type="button" className="run-drawer-backdrop" aria-label="关闭事件详情" onClick={onClose} />
-      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal="true" aria-label="事件状态详情">
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭事件详情" disabled={!active} onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal={active} aria-label="事件状态详情">
         <header className="run-drawer-head">
           <div>
             <span className="eyebrow">{current.event_id}</span>
@@ -4961,7 +5148,7 @@ function EventDetailDrawer(props: {
           </div>
           <div className="run-drawer-actions">
             <EventStatusPill event={current} />
-            <button className="run-drawer-close" aria-label="关闭" onClick={onClose}>×</button>
+            <button className="run-drawer-close" aria-label="关闭" disabled={!active} onClick={onClose}>×</button>
           </div>
         </header>
         <div className="run-drawer-body event-detail-body">
@@ -4985,41 +5172,28 @@ function EventDetailDrawer(props: {
                 </dl>
                 {detail.error && <pre className="detail-pre detail-error">{detail.error}</pre>}
               </section>
-
               <section className="event-detail-section">
                 <div className="event-detail-section-title">
-                  <div><span className="eyebrow">PREFLIGHT / CI</span><h3>本地检查</h3></div>
-                  {preflight && <span className={`status-pill status-${preflightVisualStatus}`}>{preflightStatusLabel(preflight.status)}</span>}
+                  <div><span className="eyebrow">PREFLIGHT / CI</span><h3>本地检查记录</h3></div>
+                  <span className="event-detail-count">{preflights.length}</span>
                 </div>
-                {!preflight ? (
+                {preflights.length === 0 ? (
                   <div className="event-detail-empty">本事件没有关联的 Preflight / CI 记录。</div>
                 ) : (
-                  <>
-                    {Boolean(preflight.reused) && (
-                      <div className="event-detail-reused">
-                        复用历史结果：本事件没有重新执行 CI，复用了 {timeText(preflight.started_at)} 开始的检查结果。
-                      </div>
-                    )}
-                    <dl className="run-metadata">
-                      <div><dt>结果来源</dt><dd>{preflight.reused ? "复用历史结果" : "本事件执行"}</dd></div>
-                      <div><dt>失败步骤</dt><dd>{preflight.failed_step ?? "—"}</dd></div>
-                      <div><dt>退出码</dt><dd>{preflight.exit_code ?? "—"}</dd></div>
-                      <div><dt>Head SHA</dt><dd>{preflight.head_sha}</dd></div>
-                      <div><dt>配置版本</dt><dd>{preflight.config_revision}</dd></div>
-                      <div><dt>执行次数</dt><dd>{preflight.attempts}</dd></div>
-                      <div><dt>开始时间</dt><dd>{timeText(preflight.started_at)}</dd></div>
-                      <div><dt>结束时间</dt><dd>{timeText(preflight.finished_at)}</dd></div>
-                      <div><dt>平台状态回写</dt><dd>{preflight.status_published ? "成功" : "未完成"}</dd></div>
-                    </dl>
-                    {preflight.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{preflight.error}</pre></>}
-                    <h4>检查输出</h4>
-                    <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(preflight.status) ? "detail-error" : ""}`}>
-                      {preflight.output || "暂无输出"}
-                    </pre>
-                  </>
+                  <div className="event-dispatch-list">
+                    {preflights.map((preflight) => (
+                      <button type="button" className="event-record-card" key={preflight.run_id} onClick={() => onOpenPreflight(preflight.run_id)}>
+                        <span>
+                          <strong>{preflight.reused ? "复用本地 CI" : "本地 CI"}</strong>
+                          <small>{preflight.failed_step ? `失败步骤：${preflight.failed_step}` : `开始于 ${timeText(preflight.started_at)}`}</small>
+                        </span>
+                        <span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </section>
-
               <section className="event-detail-section">
                 <div className="event-detail-section-title">
                   <div><span className="eyebrow">AGENT</span><h3>规则与运行</h3></div>
@@ -5030,21 +5204,118 @@ function EventDetailDrawer(props: {
                 ) : (
                   <div className="event-dispatch-list">
                     {detail.dispatches.map((dispatch) => (
-                      <article className="event-dispatch-card" key={`${dispatch.idempotency_key}:${dispatch.agent_name}`}>
-                        <header>
-                          <div><strong>{dispatch.agent_name}</strong><small>{dispatch.rule_name}</small></div>
-                          <StatusPill value={dispatch.run_status ?? "queued"} />
-                        </header>
-                        <dl>
-                          <div><dt>运行 ID</dt><dd>{dispatch.run_id ?? "尚未创建"}</dd></div>
-                          <div><dt>创建时间</dt><dd>{timeText(dispatch.created_at)}</dd></div>
-                          <div><dt>结束时间</dt><dd>{timeText(dispatch.finished_at)}</dd></div>
-                        </dl>
-                        {dispatch.run_error && <pre className="detail-pre detail-error">{dispatch.run_error}</pre>}
-                      </article>
+                      <button
+                        type="button"
+                        className="event-record-card"
+                        key={`${dispatch.idempotency_key}:${dispatch.agent_name}`}
+                        disabled={!dispatch.run_id}
+                        onClick={() => { if (dispatch.run_id) onOpenAgent(dispatch.run_id); }}
+                      >
+                        <span><strong>{dispatch.agent_name}</strong><small>{dispatch.rule_name}</small></span>
+                        <StatusPill value={dispatch.run_status ?? "queued"} />
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
                     ))}
                   </div>
                 )}
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function PreflightRunDetailDrawer(props: {
+  runId: string;
+  depth: number;
+  onClose: () => void;
+}) {
+  const { runId, depth, onClose } = props;
+  const [detail, setDetail] = useState<PreflightRunDetail | null>(null);
+  const [error, setError] = useState("");
+
+  useBodyScrollLock(Boolean(runId));
+
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      try {
+        const next = await api<PreflightRunDetail>(`/api/preflight-runs/${encodeURIComponent(runId)}`);
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+        }
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "本地 CI 详情加载失败");
+      }
+    };
+    setDetail(null);
+    setError("");
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 3000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [runId]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭本地 CI 详情" onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal="true" aria-label="本地 CI 运行详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{runId}</span>
+            <h2>本地 Preflight / CI</h2>
+            {detail && <p>{detail.repository_id} · #{detail.number} · {detail.event_type ?? "事件检查"}</p>}
+          </div>
+          <div className="run-drawer-actions">
+            {detail && <span className={`status-pill status-${detail.status === "success" ? "completed" : detail.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(detail.status)}</span>}
+            <button className="run-drawer-close" aria-label="关闭" onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载本地 CI 详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title"><div><span className="eyebrow">RESULT</span><h3>执行结论</h3></div></div>
+                <dl className="run-metadata">
+                  <div><dt>失败步骤</dt><dd>{detail.failed_step ?? "—"}</dd></div>
+                  <div><dt>退出码</dt><dd>{detail.exit_code ?? "—"}</dd></div>
+                  <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
+                  <div><dt>配置版本</dt><dd>{detail.config_revision}</dd></div>
+                  <div><dt>执行次数</dt><dd>{detail.attempts}</dd></div>
+                  <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
+                  <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
+                  <div><dt>耗时</dt><dd>{durationText(detail.started_at, detail.finished_at)}</dd></div>
+                  <div><dt>平台状态回写</dt><dd>{detail.status_published ? "成功" : "未完成"}</dd></div>
+                </dl>
+                {detail.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{detail.error}</pre></>}
+                <h4>检查输出</h4>
+                <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(detail.status) ? "detail-error" : ""}`}>{detail.output || "暂无输出"}</pre>
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENTS</span><h3>关联事件</h3></div>
+                  <span className="event-detail-count">{detail.linked_events.length}</span>
+                </div>
+                <div className="event-linked-list">
+                  {detail.linked_events.map((event) => (
+                    <div key={event.event_id}><strong>{event.event_type}</strong><span>{event.reused ? "复用" : "本次执行"} · {dateTimeText(event.occurred_at)}</span></div>
+                  ))}
+                </div>
               </section>
             </>
           )}
@@ -5073,13 +5344,13 @@ function runTargetText(run: RunSummary): string {
   return run.resource_key;
 }
 
-function RunsView(props: {
-  runs: RunSummary[];
-  requestedRunId?: string | null;
-  onRequestedRunOpened: () => void;
+function AgentRunDetailDrawer(props: {
+  initialRunId: string;
+  depth?: number;
+  onClose: () => void;
   onRefresh: () => void;
 }) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState(props.initialRunId);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState("");
@@ -5087,7 +5358,7 @@ function RunsView(props: {
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
 
-  useBodyScrollLock(selectedId !== null);
+  useBodyScrollLock(true);
 
   function openRun(runId: string) {
     setSelectedId(runId);
@@ -5096,21 +5367,19 @@ function RunsView(props: {
 
   function closeDrawer() {
     setCancelConfirmationOpen(false);
-    setSelectedId(null);
     setDetail(null);
     setLogs([]);
     setError("");
+    props.onClose();
   }
 
   useEffect(() => {
-    if (!props.requestedRunId) return;
-    setSelectedId(props.requestedRunId);
+    setSelectedId(props.initialRunId);
     setDrawerTab("messages");
-    props.onRequestedRunOpened();
-  }, [props.requestedRunId, props.onRequestedRunOpened]);
+  }, [props.initialRunId]);
 
   async function cancelSelectedRun() {
-    if (!selectedId || !detail) return;
+    if (!detail) return;
     setCancelling(true);
     setError("");
     try {
@@ -5130,7 +5399,7 @@ function RunsView(props: {
   }
 
   const cancelConfirmation = useMemo<AgentActionConfirmation | null>(() => {
-    if (!cancelConfirmationOpen || !selectedId || !detail) return null;
+    if (!cancelConfirmationOpen || !detail) return null;
     return {
       eyebrow: "RUN CANCELLATION",
       title: `取消 ${detail.agent_name} 的本次运行？`,
@@ -5149,7 +5418,6 @@ function RunsView(props: {
   }, [cancelConfirmationOpen, detail, selectedId]);
 
   useEffect(() => {
-    if (!selectedId) return;
     const controller = new AbortController();
     setDetail(null);
     setLogs([]);
@@ -5179,7 +5447,6 @@ function RunsView(props: {
   }, [selectedId]);
 
   useEffect(() => {
-    if (!selectedId) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !cancelConfirmationOpen && !cancelling) {
         closeDrawer();
@@ -5193,43 +5460,7 @@ function RunsView(props: {
 
   return (
     <>
-      <section className="section-card runs-list">
-        <div className="section-title-row">
-          <div><h2>Agent 运行记录</h2><p>按时间查看所有运行；点击一行后从右侧打开消息、结果与上下文。</p></div>
-          <button className="button secondary" onClick={props.onRefresh}>刷新</button>
-        </div>
-        <div className="run-table">
-          <div className="run-table-head" aria-hidden="true">
-            <span>Agent</span><span>仓库 / MR / PR</span><span>触发来源</span><span>状态</span><span>开始时间</span><span>耗时</span><span />
-          </div>
-          <div className="run-items">
-            {props.runs.map((run) => (
-              <button key={run.run_id} className={`run-row ${selectedId === run.run_id ? "selected" : ""}`} onClick={() => openRun(run.run_id)}>
-                <span className="run-agent-cell">
-                  <span className="run-status-dot" data-status={run.status} />
-                  <span><strong>{run.agent_name}</strong><small>{run.run_id.slice(0, 8)}</small></span>
-                </span>
-                <span className="run-target-cell">
-                  <strong>{runTargetText(run)}</strong>
-                  <small>{run.change_request_title ?? run.resource_key}</small>
-                </span>
-                <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
-                <span className="run-status-cell">
-                  <StatusPill value={run.status} />
-                  {run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}
-                  {run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}
-                </span>
-                <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
-                <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
-                <span className="run-row-arrow" aria-hidden="true">›</span>
-              </button>
-            ))}
-            {props.runs.length === 0 && <div className="empty">尚无 Agent 运行记录</div>}
-          </div>
-        </div>
-      </section>
-      {selectedId && (
-        <div className="run-drawer-layer">
+      <div className="run-drawer-layer" style={drawerLayerStyle(props.depth ?? 0)}>
           <button className="run-drawer-backdrop" aria-label="关闭运行详情" onClick={closeDrawer} />
           <aside className="run-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
             <header className="run-drawer-head">
@@ -5304,7 +5535,6 @@ function RunsView(props: {
             </div>
           </aside>
         </div>
-      )}
       <AgentActionConfirmationDialog
         model={cancelConfirmation}
         busy={cancelling}
@@ -5315,12 +5545,107 @@ function RunsView(props: {
   );
 }
 
+type ExecutionSelection = { kind: "agent" | "preflight"; id: string };
+
+function RunsView(props: {
+  runs: RunSummary[];
+  preflightRuns: PreflightRunSummary[];
+  requestedRunId?: string | null;
+  onRequestedRunOpened: () => void;
+  onRefresh: () => void;
+}) {
+  const [selected, setSelected] = useState<ExecutionSelection | null>(null);
+  const [typeFilter, setTypeFilter] = useState<"all" | "agent" | "preflight">("all");
+  const records = useMemo<Array<{
+    kind: "agent" | "preflight";
+    id: string;
+    startedAt: number;
+    agent?: RunSummary;
+    preflight?: PreflightRunSummary;
+  }>>(() => {
+    const agentRecords = props.runs.map((agent) => ({
+      kind: "agent" as const,
+      id: agent.run_id,
+      startedAt: agent.started_at,
+      agent,
+    }));
+    const preflightRecords = props.preflightRuns.map((preflight) => ({
+      kind: "preflight" as const,
+      id: preflight.run_id,
+      startedAt: preflight.started_at,
+      preflight,
+    }));
+    return [...agentRecords, ...preflightRecords]
+      .filter((record) => typeFilter === "all" || record.kind === typeFilter)
+      .sort((left, right) => right.startedAt - left.startedAt);
+  }, [props.preflightRuns, props.runs, typeFilter]);
+
+  useEffect(() => {
+    if (!props.requestedRunId) return;
+    setSelected({ kind: "agent", id: props.requestedRunId });
+    props.onRequestedRunOpened();
+  }, [props.requestedRunId, props.onRequestedRunOpened]);
+
+  return (
+    <>
+      <section className="section-card runs-list">
+        <div className="section-title-row">
+          <div><h2>执行记录</h2><p>按开始时间统一查看 Agent 与本地 Preflight / CI；点击一行打开详情。</p></div>
+          <div className="runs-list-actions">
+            <label><span>类型</span><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as typeof typeFilter)}><option value="all">全部</option><option value="agent">Agent</option><option value="preflight">本地 CI</option></select></label>
+            <button className="button secondary" onClick={props.onRefresh}>刷新</button>
+          </div>
+        </div>
+        <div className="run-table">
+          <div className="run-table-head" aria-hidden="true">
+            <span>类型 / 名称</span><span>仓库 / MR / PR</span><span>触发来源</span><span>状态</span><span>开始时间</span><span>耗时</span><span />
+          </div>
+          <div className="run-items">
+            {records.map((record) => {
+              if (record.agent) {
+                const run = record.agent;
+                return (
+                  <button key={`agent:${run.run_id}`} className={`run-row ${selected?.kind === "agent" && selected.id === run.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "agent", id: run.run_id })}>
+                    <span className="run-agent-cell"><span className="run-status-dot" data-status={run.status} /><span><strong>{run.agent_name}</strong><small>Agent · {run.run_id.slice(0, 8)}</small></span></span>
+                    <span className="run-target-cell"><strong>{runTargetText(run)}</strong><small>{run.change_request_title ?? run.resource_key}</small></span>
+                    <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
+                    <span className="run-status-cell"><StatusPill value={run.status} />{run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
+                    <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
+                    <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
+                    <span className="run-row-arrow" aria-hidden="true">›</span>
+                  </button>
+                );
+              }
+              const preflight = record.preflight!;
+              return (
+                <button key={`preflight:${preflight.run_id}`} className={`run-row ${selected?.kind === "preflight" && selected.id === preflight.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "preflight", id: preflight.run_id })}>
+                  <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
+                  <span className="run-target-cell"><strong>{preflight.repository_id} · #{preflight.number}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
+                  <span className="run-source-cell"><strong>{preflight.event_type ?? "事件检查"}</strong><small>{preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本次执行"}</small></span>
+                  <span className="run-status-cell"><span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
+                  <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
+                  <span className="run-duration-cell"><strong>{durationText(preflight.started_at, preflight.finished_at)}</strong></span>
+                  <span className="run-row-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+            {records.length === 0 && <div className="empty">当前筛选下尚无执行记录</div>}
+          </div>
+        </div>
+      </section>
+      {selected?.kind === "agent" && <AgentRunDetailDrawer initialRunId={selected.id} onClose={() => setSelected(null)} onRefresh={props.onRefresh} />}
+      {selected?.kind === "preflight" && <PreflightRunDetailDrawer runId={selected.id} depth={0} onClose={() => setSelected(null)} />}
+    </>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [document, setDocument] = useState<ConfigDocument | null>(null);
   const [savedDocument, setSavedDocument] = useState<ConfigDocument | null>(null);
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [preflightRuns, setPreflightRuns] = useState<PreflightRunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
   const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
@@ -5355,17 +5680,19 @@ export default function App() {
   const [token, setToken] = useState(getToken());
 
   const refreshOperationalData = useCallback(async () => {
-    const [nextStatus, nextRuns] = await Promise.all([
+    const [nextStatus, nextRuns, nextPreflightRuns] = await Promise.all([
       api<RuntimeStatus>("/api/status"),
       api<RunSummary[]>("/api/runs?limit=100"),
+      api<PreflightRunSummary[]>("/api/preflight-runs?limit=100"),
     ]);
     setStatus(nextStatus);
     setRuns(nextRuns);
+    setPreflightRuns(nextPreflightRuns);
   }, []);
 
   const refreshOverviewData = useCallback(async () => {
     const [nextEvents, nextChangeRequests] = await Promise.all([
-      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter)}`),
+      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter, true)}`),
       api<ChangeRequestRecord[]>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
     ]);
     setEvents(nextEvents);
@@ -5884,6 +6211,7 @@ export default function App() {
               {tab === "runs" && (
                 <RunsView
                   runs={runs}
+                  preflightRuns={preflightRuns}
                   requestedRunId={requestedRunId}
                   onRequestedRunOpened={() => setRequestedRunId(null)}
                   onRefresh={() => { void refreshOperationalData(); }}

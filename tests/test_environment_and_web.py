@@ -20,7 +20,11 @@ from teamwork_review_agents.environment import (
     resolve_provider_token,
 )
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
+from teamwork_review_agents.models import (
+    AgentResult,
+    ChangeRequestActivity,
+    PreflightResult,
+)
 from teamwork_review_agents.webapp import create_app
 
 
@@ -990,6 +994,18 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/change-requests?repository_id=second&status=closed&limit=10"
         ).json()
         assert [item["snapshot_key"] for item in filtered_snapshots] == [second.key]
+        change_request_detail = client.get(
+            "/api/change-request-detail?repository_id=second&number=2"
+        )
+        assert change_request_detail.status_code == 200
+        assert change_request_detail.json()["snapshot_key"] == second.key
+        assert [
+            item["event_id"]
+            for item in change_request_detail.json()["events"]
+        ] == [second_event.id]
+        assert client.get(
+            "/api/change-request-detail?repository_id=second&number=999"
+        ).status_code == 404
 
         assert len(client.get("/api/events?limit=1").json()) == 1
         all_events = client.get("/api/events?all_records=true").json()
@@ -1001,7 +1017,44 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/events?repository_id=second&status=cancelled&limit=10"
         ).json()
         assert [item["event_id"] for item in filtered_events] == [second_event.id]
+        number_events = client.get("/api/events?number=2&limit=10").json()
+        assert [item["event_id"] for item in number_events] == [second_event.id]
+
+        reservation = store.begin_preflight_run(
+            proposed_run_id="web-preflight",
+            idempotency_key="first:1:web-preflight",
+            event_id=first_event.id,
+            repository_id="first",
+            number=1,
+            head_sha=first.head_sha,
+            config_revision="revision-web",
+            max_attempts=2,
+        )
+        assert reservation is not None
+        store.finish_preflight_run(
+            PreflightResult(
+                run_id=reservation.run_id,
+                repository_id="first",
+                number=1,
+                head_sha=first.head_sha,
+                status="failure",
+                failed_step="tests",
+                exit_code=1,
+                output="pytest failed",
+            )
+        )
+        preflight_summaries = client.get("/api/preflight-runs").json()
+        assert preflight_summaries[0]["run_id"] == reservation.run_id
+        assert preflight_summaries[0]["event_type"] == first_event.type
+        assert "output" not in preflight_summaries[0]
+        preflight_detail = client.get(
+            f"/api/preflight-runs/{reservation.run_id}"
+        ).json()
+        assert preflight_detail["output"] == "pytest failed"
+        assert preflight_detail["linked_events"][0]["event_id"] == first_event.id
+        assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422
+        assert client.get("/api/events?number=0").status_code == 422
         assert client.get("/api/change-requests?status=unknown").status_code == 422
 
 

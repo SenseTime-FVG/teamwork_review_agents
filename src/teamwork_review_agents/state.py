@@ -96,6 +96,9 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_event_inbox_status
                 ON event_inbox(status, updated_at);
 
+                CREATE INDEX IF NOT EXISTS idx_event_inbox_change_request
+                ON event_inbox(repository_id, number, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS event_agent_dispatches (
                     event_id TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
@@ -179,6 +182,9 @@ class StateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_event_started
                 ON preflight_runs(event_id, started_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_runs_started
+                ON preflight_runs(started_at DESC);
 
                 CREATE TABLE IF NOT EXISTS event_preflight_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,6 +660,7 @@ class StateStore:
         limit: int | None = 100,
         *,
         repository_id: str | None = None,
+        number: int | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
@@ -665,6 +672,11 @@ class StateStore:
                 "json_extract(snapshots.payload, '$.repository_id') = ?"
             )
             parameters.append(repository_id)
+        if number is not None:
+            conditions.append(
+                "CAST(json_extract(snapshots.payload, '$.number') AS INTEGER) = ?"
+            )
+            parameters.append(number)
         if status:
             conditions.append("json_extract(snapshots.payload, '$.state') = ?")
             parameters.append(status)
@@ -746,6 +758,29 @@ class StateStore:
             )
             results.append(summary)
         return results
+
+    def get_change_request_detail(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> dict[str, Any] | None:
+        """按需返回 MR/PR 当前快照及其全部关联事件摘要。"""
+
+        snapshots = self.list_snapshots(
+            None,
+            repository_id=repository_id,
+            number=number,
+        )
+        if not snapshots:
+            return None
+        return {
+            **snapshots[0],
+            "events": self.list_events(
+                None,
+                repository_id=repository_id,
+                number=number,
+            ),
+        }
 
     def save_snapshot_and_events(
         self,
@@ -2012,6 +2047,7 @@ class StateStore:
         *,
         status: str | None = None,
         repository_id: str | None = None,
+        number: int | None = None,
         event_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
@@ -2024,6 +2060,9 @@ class StateStore:
         if repository_id:
             conditions.append("event_inbox.repository_id = ?")
             parameters.append(repository_id)
+        if number is not None:
+            conditions.append("event_inbox.number = ?")
+            parameters.append(number)
         if event_id:
             conditions.append("event_inbox.event_id = ?")
             parameters.append(event_id)
@@ -2126,7 +2165,7 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
-        """按需返回单个事件、Agent 调度和完整 CI 详情。"""
+        """按需返回单个事件、Agent 调度和全部 CI 摘要。"""
 
         records = self.list_events(None, event_id=event_id)
         if not records:
@@ -2148,13 +2187,13 @@ class StateStore:
                 """,
                 (event_id,),
             ).fetchall()
-            preflight_row = connection.execute(
+            preflight_rows = connection.execute(
                 """
                 SELECT preflight.run_id, preflight.repository_id,
                        preflight.number, preflight.head_sha,
                        preflight.config_revision, preflight.status,
                        preflight.attempts, preflight.failed_step,
-                       preflight.exit_code, preflight.output,
+                       preflight.exit_code,
                        preflight.error, preflight.status_published,
                        preflight.started_at, preflight.finished_at,
                        link.reused, link.linked_at
@@ -2163,14 +2202,130 @@ class StateStore:
                     ON preflight.run_id = link.run_id
                 WHERE link.event_id = ?
                 ORDER BY link.linked_at DESC, link.id DESC
-                LIMIT 1
                 """,
                 (event_id,),
-            ).fetchone()
+            ).fetchall()
+        preflights = [dict(row) for row in preflight_rows]
         return {
             **records[0],
             "dispatches": [dict(row) for row in dispatch_rows],
-            "preflight": dict(preflight_row) if preflight_row is not None else None,
+            "preflights": preflights,
+            # 保留最新单条字段，兼容只识别旧事件详情结构的客户端。
+            "preflight": preflights[0] if preflights else None,
+        }
+
+    def list_preflight_runs(
+        self,
+        limit: int = 100,
+        *,
+        status: str | None = None,
+        repository_id: str | None = None,
+        number: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """按可选条件返回最近本地 Preflight / CI 运行摘要。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if status:
+            conditions.append("preflight.status = ?")
+            parameters.append(status)
+        if repository_id:
+            conditions.append("preflight.repository_id = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append("preflight.number = ?")
+            parameters.append(number)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT preflight.run_id, preflight.event_id,
+                       preflight.repository_id, preflight.number,
+                       preflight.head_sha, preflight.config_revision,
+                       preflight.status, preflight.attempts,
+                       preflight.failed_step, preflight.exit_code,
+                       preflight.error, preflight.status_published,
+                       preflight.started_at, preflight.finished_at,
+                       event.event_type,
+                       json_extract(snapshot.payload, '$.title')
+                           AS change_request_title,
+                       json_extract(snapshot.payload, '$.web_url')
+                           AS change_request_url,
+                       COALESCE(link_stats.linked_event_count, 0)
+                           AS linked_event_count,
+                       COALESCE(link_stats.reused_event_count, 0)
+                           AS reused_event_count
+                FROM preflight_runs AS preflight
+                LEFT JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                LEFT JOIN snapshots AS snapshot
+                    ON snapshot.snapshot_key = (
+                        preflight.repository_id || ':' || preflight.number
+                    )
+                LEFT JOIN (
+                    SELECT run_id, COUNT(*) AS linked_event_count,
+                           SUM(CASE WHEN reused = 1 THEN 1 ELSE 0 END)
+                               AS reused_event_count
+                    FROM event_preflight_links
+                    GROUP BY run_id
+                ) AS link_stats ON link_stats.run_id = preflight.run_id
+                {where}
+                ORDER BY preflight.started_at DESC, preflight.run_id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_preflight_run(self, run_id: str) -> dict[str, Any] | None:
+        """按需返回单次本地 Preflight / CI 的完整结果与事件关联。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT preflight.run_id, preflight.event_id,
+                       preflight.repository_id, preflight.number,
+                       preflight.head_sha, preflight.config_revision,
+                       preflight.status, preflight.attempts,
+                       preflight.failed_step, preflight.exit_code,
+                       preflight.output, preflight.error,
+                       preflight.status_published, preflight.started_at,
+                       preflight.finished_at,
+                       event.event_type,
+                       json_extract(snapshot.payload, '$.title')
+                           AS change_request_title,
+                       json_extract(snapshot.payload, '$.web_url')
+                           AS change_request_url
+                FROM preflight_runs AS preflight
+                LEFT JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                LEFT JOIN snapshots AS snapshot
+                    ON snapshot.snapshot_key = (
+                        preflight.repository_id || ':' || preflight.number
+                    )
+                WHERE preflight.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            event_rows = connection.execute(
+                """
+                SELECT event.event_id, event.event_type, event.status,
+                       json_extract(event.payload, '$.occurred_at')
+                           AS occurred_at,
+                       link.reused, link.linked_at
+                FROM event_preflight_links AS link
+                JOIN event_inbox AS event ON event.event_id = link.event_id
+                WHERE link.run_id = ?
+                ORDER BY link.linked_at DESC, link.id DESC
+                """,
+                (run_id,),
+            ).fetchall()
+        return {
+            **dict(row),
+            "linked_events": [dict(event_row) for event_row in event_rows],
         }
 
     def save_config_version(
