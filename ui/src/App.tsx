@@ -3,6 +3,7 @@ import {
   api,
   getToken,
   setToken as persistToken,
+  streamPreflightLogs,
   streamRunLogs,
   uploadPromptFile,
   uploadSkillDirectory,
@@ -355,7 +356,7 @@ function executionStatusMatches(
         success: ["success"],
         failure: ["failure", "error"],
         timed_out: ["timed_out"],
-        cancelled: [],
+        cancelled: ["cancelled"],
       };
   return groups[filter].includes(status);
 }
@@ -2885,6 +2886,7 @@ function RepositoryDetailEditor(props: {
     steps: RepositoryPreflightStep[];
   } = {
     enabled: repository.preflight?.enabled ?? false,
+    cache_enabled: repository.preflight?.cache_enabled ?? true,
     status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
     timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
     max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
@@ -3003,6 +3005,14 @@ function RepositoryDetailEditor(props: {
                   onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
                 />
               </div>
+              <div className="repository-preflight-cache-option">
+                <Toggle
+                  label={preflight.cache_enabled ? "仓库级依赖缓存已启用" : "仓库级依赖缓存已停用"}
+                  checked={preflight.cache_enabled}
+                  onChange={(cache_enabled) => updatePreflight({ cache_enabled })}
+                />
+                <p>同一仓库的不同分支和 MR / PR 共享下载缓存；每次 CI 的工作区与安装结果仍保持隔离。覆盖 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer 和常见浏览器缓存。</p>
+              </div>
               <div className="repository-preflight-steps-head">
                 <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
                 <button
@@ -3089,6 +3099,8 @@ function RepositoriesView(props: {
   const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
   const [draftId, setDraftId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [startingPreflight, setStartingPreflight] = useState(false);
+  const [selectedPreflightRunId, setSelectedPreflightRunId] = useState<string | null>(null);
   const [togglingRepositoryId, setTogglingRepositoryId] = useState<string | null>(null);
   const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
@@ -3310,6 +3322,27 @@ function RepositoriesView(props: {
     }
   }
 
+  async function startManualPreflight() {
+    if (!detailId || startingPreflight || dirty) return;
+    setStartingPreflight(true);
+    props.onError("");
+    try {
+      const result = await api<{
+        accepted: boolean;
+        run_id: string;
+        reason: string;
+      }>(`/api/repositories/${encodeURIComponent(detailId)}/preflight/start`, {
+        method: "POST",
+      });
+      props.onNotice(result.reason);
+      setSelectedPreflightRunId(result.run_id);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "启动手动 CI 失败");
+    } finally {
+      setStartingPreflight(false);
+    }
+  }
+
   const confirmation = useMemo<AgentActionConfirmation | null>(() => {
     if (!pendingAction) return null;
     if (pendingAction.kind === "discard") {
@@ -3461,6 +3494,25 @@ function RepositoriesView(props: {
             <>
               <button
                 type="button"
+                className="button secondary"
+                disabled={
+                  startingPreflight
+                  || gitActive
+                  || originalRepository?.enabled === false
+                  || !originalRepository?.preflight?.enabled
+                  || !originalRepository?.preflight?.steps?.length
+                }
+                title={
+                  originalRepository?.enabled === false
+                    ? "请先启用仓库"
+                    : !originalRepository?.preflight?.enabled
+                      ? "请先配置并启用本地 CI"
+                      : "不限时执行远端默认分支最新提交，用于验证 CI 并预热仓库级缓存"
+                }
+                onClick={() => { void startManualPreflight(); }}
+              >{startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
+              <button
+                type="button"
                 className="button danger"
                 disabled={gitActive || referencingRules.length > 0}
                 title={gitActive ? "仓库正在执行 Git 操作" : referencingRules.length > 0 ? `仍被规则引用：${referencingRules.map((rule) => rule.name).join("、")}` : "删除仓库配置"}
@@ -3513,6 +3565,13 @@ function RepositoriesView(props: {
         onCancel={() => { if (!saving) setPendingAction(null); }}
         onConfirm={confirmPendingAction}
       />
+      {selectedPreflightRunId && (
+        <PreflightRunDetailDrawer
+          runId={selectedPreflightRunId}
+          depth={0}
+          onClose={() => setSelectedPreflightRunId(null)}
+        />
+      )}
     </div>
   );
 }
@@ -5017,8 +5076,22 @@ function preflightStatusLabel(status?: string | null): string {
     failure: "未通过",
     timed_out: "超时",
     error: "执行异常",
+    cancelled: "已取消",
   };
   return status ? labels[status] ?? status : "未执行";
+}
+
+function preflightPhaseLabel(phase?: string | null): string {
+  const labels: Record<string, string> = {
+    queued: "等待启动",
+    waiting_lock: "等待仓库锁",
+    preparing: "准备代码工作区",
+    preparing_cache: "准备依赖缓存",
+    running_steps: "执行 CI 步骤",
+    cancelling: "正在取消",
+    finished: "执行结束",
+  };
+  return phase ? labels[phase] ?? phase : "等待状态";
 }
 
 function preflightStepStatusLabel(status: string): string {
@@ -5029,6 +5102,7 @@ function preflightStepStatusLabel(status: string): string {
     failure: "未通过",
     timed_out: "超时",
     error: "执行异常",
+    cancelled: "已取消",
     skipped: "已跳过",
   };
   return labels[status] ?? status;
@@ -5039,6 +5113,7 @@ function preflightStepStatusClass(status: string): string {
   if (status === "running") return "processing";
   if (status === "pending") return "queued";
   if (status === "skipped") return "unmatched";
+  if (status === "cancelled") return "cancelled";
   return "failed";
 }
 
@@ -5346,6 +5421,10 @@ function PreflightRunDetailDrawer(props: {
   const { runId, depth, onClose } = props;
   const [detail, setDetail] = useState<PreflightRunDetail | null>(null);
   const [error, setError] = useState("");
+  const [logs, setLogs] = useState<RunLog[]>([]);
+  const [streamError, setStreamError] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const liveOutputRef = useRef<HTMLPreElement | null>(null);
 
   useBodyScrollLock(Boolean(runId));
 
@@ -5365,7 +5444,7 @@ function PreflightRunDetailDrawer(props: {
         if (!disposed) setError(reason instanceof Error ? reason.message : "本地 CI 详情加载失败");
       }
       if (!disposed && refreshAgain) {
-        timer = window.setTimeout(() => { void load(); }, 3000);
+        timer = window.setTimeout(() => { void load(); }, 1000);
       }
     };
     setDetail(null);
@@ -5378,12 +5457,86 @@ function PreflightRunDetailDrawer(props: {
   }, [runId]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    let cursor = 0;
+    setLogs([]);
+    setStreamError("");
+    void streamPreflightLogs(
+      runId,
+      cursor,
+      controller.signal,
+      (log) => {
+        cursor = Math.max(cursor, log.id);
+        setLogs((current) => (
+          current.some((item) => item.id === log.id) ? current : [...current, log]
+        ));
+      },
+    ).catch((reason) => {
+      if (!controller.signal.aborted) {
+        setStreamError(reason instanceof Error ? reason.message : "CI 实时日志连接中断");
+      }
+    });
+    return () => controller.abort();
+  }, [runId]);
+
+  useEffect(() => {
+    const output = liveOutputRef.current;
+    if (output) output.scrollTop = output.scrollHeight;
+  }, [logs]);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose]);
+
+  async function cancelManualPreflight() {
+    if (!detail || detail.trigger_source !== "manual" || detail.status !== "running") return;
+    setCancelling(true);
+    setError("");
+    try {
+      const result = await api<{ accepted: boolean; reason: string }>(
+        `/api/preflight-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST" },
+      );
+      if (!result.accepted) setError(result.reason);
+      setDetail((current) => current ? { ...current, cancel_requested: true, phase: "cancelling" } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消手动 CI 失败");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  const liveOutput = logs.map((log) => {
+    if (log.event_type === "git_progress") {
+      try {
+        const progress = JSON.parse(log.payload) as {
+          operation?: string;
+          state?: string;
+          elapsed_seconds?: number;
+        };
+        return `[Git] ${progress.operation ?? "Git 操作"} · ${progress.state ?? "运行中"} · ${progress.elapsed_seconds ?? 0} 秒\n`;
+      } catch {
+        return `${log.payload}\n`;
+      }
+    }
+    if (log.event_type === "completed") {
+      try {
+        const result = JSON.parse(log.payload) as { status?: string };
+        return `\n[完成] ${preflightStatusLabel(result.status)}\n`;
+      } catch {
+        return `\n[完成] ${log.payload}\n`;
+      }
+    }
+    return log.payload;
+  }).join("");
+  const activeStep = detail?.steps.find((step) => step.status === "running");
+  const progressLabel = activeStep
+    ? `步骤 ${activeStep.step_index + 1}：${activeStep.name}`
+    : preflightPhaseLabel(detail?.phase);
 
   return (
     <div className="run-drawer-layer" style={drawerLayerStyle(depth)}>
@@ -5393,10 +5546,18 @@ function PreflightRunDetailDrawer(props: {
           <div>
             <span className="eyebrow">{runId}</span>
             <h2>本地 Preflight / CI</h2>
-            {detail && <p>{detail.repository_id} · #{detail.number} · {detail.event_type ?? "事件检查"}</p>}
+            {detail && <p>{detail.repository_id} · {detail.number ? `#${detail.number}` : detail.branch ?? "默认分支"} · {detail.trigger_source === "manual" ? "手动执行" : detail.event_type ?? "事件检查"}</p>}
           </div>
           <div className="run-drawer-actions">
             {detail && <span className={`status-pill status-${detail.status === "success" ? "completed" : detail.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(detail.status)}</span>}
+            {detail?.trigger_source === "manual" && detail.status === "running" && (
+              <button
+                type="button"
+                className="button danger compact"
+                disabled={cancelling || Boolean(detail.cancel_requested)}
+                onClick={() => { void cancelManualPreflight(); }}
+              >{detail.cancel_requested || cancelling ? "取消中…" : "取消 CI"}</button>
+            )}
             <button className="run-drawer-close" aria-label="关闭" onClick={onClose}>×</button>
           </div>
         </header>
@@ -5405,18 +5566,30 @@ function PreflightRunDetailDrawer(props: {
           {!detail && !error && <div className="empty tall">正在加载本地 CI 详情…</div>}
           {detail && (
             <>
+              <section className="event-detail-section preflight-live-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">LIVE</span><h3>实时执行过程</h3></div>
+                  <span className="event-detail-count">{detail.status === "running" ? progressLabel : preflightStatusLabel(detail.status)}</span>
+                </div>
+                {streamError && <div className="alert error">{streamError}；步骤状态仍会继续刷新。</div>}
+                <pre ref={liveOutputRef} className="detail-pre preflight-live-output">{liveOutput || (detail.status === "running" ? "正在等待 CI 输出…" : detail.output || "该历史记录没有实时日志")}</pre>
+              </section>
               <section className="event-detail-section">
                 <div className="event-detail-section-title"><div><span className="eyebrow">RESULT</span><h3>执行结论</h3></div></div>
                 <dl className="run-metadata">
                   <div><dt>失败步骤</dt><dd>{detail.failed_step ?? "—"}</dd></div>
                   <div><dt>退出码</dt><dd>{detail.exit_code ?? "—"}</dd></div>
+                  <div><dt>触发来源</dt><dd>{detail.trigger_source === "manual" ? "仓库手动执行" : "MR / PR 事件"}</dd></div>
+                  <div><dt>当前阶段</dt><dd>{progressLabel}</dd></div>
+                  <div><dt>分支</dt><dd>{detail.branch ?? "—"}</dd></div>
                   <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
+                  <div><dt>依赖缓存</dt><dd>{detail.cache_path ?? "未启用"}</dd></div>
                   <div><dt>配置版本</dt><dd>{detail.config_revision}</dd></div>
                   <div><dt>执行次数</dt><dd>{detail.attempts}</dd></div>
                   <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                   <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
                   <div><dt>耗时</dt><dd>{durationText(detail.started_at, detail.finished_at)}</dd></div>
-                  <div><dt>平台状态回写</dt><dd>{detail.status_published ? "成功" : "未完成"}</dd></div>
+                  <div><dt>平台状态回写</dt><dd>{detail.trigger_source === "manual" ? "手动 CI 不回写" : detail.status_published ? "成功" : "未完成"}</dd></div>
                 </dl>
                 {detail.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{detail.error}</pre></>}
                 <h4>命令步骤</h4>
@@ -5443,7 +5616,7 @@ function PreflightRunDetailDrawer(props: {
                   </div>
                 )}
                 <h4>检查输出</h4>
-                <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(detail.status) ? "detail-error" : ""}`}>{detail.output || "暂无输出"}</pre>
+                <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(detail.status) ? "detail-error" : ""}`}>{detail.status === "running" ? "运行中，完整有界输出将在结束后固化；请查看上方实时执行过程。" : detail.output || "暂无输出"}</pre>
               </section>
               <section className="event-detail-section">
                 <div className="event-detail-section-title">
@@ -5451,6 +5624,13 @@ function PreflightRunDetailDrawer(props: {
                   <span className="event-detail-count">{detail.linked_events.length}</span>
                 </div>
                 <div className="event-linked-list">
+                  {detail.linked_events.length === 0 && (
+                    <div className="event-detail-empty">
+                      {detail.trigger_source === "manual"
+                        ? "手动 CI 不绑定 MR / PR 事件，也不会触发 Agent。"
+                        : "当前 CI 记录没有可读取的关联事件。"}
+                    </div>
+                  )}
                   {detail.linked_events.map((event) => (
                     <div key={event.event_id}><strong>{event.event_type}</strong><span>{event.reused ? "复用历史结果" : "本批次新执行"} · {dateTimeText(event.occurred_at)}</span></div>
                   ))}
@@ -5920,8 +6100,8 @@ function RunsView(props: {
               return (
                 <button key={`preflight:${preflight.run_id}`} className={`run-row ${selected?.kind === "preflight" && selected.id === preflight.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "preflight", id: preflight.run_id })}>
                   <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
-                  <span className="run-target-cell"><strong>{preflight.repository_id} · #{preflight.number}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
-                  <span className="run-source-cell"><strong>{preflight.event_type ?? "事件检查"}</strong><small>{preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
+                  <span className="run-target-cell"><strong>{preflight.repository_id} · {preflight.number ? `#${preflight.number}` : preflight.branch ?? "默认分支"}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
+                  <span className="run-source-cell"><strong>{preflight.trigger_source === "manual" ? "仓库手动执行" : preflight.event_type ?? "事件检查"}</strong><small>{preflight.trigger_source === "manual" ? "不触发 Agent、不回写 PR 状态" : preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
                   <span className="run-status-cell"><span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
                   <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
                   <span className="run-duration-cell"><strong>{durationText(preflight.started_at, preflight.finished_at)}</strong></span>

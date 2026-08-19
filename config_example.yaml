@@ -186,6 +186,8 @@ web:
 #     # run_preflight 的 Agent 才会等待门禁；具体命令和 CI 脚本由目标仓库维护。
 #     preflight:
 #       enabled: true
+#       # 同一仓库的全部分支和 MR / PR 共享常用依赖下载缓存；工作区仍逐次隔离。
+#       cache_enabled: true
 #       # 仅运行可信内部 PR；环境会过滤，但这不是容器或系统级安全沙箱。
 #       # 应同时将此名称配置为 GitHub Ruleset 的 required status check。
 #       status_context: teamwork/local-ci

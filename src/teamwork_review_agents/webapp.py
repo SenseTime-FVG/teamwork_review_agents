@@ -30,6 +30,7 @@ from .events import (
     detect_events,
 )
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
+from .preflight_manager import ManualPreflightManager
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
 from .skill_files import (
@@ -66,7 +67,7 @@ PREFLIGHT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
     "success": ("success",),
     "failure": ("failure", "error"),
     "timed_out": ("timed_out",),
-    "cancelled": (),
+    "cancelled": ("cancelled",),
 }
 
 
@@ -169,6 +170,7 @@ def create_app(
     runtime = BackgroundRuntime(manager)
     login_manager = CodexLoginManager()
     repository_initialization_manager = RepositoryInitializationManager(manager)
+    manual_preflight_manager = ManualPreflightManager(manager)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -177,6 +179,7 @@ def create_app(
         try:
             yield
         finally:
+            await manual_preflight_manager.close()
             await repository_initialization_manager.close()
             await login_manager.close()
             if start_scheduler:
@@ -191,6 +194,7 @@ def create_app(
     app.state.runtime = runtime
     app.state.codex_login_manager = login_manager
     app.state.repository_initialization_manager = repository_initialization_manager
+    app.state.manual_preflight_manager = manual_preflight_manager
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -619,6 +623,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="仓库配置不存在")
         return result
 
+    @app.post("/api/repositories/{repository_id}/preflight/start")
+    async def start_manual_preflight(repository_id: str) -> dict[str, object]:
+        """对仓库远端默认分支最新提交启动一次不限时手动 CI。"""
+
+        try:
+            return await manual_preflight_manager.start(repository_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/codex/runtime-options")
     async def codex_runtime_options() -> dict[str, Any]:
         """返回本机 Codex 模型目录和当前可验证的继承模型来源。"""
@@ -836,6 +851,7 @@ def create_app(
             "failure",
             "timed_out",
             "error",
+            "cancelled",
         ]
         | None = None,
         status_group: ExecutionStatusGroup | None = None,
@@ -870,6 +886,102 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
         return run
+
+    @app.post("/api/preflight-runs/{run_id}/cancel")
+    async def cancel_preflight_run(run_id: str) -> dict[str, object]:
+        """取消仍在执行的手动 CI；自动事件 CI 不允许从此接口中止。"""
+
+        run = await asyncio.to_thread(manager.store.get_preflight_run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        if run.get("trigger_source") != "manual":
+            raise HTTPException(status_code=409, detail="自动事件 CI 不支持手动取消")
+        accepted = await manual_preflight_manager.cancel(run_id)
+        return {
+            "accepted": accepted,
+            "run_id": run_id,
+            "reason": "已请求取消手动 CI" if accepted else "手动 CI 已经结束",
+        }
+
+    @app.get("/api/preflight-runs/{run_id}/logs")
+    async def preflight_run_logs(
+        run_id: str,
+        after_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=500, ge=1, le=2000),
+    ):
+        """按游标返回 CI 实时日志。"""
+
+        if await asyncio.to_thread(manager.store.get_preflight_run, run_id) is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        return await asyncio.to_thread(
+            manager.store.list_preflight_logs,
+            run_id,
+            after_id=after_id,
+            limit=limit,
+        )
+
+    @app.get("/api/preflight-runs/{run_id}/stream")
+    async def stream_preflight_logs(
+        run_id: str,
+        after_id: int = Query(default=0, ge=0),
+    ) -> StreamingResponse:
+        """持续推送 CI 阶段与命令输出，终态日志排空后主动结束。"""
+
+        if await asyncio.to_thread(manager.store.get_preflight_run, run_id) is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+
+        async def generate() -> AsyncIterator[str]:
+            cursor = after_id
+            idle_after_terminal = 0
+            heartbeat_ticks = 0
+            while True:
+                logs = await asyncio.to_thread(
+                    manager.store.list_preflight_logs,
+                    run_id,
+                    after_id=cursor,
+                    limit=500,
+                )
+                for log in logs:
+                    cursor = int(log["id"])
+                    heartbeat_ticks = 0
+                    yield (
+                        f"id: {cursor}\n"
+                        f"event: {log['event_type']}\n"
+                        f"data: {json.dumps(log, ensure_ascii=False)}\n\n"
+                    )
+                run = await asyncio.to_thread(
+                    manager.store.get_preflight_run,
+                    run_id,
+                )
+                terminal = run and run.get("status") in {
+                    "success",
+                    "failure",
+                    "timed_out",
+                    "error",
+                    "cancelled",
+                }
+                if terminal and not logs:
+                    idle_after_terminal += 1
+                    if idle_after_terminal >= 2:
+                        yield "event: end\ndata: {}\n\n"
+                        return
+                else:
+                    idle_after_terminal = 0
+                if not logs and not terminal:
+                    heartbeat_ticks += 1
+                    if heartbeat_ticks >= 30:
+                        yield ": heartbeat\n\n"
+                        heartbeat_ticks = 0
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:

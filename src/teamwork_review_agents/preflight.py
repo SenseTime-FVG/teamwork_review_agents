@@ -13,10 +13,14 @@ from typing import Awaitable, Callable, Literal
 from .config import AppConfig, PreflightConfig
 from .environment import resolve_provider_token
 from .models import ChangeEvent, PreflightResult, stable_hash
+from .preflight_cache import (
+    build_repository_cache_environment,
+    repository_cache_root,
+)
 from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
-from .workspace import temporary_change_request_worktree
+from .workspace import GitProgressEvent, temporary_change_request_worktree
 
 
 SAFE_HOST_ENVIRONMENT = {
@@ -39,7 +43,6 @@ SAFE_HOST_ENVIRONMENT = {
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
-    "UV_CACHE_DIR",
     "UV_LINK_MODE",
 }
 
@@ -48,7 +51,7 @@ SAFE_HOST_ENVIRONMENT = {
 class StepExecutionOutcome:
     """一组 CI 步骤的确定性执行结果。"""
 
-    status: Literal["success", "failure", "timed_out", "error"]
+    status: Literal["success", "failure", "timed_out", "error", "cancelled"]
     failed_step: str | None = None
     exit_code: int | None = None
     output: str = ""
@@ -60,13 +63,22 @@ class PreflightStepUpdate:
     """一次 CI 步骤状态变化。"""
 
     step_index: int
-    status: Literal["running", "success", "failure", "timed_out", "error"]
+    status: Literal[
+        "running",
+        "success",
+        "failure",
+        "timed_out",
+        "error",
+        "cancelled",
+    ]
     timeout_seconds: float | None = None
     exit_code: int | None = None
     error: str | None = None
 
 
 StepUpdateCallback = Callable[[PreflightStepUpdate], Awaitable[None]]
+OutputCallback = Callable[[str], Awaitable[None]]
+CancelCheck = Callable[[], bool]
 
 
 async def _emit_step_update(
@@ -79,7 +91,11 @@ async def _emit_step_update(
         await callback(update)
 
 
-def build_preflight_environment(*, home: Path | None = None) -> dict[str, str]:
+def build_preflight_environment(
+    *,
+    home: Path | None = None,
+    cache_environment: dict[str, str] | None = None,
+) -> dict[str, str]:
     """只继承运行工具所需的宿主机变量，不传递平台或模型凭据。"""
 
     environment = {
@@ -98,6 +114,8 @@ def build_preflight_environment(*, home: Path | None = None) -> dict[str, str]:
     )
     if home is not None:
         environment["HOME"] = str(home)
+    if cache_environment:
+        environment.update(cache_environment)
     return environment
 
 
@@ -124,6 +142,7 @@ async def _read_bounded_stream(
     stream: asyncio.StreamReader,
     limit: int,
     latest: list[str] | None = None,
+    on_output: OutputCallback | None = None,
 ) -> str:
     """持续排空子进程输出，但内存中只保留最新的有界内容。"""
 
@@ -132,6 +151,12 @@ async def _read_bounded_stream(
         output = _append_bounded_output(output, chunk, limit)
         if latest is not None:
             latest[:] = [output]
+        if on_output is not None:
+            try:
+                await on_output(chunk.decode("utf-8", errors="replace"))
+            except Exception:
+                # 实时日志写入失败不能改变被测命令本身的执行结果。
+                pass
     return output
 
 
@@ -141,15 +166,25 @@ async def execute_preflight_steps(
     cwd: Path,
     environment: dict[str, str],
     on_step_update: StepUpdateCallback | None = None,
+    on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    unlimited: bool = False,
 ) -> StepExecutionOutcome:
-    """按配置顺序执行 CI 步骤，并返回首个失败或最终成功。"""
+    """按配置顺序执行 CI 步骤，并支持实时输出、取消和手动不限时。"""
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + config.timeout_seconds
+    deadline = None if unlimited else loop.time() + config.timeout_seconds
     output = ""
     for step_index, step in enumerate(config.steps):
-        remaining = deadline - loop.time()
-        if remaining <= 0:
+        if cancel_check is not None and cancel_check():
+            return StepExecutionOutcome(
+                status="cancelled",
+                failed_step=step.name,
+                output=output,
+                error="用户取消了手动 CI",
+            )
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
             error = "Preflight 总运行时间超时"
             await _emit_step_update(
                 on_step_update,
@@ -166,12 +201,17 @@ async def execute_preflight_steps(
                 output=output,
                 error=error,
             )
-        step_timeout = min(float(step.timeout_seconds or remaining), remaining)
-        output = _append_bounded_output(
-            output,
-            f"\n[{step.name}]\n".encode("utf-8"),
-            config.max_output_bytes,
+        step_timeout = (
+            None
+            if unlimited
+            else min(float(step.timeout_seconds or remaining), float(remaining))
         )
+        heading = f"\n[{step.name}]\n"
+        output = _append_bounded_output(
+            output, heading.encode("utf-8"), config.max_output_bytes
+        )
+        if on_output is not None:
+            await on_output(heading)
         await _emit_step_update(
             on_step_update,
             PreflightStepUpdate(
@@ -214,15 +254,40 @@ async def execute_preflight_steps(
                 process.stdout,
                 config.max_output_bytes,
                 latest_step_output,
+                on_output,
             )
         )
         process_waiter = asyncio.create_task(process.wait())
-        completed, pending = await asyncio.wait(
-            {process_waiter, output_reader},
-            timeout=step_timeout,
-            return_when=asyncio.ALL_COMPLETED,
+        timed_out = False
+        cancelled = False
+        step_deadline = (
+            None if step_timeout is None else loop.time() + step_timeout
         )
-        if pending:
+        while not (process_waiter.done() and output_reader.done()):
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
+            if step_deadline is not None and loop.time() >= step_deadline:
+                timed_out = True
+                break
+            wait_seconds = 0.25
+            if step_deadline is not None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.01, step_deadline - loop.time()),
+                )
+            # 只等待尚未完成的任务，避免 stdout 已关闭但进程仍收尾时空转。
+            pending_tasks = {
+                task
+                for task in (process_waiter, output_reader)
+                if not task.done()
+            }
+            await asyncio.wait(
+                pending_tasks,
+                timeout=wait_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        if timed_out or cancelled:
             await _terminate_process(process)
             cleanup_done, cleanup_pending = await asyncio.wait(
                 {process_waiter, output_reader},
@@ -248,25 +313,28 @@ async def execute_preflight_steps(
                 step_output.encode("utf-8"),
                 config.max_output_bytes,
             )
-            error = f"步骤 {step.name} 超过 {step_timeout:.0f} 秒"
+            if cancelled:
+                error = "用户取消了手动 CI"
+                terminal_status = "cancelled"
+            else:
+                error = f"步骤 {step.name} 超过 {step_timeout:.0f} 秒"
+                terminal_status = "timed_out"
             await _emit_step_update(
                 on_step_update,
                 PreflightStepUpdate(
                     step_index=step_index,
-                    status="timed_out",
+                    status=terminal_status,
                     timeout_seconds=step_timeout,
                     error=error,
                 ),
             )
             return StepExecutionOutcome(
-                status="timed_out",
+                status=terminal_status,
                 failed_step=step.name,
                 output=output,
                 error=error,
             )
 
-        assert process_waiter in completed
-        assert output_reader in completed
         step_output = output_reader.result()
         output = _append_bounded_output(
             output,
@@ -334,6 +402,27 @@ class PreflightExecutor:
         self.config = config
         self.store = store
         self.repositories = config.repository_map()
+
+    async def _append_log(
+        self,
+        run_id: str,
+        payload: str | dict[str, object],
+        *,
+        stream: str = "system",
+        event_type: str = "message",
+    ) -> None:
+        """追加 CI 实时日志，日志故障不应覆盖实际检查结果。"""
+
+        try:
+            await asyncio.to_thread(
+                self.store.append_preflight_log,
+                run_id,
+                stream=stream,
+                event_type=event_type,
+                payload=payload,
+            )
+        except Exception:
+            pass
 
     async def _set_remote_status(
         self,
@@ -436,6 +525,16 @@ class PreflightExecutor:
         result: PreflightResult
         try:
             await asyncio.to_thread(
+                self.store.set_preflight_phase,
+                reservation.run_id,
+                "preparing",
+                branch=event.new.source_branch,
+            )
+            await self._append_log(
+                reservation.run_id,
+                "正在准备 MR / PR 临时工作区\n",
+            )
+            await asyncio.to_thread(
                 self.store.initialize_preflight_steps,
                 reservation.run_id,
                 (
@@ -461,28 +560,80 @@ class PreflightExecutor:
                     error=update.error,
                 )
 
+            async def record_output(chunk: str) -> None:
+                """持续保存合并后的 stdout / stderr 输出。"""
+
+                await self._append_log(
+                    reservation.run_id,
+                    chunk,
+                    stream="stdout",
+                    event_type="output",
+                )
+
             await self._set_remote_status(
                 repository,
                 event.new.head_sha,
                 state="pending",
                 description="本地 CI 正在运行",
             )
+
+            def record_git_progress(git_event: GitProgressEvent) -> None:
+                """从 Git 工作线程写入脱敏阶段，不保存认证和命令输出。"""
+
+                try:
+                    self.store.append_preflight_log(
+                        reservation.run_id,
+                        stream="system",
+                        event_type="git_progress",
+                        payload=git_event.as_dict(),
+                    )
+                except Exception:
+                    pass
+
             manager = temporary_change_request_worktree(
                 provider_config,
                 repository,
                 event.new,
+                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                initialization_timeout_seconds=(
+                    self.config.runtime.repository_initialization_timeout_seconds
+                ),
+                progress_callback=record_git_progress,
             )
             checkout: Path | None = None
             try:
                 checkout = await asyncio.to_thread(manager.__enter__)
+                cache_environment: dict[str, str] = {}
+                cache_path: str | None = None
+                if repository.preflight.cache_enabled:
+                    cache_root = repository_cache_root(self.config, repository)
+                    cache_environment = await asyncio.to_thread(
+                        build_repository_cache_environment,
+                        cache_root,
+                    )
+                    cache_path = str(cache_root.expanduser().resolve())
+                    await self._append_log(
+                        reservation.run_id,
+                        f"已启用仓库级依赖缓存：{cache_path}\n",
+                    )
+                await asyncio.to_thread(
+                    self.store.set_preflight_phase,
+                    reservation.run_id,
+                    "running_steps",
+                    cache_path=cache_path,
+                )
                 with tempfile.TemporaryDirectory(
                     prefix="teamwork-preflight-home-"
                 ) as home:
                     outcome = await execute_preflight_steps(
                         repository.preflight,
                         cwd=checkout,
-                        environment=build_preflight_environment(home=Path(home)),
+                        environment=build_preflight_environment(
+                            home=Path(home),
+                            cache_environment=cache_environment,
+                        ),
                         on_step_update=record_step,
+                        on_output=record_output,
                     )
             finally:
                 if checkout is not None:
@@ -499,6 +650,12 @@ class PreflightExecutor:
                 error=outcome.error,
             )
         except Exception as exc:
+            await self._append_log(
+                reservation.run_id,
+                f"Preflight 基础设施错误：{exc}\n",
+                stream="stderr",
+                event_type="error",
+            )
             result = PreflightResult(
                 run_id=reservation.run_id,
                 repository_id=repository.id,
@@ -509,4 +666,14 @@ class PreflightExecutor:
             )
 
         await asyncio.to_thread(self.store.finish_preflight_run, result)
+        await self._append_log(
+            reservation.run_id,
+            {
+                "status": result.status,
+                "failed_step": result.failed_step,
+                "exit_code": result.exit_code,
+                "error": result.error,
+            },
+            event_type="completed",
+        )
         return await self._publish_terminal_result(repository, result)

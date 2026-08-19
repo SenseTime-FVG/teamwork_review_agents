@@ -291,6 +291,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .repository-preflight-head strong, .repository-preflight-steps-head strong { color: var(--bright); font-size: 12px; }
 .repository-preflight-head p, .repository-preflight-steps-head p { margin: 5px 0 0; color: #6e7d91; font-size: 10px; line-height: 1.55; }
 .repository-preflight-content { margin-top: 16px; padding-top: 16px; border-top: 1px solid #233446; }
+.repository-preflight-cache-option { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; margin-top: 14px; padding: 12px 13px; border: 1px solid #294052; border-radius: 8px; background: #0b1621; }
+.repository-preflight-cache-option p { margin: 0; color: #7f8da1; font-size: 10px; line-height: 1.6; }
 .repository-preflight-steps-head { margin-top: 17px; align-items: center; }
 .repository-preflight-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 11px; }
 .repository-preflight-step { padding: 13px 14px; border: 1px solid #263547; border-radius: 8px; background: #0b121d; }
@@ -678,6 +680,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-message-new { position: absolute; right: 18px; bottom: 14px; padding: 8px 12px; border: 1px solid #39634a; border-radius: 18px; background: #12291d; color: #8ae2b2; box-shadow: 0 8px 24px rgba(0, 0, 0, .32); cursor: pointer; font-size: 9px; }
 .detail-pre { max-height: 380px; overflow: auto; margin: 0 0 14px; padding: 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #080d14; color: #9eacbd; white-space: pre-wrap; word-break: break-word; font: 400 10px/1.6 "SFMono-Regular", Consolas, monospace; }
 .detail-pre.detail-error { border-color: #603036; color: #ffaaaa; background: #211216; }
+.preflight-live-output { min-height: 190px; max-height: 430px; color: #b9d7c5; background: #060c12; border-color: #2c4d3d; }
 .run-result-panel h3 { margin: 18px 0 9px; color: #aebaca; font-size: 11px; }
 .run-result-message { padding: 14px 16px; border: 1px solid #2e5941; border-radius: 9px; background: #102319; }
 .run-result-message .run-message-markdown { margin-top: 0; }
@@ -799,6 +802,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .agent-detail-actions .button { flex: 1; }
   .agent-detail-form, .rule-detail-form { padding: 16px; }
   .repository-detail-form { padding: 16px; }
+  .repository-preflight-cache-option { grid-template-columns: 1fr; align-items: start; }
   .repository-reference-warning { flex-direction: column; gap: 6px; }
   .overview-section-tools { width: 100%; flex-direction: column; align-items: stretch; }
   .overview-selection-actions { width: 100%; }

@@ -933,6 +933,75 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert changed.run_id == "preflight-2"
 
 
+def test_manual_preflight_supports_nullable_pr_live_logs_and_cancel(tmp_path) -> None:
+    """手动 CI 不绑定事件或编号，并能持久化阶段、日志与取消终态。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.create_manual_preflight_run(
+        run_id="manual-preflight",
+        repository_id="demo",
+        config_revision="revision-manual",
+    )
+    store.initialize_preflight_steps(
+        "manual-preflight",
+        [{"name": "install", "command": ["uv", "sync"]}],
+    )
+    store.set_preflight_phase(
+        "manual-preflight",
+        "running_steps",
+        branch="main",
+        head_sha="b" * 40,
+        cache_path=str(tmp_path / "cache"),
+    )
+    first_log = store.append_preflight_log(
+        "manual-preflight",
+        stream="stdout",
+        event_type="output",
+        payload="downloading dependencies\n",
+    )
+    second_log = store.append_preflight_log(
+        "manual-preflight",
+        stream="system",
+        event_type="message",
+        payload={"phase": "install"},
+    )
+
+    assert store.request_cancel_preflight("manual-preflight") is True
+    assert store.preflight_cancel_requested("manual-preflight") is True
+    store.update_preflight_step(
+        "manual-preflight",
+        0,
+        status="running",
+    )
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id="manual-preflight",
+            repository_id="demo",
+            number=None,
+            head_sha="b" * 40,
+            status="cancelled",
+            error="用户取消了手动 CI",
+        )
+    )
+
+    detail = store.get_preflight_run("manual-preflight")
+    assert detail is not None
+    assert detail["event_id"] is None
+    assert detail["number"] is None
+    assert detail["trigger_source"] == "manual"
+    assert detail["branch"] == "main"
+    assert detail["phase"] == "finished"
+    assert detail["status"] == "cancelled"
+    assert detail["steps"][0]["status"] == "cancelled"
+    assert detail["linked_events"] == []
+    assert [item["id"] for item in store.list_preflight_logs(
+        "manual-preflight",
+        after_id=first_log,
+    )] == [second_log]
+    assert store.request_cancel_preflight("manual-preflight") is False
+
+
 def test_event_list_exposes_linked_preflight_summary(
     tmp_path,
     snapshot_factory,

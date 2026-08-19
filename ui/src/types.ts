@@ -16,6 +16,7 @@ export type RepositoryPreflightStep = {
 
 export type RepositoryPreflight = {
   enabled?: boolean;
+  cache_enabled?: boolean;
   status_context?: string;
   timeout_seconds?: number;
   max_output_bytes?: number;
@@ -464,12 +465,17 @@ export type EventDetailRecord = EventRecord & {
 
 export type PreflightRunSummary = {
   run_id: string;
-  event_id: string;
+  event_id?: string | null;
   repository_id: string;
-  number: number;
+  number?: number | null;
   head_sha: string;
   config_revision: string;
-  status: "running" | "success" | "failure" | "timed_out" | "error";
+  trigger_source: "event" | "manual";
+  branch?: string | null;
+  phase: string;
+  cache_path?: string | null;
+  cancel_requested: number | boolean;
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled";
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;
@@ -488,7 +494,7 @@ export type PreflightStepRunDetail = {
   step_index: number;
   name: string;
   command: string[];
-  status: "pending" | "running" | "success" | "failure" | "timed_out" | "error" | "skipped";
+  status: "pending" | "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "skipped";
   timeout_seconds?: number | null;
   started_at?: number | null;
   finished_at?: number | null;

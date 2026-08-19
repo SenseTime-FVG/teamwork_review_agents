@@ -288,6 +288,7 @@ class PreflightConfig(BaseModel):
     """仓库级 CI 能力与执行步骤配置。"""
 
     enabled: bool = False
+    cache_enabled: bool = True
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
     timeout_seconds: PositiveInt = 1800
     max_output_bytes: PositiveInt = 1_000_000

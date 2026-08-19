@@ -1098,6 +1098,8 @@ def test_overview_api_filters_status_repository_and_limit(
         preflight_summaries = client.get("/api/preflight-runs").json()
         assert preflight_summaries[0]["run_id"] == reservation.run_id
         assert preflight_summaries[0]["event_type"] == first_event.type
+        assert preflight_summaries[0]["trigger_source"] == "event"
+        assert preflight_summaries[0]["phase"] == "finished"
         assert "output" not in preflight_summaries[0]
         filtered_preflights = client.get(
             "/api/preflight-runs?repository_id=first&number=1"
@@ -1123,6 +1125,25 @@ def test_overview_api_filters_status_repository_and_limit(
         assert preflight_detail["steps"][0]["command"] == ["python", "-m", "pytest"]
         assert preflight_detail["steps"][0]["status"] == "failure"
         assert preflight_detail["linked_events"][0]["event_id"] == first_event.id
+        log_id = store.append_preflight_log(
+            reservation.run_id,
+            stream="stdout",
+            event_type="output",
+            payload="live pytest output\n",
+        )
+        preflight_logs = client.get(
+            f"/api/preflight-runs/{reservation.run_id}/logs"
+        ).json()
+        assert preflight_logs == [
+            {
+                "id": log_id,
+                "run_id": reservation.run_id,
+                "created_at": preflight_logs[0]["created_at"],
+                "stream": "stdout",
+                "event_type": "output",
+                "payload": "live pytest output\n",
+            }
+        ]
         assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422
         assert client.get("/api/events?number=0").status_code == 422

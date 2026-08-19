@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +19,11 @@ from teamwork_review_agents.preflight import (
     build_preflight_environment,
     execute_preflight_steps,
 )
+from teamwork_review_agents.preflight_cache import (
+    build_repository_cache_environment,
+    repository_cache_root,
+)
+from teamwork_review_agents.preflight_manager import ManualPreflightManager
 from teamwork_review_agents.state import StateStore
 
 
@@ -125,6 +133,182 @@ async def test_preflight_times_out_and_truncates_output(tmp_path) -> None:
         (0, "timed_out"),
     ]
     assert updates[-1].timeout_seconds == 1
+
+
+async def test_manual_preflight_is_unlimited_but_remains_cancellable(tmp_path) -> None:
+    """手动预热忽略配置超时，但收到取消后必须回收命令并保留实时输出。"""
+
+    cancel_event = asyncio.Event()
+    chunks: list[str] = []
+    updates = []
+
+    async def record_output(chunk: str) -> None:
+        chunks.append(chunk)
+        if "ready" in chunk:
+            cancel_event.set()
+
+    async def record_step(update) -> None:
+        updates.append(update)
+
+    config = PreflightConfig.model_validate(
+        {
+            "enabled": True,
+            "timeout_seconds": 1,
+            "steps": [
+                {
+                    "name": "warm-cache",
+                    "timeout_seconds": 1,
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        "import time; print('ready', flush=True); time.sleep(30)",
+                    ],
+                }
+            ],
+        }
+    )
+
+    started_at = time.monotonic()
+    outcome = await execute_preflight_steps(
+        config,
+        cwd=tmp_path,
+        environment=build_preflight_environment(),
+        on_step_update=record_step,
+        on_output=record_output,
+        cancel_check=cancel_event.is_set,
+        unlimited=True,
+    )
+
+    assert outcome.status == "cancelled"
+    assert "ready" in "".join(chunks)
+    assert time.monotonic() - started_at < 3
+    assert [(update.step_index, update.status) for update in updates] == [
+        (0, "running"),
+        (0, "cancelled"),
+    ]
+
+
+def test_repository_cache_is_shared_by_repository_not_branch(tmp_path) -> None:
+    """缓存根目录只按仓库稳定身份划分，并覆盖常见依赖管理器。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "data" / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    repository = config.repository_map()["demo"]
+    root = repository_cache_root(config, repository)
+    environment = build_repository_cache_environment(root)
+
+    assert root.parent == config.database.path.parent / "preflight-cache"
+    assert environment["TEAMWORK_PREFLIGHT_CACHE_DIR"] == str(root.resolve())
+    for name in (
+        "UV_CACHE_DIR",
+        "PIP_CACHE_DIR",
+        "NPM_CONFIG_CACHE",
+        "npm_config_store_dir",
+        "CARGO_HOME",
+        "GOMODCACHE",
+        "GRADLE_USER_HOME",
+        "PLAYWRIGHT_BROWSERS_PATH",
+    ):
+        assert name in environment
+        assert Path(environment[name]).is_relative_to(root.resolve())
+
+
+async def test_manual_preflight_manager_runs_default_branch_without_event(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """仓库手动 CI 应独立完成默认分支检查，不创建事件或远端状态。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {
+                                "name": "tests",
+                                "command": [
+                                    sys.executable,
+                                    "-c",
+                                    "print('manual ci complete', flush=True)",
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+
+    @contextmanager
+    def fake_default_worktree(*_args, **_kwargs):
+        yield tmp_path, "main", "c" * 40
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight_manager.temporary_default_branch_worktree",
+        fake_default_worktree,
+    )
+    manager = ManualPreflightManager(
+        SimpleNamespace(config=config, store=store),
+    )
+    started = await manager.start("demo")
+    run_id = str(started["run_id"])
+    for _ in range(100):
+        detail = store.get_preflight_run(run_id)
+        if detail and detail["status"] != "running":
+            break
+        await asyncio.sleep(0.02)
+    await manager.close()
+
+    detail = store.get_preflight_run(run_id)
+    assert detail is not None
+    assert detail["status"] == "success"
+    assert detail["trigger_source"] == "manual"
+    assert detail["number"] is None
+    assert detail["branch"] == "main"
+    assert detail["head_sha"] == "c" * 40
+    assert detail["status_published"] == 0
+    assert detail["linked_events"] == []
+    assert "manual ci complete" in detail["output"]
+    assert any(
+        log["event_type"] == "output"
+        for log in store.list_preflight_logs(run_id)
+    )
 
 
 async def test_preflight_timeout_kills_background_process_holding_stdout(
