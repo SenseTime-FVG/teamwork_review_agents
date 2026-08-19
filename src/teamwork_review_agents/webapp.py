@@ -76,6 +76,20 @@ class RuleDeleteRequest(BaseModel):
     revision: str
 
 
+class ProviderConfigRequest(BaseModel):
+    """UI 提交的单个平台连接配置。"""
+
+    revision: str
+    name: str
+    provider: dict[str, Any]
+
+
+class ProviderDeleteRequest(BaseModel):
+    """UI 删除单个平台连接时提交的配置版本。"""
+
+    revision: str
+
+
 class RepositoryConfigRequest(BaseModel):
     """UI 提交的单个仓库配置。"""
 
@@ -365,6 +379,68 @@ def create_app(
                 status_code=409,
                 detail="仓库正在执行 Git 操作，请等待完成或先取消操作",
             )
+
+    @app.post("/api/config/providers")
+    async def create_provider(body: ProviderConfigRequest) -> dict[str, Any]:
+        """基于指定版本创建一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_provider,
+                expected_revision=body.revision,
+                name=body.name,
+                provider=body.provider,
+                source="ui-provider-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/providers/{provider_name:path}")
+    async def update_provider(
+        provider_name: str,
+        body: ProviderConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新或重命名一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_provider,
+                expected_revision=body.revision,
+                original_name=provider_name,
+                name=body.name,
+                provider=body.provider,
+                source="ui-provider-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/providers/{provider_name:path}")
+    async def delete_provider(
+        provider_name: str,
+        body: ProviderDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本安全删除一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_provider,
+                expected_revision=body.revision,
+                name=provider_name,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
 
     @app.post("/api/config/repositories")
     async def create_repository(body: RepositoryConfigRequest) -> dict[str, Any]:

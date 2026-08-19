@@ -212,6 +212,10 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .agent-workspace-note { display: flex; align-items: flex-start; gap: 14px; margin: -5px 0 18px; padding: 12px 14px; border: 1px solid #2b3d50; border-radius: 8px; background: #0b151f; }
 .agent-workspace-note strong { flex: 0 0 auto; color: #a9c9b8; font-size: 10px; }
 .agent-workspace-note span { color: #708097; font-size: 10px; line-height: 1.55; }
+.runtime-mode-stack { display: flex; flex-direction: column; gap: 14px; margin-bottom: 18px; }
+.runtime-mode-stack .alert, .runtime-mode-stack .agent-workspace-note { margin: 0; }
+.runtime-mode-option .toggle-row { flex: 0 0 auto; }
+.runtime-mode-option p { min-width: 0; overflow-wrap: anywhere; }
 .agent-list-page { min-height: 560px; }
 .agent-list-title { align-items: center; }
 .agent-list-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
@@ -258,12 +262,12 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .rule-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
 .repository-list-page { min-height: 420px; }
 .repository-config-table { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #091019; }
-.repository-config-table-head, .repository-config-row { display: grid; grid-template-columns: minmax(180px, 1.15fr) 70px minmax(105px, .7fr) minmax(155px, 1fr) minmax(145px, .95fr) minmax(125px, .8fr) 18px; gap: 16px; align-items: center; }
+.repository-config-table-head, .repository-config-row { display: grid; grid-template-columns: minmax(180px, 1.15fr) 110px minmax(105px, .7fr) minmax(155px, 1fr) minmax(145px, .95fr) minmax(125px, .8fr) 18px; gap: 16px; align-items: center; }
 .repository-config-table-head { min-height: 43px; padding: 0 17px; border-bottom: 1px solid var(--line); background: #0c131e; color: #65758a; font-size: 9px; }
 .repository-config-items { display: flex; flex-direction: column; }
 .repository-config-row { position: relative; width: 100%; min-height: 76px; padding: 12px 17px; border: 0; border-bottom: 1px solid #192433; background: transparent; color: #9aa8ba; cursor: pointer; text-align: left; transition: .15s ease; }
 .repository-config-row:last-child { border-bottom: 0; }
-.repository-config-row:hover, .repository-config-row:focus-visible { z-index: 1; outline: none; background: #101b19; box-shadow: inset 3px 0 var(--accent); }
+.repository-config-row:hover, .repository-config-row:focus-within { z-index: 1; outline: none; background: #101b19; box-shadow: inset 3px 0 var(--accent); }
 .repository-config-row:disabled { cursor: not-allowed; opacity: .58; }
 .repository-config-row:disabled:hover { background: transparent; box-shadow: none; }
 .repository-config-row > span { min-width: 0; }
@@ -272,6 +276,11 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .repository-config-row small { margin-top: 4px; color: #5f6f84; font-size: 8px; }
 .repository-config-row .success-text { color: var(--accent); }
 .repository-config-row .muted-text { color: #6c798b; }
+.repository-config-status .toggle-row { gap: 6px; color: #6c798b; font-size: 9px; font-weight: 700; }
+.repository-config-status.enabled .toggle-row { color: var(--accent); }
+.repository-config-status .toggle-row.disabled { color: #596679; }
+.repository-config-detail-button { width: 18px; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: center; }
+.repository-config-detail-button:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; border-radius: 3px; color: var(--accent); }
 .repository-config-avatar { width: 34px; height: 34px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid #4c5540; border-radius: 10px; background: #202316; color: #d2d98a; font: 700 12px "SFMono-Regular", Consolas, monospace; }
 .repository-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
 .repository-detail-form { padding: 22px; }
@@ -351,7 +360,10 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .credential-note { color: #56866b; }
 .mini-check { display: flex; flex-direction: column; gap: 3px; align-items: center; color: #748297; font-size: 9px; }
 .mini-check input { width: 14px; height: 14px; accent-color: var(--accent); }
-.provider-row { display: grid; grid-template-columns: 1fr .75fr 1.8fr 1.2fr 32px; gap: 10px; align-items: end; }
+.provider-card.editing { border-color: #315c43; background: #0e1814; }
+.provider-card-head { align-items: center; }
+.provider-card-head .button-group { justify-content: flex-end; }
+.provider-row { display: grid; grid-template-columns: 1fr .75fr 1.8fr 1.2fr; gap: 10px; align-items: start; }
 .prompt-editor { margin-top: 17px; padding: 15px; border: 1px solid var(--line-soft); border-radius: 9px; background: #090f18; }
 .prompt-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: #8998ab; font-size: 10px; }
 .prompt-toolbar select { margin-left: 6px; padding: 5px 7px; border: 1px solid #293546; border-radius: 5px; background: #101823; color: var(--text); }
@@ -657,7 +669,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .agent-config-table-head > span:nth-child(6), .agent-config-row > span:nth-child(6) { display: none; }
   .rule-config-table-head, .rule-config-row { grid-template-columns: minmax(180px, 1.2fr) 104px minmax(140px, .95fr) minmax(115px, .8fr) minmax(115px, .8fr) 18px; }
   .rule-config-table-head > span:nth-child(6), .rule-config-row > span:nth-child(6) { display: none; }
-  .repository-config-table-head, .repository-config-row { grid-template-columns: minmax(175px, 1.15fr) 68px minmax(105px, .7fr) minmax(150px, 1fr) minmax(120px, .8fr) 18px; }
+  .repository-config-table-head, .repository-config-row { grid-template-columns: minmax(175px, 1.15fr) 104px minmax(105px, .7fr) minmax(150px, 1fr) minmax(120px, .8fr) 18px; }
   .repository-config-table-head > span:nth-child(5), .repository-config-row > span:nth-child(5) { display: none; }
 }
 
@@ -677,6 +689,11 @@ tbody tr:last-child td { border-bottom: 0; }
   .metric-card { min-height: 108px; padding: 15px; }
   .section-card { padding: 16px; }
   .section-title-row { flex-direction: column; }
+  .runtime-mode-option { flex-direction: column; gap: 11px; }
+  .runtime-mode-option .toggle-row { white-space: normal; }
+  .provider-card-head { align-items: stretch; }
+  .provider-card-head .button-group { justify-content: stretch; }
+  .provider-card-head .button { flex: 1; }
   .agent-list-title { align-items: stretch; }
   .agent-list-title .button { width: 100%; }
   .agent-list-toolbar { align-items: stretch; flex-direction: column; gap: 7px; }

@@ -323,6 +323,96 @@ class ConfigManager:
             ]
             return self._persist_locked(document, source=source)
 
+    def save_provider(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        provider: dict[str, Any],
+        original_name: str | None = None,
+        source: str = "ui-provider",
+    ) -> AppConfig:
+        """基于最新配置原子创建或更新一个平台连接。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            next_name = name.strip()
+            if not next_name:
+                raise ValueError("平台连接名称不能为空")
+            providers = current_raw.get("providers", {})
+            if not isinstance(providers, dict):
+                raise ValueError("providers 配置必须是对象")
+            if not all(isinstance(item, dict) for item in providers.values()):
+                raise ValueError("providers 中的每一项都必须是对象")
+
+            current_name = original_name.strip() if original_name is not None else None
+            if current_name is None:
+                if next_name in providers:
+                    raise ValueError(f"平台连接已存在：{next_name}")
+            else:
+                if current_name not in providers:
+                    raise ValueError(f"平台连接不存在：{current_name}")
+                if next_name != current_name and next_name in providers:
+                    raise ValueError(f"平台连接已存在：{next_name}")
+
+            next_providers: dict[str, Any] = {}
+            for provider_name, value in providers.items():
+                if current_name is not None and provider_name == current_name:
+                    next_providers[next_name] = copy.deepcopy(provider)
+                    continue
+                next_providers[provider_name] = copy.deepcopy(value)
+            if current_name is None:
+                next_providers[next_name] = copy.deepcopy(provider)
+
+            document = copy.deepcopy(current_raw)
+            document["providers"] = next_providers
+            if current_name is not None and current_name != next_name:
+                for repository in document.get("repositories", []):
+                    if (
+                        isinstance(repository, dict)
+                        and repository.get("provider") == current_name
+                    ):
+                        repository["provider"] = next_name
+            merged = protect_provider_credentials(
+                self._merge_masked(document, current_raw)
+            )
+            return self._persist_locked(merged, source=source)
+
+    def delete_provider(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        source: str = "ui-provider-delete",
+    ) -> AppConfig:
+        """删除未被仓库引用的平台连接。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            providers = current_raw.get("providers", {})
+            if not isinstance(providers, dict) or name not in providers:
+                raise ValueError(f"平台连接不存在：{name}")
+            referenced_repositories = [
+                str(repository.get("id", ""))
+                for repository in current_raw.get("repositories", [])
+                if isinstance(repository, dict)
+                and repository.get("provider") == name
+            ]
+            if referenced_repositories:
+                raise ValueError(
+                    f"平台连接 {name} 仍被仓库引用：{referenced_repositories}"
+                )
+
+            document = copy.deepcopy(current_raw)
+            document["providers"] = {
+                provider_name: copy.deepcopy(value)
+                for provider_name, value in providers.items()
+                if provider_name != name
+            }
+            return self._persist_locked(document, source=source)
+
     def save_repository(
         self,
         *,

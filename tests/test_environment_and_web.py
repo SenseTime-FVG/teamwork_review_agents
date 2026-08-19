@@ -556,6 +556,20 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
             "owner/third-updated"
         )
 
+        repository = updated_body["document"]["repositories"][2]
+        toggled = client.put(
+            "/api/config/repositories/third",
+            json={
+                "revision": updated_body["revision"],
+                "repository_id": "third",
+                "repository": {**repository, "enabled": True},
+            },
+        )
+        assert toggled.status_code == 200
+        updated_body = toggled.json()
+        repository = updated_body["document"]["repositories"][2]
+        assert repository["enabled"] is True
+
         renamed = client.put(
             "/api/config/repositories/third",
             json={
@@ -590,6 +604,79 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
         assert [item["id"] for item in deleted.json()["document"]["repositories"]] == [
             "first",
             "second",
+        ]
+
+
+def test_web_api_saves_providers_independently_and_updates_references(
+    tmp_path,
+) -> None:
+    """平台连接 API 应原子保存，并保护版本和仓库引用。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/providers",
+            json={
+                "revision": current["revision"],
+                "name": "provider-secondary",
+                "provider": {
+                    "kind": "gitlab",
+                    "base_url": "https://gitlab.example/api/v4",
+                    "token_env": "GITLAB_TOKEN",
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert list(created_body["document"]["providers"]) == [
+            "provider-main",
+            "provider-secondary",
+        ]
+
+        renamed = client.put(
+            "/api/config/providers/provider-main",
+            json={
+                "revision": created_body["revision"],
+                "name": "provider-renamed",
+                "provider": created_body["document"]["providers"]["provider-main"],
+            },
+        )
+        assert renamed.status_code == 200
+        renamed_body = renamed.json()
+        assert list(renamed_body["document"]["providers"]) == [
+            "provider-renamed",
+            "provider-secondary",
+        ]
+        assert {
+            repository["provider"]
+            for repository in renamed_body["document"]["repositories"]
+        } == {"provider-renamed"}
+
+        conflict = client.request(
+            "DELETE",
+            "/api/config/providers/provider-secondary",
+            json={"revision": current["revision"]},
+        )
+        assert conflict.status_code == 409
+
+        referenced = client.request(
+            "DELETE",
+            "/api/config/providers/provider-renamed",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert referenced.status_code == 422
+        assert "first" in referenced.json()["detail"]
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/providers/provider-secondary",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert list(deleted.json()["document"]["providers"]) == [
+            "provider-renamed"
         ]
 
 

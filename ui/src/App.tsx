@@ -1682,39 +1682,41 @@ function CodexRuntimeEditor(props: {
             <p>选择由 Codex CLI 托管完整 Agent，或只使用 Codex 模型并由 Teamwork 提供工具和运行环境。</p>
           </div>
         </div>
-        <div className="rule-option">
-          <Toggle
-            label="Codex 仅作为模型基座"
-            checked={(codex.execution_mode ?? "cli") === "model"}
-            onChange={(enabled) => patchCodex({ execution_mode: enabled ? "model" : "cli" })}
-          />
-          <p>
-            开启后不启动 <code>codex exec</code>，Teamwork 直接复用当前 Codex OAuth 登录并提供命令、补丁和 sub-agent 工具；
-            关闭后保持现有 Codex CLI 工具、MCP 与运行环境。
-          </p>
-        </div>
-        {(codex.execution_mode ?? "cli") === "model" && (
-          <div className="alert warning">
-            模型基座模式不会请求外部或本机 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
-            受限 Agent 必须成功启用下方 Teamwork 外层沙盒；默认模型需在本页、Agent 或 Codex config.toml 中明确配置。
+        <div className="runtime-mode-stack">
+          <div className="rule-option runtime-mode-option">
+            <Toggle
+              label="Codex 仅作为模型基座"
+              checked={(codex.execution_mode ?? "cli") === "model"}
+              onChange={(enabled) => patchCodex({ execution_mode: enabled ? "model" : "cli" })}
+            />
+            <p>
+              开启后不启动 <code>codex exec</code>，Teamwork 直接复用当前 Codex OAuth 登录并提供命令、补丁和 sub-agent 工具；
+              关闭后保持现有 Codex CLI 工具、MCP 与运行环境。
+            </p>
           </div>
-        )}
-        <div className="agent-workspace-note">
-          <strong>当前模型来源</strong>
-          <span>
-            {inherited.label}。下面展示的是后台全局继承值；Agent 可以单独覆盖。
-            {(codex.execution_mode ?? "cli") === "cli"
-              ? "仓库中的 .codex/config.toml 仍可能参与 Codex 原生合并。"
-              : "模型基座模式只读取配置的顶层模型默认值，不执行仓库 Codex 配置。"}
-          </span>
-        </div>
-        <div className="agent-workspace-note">
-          <strong>{(codex.execution_mode ?? "cli") === "model" ? "认证与沙盒 CLI" : "实际后台 CLI"}</strong>
-          <span>
-            {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
-            {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
-            {` · CODEX_HOME ${props.options.codex_home}`}
-          </span>
+          {(codex.execution_mode ?? "cli") === "model" && (
+            <div className="alert warning">
+              模型基座模式不会请求外部或本机 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
+              受限 Agent 必须成功启用下方 Teamwork 外层沙盒；默认模型需在本页、Agent 或 Codex config.toml 中明确配置。
+            </div>
+          )}
+          <div className="agent-workspace-note">
+            <strong>当前模型来源</strong>
+            <span>
+              {inherited.label}。下面展示的是后台全局继承值；Agent 可以单独覆盖。
+              {(codex.execution_mode ?? "cli") === "cli"
+                ? "仓库中的 .codex/config.toml 仍可能参与 Codex 原生合并。"
+                : "模型基座模式只读取配置的顶层模型默认值，不执行仓库 Codex 配置。"}
+            </span>
+          </div>
+          <div className="agent-workspace-note">
+            <strong>{(codex.execution_mode ?? "cli") === "model" ? "认证与沙盒 CLI" : "实际后台 CLI"}</strong>
+            <span>
+              {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
+              {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
+              {` · CODEX_HOME ${props.options.codex_home}`}
+            </span>
+          </div>
         </div>
         {props.options.version_warning && <div className="alert error">{props.options.version_warning}</div>}
         {props.options.effective_config_error && (
@@ -2181,8 +2183,16 @@ function ConfigHistory() {
 
 function RepositoryConnectionsEditor(props: {
   document: ConfigDocument;
-  onChange: (document: ConfigDocument) => void;
+  revision: string;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
 }) {
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [draftProvider, setDraftProvider] = useState<Record<string, unknown> | null>(null);
+  const [saving, setSaving] = useState(false);
   const providerNames = Object.keys(props.document.providers);
   const repositoryCount = props.document.repositories.length;
 
@@ -2193,42 +2203,85 @@ function RepositoryConnectionsEditor(props: {
   }
 
   function addProvider() {
+    if (editingName !== null) return;
     let index = providerNames.length + 1;
     let name = `provider-${index}`;
     while (props.document.providers[name]) name = `provider-${++index}`;
-    props.onChange({
-      ...props.document,
-      providers: {
-        ...props.document.providers,
-        [name]: { kind: "github", ...providerDefaults("github") },
-      },
-    });
+    setCreating(true);
+    setEditingName(name);
+    setDraftName(name);
+    setDraftProvider({ kind: "github", ...providerDefaults("github") });
   }
 
-  function updateProvider(name: string, patch: Record<string, unknown>) {
-    props.onChange({
-      ...props.document,
-      providers: {
-        ...props.document.providers,
-        [name]: { ...props.document.providers[name], ...patch },
-      },
-    });
+  function beginEdit(name: string) {
+    if (editingName !== null) return;
+    setCreating(false);
+    setEditingName(name);
+    setDraftName(name);
+    setDraftProvider(structuredClone(props.document.providers[name]));
   }
 
-  function renameProvider(name: string, nextName: string): boolean {
-    if (!nextName || (nextName !== name && props.document.providers[nextName])) return false;
-    const providers = Object.fromEntries(
-      Object.entries(props.document.providers).map(([key, value]) => [
-        key === name ? nextName : key,
-        value,
-      ]),
-    );
-    const repositories = props.document.repositories.map((repository) => ({
-      ...repository,
-      provider: repository.provider === name ? nextName : repository.provider,
-    }));
-    props.onChange({ ...props.document, providers, repositories });
-    return true;
+  function clearDraft() {
+    setEditingName(null);
+    setCreating(false);
+    setDraftName("");
+    setDraftProvider(null);
+  }
+
+  function updateDraft(patch: Record<string, unknown>) {
+    setDraftProvider((current) => ({ ...(current ?? {}), ...patch }));
+  }
+
+  async function saveProvider() {
+    if (!editingName || !draftName.trim() || !draftProvider) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/providers"
+        : `/api/config/providers/${encodeURIComponent(editingName)}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          name: draftName.trim(),
+          provider: draftProvider,
+        }),
+      });
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(
+        creating
+          ? `平台连接 ${draftName.trim()} 已创建并热加载`
+          : `平台连接 ${draftName.trim()} 已保存并热加载`,
+      );
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存平台连接失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteProvider(name: string) {
+    if (saving) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/providers/${encodeURIComponent(name)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`平台连接 ${name} 已删除并热加载`);
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除平台连接失败");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -2253,7 +2306,7 @@ function RepositoryConnectionsEditor(props: {
             <h2>GitHub / GitLab 连接</h2>
             <p>后台使用这里的平台 API 和 Token 扫描远端 MR / PR；平台连接本身不会立即克隆代码，Agent 首次运行时才按仓库配置自动准备本地工作目录。</p>
           </div>
-          <button className="button secondary" onClick={addProvider}>+ 添加平台连接</button>
+          <button className="button secondary" disabled={editingName !== null} onClick={addProvider}>+ 添加平台连接</button>
         </div>
         <div className="card-list compact">
           {providerNames.length === 0 && (
@@ -2262,8 +2315,11 @@ function RepositoryConnectionsEditor(props: {
               <p>先点击“添加平台连接”，再配置平台 API 地址，以及宿主机中保存访问 Token 的环境变量名。</p>
             </div>
           )}
-          {providerNames.map((name) => {
-            const provider = props.document.providers[name];
+          {[...providerNames, ...(creating && editingName ? [editingName] : [])].map((name) => {
+            const isEditing = editingName === name;
+            const provider = isEditing && draftProvider
+              ? draftProvider
+              : props.document.providers[name];
             const tokenEnvironment = String(provider.token_env ?? "").trim();
             const hasGlobalToken = Boolean(tokenEnvironment)
               && Object.hasOwn(props.document.environment.global, tokenEnvironment);
@@ -2274,25 +2330,54 @@ function RepositoryConnectionsEditor(props: {
                 : `全局环境未配置；将从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
-              <div className="sub-card provider-row" key={name}>
-                <CommitField label="连接名称" value={name} onCommit={(nextName) => renameProvider(name, nextName)} />
-                <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
-                  const kind = event.target.value as "github" | "gitlab";
-                  updateProvider(name, { kind, ...providerDefaults(kind) });
-                }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
-                <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateProvider(name, { base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
-                <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} help={tokenHelp} />
-                <button
-                  className="icon-button danger align-end"
-                  disabled={referencedRepositories > 0}
-                  title={referencedRepositories > 0 ? `有 ${referencedRepositories} 个仓库正在使用此连接` : "删除连接"}
-                  onClick={() => {
-                    const providers = { ...props.document.providers };
-                    delete providers[name];
-                    props.onChange({ ...props.document, providers });
-                  }}
-                >×</button>
-              </div>
+              <article className={`sub-card provider-card ${isEditing ? "editing" : ""}`} key={name}>
+                <div className="sub-card-head provider-card-head">
+                  <div>
+                    <span className="eyebrow">{creating && isEditing ? "NEW PROVIDER" : "PROVIDER CONNECTION"}</span>
+                    <h3>{creating && isEditing ? "新建平台连接" : name}</h3>
+                  </div>
+                  <div className="button-group">
+                    {isEditing ? (
+                      <>
+                        {!creating && (
+                          <button
+                            type="button"
+                            className="button danger compact"
+                            disabled={saving || referencedRepositories > 0}
+                            title={referencedRepositories > 0 ? `有 ${referencedRepositories} 个仓库正在使用此连接` : "删除连接"}
+                            onClick={() => { void deleteProvider(name); }}
+                          >删除连接</button>
+                        )}
+                        <button type="button" className="button secondary compact" disabled={saving} onClick={clearDraft}>取消</button>
+                        <button
+                          type="button"
+                          className="button primary compact"
+                          disabled={saving || !draftName.trim()}
+                          onClick={() => { void saveProvider(); }}
+                        >{saving ? "保存中…" : "保存连接"}</button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="button secondary compact"
+                        disabled={editingName !== null}
+                        onClick={() => beginEdit(name)}
+                      >编辑</button>
+                    )}
+                  </div>
+                </div>
+                <fieldset className="config-editor-surface provider-editor-surface" disabled={!isEditing || saving}>
+                  <div className="provider-row">
+                    <Field label="连接名称" value={isEditing ? draftName : name} onChange={setDraftName} />
+                    <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
+                      const kind = event.target.value as "github" | "gitlab";
+                      updateDraft({ kind, ...providerDefaults(kind) });
+                    }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
+                    <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateDraft({ base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
+                    <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateDraft({ token_env: value })} help={tokenHelp} />
+                  </div>
+                </fieldset>
+              </article>
             );
           })}
         </div>
@@ -2828,7 +2913,6 @@ function RepositoryDetailEditor(props: {
 function RepositoriesView(props: {
   document: ConfigDocument;
   revision: string;
-  blocked: boolean;
   onSaved: (document: ConfigDocument, revision: string) => void;
   onDirtyChange: (dirty: boolean) => void;
   onDetailOpenChange: (open: boolean) => void;
@@ -2843,6 +2927,7 @@ function RepositoriesView(props: {
   const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
   const [draftId, setDraftId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [togglingRepositoryId, setTogglingRepositoryId] = useState<string | null>(null);
   const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
   const [pendingAction, setPendingAction] = useState<
@@ -2942,7 +3027,7 @@ function RepositoriesView(props: {
 
   function beginCreate() {
     const providerNames = Object.keys(props.document.providers);
-    if (providerNames.length === 0 || props.blocked) return;
+    if (providerNames.length === 0) return;
     let index = props.document.repositories.length + 1;
     let repositoryId = `repository-${index}`;
     while (props.document.repositories.some((repository) => repository.id === repositoryId)) {
@@ -2954,7 +3039,7 @@ function RepositoriesView(props: {
       provider: providerNames[0],
       project: "owner/repository",
       workspace: `./workspaces/${repositoryId}`,
-      enabled: false,
+      enabled: true,
       environment: {},
     });
     setDetailId(null);
@@ -3036,6 +3121,33 @@ function RepositoriesView(props: {
     }
   }
 
+  async function toggleRepository(repository: Repository) {
+    if (togglingRepositoryId !== null) return;
+    const enabled = repository.enabled === false;
+    setTogglingRepositoryId(repository.id);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/repositories/${encodeURIComponent(repository.id)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            revision: props.revision,
+            repository_id: repository.id,
+            repository: { ...repository, enabled },
+          }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`仓库 ${repository.id} 已${enabled ? "启用" : "停用"}并热加载`);
+      await refreshWorkspaceItems();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "更新仓库启用状态失败");
+    } finally {
+      setTogglingRepositoryId(null);
+    }
+  }
+
   const confirmation = useMemo<AgentActionConfirmation | null>(() => {
     if (!pendingAction) return null;
     if (pendingAction.kind === "discard") {
@@ -3094,8 +3206,8 @@ function RepositoriesView(props: {
           <button
             type="button"
             className="button primary"
-            disabled={!hasProviders || props.blocked}
-            title={!hasProviders ? "请先添加 GitHub / GitLab 连接" : props.blocked ? "请先保存或取消平台连接修改" : "添加仓库"}
+            disabled={!hasProviders}
+            title={!hasProviders ? "请先添加 GitHub / GitLab 连接" : "添加仓库"}
             onClick={beginCreate}
           >+ 添加仓库</button>
         </div>
@@ -3113,22 +3225,38 @@ function RepositoriesView(props: {
           <div className="repository-config-items">
             {visibleRepositories.map((repository) => {
               const workspace = workspaceById.get(repository.id);
+              const gitBusy = Boolean(workspace && ["waiting", "initializing", "updating"].includes(workspace.status));
+              const enabled = repository.enabled !== false;
+              const toggling = togglingRepositoryId === repository.id;
               return (
-                <button
-                  type="button"
+                <div
                   className="repository-config-row"
                   key={repository.id}
-                  disabled={props.blocked}
                   onClick={() => openDetail(repository.id)}
                 >
                   <span className="agent-config-identity"><span className="repository-config-avatar" aria-hidden="true">G</span><span><strong>{repository.id}</strong><small>{repository.environment && Object.keys(repository.environment).length > 0 ? `${Object.keys(repository.environment).length} 个环境变量` : "无仓库环境变量"}</small></span></span>
-                  <span><strong className={repository.enabled !== false ? "success-text" : "muted-text"}>{repository.enabled !== false ? "已启用" : "已停用"}</strong></span>
+                  <span className={`repository-config-status ${enabled ? "enabled" : ""}`} onClick={(event) => event.stopPropagation()}>
+                    <Toggle
+                      label={toggling ? "保存中…" : enabled ? "已启用" : "已停用"}
+                      checked={enabled}
+                      disabled={togglingRepositoryId !== null || gitBusy}
+                      onChange={() => { void toggleRepository(repository); }}
+                    />
+                  </span>
                   <span><strong>{repository.provider}</strong></span>
                   <span className="agent-config-summary"><strong>{repository.project}</strong><small>{repository.clone_url ?? "使用平台默认克隆地址"}</small></span>
                   <span className="agent-config-summary"><strong>{repository.workspace}</strong><small>基础 Git 仓库</small></span>
                   <span className="agent-config-summary"><strong>{workspaceLoading && !workspace ? "检查中" : workspace ? repositoryWorkspaceStatusLabel(workspace.status) : "未读取"}</strong><small>{workspace?.phase ?? "等待状态检查"}</small></span>
-                  <span className="agent-config-arrow" aria-hidden="true">›</span>
-                </button>
+                  <button
+                    type="button"
+                    className="agent-config-arrow repository-config-detail-button"
+                    aria-label={`查看仓库 ${repository.id}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openDetail(repository.id);
+                    }}
+                  >›</button>
+                </div>
               );
             })}
             {visibleRepositories.length === 0 && (
@@ -5381,8 +5509,7 @@ export default function App() {
     { id: "runs", label: "运行与日志", mark: "08" },
   ], []);
   const configurableTab = (
-    (tab === "repositories" && !repositoryDetailOpen)
-    || tab === "environment"
+    tab === "environment"
     || tab === "skills"
     || tab === "runtime"
   );
@@ -5447,7 +5574,6 @@ export default function App() {
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
                   <fieldset className="config-editor-surface" disabled={!editing}>
-                    {tab === "repositories" && <RepositoryConnectionsEditor document={document} onChange={changeDocument} />}
                     {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
                     {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
                     {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
@@ -5461,6 +5587,18 @@ export default function App() {
                   {tab === "environment" && <ConfigHistory />}
                 </>
               )}
+              <div hidden={tab !== "repositories" || repositoryDetailOpen}>
+                <RepositoryConnectionsEditor
+                  document={document}
+                  revision={revision}
+                  onSaved={acceptItemConfig}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                />
+              </div>
               {tab === "agents" && (
                 <AgentsView
                   document={document}
@@ -5479,7 +5617,6 @@ export default function App() {
                 <RepositoriesView
                   document={document}
                   revision={revision}
-                  blocked={editing}
                   onSaved={acceptItemConfig}
                   onDirtyChange={setRepositoryDetailDirty}
                   onDetailOpenChange={setRepositoryDetailOpen}
