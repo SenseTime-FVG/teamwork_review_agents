@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 import yaml
@@ -22,12 +23,17 @@ from teamwork_review_agents.process_control import (
 )
 from teamwork_review_agents.process_manager import (
     ServiceLease,
+    _effective_startup_timeout_seconds,
+    _read_record,
     _write_stop_request,
     running_process,
     runtime_paths,
     start_background,
     stop_managed_process,
 )
+
+
+_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS = 30 if os.name == "nt" else 10
 
 
 def _unused_port() -> int:
@@ -99,7 +105,7 @@ def test_background_service_starts_and_stops(tmp_path) -> None:
         config_path,
         host="127.0.0.1",
         port=port,
-        startup_timeout_seconds=10,
+        startup_timeout_seconds=_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS,
     )
     try:
         assert result.exit_code == 0, result.message
@@ -110,7 +116,7 @@ def test_background_service_starts_and_stops(tmp_path) -> None:
             config_path,
             host="127.0.0.1",
             port=port,
-            startup_timeout_seconds=10,
+            startup_timeout_seconds=_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS,
         )
         assert duplicate.exit_code == 0, duplicate.message
         assert duplicate.record is not None
@@ -155,6 +161,61 @@ def test_service_lease_matches_only_its_stop_request(tmp_path) -> None:
         replacement.release()
 
 
+def test_read_record_retries_transient_permission_error(tmp_path, monkeypatch) -> None:
+    """PID 文件原子替换期间短暂不可读时应重试并恢复。"""
+
+    config_path = _write_config(tmp_path, 8080)
+    paths = runtime_paths(config_path)
+    paths.directory.mkdir(parents=True, exist_ok=True)
+    paths.pid_file.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "config_path": str(config_path.resolve()),
+                "process_started_at": "123.000000",
+                "host": "127.0.0.1",
+                "port": 8080,
+                "detached": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_read_text = Path.read_text
+    attempts = 0
+
+    def flaky_read_text(path: Path, *args, **kwargs):
+        nonlocal attempts
+        if path == paths.pid_file and attempts < 2:
+            attempts += 1
+            raise PermissionError("模拟 Windows 文件共享冲突")
+        attempts += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    record = _read_record(paths)
+
+    assert record is not None
+    assert record.pid == 1234
+    assert attempts == 3
+
+
+def test_background_startup_timeout_uses_platform_default(monkeypatch) -> None:
+    """Windows 默认启动预算更长，显式传值始终优先。"""
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.process_manager._is_native_windows",
+        lambda: True,
+    )
+    assert _effective_startup_timeout_seconds(None) == 30
+    monkeypatch.setattr(
+        "teamwork_review_agents.process_manager._is_native_windows",
+        lambda: False,
+    )
+    assert _effective_startup_timeout_seconds(None) == 5
+    assert _effective_startup_timeout_seconds(7.5) == 7.5
+
+
 def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> None:
     """旧服务占用端口时不能把新子进程误报为启动成功。"""
 
@@ -189,7 +250,7 @@ def test_stop_discovers_process_after_pid_and_lock_are_moved(tmp_path) -> None:
         config_path,
         host="127.0.0.1",
         port=port,
-        startup_timeout_seconds=10,
+        startup_timeout_seconds=_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS,
     )
     assert started.exit_code == 0, started.message
     assert started.record is not None
@@ -219,7 +280,7 @@ def test_restart_replaces_process_after_runtime_files_are_moved(tmp_path) -> Non
         config_path,
         host="127.0.0.1",
         port=port,
-        startup_timeout_seconds=10,
+        startup_timeout_seconds=_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS,
     )
     assert started.exit_code == 0, started.message
     assert started.record is not None
@@ -245,7 +306,7 @@ def test_restart_replaces_process_after_runtime_files_are_moved(tmp_path) -> Non
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=30,
+            timeout=75 if os.name == "nt" else 30,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         replacement = running_process(config_path)
@@ -273,7 +334,7 @@ def test_stop_closes_all_managed_processes_for_same_config(tmp_path) -> None:
         config_path,
         host="127.0.0.1",
         port=first_port,
-        startup_timeout_seconds=10,
+        startup_timeout_seconds=_SUCCESSFUL_STARTUP_TIMEOUT_SECONDS,
     )
     assert first.exit_code == 0, first.message
     assert first.record is not None

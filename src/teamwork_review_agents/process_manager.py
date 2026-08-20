@@ -32,6 +32,11 @@ from .process_control import (
 )
 
 
+_RUNTIME_FILE_READ_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1)
+_POSIX_BACKGROUND_STARTUP_TIMEOUT_SECONDS = 5.0
+_WINDOWS_BACKGROUND_STARTUP_TIMEOUT_SECONDS = 30.0
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     """单个配置文件对应的运行时文件路径。"""
@@ -150,6 +155,16 @@ def _is_native_windows() -> bool:
     return os.name == "nt"
 
 
+def _effective_startup_timeout_seconds(value: float | None) -> float:
+    """返回显式值或当前平台适用的后台启动等待时间。"""
+
+    if value is not None:
+        return value
+    if _is_native_windows():
+        return _WINDOWS_BACKGROUND_STARTUP_TIMEOUT_SECONDS
+    return _POSIX_BACKGROUND_STARTUP_TIMEOUT_SECONDS
+
+
 def _process_started_at(pid: int) -> str | None:
     """读取进程启动时间，用于防止 PID 重用时误杀其他进程。"""
 
@@ -237,18 +252,25 @@ def _reap_child(pid: int) -> None:
 def _read_record(paths: RuntimePaths) -> ProcessRecord | None:
     """读取并校验 PID 文件。"""
 
-    try:
-        payload = json.loads(paths.pid_file.read_text(encoding="utf-8"))
-        return ProcessRecord(
-            pid=int(payload["pid"]),
-            config_path=str(payload["config_path"]),
-            process_started_at=str(payload["process_started_at"]),
-            host=str(payload["host"]),
-            port=int(payload["port"]),
-            detached=bool(payload.get("detached", False)),
-        )
-    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+    for attempt in range(len(_RUNTIME_FILE_READ_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            payload = json.loads(paths.pid_file.read_text(encoding="utf-8"))
+            return ProcessRecord(
+                pid=int(payload["pid"]),
+                config_path=str(payload["config_path"]),
+                process_started_at=str(payload["process_started_at"]),
+                host=str(payload["host"]),
+                port=int(payload["port"]),
+                detached=bool(payload.get("detached", False)),
+            )
+        except PermissionError:
+            # Windows 原子替换窗口可能短暂拒绝并发读取，下一轮继续观察。
+            if attempt == len(_RUNTIME_FILE_READ_RETRY_DELAYS_SECONDS):
+                return None
+            time.sleep(_RUNTIME_FILE_READ_RETRY_DELAYS_SECONDS[attempt])
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return None
 
 
 def _record_is_running(record: ProcessRecord) -> bool:
@@ -436,12 +458,13 @@ def start_background(
     *,
     host: str,
     port: int,
-    startup_timeout_seconds: float = 5,
+    startup_timeout_seconds: float | None = None,
 ) -> ProcessActionResult:
     """启动脱离当前终端的后台服务进程。"""
 
     resolved = resolve_config_path(config_path)
     paths = runtime_paths(resolved)
+    startup_timeout = _effective_startup_timeout_seconds(startup_timeout_seconds)
     existing_records = _running_processes(resolved)
     if len(existing_records) > 1:
         pids = ", ".join(str(record.pid) for record in existing_records)
@@ -498,7 +521,7 @@ def start_background(
             **process_group_options(detached=True),
         )
 
-    deadline = time.monotonic() + startup_timeout_seconds
+    deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
         return_code = process.poll()
         record = _read_record(paths)
@@ -550,7 +573,7 @@ def start_background(
     return ProcessActionResult(
         1,
         (
-            f"后台服务未在 {startup_timeout_seconds:g} 秒内完成启动，"
+            f"后台服务未在 {startup_timeout:g} 秒内完成启动，"
             f"请查看日志：{paths.log_file}{detail}"
         ),
     )
