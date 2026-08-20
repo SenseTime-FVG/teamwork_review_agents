@@ -378,6 +378,7 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 
 | 文档 | 用途 |
 | --- | --- |
+| [`docs/README.md`](docs/README.md) | 完整文档导航与更新路由 |
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
 | [`docs/first-time-setup.md`](docs/first-time-setup.md) | 首次启动后的管理界面图文配置流程 |
 | [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
