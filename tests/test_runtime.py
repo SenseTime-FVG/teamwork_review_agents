@@ -1,10 +1,72 @@
 """后台运行循环的手动事件调度测试。"""
 
 import asyncio
+import time
 
 from teamwork_review_agents.orchestrator import CycleSummary
 from teamwork_review_agents.runtime import BackgroundRuntime
 from teamwork_review_agents.state import StateStore
+
+
+async def test_dispatch_prunes_terminal_target_events_with_runtime_retention(
+    monkeypatch,
+    configured_app_factory,
+) -> None:
+    """每轮调度结束后应按运行时保留期清理已耗尽重试的目标事件。"""
+
+    config = configured_app_factory()
+    config.web.log_retention_days = 7
+    config.runtime.event_retry_count = 4
+
+    class FakeManager:
+        """提供单轮调度测试所需的最小管理接口。"""
+
+        def __init__(self) -> None:
+            self.config = config
+            self.store = StateStore(config.database.path)
+            self.store.initialize()
+            self.last_error = None
+
+        def reload_if_changed(self) -> None:
+            return None
+
+    class FakeOrchestrator:
+        """完成空调度以触发统一保留期清理。"""
+
+        async def process_events(self, _summary: CycleSummary) -> None:
+            return None
+
+    runtime = BackgroundRuntime(FakeManager())
+    runtime._orchestrator = FakeOrchestrator()
+    calls: dict[str, float | int] = {}
+
+    monkeypatch.setattr(
+        runtime.store,
+        "prune_run_logs",
+        lambda older_than: calls.update(log_cutoff=older_than),
+    )
+
+    def record_target_prune(older_than: float, *, max_attempts: int) -> None:
+        calls["target_cutoff"] = older_than
+        calls["max_attempts"] = max_attempts
+
+    monkeypatch.setattr(
+        runtime.store,
+        "prune_terminal_target_events",
+        record_target_prune,
+    )
+
+    started_at = time.time()
+    await runtime._run_dispatch_cycle()
+    finished_at = time.time()
+
+    expected_seconds = config.web.log_retention_days * 86400
+    target_cutoff = float(calls["target_cutoff"])
+    assert started_at - expected_seconds <= target_cutoff <= (
+        finished_at - expected_seconds
+    )
+    assert target_cutoff == calls["log_cutoff"]
+    assert calls["max_attempts"] == config.runtime.event_retry_count + 1
 
 
 async def test_manual_dispatch_runs_while_paused_without_scanning(

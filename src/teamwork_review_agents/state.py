@@ -1386,8 +1386,8 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def cleanup_terminal_transient_event(self, event_id: str) -> bool:
-        """固化运行上下文并删除已经成功结束的临时事件。"""
+    def finalize_terminal_target_event_context(self, event_id: str) -> bool:
+        """为终态目标分支事件固化运行上下文，并保留事件供历史查询。"""
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1395,7 +1395,7 @@ class StateStore:
                 """
                 SELECT payload FROM event_inbox
                 WHERE event_id = ? AND event_type = ?
-                  AND status IN ('completed', 'unmatched')
+                  AND status IN ('completed', 'unmatched', 'failed', 'cancelled')
                 """,
                 (event_id, TARGET_COMMITS_CHANGED_EVENT),
             ).fetchone()
@@ -1420,10 +1420,6 @@ class StateStore:
                     snapshot.web_url,
                     event_id,
                 ),
-            )
-            connection.execute(
-                "DELETE FROM event_inbox WHERE event_id = ?",
-                (event_id,),
             )
             connection.commit()
         return True
@@ -3342,3 +3338,26 @@ class StateStore:
                 (older_than,),
             )
         return run_cursor.rowcount + preflight_cursor.rowcount
+
+    def prune_terminal_target_events(
+        self,
+        older_than: float,
+        *,
+        max_attempts: int,
+    ) -> int:
+        """删除超过保留期的终态目标分支事件，活动事件必须继续保留。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM event_inbox
+                WHERE event_type = ?
+                  AND (
+                      status IN ('completed', 'unmatched', 'cancelled')
+                      OR (status = 'failed' AND attempts >= ?)
+                  )
+                  AND updated_at < ?
+                """,
+                (TARGET_COMMITS_CHANGED_EVENT, max_attempts, older_than),
+            )
+        return cursor.rowcount

@@ -216,6 +216,11 @@ class BackgroundRuntime:
             self._persist_status()
         cutoff = time.time() - self.manager.config.web.log_retention_days * 86400
         await asyncio.to_thread(self.store.prune_run_logs, cutoff)
+        await asyncio.to_thread(
+            self.store.prune_terminal_target_events,
+            cutoff,
+            max_attempts=self.manager.config.runtime.event_retry_count + 1,
+        )
 
     async def _scan_loop(self) -> None:
         """按固定间隔扫描 Provider，不等待事件执行循环。"""

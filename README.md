@@ -171,7 +171,7 @@ GitHub 历史 PR 的列表行会展示 Timeline 中最新一条可转换为规�
 
 GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产生的 `closed`；系统将其归并为一次 `change_request.merged`，不会把自动关闭另算为普通关闭，也不会重复触发合并规则。
 
-`change_request.commits_changed` 表示 PR / MR 源分支 Head 变化；`change_request.target_commits_changed` 表示打开状态 PR / MR 的目标分支真实 Head 变化。目标分支按仓库和分支每轮只查询一次，首次读取只建立基线。目标分支变化事件仅作为可靠触发信号短期入队，成功处理或未匹配规则后立即删除，不进入长期事件历史，但由它创建的 Agent 运行与日志仍会保留。
+`change_request.commits_changed` 表示 PR / MR 源分支 Head 变化；`change_request.target_commits_changed` 表示打开状态 PR / MR 的目标分支真实 Head 变化。目标分支按仓库和分支每轮只查询一次，首次读取只建立基线。目标分支变化事件作为轻量可靠触发信号入队，进入完成、未匹配、失败或取消终态后仍会在事件历史中保留，并与实时日志共用 `web.log_retention_days`（默认 30 天）保留期；由它创建的 Agent 运行与固化上下文不随事件过期清理。
 
 ## Agent 运行状态与 Git 超时
 

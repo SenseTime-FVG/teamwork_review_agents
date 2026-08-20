@@ -525,7 +525,7 @@ class Orchestrator:
                         status="unmatched",
                     )
                     await asyncio.to_thread(
-                        self.store.cleanup_terminal_transient_event,
+                        self.store.finalize_terminal_target_event_context,
                         event.id,
                     )
                     summary.processed_events += 1
@@ -559,7 +559,7 @@ class Orchestrator:
                     )
                     settled_unmatched_event_ids.add(event.id)
                     await asyncio.to_thread(
-                        self.store.cleanup_terminal_transient_event,
+                        self.store.finalize_terminal_target_event_context,
                         event.id,
                     )
                     summary.processed_events += 1
@@ -747,6 +747,10 @@ class Orchestrator:
                         status="cancelled",
                         error="关联 Agent 运行已由管理员取消",
                     )
+                    await asyncio.to_thread(
+                        self.store.finalize_terminal_target_event_context,
+                        event.id,
+                    )
                     summary.processed_events += 1
                     continue
                 error = "; ".join(errors_by_event[event.id]) or None
@@ -757,7 +761,7 @@ class Orchestrator:
                         status="unmatched",
                     )
                     await asyncio.to_thread(
-                        self.store.cleanup_terminal_transient_event,
+                        self.store.finalize_terminal_target_event_context,
                         event.id,
                     )
                     summary.processed_events += 1
@@ -766,11 +770,10 @@ class Orchestrator:
                     summary.errors.append(f"处理事件 {event.id} 失败：{error}")
                     retry_deferred = True
                 await asyncio.to_thread(self.store.finish_event, event.id, error=error)
-                if error is None:
-                    await asyncio.to_thread(
-                        self.store.cleanup_terminal_transient_event,
-                        event.id,
-                    )
+                await asyncio.to_thread(
+                    self.store.finalize_terminal_target_event_context,
+                    event.id,
+                )
                 summary.processed_events += 1
             if service_interrupted:
                 return "service_shutdown"

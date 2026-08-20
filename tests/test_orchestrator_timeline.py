@@ -133,11 +133,11 @@ async def test_first_target_head_only_builds_baseline(
     assert saved.target_head_sha == "b" * 40
 
 
-async def test_unmatched_target_event_is_removed(
+async def test_unmatched_target_event_is_retained(
     configured_app_factory,
     snapshot_factory,
 ) -> None:
-    """没有规则匹配的目标变化事件处理后不进入长期历史。"""
+    """没有规则匹配的目标变化事件也应保留终态供历史查询。"""
 
     config = configured_app_factory()
     orchestrator = Orchestrator(config, recover_interrupted=False)
@@ -155,7 +155,10 @@ async def test_unmatched_target_event_is_removed(
     await orchestrator.process_events(summary)
 
     assert summary.processed_events == 1
-    assert orchestrator.store.list_events(None) == []
+    records = orchestrator.store.list_events(None)
+    assert len(records) == 1
+    assert records[0]["event_id"] == event.id
+    assert records[0]["status"] == "unmatched"
 
 
 async def test_scan_recovers_transient_state_changes_from_timeline(
