@@ -355,6 +355,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
 
     config = configured_app_factory()
     config.runtime.codex_binary = str(fake_codex)
+    config.runtime.codex.execution_mode = "cli"
     config.runtime.managed_sandbox.enabled = False
     repository = config.repositories[0]
     repository.clone_url = str(origin)

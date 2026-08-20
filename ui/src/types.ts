@@ -197,7 +197,6 @@ export type RuntimeConfig = Record<string, unknown> & {
 
 export type ModelProviderDriver =
   | "codex_cli"
-  | "codex_oauth"
   | "openai_responses"
   | "openai_chat_completions"
   | "anthropic_messages"

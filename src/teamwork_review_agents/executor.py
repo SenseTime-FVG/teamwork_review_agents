@@ -152,7 +152,15 @@ class AgentExecutor:
             return runner
         provider = self.config.model_providers[provider_id]
         if provider.driver == "codex_cli":
-            runner = CodexRunner(self.config)
+            runner = (
+                CodexModelRunner(
+                    self.config,
+                    provider_id=provider_id,
+                    invoke_agent_callback=self._invoke_embedded_agent,
+                )
+                if self.config.runtime.codex.execution_mode == "model"
+                else CodexRunner(self.config)
+            )
         else:
             runner = CodexModelRunner(
                 self.config,
@@ -810,7 +818,7 @@ class AgentExecutor:
                         {
                             "agent_name": agent_name,
                             "execution_mode": (
-                                "cli"
+                                self.config.runtime.codex.execution_mode
                                 if model_selection.provider.driver == "codex_cli"
                                 else "model"
                             ),

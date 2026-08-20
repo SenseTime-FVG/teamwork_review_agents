@@ -133,6 +133,7 @@ class ModelProviderConfigRequest(BaseModel):
     revision: str
     provider_id: str
     provider: dict[str, Any]
+    codex_runtime: dict[str, Any] | None = None
     api_key: str | None = None
 
 
@@ -544,7 +545,7 @@ def create_app(
                 referenced_agents[agent.model_provider].append(agent_name)
         providers: list[dict[str, Any]] = []
         for provider_id, provider in config.model_providers.items():
-            is_external = provider.driver not in {"codex_cli", "codex_oauth"}
+            is_external = provider.driver != "codex_cli"
             providers.append(
                 {
                     "id": provider_id,
@@ -592,6 +593,7 @@ def create_app(
                 expected_revision=body.revision,
                 provider_id=body.provider_id,
                 provider=body.provider,
+                codex_runtime=body.codex_runtime,
                 source="ui-model-provider-create",
             )
             if body.api_key:
@@ -625,6 +627,7 @@ def create_app(
                 expected_revision=body.revision,
                 provider_id=provider_id,
                 provider=body.provider,
+                codex_runtime=body.codex_runtime,
                 source="ui-model-provider-update",
             )
             if body.api_key:
@@ -697,7 +700,7 @@ def create_app(
         provider = manager.config.model_providers.get(provider_id)
         if provider is None:
             raise HTTPException(status_code=404, detail="模型 Provider 不存在")
-        if provider.driver in {"codex_cli", "codex_oauth"}:
+        if provider.driver == "codex_cli":
             raise HTTPException(status_code=422, detail="内置 Codex Provider 不使用 API Key")
         await asyncio.to_thread(
             model_provider_credentials.replace,
@@ -755,11 +758,8 @@ def create_app(
         model = provider.default_model or next(iter(provider.models), None)
         started_at = asyncio.get_running_loop().time()
         try:
-            if provider.driver in {"codex_cli", "codex_oauth"}:
+            if provider.driver == "codex_cli":
                 test_config = config.model_copy(deep=True)
-                test_config.runtime.codex.execution_mode = (
-                    "cli" if provider.driver == "codex_cli" else "model"
-                )
                 if model:
                     test_config.runtime.codex.model = model
                 result = await test_codex_connection(test_config)

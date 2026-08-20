@@ -64,7 +64,7 @@ def resolve_model_selection(
         source = "provider_default"
 
     unresolved_reason: str | None = None
-    if model is None and provider.driver in {"codex_cli", "codex_oauth"}:
+    if model is None and provider.driver == "codex_cli":
         user_model, error, _ = read_user_model(codex_home(config.runtime.codex_home))
         if user_model:
             model = user_model
@@ -134,7 +134,7 @@ def resolve_model_snapshot(
         reasoning_source = (
             "agent" if agent.model_reasoning_effort else "provider"
         )
-    elif provider.driver in {"codex_cli", "codex_oauth"}:
+    elif provider.driver == "codex_cli":
         reasoning = (
             config.runtime.codex.model_reasoning_effort
             or inherited_value("model_reasoning_effort")
@@ -153,7 +153,7 @@ def resolve_model_snapshot(
     if agent.fast_mode != "inherit":
         fast_mode = agent.fast_mode
         fast_source = "agent"
-    elif provider.driver in {"codex_cli", "codex_oauth"}:
+    elif provider.driver == "codex_cli":
         fast_mode = config.runtime.codex.fast_mode
         if fast_mode == "inherit":
             fast_mode = inherited_value("fast_mode") or "standard"
@@ -171,7 +171,7 @@ def resolve_model_snapshot(
     if effective_agent.model_verbosity:
         verbosity = effective_agent.model_verbosity
         verbosity_source = "agent" if agent.model_verbosity else "provider"
-    elif provider.driver in {"codex_cli", "codex_oauth"}:
+    elif provider.driver == "codex_cli":
         verbosity = (
             config.runtime.codex.model_verbosity
             or inherited_value("model_verbosity")
@@ -189,7 +189,9 @@ def resolve_model_snapshot(
 
     return {
         "execution_mode": (
-            "cli" if provider.driver == "codex_cli" else "model"
+            config.runtime.codex.execution_mode
+            if provider.driver == "codex_cli"
+            else "model"
         ),
         "provider_id": selection.provider_id,
         "provider_name": provider.display_name,
