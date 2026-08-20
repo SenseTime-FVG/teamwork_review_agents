@@ -170,6 +170,60 @@ def resolve_environment(
     )
 
 
+def resolve_repository_process_environment(
+    config: AppConfig,
+    repository: RepositoryConfig,
+    run_id: str,
+) -> ResolvedEnvironment:
+    """为不隶属具体 Agent 或变更请求的仓库准备任务解析环境。"""
+
+    definitions: dict[str, EnvironmentVariable] = {}
+    definitions.update(config.environment.global_variables)
+    definitions.update(repository.environment)
+    provider_token_names = {
+        provider.token_env for provider in config.providers.values()
+    }
+
+    all_values: dict[str, str] = {}
+    prompt_values: dict[str, str] = {}
+    process_values: dict[str, str] = {}
+    audit_values: dict[str, str] = {}
+    secrets: list[str] = []
+    for name, definition in definitions.items():
+        value = _resolve_variable(definition)
+        is_provider_credential = name in provider_token_names
+        is_secret = bool(definition.secret) or is_provider_credential
+        all_values[name] = value
+        prompt_values[name] = (
+            value
+            if definition.expose_to_prompt and not is_provider_credential
+            else ""
+        )
+        if definition.expose_to_process and not is_provider_credential:
+            process_values[name] = value
+        audit_values[name] = MASK if is_secret and value else value
+        if is_secret and value:
+            secrets.append(value)
+
+    builtins = {
+        "REPOSITORY_ID": repository.id,
+        "REPOSITORY_PROJECT": repository.project,
+        "REPOSITORY_WORKSPACE": str(repository.workspace),
+        "RUN_ID": run_id,
+    }
+    all_values.update(builtins)
+    prompt_values.update(builtins)
+    process_values.update(builtins)
+    audit_values.update(builtins)
+    return ResolvedEnvironment(
+        all_values=all_values,
+        prompt_values=prompt_values,
+        process_values=process_values,
+        audit_values=audit_values,
+        secret_values=tuple(sorted(set(secrets), key=len, reverse=True)),
+    )
+
+
 def render_prompt(template: str, values: dict[str, str]) -> str:
     """使用沙盒 Jinja 渲染 Prompt，并兼容旧 `${{NAME}}` 语法。"""
 

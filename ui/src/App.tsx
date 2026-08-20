@@ -39,6 +39,7 @@ import type {
   RepositoryPreflight,
   RepositoryPreflightStep,
   RepositoryWorkspaceStatus,
+  RepositoryWorkspaceWarmupStatus,
   Rule,
   RunDetail,
   RunLog,
@@ -3150,6 +3151,8 @@ function RepositoryDetailEditor(props: {
   creating: boolean;
   disabled: boolean;
   preflightAction?: ReactNode;
+  agentWorkspaceAction?: ReactNode;
+  agentWorkspaceWarmup?: RepositoryWorkspaceWarmupStatus | null;
   onIdChange: (repositoryId: string) => void;
   onChange: (document: ConfigDocument) => void;
 }) {
@@ -3289,6 +3292,9 @@ function RepositoryDetailEditor(props: {
               <strong>Agent 工作区准备</strong>
               <p>在模型启动前，于本次隔离工作区中执行用户定义的安装命令；不会修改 Prompt，也不会自动猜测包管理器。</p>
             </div>
+            <div className="repository-preflight-head-actions">
+              {props.agentWorkspaceAction}
+            </div>
           </div>
           <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
             <div className="repository-preflight-content">
@@ -3312,8 +3318,31 @@ function RepositoryDetailEditor(props: {
                   checked={agentWorkspace.cache_enabled}
                   onChange={(cache_enabled) => updateAgentWorkspace({ cache_enabled })}
                 />
-                <p>同一仓库跨分支共享包管理器下载缓存；node_modules、虚拟环境和构建产物仍只存在于每次运行的隔离工作区。</p>
+                <p>同一仓库跨分支共享包管理器下载缓存；准备成功后还会按命令、依赖清单和运行平台保存最多 3 份工作区快照，总上限 5 GiB。</p>
               </div>
+              {props.agentWorkspaceWarmup && (
+                <div className={`repository-workspace-warmup status-${props.agentWorkspaceWarmup.status}`}>
+                  <div className="repository-workspace-warmup-summary">
+                    <strong>{props.agentWorkspaceWarmup.phase}</strong>
+                    <span>
+                      {props.agentWorkspaceWarmup.snapshot_count} 份快照 · {bytesText(props.agentWorkspaceWarmup.total_size_bytes)}
+                      {props.agentWorkspaceWarmup.latest?.last_used_at
+                        ? ` · 最近使用 ${timeText(props.agentWorkspaceWarmup.latest.last_used_at)}`
+                        : ""}
+                    </span>
+                  </div>
+                  {props.agentWorkspaceWarmup.latest?.fingerprint && (
+                    <code>指纹 {props.agentWorkspaceWarmup.latest.fingerprint.slice(0, 12)} · {props.agentWorkspaceWarmup.latest.artifact_count ?? 0} 个文件</code>
+                  )}
+                  {props.agentWorkspaceWarmup.error && <small>{props.agentWorkspaceWarmup.error}</small>}
+                  {props.agentWorkspaceWarmup.logs.length > 0 && ["waiting", "preparing", "failed", "cancelled"].includes(props.agentWorkspaceWarmup.status) && (
+                    <pre>{props.agentWorkspaceWarmup.logs.slice(-8).map((log) => {
+                      const payload = typeof log.payload === "string" ? log.payload : JSON.stringify(log.payload, null, 2);
+                      return `[${new Date(log.created_at * 1000).toLocaleTimeString("zh-CN")}] ${log.event_type}\n${payload}`;
+                    }).join("\n")}</pre>
+                  )}
+                </div>
+              )}
               <div className="repository-preflight-steps-head">
                 <div>
                   <strong>模型启动前准备步骤</strong>
@@ -3534,6 +3563,8 @@ function RepositoriesView(props: {
   const [togglingRepositoryId, setTogglingRepositoryId] = useState<string | null>(null);
   const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
+  const [workspaceWarmup, setWorkspaceWarmup] = useState<RepositoryWorkspaceWarmupStatus | null>(null);
+  const [workspaceWarmupBusy, setWorkspaceWarmupBusy] = useState(false);
   const [pendingAction, setPendingAction] = useState<
     { kind: "discard" } | { kind: "delete" } | null
   >(null);
@@ -3553,6 +3584,30 @@ function RepositoriesView(props: {
     const timer = window.setInterval(() => { void refreshWorkspaceItems(); }, 2000);
     return () => window.clearInterval(timer);
   }, [refreshWorkspaceItems]);
+
+  useEffect(() => {
+    if (!detailId || creating) {
+      setWorkspaceWarmup(null);
+      return;
+    }
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const status = await api<RepositoryWorkspaceWarmupStatus>(
+          `/api/repositories/${encodeURIComponent(detailId)}/workspace/warmup`,
+        );
+        if (!disposed) setWorkspaceWarmup(status);
+      } catch {
+        // 轮询失败不覆盖用户正在编辑的配置，主动操作仍会显示明确错误。
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 1500);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [creating, detailId]);
 
   const findActiveManualPreflight = useCallback(async (repositoryId: string): Promise<string | null> => {
     const parameters = new URLSearchParams({
@@ -3631,6 +3686,10 @@ function RepositoriesView(props: {
     "initializing",
     "updating",
   ].includes(currentWorkspace.status));
+  const workspaceWarmupActive = Boolean(
+    workspaceWarmup
+    && ["waiting", "preparing"].includes(workspaceWarmup.status),
+  );
   const referencingRules = detailId
     ? props.document.rules.filter((rule) => rule.repositories?.includes(detailId))
     : [];
@@ -3831,6 +3890,26 @@ function RepositoriesView(props: {
     }
   }
 
+  async function toggleWorkspaceWarmup() {
+    if (!detailId || workspaceWarmupBusy || editing || creating) return;
+    const active = workspaceWarmup && ["waiting", "preparing"].includes(workspaceWarmup.status);
+    setWorkspaceWarmupBusy(true);
+    props.onError("");
+    try {
+      const action = active ? "cancel" : "start";
+      const status = await api<RepositoryWorkspaceWarmupStatus>(
+        `/api/repositories/${encodeURIComponent(detailId)}/workspace/warmup/${action}`,
+        { method: "POST" },
+      );
+      setWorkspaceWarmup(status);
+      props.onNotice(active ? "已请求取消 Agent 工作区预热" : "已启动默认分支 Agent 工作区预热");
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "Agent 工作区预热操作失败");
+    } finally {
+      setWorkspaceWarmupBusy(false);
+    }
+  }
+
   const confirmation = useMemo<AgentActionConfirmation | null>(() => {
     if (!pendingAction) return null;
     if (pendingAction.kind === "discard") {
@@ -4004,6 +4083,39 @@ function RepositoriesView(props: {
           repositoryIndex={detailIndex}
           creating={creating}
           disabled={!editing || saving || gitActive}
+          agentWorkspaceWarmup={!editing ? workspaceWarmup : null}
+          agentWorkspaceAction={!editing ? (
+            <button
+              type="button"
+              className={`button ${workspaceWarmupActive ? "danger" : "secondary"}`}
+              disabled={
+                workspaceWarmupBusy
+                || Boolean(workspaceWarmup?.cancel_requested)
+                || (!workspaceWarmupActive && (
+                  gitActive
+                  || originalRepository?.enabled === false
+                  || !originalRepository?.agent_workspace?.cache_enabled
+                  || !originalRepository?.agent_workspace?.prepare_steps?.length
+                ))
+              }
+              title={
+                workspaceWarmupActive
+                  ? "取消当前 Agent 工作区预热"
+                  : originalRepository?.enabled === false
+                  ? "请先启用仓库"
+                  : !originalRepository?.agent_workspace?.cache_enabled
+                    ? "请先启用 Agent 仓库级下载缓存"
+                    : !originalRepository?.agent_workspace?.prepare_steps?.length
+                      ? "请先配置模型启动前准备步骤"
+                      : "在远端默认分支执行准备步骤并创建可跨分支复用的依赖快照"
+              }
+              onClick={() => { void toggleWorkspaceWarmup(); }}
+            >{workspaceWarmupBusy
+              ? "处理中…"
+              : workspaceWarmupActive
+                ? workspaceWarmup?.cancel_requested ? "取消中…" : "取消预热"
+                : workspaceWarmup?.status === "ready" ? "重新预热" : "预热准备"}</button>
+          ) : undefined}
           preflightAction={!editing ? (
             <button
               type="button"
