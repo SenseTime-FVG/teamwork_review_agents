@@ -6714,6 +6714,7 @@ export default function App() {
   const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
   const operationalRequestSequence = useRef(0);
   const overviewRequestSequence = useRef(0);
+  const mainRef = useRef<HTMLElement>(null);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
@@ -7181,6 +7182,15 @@ export default function App() {
     || tab === "runtime"
   );
 
+  useLayoutEffect(() => {
+    globalThis.document.scrollingElement?.scrollTo({
+      top: 0,
+      left: 0,
+      behavior: "auto",
+    });
+    mainRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [tab]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -7188,7 +7198,7 @@ export default function App() {
         <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
         <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle || status.dispatching_events ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
       </aside>
-      <main className="main">
+      <main className="main" ref={mainRef}>
         <header className="topbar">
           <div><span className="eyebrow">MR / PR AUTOMATION</span><h1>{tabs.find((item) => item.id === tab)?.label}</h1></div>
           <div className="top-actions">
