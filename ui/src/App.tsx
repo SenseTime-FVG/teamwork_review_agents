@@ -452,23 +452,31 @@ function Field(props: {
   );
 }
 
-function SelectField(props: {
-  label: string;
+type SelectOption = { value: string; label: string };
+
+function SelectControl(props: {
   value: string;
   onChange: (value: string) => void;
-  options: Array<{ value: string; label: string }>;
-  help?: string;
+  options: SelectOption[];
+  ariaLabel?: string;
+  ariaLabelledBy?: string;
+  className?: string;
+  disabled?: boolean;
 }) {
-  const fieldId = useId();
+  const controlId = useId();
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [openUpward, setOpenUpward] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const listboxId = `${fieldId}-options`;
+  const listboxId = `${controlId}-options`;
   const selectedIndex = props.options.findIndex((option) => option.value === props.value);
   const selectedOption = selectedIndex >= 0 ? props.options[selectedIndex] : props.options[0];
+
+  useEffect(() => {
+    if (props.disabled) setOpen(false);
+  }, [props.disabled]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -503,10 +511,11 @@ function SelectField(props: {
 
   useEffect(() => {
     if (!open || activeIndex < 0) return;
-    document.getElementById(`${fieldId}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
-  }, [activeIndex, fieldId, open]);
+    document.getElementById(`${controlId}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, controlId, open]);
 
   function openOptions(direction: "first" | "last" = "first") {
+    if (props.disabled || !props.options.length) return;
     const fallbackIndex = direction === "last" ? props.options.length - 1 : 0;
     setActiveIndex(selectedIndex >= 0 ? selectedIndex : fallbackIndex);
     setOpen(true);
@@ -521,94 +530,118 @@ function SelectField(props: {
   }
 
   return (
-    <div className={`field select-field ${open ? "open" : ""}`} ref={containerRef}>
-      <span id={`${fieldId}-label`}>{props.label}</span>
-      <div className="select-combobox">
-        <button
-          ref={triggerRef}
-          className="select-combobox-trigger"
-          type="button"
-          role="combobox"
-          aria-labelledby={`${fieldId}-label`}
-          aria-expanded={open}
-          aria-controls={listboxId}
-          aria-haspopup="listbox"
-          aria-activedescendant={open && activeIndex >= 0 ? `${fieldId}-option-${activeIndex}` : undefined}
-          onClick={() => {
-            if (open) setOpen(false);
+    <div className={`select-combobox ${open ? "open" : ""} ${props.className ?? ""}`.trim()} ref={containerRef}>
+      <button
+        ref={triggerRef}
+        className="select-combobox-trigger"
+        type="button"
+        role="combobox"
+        aria-label={props.ariaLabel}
+        aria-labelledby={props.ariaLabelledBy}
+        aria-expanded={open}
+        aria-controls={listboxId}
+        aria-haspopup="listbox"
+        aria-activedescendant={open && activeIndex >= 0 ? `${controlId}-option-${activeIndex}` : undefined}
+        disabled={props.disabled}
+        onClick={() => {
+          if (open) setOpen(false);
+          else openOptions();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            setOpen(false);
+            return;
+          }
+          if (event.key === "Tab") {
+            setOpen(false);
+            return;
+          }
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            if (!open) {
+              openOptions(event.key === "ArrowUp" ? "last" : "first");
+              return;
+            }
+            const offset = event.key === "ArrowDown" ? 1 : -1;
+            setActiveIndex((current) => (
+              current < 0
+                ? 0
+                : (current + offset + props.options.length) % props.options.length
+            ));
+            return;
+          }
+          if (open && event.key === "Home") {
+            event.preventDefault();
+            setActiveIndex(0);
+            return;
+          }
+          if (open && event.key === "End") {
+            event.preventDefault();
+            setActiveIndex(props.options.length - 1);
+            return;
+          }
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (open) selectOption(activeIndex);
             else openOptions();
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              setOpen(false);
-              return;
-            }
-            if (event.key === "Tab") {
-              setOpen(false);
-              return;
-            }
-            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-              event.preventDefault();
-              if (!open) {
-                openOptions(event.key === "ArrowUp" ? "last" : "first");
-                return;
-              }
-              if (!props.options.length) return;
-              const offset = event.key === "ArrowDown" ? 1 : -1;
-              setActiveIndex((current) => (
-                current < 0
-                  ? 0
-                  : (current + offset + props.options.length) % props.options.length
-              ));
-              return;
-            }
-            if (open && event.key === "Home") {
-              event.preventDefault();
-              setActiveIndex(0);
-              return;
-            }
-            if (open && event.key === "End") {
-              event.preventDefault();
-              setActiveIndex(props.options.length - 1);
-              return;
-            }
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              if (open) selectOption(activeIndex);
-              else openOptions();
-            }
-          }}
+          }
+        }}
+      >
+        <span>{selectedOption?.label ?? props.value}</span>
+        <span className="select-combobox-chevron" aria-hidden="true">⌄</span>
+      </button>
+      {open && (
+        <div
+          ref={menuRef}
+          id={listboxId}
+          className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
+          role="listbox"
+          aria-label={props.ariaLabel}
+          aria-labelledby={props.ariaLabelledBy}
         >
-          <span>{selectedOption?.label ?? props.value}</span>
-          <span className="select-combobox-chevron" aria-hidden="true">⌄</span>
-        </button>
-        {open && (
-          <div
-            ref={menuRef}
-            id={listboxId}
-            className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
-            role="listbox"
-            aria-labelledby={`${fieldId}-label`}
-          >
-            {props.options.map((option, index) => (
-              <button
-                id={`${fieldId}-option-${index}`}
-                key={option.value}
-                type="button"
-                role="option"
-                aria-selected={option.value === props.value}
-                className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${option.value === props.value ? "selected" : ""}`}
-                onMouseDown={(event) => event.preventDefault()}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => selectOption(index)}
-              >
-                <span className="select-combobox-check" aria-hidden="true">{option.value === props.value ? "✓" : ""}</span>
-                <span>{option.label}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
+          {props.options.map((option, index) => (
+            <button
+              id={`${controlId}-option-${index}`}
+              key={option.value}
+              type="button"
+              role="option"
+              aria-selected={option.value === props.value}
+              className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${option.value === props.value ? "selected" : ""}`}
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => setActiveIndex(index)}
+              onClick={() => selectOption(index)}
+            >
+              <span className="select-combobox-check" aria-hidden="true">{option.value === props.value ? "✓" : ""}</span>
+              <span>{option.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SelectField(props: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: SelectOption[];
+  help?: string;
+  className?: string;
+  disabled?: boolean;
+}) {
+  const fieldId = useId();
+
+  return (
+    <div className={`field select-field ${props.className ?? ""}`.trim()}>
+      <span id={`${fieldId}-label`}>{props.label}</span>
+      <SelectControl
+        value={props.value}
+        onChange={props.onChange}
+        options={props.options}
+        ariaLabelledBy={`${fieldId}-label`}
+        disabled={props.disabled}
+      />
       {props.help && <small>{props.help}</small>}
     </div>
   );
@@ -978,17 +1011,18 @@ function PromptFilePicker(props: {
         help="相对路径以 config.yaml 所在目录为基准"
       />
       <div className="prompt-file-actions">
-        <select
+        <SelectControl
           value=""
-          onChange={(event) => {
-            if (event.target.value) props.onChange(event.target.value);
+          ariaLabel="选择已有 Prompt"
+          className="prompt-file-select"
+          options={[
+            { value: "", label: "选择已有 Prompt…" },
+            ...files.map((file) => ({ value: file.path, label: file.name })),
+          ]}
+          onChange={(value) => {
+            if (value) props.onChange(value);
           }}
-        >
-          <option value="">选择已有 Prompt…</option>
-          {files.map((file) => (
-            <option key={file.path} value={file.path}>{file.name}</option>
-          ))}
-        </select>
+        />
         <label className={`button secondary file-button ${uploading ? "disabled" : ""}`}>
           {uploading ? "正在导入…" : "从电脑选择并导入"}
           <input
@@ -1110,21 +1144,22 @@ function EnvironmentEditor(props: {
                 />
                 {isProviderCredential && <span className="credential-badge">Provider 凭据</span>}
               </div>
-              <select
+              <SelectControl
                 value={source}
-                aria-label="变量来源"
-                onChange={(event) => {
-                  const fromSystem = event.target.value === "system";
+                ariaLabel="变量来源"
+                options={[
+                  { value: "value", label: "固定值" },
+                  { value: "system", label: "宿主机环境" },
+                ]}
+                onChange={(value) => {
+                  const fromSystem = value === "system";
                   update(name, name, {
                     ...variable,
                     value: fromSystem ? undefined : "",
                     from_system: fromSystem ? name : undefined,
                   });
                 }}
-              >
-                <option value="value">固定值</option>
-                <option value="system">宿主机环境</option>
-              </select>
+              />
               <input
                 type={variable.secret && source === "value" ? "password" : "text"}
                 value={source === "system" ? variable.from_system ?? "" : variable.value ?? ""}
@@ -1240,20 +1275,19 @@ function OverviewListControls(props: {
 
   return (
     <div className={controlClassName}>
-      <label>
-        <span>仓库</span>
-        <select
-          value={props.filter.repositoryId}
-          onChange={(event) => props.onChange({ ...props.filter, repositoryId: event.target.value })}
-        >
-          <option value="">全部仓库</option>
-          {props.repositories.map((repository) => (
-            <option key={repository.id} value={repository.id}>
-              {repository.id} · {repository.project}
-            </option>
-          ))}
-        </select>
-      </label>
+      <SelectField
+        className="overview-repository-filter"
+        label="仓库"
+        value={props.filter.repositoryId}
+        onChange={(repositoryId) => props.onChange({ ...props.filter, repositoryId })}
+        options={[
+          { value: "", label: "全部仓库" },
+          ...props.repositories.map((repository) => ({
+            value: repository.id,
+            label: `${repository.id} · ${repository.project}`,
+          })),
+        ]}
+      />
       {props.showNumber && (
         <label className="overview-number-filter">
           <span>编号</span>
@@ -1268,43 +1302,39 @@ function OverviewListControls(props: {
           />
         </label>
       )}
-      <label>
-        <span>状态</span>
-        <select
-          value={props.filter.status}
-          onChange={(event) => props.onChange({ ...props.filter, status: event.target.value })}
-        >
-          <option value="">全部状态</option>
-          {props.statuses.map((status) => (
-            <option key={status.value} value={status.value}>{status.label}</option>
-          ))}
-        </select>
-      </label>
-      <label>
-        <span>展示</span>
-        <select
-          value={limitMode}
-          onChange={(event) => {
-            if (event.target.value === "all") {
-              props.onChange({ ...props.filter, limit: null });
-            } else if (event.target.value === "custom") {
-              const parsed = Number(customLimit);
-              props.onChange({
-                ...props.filter,
-                limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
-              });
-            } else {
-              props.onChange({ ...props.filter, limit: Number(event.target.value) });
-            }
-          }}
-        >
-          <option value="10">10 条</option>
-          <option value="20">20 条</option>
-          <option value="50">50 条</option>
-          <option value="all">全部</option>
-          <option value="custom">自定义</option>
-        </select>
-      </label>
+      <SelectField
+        label="状态"
+        value={props.filter.status}
+        onChange={(status) => props.onChange({ ...props.filter, status })}
+        options={[
+          { value: "", label: "全部状态" },
+          ...props.statuses,
+        ]}
+      />
+      <SelectField
+        label="展示"
+        value={limitMode}
+        onChange={(value) => {
+          if (value === "all") {
+            props.onChange({ ...props.filter, limit: null });
+          } else if (value === "custom") {
+            const parsed = Number(customLimit);
+            props.onChange({
+              ...props.filter,
+              limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
+            });
+          } else {
+            props.onChange({ ...props.filter, limit: Number(value) });
+          }
+        }}
+        options={[
+          { value: "10", label: "10 条" },
+          { value: "20", label: "20 条" },
+          { value: "50", label: "50 条" },
+          { value: "all", label: "全部" },
+          { value: "custom", label: "自定义" },
+        ]}
+      />
       {limitMode === "custom" && (
         <label className="overview-custom-limit">
           <span>自定义条数</span>
@@ -2807,10 +2837,18 @@ function RepositoryConnectionsEditor(props: {
                 <fieldset className="config-editor-surface provider-editor-surface" disabled={!isEditing || saving}>
                   <div className="provider-row">
                     <Field label="连接名称" value={isEditing ? draftName : name} onChange={setDraftName} />
-                    <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
-                      const kind = event.target.value as "github" | "gitlab";
-                      updateDraft({ kind, ...providerDefaults(kind) });
-                    }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
+                    <SelectField
+                      label="代码平台"
+                      value={String(provider.kind)}
+                      onChange={(value) => {
+                        const kind = value as "github" | "gitlab";
+                        updateDraft({ kind, ...providerDefaults(kind) });
+                      }}
+                      options={[
+                        { value: "github", label: "GitHub" },
+                        { value: "gitlab", label: "GitLab" },
+                      ]}
+                    />
                     <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateDraft({ base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
                     <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateDraft({ token_env: value })} help={tokenHelp} />
                   </div>
@@ -3264,13 +3302,13 @@ function RepositoryDetailEditor(props: {
                 <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
               </label>
             )}
-            <label className="field">
-              <span>所属 GitHub / GitLab 连接</span>
-              <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
-                {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
-              </select>
-              <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
-            </label>
+            <SelectField
+              label="所属 GitHub / GitLab 连接"
+              value={repository.provider}
+              onChange={(provider) => update({ provider })}
+              options={providerNames.map((provider) => ({ value: provider, label: provider }))}
+              help="决定使用哪个平台 API 和 Token 扫描此仓库"
+            />
             <Field
               label="远端仓库地址 / 项目路径"
               value={repository.clone_url ?? repository.project}
@@ -4541,24 +4579,48 @@ function AgentsEditor(props: {
                   onChange={(model) => update(name, { model: model || undefined })}
                   help={agent.model ? "当前 Agent 显式覆盖运行时默认" : inheritedModel.label}
                 />
-                <label className="field"><span>本地文件权限（Sandbox）</span><select value={agent.sandbox ?? "read-only"} onChange={(event) => {
-                  const sandbox = event.target.value as Agent["sandbox"];
-                  const nextScopes = sandbox === "read-only"
-                    ? writeScopes.filter((scope) => scope !== "workspace")
-                    : Array.from(new Set([...writeScopes, "workspace"]));
-                  update(name, {
-                    sandbox,
-                    home_mode: sandbox === "read-only" ? "inherit" : agent.home_mode ?? "inherit",
-                    write_scopes: nextScopes as Agent["write_scopes"],
-                    network_access: sandbox === "danger-full-access"
-                      ? true
-                      : sandbox === "read-only" || agent.sandbox === "danger-full-access"
-                        ? false
-                        : agent.network_access ?? false,
-                    network_domains: sandbox === "workspace-write" ? agent.network_domains ?? [] : [],
-                  });
-                }}><option value="read-only">只读：不能修改本地文件</option><option value="workspace-write">工作区可写：可修改仓库文件和独立 .git</option><option value="danger-full-access">完全访问：绕过受限外层沙盒（高风险）</option></select><small>可写模式放行本次独立 clone（含 .git）和系统临时目录，基础仓库不在可写范围；切换时会自动启用“本地仓库写操作”</small></label>
-                <label className="field"><span>HOME 目录</span><select value={agent.home_mode ?? "inherit"} disabled={agent.sandbox === "read-only"} onChange={(event) => update(name, { home_mode: event.target.value as Agent["home_mode"] })}><option value="inherit">继承系统 HOME</option><option value="temporary">每次运行使用临时 HOME</option></select><small>{agent.sandbox === "read-only" ? "只读沙箱不能提供可写的临时 HOME" : agent.home_mode === "temporary" ? "缓存与用户级配置写入本次运行目录，结束后清理" : "命令继续直接使用启动服务用户的 HOME"}</small></label>
+                <SelectField
+                  label="本地文件权限（Sandbox）"
+                  value={agent.sandbox ?? "read-only"}
+                  onChange={(value) => {
+                    const sandbox = value as Agent["sandbox"];
+                    const nextScopes = sandbox === "read-only"
+                      ? writeScopes.filter((scope) => scope !== "workspace")
+                      : Array.from(new Set([...writeScopes, "workspace"]));
+                    update(name, {
+                      sandbox,
+                      home_mode: sandbox === "read-only" ? "inherit" : agent.home_mode ?? "inherit",
+                      write_scopes: nextScopes as Agent["write_scopes"],
+                      network_access: sandbox === "danger-full-access"
+                        ? true
+                        : sandbox === "read-only" || agent.sandbox === "danger-full-access"
+                          ? false
+                          : agent.network_access ?? false,
+                      network_domains: sandbox === "workspace-write" ? agent.network_domains ?? [] : [],
+                    });
+                  }}
+                  options={[
+                    { value: "read-only", label: "只读：不能修改本地文件" },
+                    { value: "workspace-write", label: "工作区可写：可修改仓库文件和独立 .git" },
+                    { value: "danger-full-access", label: "完全访问：绕过受限外层沙盒（高风险）" },
+                  ]}
+                  help="可写模式放行本次独立 clone（含 .git）和系统临时目录，基础仓库不在可写范围；切换时会自动启用“本地仓库写操作”"
+                />
+                <SelectField
+                  label="HOME 目录"
+                  value={agent.home_mode ?? "inherit"}
+                  disabled={agent.sandbox === "read-only"}
+                  onChange={(homeMode) => update(name, { home_mode: homeMode as Agent["home_mode"] })}
+                  options={[
+                    { value: "inherit", label: "继承系统 HOME" },
+                    { value: "temporary", label: "每次运行使用临时 HOME" },
+                  ]}
+                  help={agent.sandbox === "read-only"
+                    ? "只读沙箱不能提供可写的临时 HOME"
+                    : agent.home_mode === "temporary"
+                      ? "缓存与用户级配置写入本次运行目录，结束后清理"
+                      : "命令继续直接使用启动服务用户的 HOME"}
+                />
                 <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
@@ -4759,7 +4821,20 @@ function AgentsEditor(props: {
               </div>
               <div className="prompt-editor">
                 <div className="prompt-toolbar">
-                  <label>Prompt 来源 <select value={promptSource} onChange={(event) => update(name, event.target.value === "file" ? { prompt_file: "./prompts/agent.md", prompt: undefined } : { prompt: "请处理当前 MR / PR。", prompt_file: undefined })}><option value="file">文件</option><option value="inline">内联模板</option></select></label>
+                  <div className="prompt-source-picker">
+                    <span>Prompt 来源</span>
+                    <SelectControl
+                      value={promptSource}
+                      ariaLabel="Prompt 来源"
+                      onChange={(value) => update(name, value === "file"
+                        ? { prompt_file: "./prompts/agent.md", prompt: undefined }
+                        : { prompt: "请处理当前 MR / PR。", prompt_file: undefined })}
+                      options={[
+                        { value: "file", label: "文件" },
+                        { value: "inline", label: "内联模板" },
+                      ]}
+                    />
+                  </div>
                   <code>{"支持 ${{ENV_NAME}}，缺失变量会渲染为空"}</code>
                 </div>
                 {promptSource === "file" ? (
@@ -6789,23 +6864,22 @@ function RunsView(props: {
         <div className="section-title-row">
           <div><h2>执行记录</h2><p>按开始时间统一查看 Agent 与本地 Preflight / CI；点击一行打开详情。</p></div>
           <div className="runs-list-actions">
-            <label className="runs-repository-filter">
-              <span>仓库</span>
-              <select
-                value={props.filter.repositoryId}
-                onChange={(event) => props.onFilterChange({
-                  ...props.filter,
-                  repositoryId: event.target.value,
-                })}
-              >
-                <option value="">全部仓库</option>
-                {props.repositories.map((repository) => (
-                  <option key={repository.id} value={repository.id}>
-                    {repository.id} · {repository.project}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <SelectField
+              className="runs-repository-filter"
+              label="仓库"
+              value={props.filter.repositoryId}
+              onChange={(repositoryId) => props.onFilterChange({
+                ...props.filter,
+                repositoryId,
+              })}
+              options={[
+                { value: "", label: "全部仓库" },
+                ...props.repositories.map((repository) => ({
+                  value: repository.id,
+                  label: `${repository.id} · ${repository.project}`,
+                })),
+              ]}
+            />
             <label className="runs-number-filter">
               <span>编号</span>
               <input
@@ -6821,63 +6895,58 @@ function RunsView(props: {
                 })}
               />
             </label>
-            <label>
-              <span>类型</span>
-              <select
-                value={props.filter.type}
-                onChange={(event) => props.onFilterChange({
-                  ...props.filter,
-                  type: event.target.value as ExecutionTypeFilter,
-                })}
-              >
-                <option value="all">全部</option>
-                <option value="agent">Agent</option>
-                <option value="preflight">本地 CI</option>
-              </select>
-            </label>
-            <label>
-              <span>状态</span>
-              <select
-                value={props.filter.status}
-                onChange={(event) => props.onFilterChange({
-                  ...props.filter,
-                  status: event.target.value as ExecutionStatusFilter,
-                })}
-              >
-                <option value="">全部状态</option>
-                {EXECUTION_STATUS_OPTIONS.map((status) => (
-                  <option key={status.value} value={status.value}>{status.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>展示</span>
-              <select
-                value={limitMode}
-                onChange={(event) => {
-                  if (event.target.value === "all") {
-                    props.onFilterChange({ ...props.filter, limit: null });
-                  } else if (event.target.value === "custom") {
-                    const parsed = Number(customLimit);
-                    props.onFilterChange({
-                      ...props.filter,
-                      limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
-                    });
-                  } else {
-                    props.onFilterChange({
-                      ...props.filter,
-                      limit: Number(event.target.value),
-                    });
-                  }
-                }}
-              >
-                <option value="10">10 条</option>
-                <option value="20">20 条</option>
-                <option value="50">50 条</option>
-                <option value="all">全部</option>
-                <option value="custom">自定义</option>
-              </select>
-            </label>
+            <SelectField
+              label="类型"
+              value={props.filter.type}
+              onChange={(value) => props.onFilterChange({
+                ...props.filter,
+                type: value as ExecutionTypeFilter,
+              })}
+              options={[
+                { value: "all", label: "全部" },
+                { value: "agent", label: "Agent" },
+                { value: "preflight", label: "本地 CI" },
+              ]}
+            />
+            <SelectField
+              label="状态"
+              value={props.filter.status}
+              onChange={(value) => props.onFilterChange({
+                ...props.filter,
+                status: value as ExecutionStatusFilter,
+              })}
+              options={[
+                { value: "", label: "全部状态" },
+                ...EXECUTION_STATUS_OPTIONS,
+              ]}
+            />
+            <SelectField
+              label="展示"
+              value={limitMode}
+              onChange={(value) => {
+                if (value === "all") {
+                  props.onFilterChange({ ...props.filter, limit: null });
+                } else if (value === "custom") {
+                  const parsed = Number(customLimit);
+                  props.onFilterChange({
+                    ...props.filter,
+                    limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
+                  });
+                } else {
+                  props.onFilterChange({
+                    ...props.filter,
+                    limit: Number(value),
+                  });
+                }
+              }}
+              options={[
+                { value: "10", label: "10 条" },
+                { value: "20", label: "20 条" },
+                { value: "50", label: "50 条" },
+                { value: "all", label: "全部" },
+                { value: "custom", label: "自定义" },
+              ]}
+            />
             {limitMode === "custom" && (
               <label className="runs-custom-limit">
                 <span>自定义条数</span>
