@@ -13,12 +13,13 @@ from types import SimpleNamespace
 import pytest
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
-from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import PreflightResult
+from teamwork_review_agents.events import detect_activity_events, detect_events
+from teamwork_review_agents.models import ChangeRequestActivity, PreflightResult
 from teamwork_review_agents.preflight import (
     PreflightExecutor,
     build_preflight_environment,
     execute_preflight_steps,
+    preflight_idempotency_key,
 )
 from teamwork_review_agents.preflight_cache import (
     build_repository_cache_environment,
@@ -627,6 +628,122 @@ async def test_preflight_superseded_head_is_terminal_and_not_published(
         log["event_type"] == "superseded"
         for log in store.list_preflight_logs(first.run_id)
     )
+
+
+async def test_preflight_uses_final_snapshot_for_deduplicated_commit_batch(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """同批次多个提交活动只能对最终快照 Head 执行一次 CI。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {
+                                "name": "success",
+                                "command": [sys.executable, "-c", "print('ok')"],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    old = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        head_sha="a" * 40,
+        updated_at="2026-08-20T05:20:00Z",
+    )
+    current = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        head_sha="c" * 40,
+        updated_at="2026-08-20T05:21:24Z",
+    )
+    events = detect_activity_events(
+        old,
+        current,
+        (
+            ChangeRequestActivity(
+                id="commit-b",
+                type="committed",
+                occurred_at="2026-08-20T05:21:10Z",
+                data={"sha": "b" * 40},
+            ),
+            ChangeRequestActivity(
+                id="force-push-c",
+                type="head_ref_force_pushed",
+                occurred_at="2026-08-20T05:21:24Z",
+                data={"sha": "", "commit_id": "c" * 40},
+            ),
+        ),
+        batch_id="force-push-batch",
+    )
+    commit_events = [
+        event for event in events if event.type == "change_request.commits_changed"
+    ]
+    representative = commit_events[0]
+    assert representative.new.head_sha == "b" * 40
+    assert representative.current_snapshot.head_sha == "c" * 40
+    assert commit_events[-1].new.head_sha == "c" * 40
+    assert preflight_idempotency_key(
+        config,
+        representative,
+    ) == preflight_idempotency_key(config, commit_events[-1])
+
+    prepared_snapshots = []
+
+    @contextmanager
+    def fake_worktree(_provider, _repository, snapshot, **_kwargs):
+        prepared_snapshots.append(snapshot)
+        yield tmp_path
+
+    statuses: list[tuple[str, str]] = []
+
+    async def record_status(_repository, head_sha, *, state, **_kwargs):
+        statuses.append((head_sha, state))
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        fake_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = PreflightExecutor(config, store)
+    monkeypatch.setattr(executor, "_set_remote_status", record_status)
+
+    first = await executor.ensure_passed(representative)
+    reused = await executor.ensure_passed(commit_events[-1])
+
+    assert first.status == "success"
+    assert first.head_sha == "c" * 40
+    assert reused.reused is True
+    assert reused.run_id == first.run_id
+    assert [snapshot.head_sha for snapshot in prepared_snapshots] == ["c" * 40]
+    assert statuses == [("c" * 40, "pending"), ("c" * 40, "success")]
+    detail = store.get_preflight_run(first.run_id)
+    assert detail is not None
+    assert detail["head_sha"] == "c" * 40
+    assert detail["attempts"] == 1
 
 
 async def test_preflight_retries_only_final_status_delivery(

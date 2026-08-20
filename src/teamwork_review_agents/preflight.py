@@ -397,13 +397,13 @@ async def execute_preflight_steps(
 
 
 def preflight_idempotency_key(config: AppConfig, event: ChangeEvent) -> str:
-    """返回按仓库、PR、Head 与配置版本隔离的 CI 幂等键。"""
+    """按批次最终 Head 与配置版本返回 CI 幂等键。"""
 
     return stable_hash(
         "preflight",
         event.repository_id,
         event.number,
-        event.new.head_sha,
+        event.current_snapshot.head_sha,
         config.revision,
     )
 
@@ -717,6 +717,7 @@ class PreflightExecutor:
 
         repository = self.repositories[event.repository_id]
         provider_config = self.config.providers[repository.provider]
+        snapshot = event.current_snapshot
         key = preflight_idempotency_key(self.config, event)
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
@@ -736,7 +737,7 @@ class PreflightExecutor:
             event_id=event.id,
             repository_id=repository.id,
             number=event.number,
-            head_sha=event.new.head_sha,
+            head_sha=snapshot.head_sha,
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
         )
@@ -748,7 +749,7 @@ class PreflightExecutor:
                 run_id=proposed_run_id,
                 repository_id=repository.id,
                 number=event.number,
-                head_sha=event.new.head_sha,
+                head_sha=snapshot.head_sha,
                 status="error",
                 error="无法创建或读取 Preflight 运行记录",
             )
@@ -759,7 +760,7 @@ class PreflightExecutor:
                 self.store.set_preflight_phase,
                 reservation.run_id,
                 "preparing",
-                branch=event.new.source_branch,
+                branch=snapshot.source_branch,
             )
             await self._append_log(
                 reservation.run_id,
@@ -817,7 +818,7 @@ class PreflightExecutor:
             manager = temporary_change_request_worktree(
                 provider_config,
                 repository,
-                event.new,
+                snapshot,
                 timeout_seconds=self.config.runtime.git_timeout_seconds,
                 initialization_timeout_seconds=(
                     self.config.runtime.repository_initialization_timeout_seconds
@@ -829,7 +830,7 @@ class PreflightExecutor:
                 checkout = await asyncio.to_thread(manager.__enter__)
                 await self._set_remote_status(
                     repository,
-                    event.new.head_sha,
+                    snapshot.head_sha,
                     state="pending",
                     description="本地 CI 正在运行",
                 )
@@ -872,7 +873,7 @@ class PreflightExecutor:
                 run_id=reservation.run_id,
                 repository_id=repository.id,
                 number=event.number,
-                head_sha=event.new.head_sha,
+                head_sha=snapshot.head_sha,
                 status=outcome.status,
                 failed_step=outcome.failed_step,
                 exit_code=outcome.exit_code,
@@ -890,7 +891,7 @@ class PreflightExecutor:
                 run_id=reservation.run_id,
                 repository_id=repository.id,
                 number=event.number,
-                head_sha=event.new.head_sha,
+                head_sha=snapshot.head_sha,
                 status="superseded",
                 error=str(exc),
             )
@@ -905,7 +906,7 @@ class PreflightExecutor:
                 run_id=reservation.run_id,
                 repository_id=repository.id,
                 number=event.number,
-                head_sha=event.new.head_sha,
+                head_sha=snapshot.head_sha,
                 status="error",
                 error=str(exc),
             )
