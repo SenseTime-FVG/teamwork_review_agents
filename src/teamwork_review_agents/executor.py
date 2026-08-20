@@ -7,9 +7,11 @@ import json
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
+from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
+from .codex_settings import resolve_agent_model_snapshot
 from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
     PromptRenderError,
@@ -19,9 +21,11 @@ from .environment import (
 )
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
+from .model_tools import InvokeAgentStartedCallback
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
     CANCEL_SOURCE_SERVICE_SHUTDOWN,
+    RunReservation,
     StateStore,
 )
 from .workspace import (
@@ -103,14 +107,109 @@ def _mr_payload(
 
 
 class AgentExecutor:
-    """统一执行根 Agent 和 MCP 调起的 sub-agent。"""
+    """统一执行根 Agent 和 CLI/MCP/内嵌模式调起的 sub-agent。"""
 
     def __init__(self, config: AppConfig, store: StateStore) -> None:
         self.config = config
         self.store = store
-        self.runner = CodexRunner(config)
+        self.runner = (
+            CodexModelRunner(
+                config,
+                invoke_agent_callback=self._invoke_embedded_agent,
+            )
+            if config.runtime.codex.execution_mode == "model"
+            else CodexRunner(config)
+        )
         self.repositories = config.repository_map()
         self._shutdown_requested = threading.Event()
+
+    async def _invoke_embedded_agent(
+        self,
+        context: InvocationContext,
+        agent_name: str,
+        task: str,
+        extra_context: dict[str, Any] | None,
+        started_callback: InvokeAgentStartedCallback | None = None,
+    ) -> dict[str, Any]:
+        """复用现有执行器语义直接调度内嵌模式 sub-agent。"""
+
+        if context.config_path != str(self.config.config_path):
+            raise AgentExecutionError("调用上下文与当前配置文件不一致")
+        if context.current_agent not in self.config.agents:
+            raise AgentExecutionError(f"父 Agent 不存在：{context.current_agent}")
+        parent = self.config.agents[context.current_agent]
+        if agent_name not in parent.allowed_sub_agents:
+            raise PermissionError(
+                f"Agent {context.current_agent} 不允许调用 sub-agent {agent_name}"
+            )
+        if agent_name not in self.config.agents:
+            raise AgentExecutionError(f"sub-agent 不存在：{agent_name}")
+        child_depth = context.depth + 1
+        if child_depth > self.config.runtime.max_sub_agent_depth:
+            raise AgentExecutionError(
+                f"sub-agent 深度 {child_depth} 超过限制 "
+                f"{self.config.runtime.max_sub_agent_depth}"
+            )
+        if agent_name in context.call_chain:
+            raise AgentExecutionError(
+                f"检测到 Agent 调用环：{' -> '.join((*context.call_chain, agent_name))}"
+            )
+        execute_arguments = {
+            "agent_name": agent_name,
+            "event": context.event,
+            "task": task,
+            "extra_context": extra_context,
+            "root_run_id": context.root_run_id,
+            "parent_run_id": context.run_id,
+            "depth": child_depth,
+            "call_chain": context.call_chain,
+            "inherit_workspace": context.inherit_workspace,
+            "parent_workspace": (
+                Path(context.active_workspace) if context.active_workspace else None
+            ),
+            "idempotency_key": sub_agent_idempotency_key(
+                root_run_id=context.root_run_id,
+                parent_run_id=context.run_id,
+                agent_name=agent_name,
+                event_id=context.event.id,
+                task=task,
+                extra_context=extra_context,
+            ),
+        }
+        # Responses 明确关闭并行工具调用，同一父回合的委托天然串行；
+        # 子 Agent 仍由资源租约处理跨运行写冲突，避免嵌套委托持锁死锁。
+        async def report_started(reservation: RunReservation) -> None:
+            """在子运行占位完成后立即把精确关联交回父运行日志。"""
+
+            if started_callback is None:
+                return
+            await started_callback(
+                {
+                    "run_id": reservation.run_id,
+                    "root_run_id": reservation.root_run_id,
+                    "parent_run_id": reservation.parent_run_id,
+                    "agent_name": agent_name,
+                    "status": "queued",
+                }
+            )
+
+        result = await self.execute(
+            **execute_arguments,
+            run_started_callback=report_started,
+        )
+        if result is None:
+            return {
+                "status": "deduplicated",
+                "agent_name": agent_name,
+                "message": "相同委托已经运行或完成",
+            }
+        return {
+            "status": result.status,
+            "run_id": result.run_id,
+            "agent_name": result.agent_name,
+            "final_message": result.final_message,
+            "usage": result.usage,
+        }
 
     def begin_shutdown(self) -> None:
         """阻止本执行器继续创建 Codex，并让准备阶段尽快退出。"""
@@ -259,8 +358,9 @@ class AgentExecutor:
         actions: Sequence[str] | None = None,
         inherit_workspace: bool = False,
         parent_workspace: Path | None = None,
+        run_started_callback: Callable[[RunReservation], Awaitable[None]] | None = None,
     ) -> AgentResult | None:
-        """申请审计记录与写锁，然后运行一个 Codex CLI Agent。"""
+        """申请审计记录与写锁，然后运行所选 Codex 执行模式。"""
 
         if self._shutdown_requested.is_set():
             raise AgentExecutionError("服务正在停止，不再创建新的 Agent 运行")
@@ -288,6 +388,12 @@ class AgentExecutor:
         configured_repository = self.repositories[event.repository_id]
         provider = self.config.providers[configured_repository.provider]
         agent = self.config.agents[agent_name]
+        model_snapshot = await asyncio.to_thread(
+            resolve_agent_model_snapshot,
+            self.config.runtime.codex,
+            agent,
+            self.config.runtime.codex_home,
+        )
         proposed_run_id = str(uuid.uuid4())
         reservation = await asyncio.to_thread(
             self.store.begin_agent_run,
@@ -303,6 +409,7 @@ class AgentExecutor:
             environment={},
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
+            model_snapshot=model_snapshot,
         )
         if reservation is None:
             status = await asyncio.to_thread(
@@ -314,6 +421,8 @@ class AgentExecutor:
             raise AgentExecutionError(
                 f"幂等任务已经达到重试上限，当前状态：{status or 'unknown'}"
             )
+        if run_started_callback is not None:
+            await run_started_callback(reservation)
 
         async def cancellation_source() -> str | None:
             """读取持久化来源，并兜住停止请求与数据库写入之间的竞态。"""
@@ -606,6 +715,7 @@ class AgentExecutor:
                         "run.started",
                         {
                             "agent_name": agent_name,
+                            "execution_mode": self.config.runtime.codex.execution_mode,
                             "config_revision": self.config.revision,
                             "environment": resolved_environment.audit_values,
                             "workspace_mode": workspace_mode,

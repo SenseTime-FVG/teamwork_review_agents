@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import tomllib
 from pathlib import Path
 from typing import Any
+
+from .subprocess_utils import resolve_executable
 
 from .config import (
     AgentConfig,
@@ -252,6 +253,86 @@ def read_user_inherited_settings(
     ), None
 
 
+def resolve_agent_model_snapshot(
+    runtime: CodexRuntimeConfig,
+    agent: AgentConfig,
+    configured_home: Path | None = None,
+) -> dict[str, Any]:
+    """按实际继承顺序返回可持久化的 Agent 模型设置快照。"""
+
+    home = codex_home(configured_home)
+    user_model, _, _ = read_user_model(home)
+    inherited, _ = read_user_inherited_settings(home)
+
+    if agent.model:
+        model = agent.model
+        model_source = "agent"
+    elif runtime.model:
+        model = runtime.model
+        model_source = "runtime"
+    elif user_model:
+        model = user_model
+        model_source = "codex_user"
+    else:
+        model = None
+        model_source = "codex_default"
+
+    def inherited_value(key: str) -> str | None:
+        item = inherited.get(key)
+        value = item.get("value") if isinstance(item, dict) else None
+        return str(value) if value is not None else None
+
+    if agent.model_reasoning_effort:
+        reasoning_effort = agent.model_reasoning_effort
+        reasoning_effort_source = "agent"
+    elif runtime.model_reasoning_effort:
+        reasoning_effort = runtime.model_reasoning_effort
+        reasoning_effort_source = "runtime"
+    else:
+        reasoning_effort = inherited_value("model_reasoning_effort")
+        reasoning_effort_source = (
+            "codex_user" if reasoning_effort is not None else "codex_default"
+        )
+
+    if agent.fast_mode != "inherit":
+        fast_mode = agent.fast_mode
+        fast_mode_source = "agent"
+    elif runtime.fast_mode != "inherit":
+        fast_mode = runtime.fast_mode
+        fast_mode_source = "runtime"
+    else:
+        fast_mode = inherited_value("fast_mode") or "standard"
+        fast_mode_source = (
+            "codex_user"
+            if inherited_value("fast_mode") is not None
+            else "codex_default"
+        )
+
+    if agent.model_verbosity:
+        verbosity = agent.model_verbosity
+        verbosity_source = "agent"
+    elif runtime.model_verbosity:
+        verbosity = runtime.model_verbosity
+        verbosity_source = "runtime"
+    else:
+        verbosity = inherited_value("model_verbosity")
+        verbosity_source = (
+            "codex_user" if verbosity is not None else "codex_default"
+        )
+
+    return {
+        "execution_mode": runtime.execution_mode,
+        "model": model,
+        "model_source": model_source,
+        "reasoning_effort": reasoning_effort,
+        "reasoning_effort_source": reasoning_effort_source,
+        "fast_mode": fast_mode,
+        "fast_mode_source": fast_mode_source,
+        "verbosity": verbosity,
+        "verbosity_source": verbosity_source,
+    }
+
+
 def _codex_environment(home: Path | None) -> dict[str, str]:
     """为诊断命令构造与后台 Agent 一致的 Codex Home 环境。"""
 
@@ -267,10 +348,9 @@ def inspect_codex_binary(
 ) -> dict[str, str | None]:
     """解析 Codex CLI 路径和版本，不执行任何 Agent 任务。"""
 
-    resolved = shutil.which(codex_binary)
-    if resolved is None and Path(codex_binary).expanduser().is_file():
-        resolved = str(Path(codex_binary).expanduser().resolve())
-    command = resolved or codex_binary
+    environment = _codex_environment(home)
+    command = resolve_executable(codex_binary, environment)
+    resolved = command if Path(command).is_file() else None
     try:
         result = subprocess.run(
             [command, "--version"],
@@ -280,7 +360,7 @@ def inspect_codex_binary(
             encoding="utf-8",
             errors="replace",
             timeout=5,
-            env=_codex_environment(home),
+            env=environment,
         )
         output = (result.stdout or result.stderr).strip()
     except (OSError, subprocess.SubprocessError) as exc:
@@ -335,47 +415,44 @@ def inspect_model_cache(home: Path) -> dict[str, Any]:
     }
 
 
-def read_bundled_models(
-    codex_binary: str,
-    home: Path | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
-    """从本机 Codex CLI 读取模型目录；失败时保留手工填写能力。"""
+def _normalize_model_catalog(
+    raw_models: Any,
+    *,
+    visible_only: bool = False,
+) -> list[dict[str, Any]]:
+    """把 Codex 的账号缓存或内置目录收敛为管理界面需要的字段。"""
 
-    try:
-        result = subprocess.run(
-            [codex_binary, "debug", "models", "--bundled"],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-            env=_codex_environment(home),
-        )
-        document = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        return [], str(exc)
-
-    raw_models = document.get("models", []) if isinstance(document, dict) else []
+    if not isinstance(raw_models, list):
+        return []
     models: list[dict[str, Any]] = []
     for item in raw_models:
         if not isinstance(item, dict) or not item.get("slug"):
             continue
+        if visible_only and item.get("visibility") != "list":
+            continue
         reasoning = item.get("supported_reasoning_levels", [])
-        levels = [
-            str(level.get("effort"))
-            for level in reasoning
-            if isinstance(level, dict) and level.get("effort")
-        ]
+        levels = (
+            [
+                str(level.get("effort") if isinstance(level, dict) else level)
+                for level in reasoning
+                if (isinstance(level, dict) and level.get("effort"))
+                or (isinstance(level, str) and level)
+            ]
+            if isinstance(reasoning, list)
+            else []
+        )
         speed_tiers = item.get("additional_speed_tiers", [])
         service_tiers = item.get("service_tiers", [])
-        supports_fast = "fast" in speed_tiers or any(
-            isinstance(tier, dict)
-            and (
-                tier.get("id") in {"fast", "priority"}
-                or tier.get("name") == "Fast"
+        supports_fast = (isinstance(speed_tiers, list) and "fast" in speed_tiers) or (
+            isinstance(service_tiers, list)
+            and any(
+                isinstance(tier, dict)
+                and (
+                    tier.get("id") in {"fast", "priority"}
+                    or tier.get("name") == "Fast"
+                )
+                for tier in service_tiers
             )
-            for tier in service_tiers
         )
         models.append(
             {
@@ -386,7 +463,54 @@ def read_bundled_models(
                 "supports_fast_mode": supports_fast,
             }
         )
-    return models, None
+    return models
+
+
+def read_account_models(
+    home: Path,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """读取当前 Codex Home 的账号可见模型；缓存缺失不是错误。"""
+
+    path = home / "models_cache.json"
+    if not path.is_file():
+        return [], None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], str(exc)
+    if not isinstance(document, dict):
+        return [], "模型缓存根节点不是对象"
+    return _normalize_model_catalog(
+        document.get("models", []),
+        visible_only=True,
+    ), None
+
+
+def read_bundled_models(
+    codex_binary: str,
+    home: Path | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """从本机 Codex CLI 读取模型目录；失败时保留手工填写能力。"""
+
+    environment = _codex_environment(home)
+    command = resolve_executable(codex_binary, environment)
+    try:
+        result = subprocess.run(
+            [command, "debug", "models", "--bundled"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            env=environment,
+        )
+        document = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return [], str(exc)
+
+    raw_models = document.get("models", []) if isinstance(document, dict) else []
+    return _normalize_model_catalog(raw_models), None
 
 
 def inspect_runtime_options(
@@ -401,7 +525,18 @@ def inspect_runtime_options(
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
     home = codex_home(configured_home)
-    models, catalog_error = read_bundled_models(codex_binary, home)
+    models, account_catalog_error = read_account_models(home)
+    if models:
+        catalog_source = "account_cache"
+        catalog_error = None
+    else:
+        models, catalog_error = read_bundled_models(codex_binary, home)
+        catalog_source = "bundled" if catalog_error is None else "unavailable"
+        if catalog_error and account_catalog_error:
+            catalog_error = (
+                f"账号模型缓存：{account_catalog_error}；"
+                f"Codex CLI 内置目录：{catalog_error}"
+            )
     user_model, user_error, user_config_path = read_user_model(home)
     binary = inspect_codex_binary(codex_binary, home)
     cache = inspect_model_cache(home)
@@ -467,6 +602,7 @@ def inspect_runtime_options(
         }
     return {
         "models": models,
+        "catalog_source": catalog_source,
         "inherited_model": inherited_model,
         "codex_model": codex_model,
         "codex_model_source": codex_model_source,

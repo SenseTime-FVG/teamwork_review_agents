@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .config import AgentConfig
+from .subprocess_utils import resolve_executable
 
 
 _PROFILE_NAME = "teamwork_managed"
@@ -86,16 +87,18 @@ def _inspect_cached(
             error=f"当前平台 {platform_name} 不在 Teamwork 外层沙盒支持范围内",
         )
     configured_home = Path(codex_home_text) if codex_home_text else None
+    environment = _inspection_environment(configured_home)
+    command = resolve_executable(codex_binary, environment)
     try:
         completed = subprocess.run(
-            [codex_binary, "sandbox", "--help"],
+            [command, "sandbox", "--help"],
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=_INSPECTION_TIMEOUT_SECONDS,
-            env=_inspection_environment(configured_home),
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return ManagedSandboxInspection(

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from .filesystem import remove_tree
 from .process_control import pid_exists
 
 
@@ -55,7 +56,7 @@ def agent_codex_home_root(
 ) -> Path:
     """返回不会触发 Codex 临时目录保护的每轮运行根目录。"""
 
-    host = host_environment or os.environ
+    host = host_environment if host_environment is not None else os.environ
     active_platform = platform_name or sys.platform
     active_os = os_name or os.name
     host_home_value = host.get("HOME") or host.get("USERPROFILE")
@@ -108,7 +109,7 @@ def cleanup_stale_agent_homes(root: Path | None = None) -> list[Path]:
             if path.is_symlink():
                 path.unlink()
             elif path.is_dir():
-                shutil.rmtree(path)
+                remove_tree(path)
             else:
                 path.unlink()
         except OSError:
@@ -235,12 +236,14 @@ class TemporaryAgentHome:
     ) -> tuple[str, ...]:
         """切换通用用户目录，并只桥接已存在的宿主机配置入口。"""
 
-        host = host_environment or os.environ
+        host = host_environment if host_environment is not None else os.environ
         host_home_value = host.get("HOME") or host.get("USERPROFILE")
         host_home = (
             Path(host_home_value).expanduser() if host_home_value else Path.home()
         )
         host_xdg = _environment_path(host, "XDG_CONFIG_HOME")
+        host_appdata = _environment_path(host, "APPDATA")
+        host_local_appdata = _environment_path(host, "LOCALAPPDATA")
 
         # 这些目录全部属于当前运行，仓库程序无需声明专用 HOME 变量。
         environment["HOME"] = str(self.path)
@@ -256,6 +259,8 @@ class TemporaryAgentHome:
             environment["USERPROFILE"] = str(self.path)
             environment["APPDATA"] = str(appdata)
             environment["LOCALAPPDATA"] = str(local_appdata)
+            environment["TEMP"] = str(self.path / "tmp")
+            environment["TMP"] = str(self.path / "tmp")
 
         bridges: list[str] = []
         environment["CODEX_HOME"] = str(codex_home)
@@ -266,6 +271,7 @@ class TemporaryAgentHome:
 
         gh_config = _environment_path(host, "GH_CONFIG_DIR") or _existing_directory(
             host_xdg / "gh" if host_xdg is not None else None,
+            host_appdata / "GitHub CLI" if host_appdata is not None else None,
             host_home / ".config/gh",
         )
         if gh_config is not None:
@@ -274,6 +280,12 @@ class TemporaryAgentHome:
 
         glab_config = _environment_path(host, "GLAB_CONFIG_DIR") or _existing_directory(
             host_xdg / "glab-cli" if host_xdg is not None else None,
+            host_appdata / "glab-cli" if host_appdata is not None else None,
+            (
+                host_local_appdata / "glab-cli"
+                if host_local_appdata is not None
+                else None
+            ),
             host_home / ".config/glab-cli",
             host_home / ".config/glab",
         )
@@ -302,6 +314,7 @@ class TemporaryAgentHome:
         """清理当前运行目录，失败时返回可记录但不覆盖任务结果的错误。"""
 
         try:
+            remove_tree(self.path)
             self._manager.cleanup()
         except OSError as exc:
             return str(exc)
@@ -352,7 +365,11 @@ class TemporaryCodexHome:
                     pass
                 bridges.append(bridge_name)
         except Exception:
-            manager.cleanup()
+            try:
+                remove_tree(path)
+                manager.cleanup()
+            except OSError:
+                pass
             raise
         return cls(
             path=path,
@@ -370,6 +387,7 @@ class TemporaryCodexHome:
         """清理本轮 Codex 运行目录，不回写任何宿主文件。"""
 
         try:
+            remove_tree(self.path)
             self._manager.cleanup()
         except OSError as exc:
             return str(exc)

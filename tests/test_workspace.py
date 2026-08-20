@@ -31,6 +31,7 @@ from teamwork_review_agents.workspace import (
     validate_run_workspace,
     WorkspaceCancelled,
     WorkspaceError,
+    WorkspaceSnapshotSuperseded,
     worktree_ref_head,
 )
 
@@ -225,7 +226,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "removed"
+    assert cleanup.status == "removed", cleanup.reason
     assert not isolated.exists()
 
     cloned = ensure_isolated_clone(
@@ -259,7 +260,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "removed"
+    assert cleanup.status == "removed", cleanup.reason
     assert not cloned.exists()
 
     retained_clone = ensure_isolated_clone(
@@ -531,3 +532,125 @@ def test_temporary_change_request_worktree_isolated_and_removed(
     assert not checkout_path.exists()
     assert dirty_file.read_text(encoding="utf-8") == "保留本地修改\n"
     assert run_git("branch", "--show-current", cwd=workspace) == "main"
+
+
+def test_temporary_change_request_worktree_uses_event_sha_after_force_push(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """平台引用移动后，只要旧提交仍存在就必须检出事件记录的精确 SHA。"""
+
+    origin = tmp_path / "origin.git"
+    source = tmp_path / "source"
+    workspace = tmp_path / "managed" / "demo"
+    run_git("init", "--bare", str(origin))
+    source.mkdir()
+    run_git("init", "--initial-branch=main", cwd=source)
+    run_git("config", "user.name", "Test User", cwd=source)
+    run_git("config", "user.email", "test@example.com", cwd=source)
+    (source / "README.md").write_text("基础内容\n", encoding="utf-8")
+    run_git("add", "README.md", cwd=source)
+    run_git("commit", "-m", "初始化", cwd=source)
+    run_git("remote", "add", "origin", str(origin), cwd=source)
+    run_git("push", "origin", "main", cwd=source)
+    run_git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    (source / "feature.txt").write_text("旧提交\n", encoding="utf-8")
+    run_git("add", "feature.txt", cwd=source)
+    run_git("commit", "-m", "旧 PR 提交", cwd=source)
+    event_head = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("push", "origin", "HEAD:refs/pull/7/head", cwd=source)
+
+    provider = ProviderConfig(
+        kind="github",
+        base_url="https://api.github.com",
+        token_env="GITHUB_TOKEN",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        clone_url=str(origin),
+        workspace=workspace,
+    )
+    snapshot = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        number=7,
+        head_sha=event_head,
+    )
+    prepare_change_request_workspace(provider, repository, snapshot)
+
+    run_git("reset", "--hard", "origin/main", cwd=source)
+    (source / "feature.txt").write_text("强推后的新提交\n", encoding="utf-8")
+    run_git("add", "feature.txt", cwd=source)
+    run_git("commit", "-m", "替换 PR 提交", cwd=source)
+    current_head = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("push", "--force", "origin", "HEAD:refs/pull/7/head", cwd=source)
+    assert current_head != event_head
+
+    with temporary_change_request_worktree(provider, repository, snapshot) as checkout:
+        assert run_git("rev-parse", "HEAD", cwd=checkout) == event_head
+        assert (checkout / "feature.txt").read_text(encoding="utf-8") == "旧提交\n"
+
+    change_ref = "refs/teamwork/change-requests/7/head"
+    assert run_git("rev-parse", change_ref, cwd=workspace) == event_head
+
+
+def test_prepare_change_request_workspace_marks_unavailable_old_sha_superseded(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """强推后的旧提交已被远端清理时，应返回不可重试的事件过期结论。"""
+
+    origin = tmp_path / "origin.git"
+    source = tmp_path / "source"
+    workspace = tmp_path / "managed" / "demo"
+    run_git("init", "--bare", str(origin))
+    source.mkdir()
+    run_git("init", "--initial-branch=main", cwd=source)
+    run_git("config", "user.name", "Test User", cwd=source)
+    run_git("config", "user.email", "test@example.com", cwd=source)
+    (source / "README.md").write_text("基础内容\n", encoding="utf-8")
+    run_git("add", "README.md", cwd=source)
+    run_git("commit", "-m", "初始化", cwd=source)
+    run_git("remote", "add", "origin", str(origin), cwd=source)
+    run_git("push", "origin", "main", cwd=source)
+    run_git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    (source / "feature.txt").write_text("即将被替换\n", encoding="utf-8")
+    run_git("add", "feature.txt", cwd=source)
+    run_git("commit", "-m", "旧 PR 提交", cwd=source)
+    event_head = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("push", "origin", "HEAD:refs/pull/7/head", cwd=source)
+    run_git("reset", "--hard", "origin/main", cwd=source)
+    (source / "feature.txt").write_text("强推后的新提交\n", encoding="utf-8")
+    run_git("add", "feature.txt", cwd=source)
+    run_git("commit", "-m", "替换 PR 提交", cwd=source)
+    current_head = run_git("rev-parse", "HEAD", cwd=source)
+    run_git("push", "--force", "origin", "HEAD:refs/pull/7/head", cwd=source)
+    run_git("--git-dir", str(origin), "reflog", "expire", "--expire=now", "--all")
+    run_git("--git-dir", str(origin), "gc", "--prune=now")
+
+    provider = ProviderConfig(
+        kind="github",
+        base_url="https://api.github.com",
+        token_env="GITHUB_TOKEN",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        clone_url=str(origin),
+        workspace=workspace,
+    )
+    snapshot = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        number=7,
+        head_sha=event_head,
+    )
+
+    with pytest.raises(WorkspaceSnapshotSuperseded) as raised:
+        prepare_change_request_workspace(provider, repository, snapshot)
+
+    assert raised.value.expected_head == event_head
+    assert raised.value.current_head == current_head

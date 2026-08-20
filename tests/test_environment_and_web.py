@@ -20,7 +20,11 @@ from teamwork_review_agents.environment import (
     resolve_provider_token,
 )
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import AgentResult, ChangeRequestActivity
+from teamwork_review_agents.models import (
+    AgentResult,
+    ChangeRequestActivity,
+    PreflightResult,
+)
 from teamwork_review_agents.webapp import create_app
 
 
@@ -556,6 +560,20 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
             "owner/third-updated"
         )
 
+        repository = updated_body["document"]["repositories"][2]
+        toggled = client.put(
+            "/api/config/repositories/third",
+            json={
+                "revision": updated_body["revision"],
+                "repository_id": "third",
+                "repository": {**repository, "enabled": True},
+            },
+        )
+        assert toggled.status_code == 200
+        updated_body = toggled.json()
+        repository = updated_body["document"]["repositories"][2]
+        assert repository["enabled"] is True
+
         renamed = client.put(
             "/api/config/repositories/third",
             json={
@@ -590,6 +608,79 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
         assert [item["id"] for item in deleted.json()["document"]["repositories"]] == [
             "first",
             "second",
+        ]
+
+
+def test_web_api_saves_providers_independently_and_updates_references(
+    tmp_path,
+) -> None:
+    """平台连接 API 应原子保存，并保护版本和仓库引用。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/providers",
+            json={
+                "revision": current["revision"],
+                "name": "provider-secondary",
+                "provider": {
+                    "kind": "gitlab",
+                    "base_url": "https://gitlab.example/api/v4",
+                    "token_env": "GITLAB_TOKEN",
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert list(created_body["document"]["providers"]) == [
+            "provider-main",
+            "provider-secondary",
+        ]
+
+        renamed = client.put(
+            "/api/config/providers/provider-main",
+            json={
+                "revision": created_body["revision"],
+                "name": "provider-renamed",
+                "provider": created_body["document"]["providers"]["provider-main"],
+            },
+        )
+        assert renamed.status_code == 200
+        renamed_body = renamed.json()
+        assert list(renamed_body["document"]["providers"]) == [
+            "provider-renamed",
+            "provider-secondary",
+        ]
+        assert {
+            repository["provider"]
+            for repository in renamed_body["document"]["repositories"]
+        } == {"provider-renamed"}
+
+        conflict = client.request(
+            "DELETE",
+            "/api/config/providers/provider-secondary",
+            json={"revision": current["revision"]},
+        )
+        assert conflict.status_code == 409
+
+        referenced = client.request(
+            "DELETE",
+            "/api/config/providers/provider-renamed",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert referenced.status_code == 422
+        assert "first" in referenced.json()["detail"]
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/providers/provider-secondary",
+            json={"revision": renamed_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert list(deleted.json()["document"]["providers"]) == [
+            "provider-renamed"
         ]
 
 
@@ -679,7 +770,15 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         event_record = client.get("/api/events").json()[0]
         assert event_record["status"] == "pending"
         assert event_record["trigger_count"] == 0
+        assert event_record["sub_agent_count"] == 0
         assert event_record["agent_running_count"] == 0
+        event_detail = client.get(
+            f"/api/events/{event_record['event_id']}"
+        ).json()
+        assert event_detail["dispatches"] == []
+        assert event_detail["agent_runs"] == []
+        assert event_detail["preflight"] is None
+        assert client.get("/api/events/unknown-event").status_code == 404
         assert client.post(
             "/api/change-requests/first/999/emit-discovered"
         ).status_code == 404
@@ -800,6 +899,11 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
             environment={"SECRET": MASK},
             config_revision="revision-test",
             max_attempts=1,
+            model_snapshot={
+                "execution_mode": "cli",
+                "model": "gpt-web",
+                "model_source": "runtime",
+            },
         )
         assert reservation is not None
         store.append_run_log(
@@ -817,7 +921,13 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
                 final_message="完成",
             )
         )
-        assert client.get("/api/runs/run-web").json()["environment"] == {"SECRET": MASK}
+        run_detail = client.get("/api/runs/run-web").json()
+        assert run_detail["environment"] == {"SECRET": MASK}
+        assert run_detail["model_snapshot"] == {
+            "execution_mode": "cli",
+            "model": "gpt-web",
+            "model_source": "runtime",
+        }
         assert client.get("/api/runs/run-web/logs").json()[0]["event_type"] == "item.completed"
         stream = client.get("/api/runs/run-web/stream")
         assert "event: item.completed" in stream.text
@@ -897,6 +1007,18 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/change-requests?repository_id=second&status=closed&limit=10"
         ).json()
         assert [item["snapshot_key"] for item in filtered_snapshots] == [second.key]
+        change_request_detail = client.get(
+            "/api/change-request-detail?repository_id=second&number=2"
+        )
+        assert change_request_detail.status_code == 200
+        assert change_request_detail.json()["snapshot_key"] == second.key
+        assert [
+            item["event_id"]
+            for item in change_request_detail.json()["events"]
+        ] == [second_event.id]
+        assert client.get(
+            "/api/change-request-detail?repository_id=second&number=999"
+        ).status_code == 404
 
         assert len(client.get("/api/events?limit=1").json()) == 1
         all_events = client.get("/api/events?all_records=true").json()
@@ -908,7 +1030,166 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/events?repository_id=second&status=cancelled&limit=10"
         ).json()
         assert [item["event_id"] for item in filtered_events] == [second_event.id]
+        number_events = client.get("/api/events?number=2&limit=10").json()
+        assert [item["event_id"] for item in number_events] == [second_event.id]
+
+        reservation = store.begin_preflight_run(
+            proposed_run_id="web-preflight",
+            idempotency_key="first:1:web-preflight",
+            event_id=first_event.id,
+            repository_id="first",
+            number=1,
+            head_sha=first.head_sha,
+            config_revision="revision-web",
+            max_attempts=2,
+        )
+        assert reservation is not None
+        store.initialize_preflight_steps(
+            reservation.run_id,
+            [{"name": "tests", "command": ["python", "-m", "pytest"]}],
+        )
+        store.update_preflight_step(
+            reservation.run_id,
+            0,
+            status="running",
+            timeout_seconds=120,
+        )
+        store.update_preflight_step(
+            reservation.run_id,
+            0,
+            status="failure",
+            timeout_seconds=120,
+            exit_code=1,
+        )
+        store.finish_preflight_run(
+            PreflightResult(
+                run_id=reservation.run_id,
+                repository_id="first",
+                number=1,
+                head_sha=first.head_sha,
+                status="failure",
+                failed_step="tests",
+                exit_code=1,
+                output="pytest failed",
+            )
+        )
+        agent_reservation = store.begin_agent_run(
+            proposed_run_id="web-filter-agent",
+            root_run_id=None,
+            parent_run_id=None,
+            idempotency_key="web-filter-agent-key",
+            event_id=first_event.id,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key=first_event.resource_key,
+            prompt="筛选测试",
+            max_attempts=1,
+        )
+        assert agent_reservation is not None
+        store.finish_agent_run(
+            AgentResult(
+                run_id=agent_reservation.run_id,
+                root_run_id=agent_reservation.root_run_id,
+                agent_name="reviewer",
+                status="completed",
+            )
+        )
+
+        filtered_runs = client.get(
+            "/api/runs?repository_id=first&number=1&status_group=success&limit=10"
+        ).json()
+        assert [item["run_id"] for item in filtered_runs] == [
+            agent_reservation.run_id
+        ]
+        assert client.get("/api/runs?status_group=failure").json() == []
+        assert len(client.get("/api/runs?all_records=true").json()) == 1
+        assert client.get("/api/runs?status_group=unknown").status_code == 422
+        assert client.get(
+            "/api/runs?status=completed&status_group=success"
+        ).status_code == 422
+
+        preflight_summaries = client.get("/api/preflight-runs").json()
+        assert preflight_summaries[0]["run_id"] == reservation.run_id
+        assert preflight_summaries[0]["event_type"] == first_event.type
+        assert preflight_summaries[0]["trigger_source"] == "event"
+        assert preflight_summaries[0]["phase"] == "finished"
+        assert "output" not in preflight_summaries[0]
+        filtered_preflights = client.get(
+            "/api/preflight-runs?repository_id=first&number=1"
+            "&status_group=failure&limit=10"
+        ).json()
+        assert [item["run_id"] for item in filtered_preflights] == [
+            reservation.run_id
+        ]
+        assert client.get(
+            "/api/preflight-runs?status_group=waiting"
+        ).json() == []
+        assert len(
+            client.get("/api/preflight-runs?all_records=true").json()
+        ) == 1
+        assert client.get(
+            "/api/preflight-runs?status=failure&status_group=failure"
+        ).status_code == 422
+        preflight_detail = client.get(
+            f"/api/preflight-runs/{reservation.run_id}"
+        ).json()
+        assert preflight_detail["output"] == "pytest failed"
+        assert preflight_detail["steps"][0]["name"] == "tests"
+        assert preflight_detail["steps"][0]["command"] == ["python", "-m", "pytest"]
+        assert preflight_detail["steps"][0]["status"] == "failure"
+        assert preflight_detail["linked_events"][0]["event_id"] == first_event.id
+        log_id = store.append_preflight_log(
+            reservation.run_id,
+            stream="stdout",
+            event_type="output",
+            payload="live pytest output\n",
+        )
+        preflight_logs = client.get(
+            f"/api/preflight-runs/{reservation.run_id}/logs"
+        ).json()
+        assert preflight_logs == [
+            {
+                "id": log_id,
+                "run_id": reservation.run_id,
+                "created_at": preflight_logs[0]["created_at"],
+                "stream": "stdout",
+                "event_type": "output",
+                "payload": "live pytest output\n",
+            }
+        ]
+        superseded = store.begin_preflight_run(
+            proposed_run_id="web-preflight-superseded",
+            idempotency_key="second:2:web-preflight-superseded",
+            event_id=second_event.id,
+            repository_id="second",
+            number=2,
+            head_sha=second.head_sha,
+            config_revision="revision-web",
+            max_attempts=2,
+        )
+        assert superseded is not None
+        store.finish_preflight_run(
+            PreflightResult(
+                run_id=superseded.run_id,
+                repository_id="second",
+                number=2,
+                head_sha=second.head_sha,
+                status="superseded",
+                error="事件 Head 已被后续提交取代",
+            )
+        )
+        superseded_runs = client.get(
+            "/api/preflight-runs?status=superseded"
+        ).json()
+        assert [item["run_id"] for item in superseded_runs] == [superseded.run_id]
+        superseded_detail = client.get(
+            f"/api/preflight-runs/{superseded.run_id}"
+        ).json()
+        assert superseded_detail["status"] == "superseded"
+        assert superseded_detail["error"] == "事件 Head 已被后续提交取代"
+        assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422
+        assert client.get("/api/events?number=0").status_code == 422
         assert client.get("/api/change-requests?status=unknown").status_code == 422
 
 
@@ -968,6 +1249,7 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     assert result["models"][0]["slug"] == "gpt-test"
     assert result["models"][0]["supported_reasoning_levels"] == ["low", "medium"]
     assert result["models"][0]["supports_fast_mode"] is True
+    assert result["catalog_source"] == "bundled"
     assert result["user_model"] == "gpt-user"
     assert result["inherited_model"] == {
         "value": "gpt-user",
@@ -997,6 +1279,64 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     }
     assert "credential" not in result
     assert "不得返回的配置" not in str(result)
+
+
+def test_codex_runtime_options_prefer_visible_account_models(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """账号缓存存在时应优先返回可见模型，并过滤隐藏模型。"""
+
+    config_path = write_config(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        '{"client_version":"0.148.0","models":['
+        '{"slug":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark",'
+        '"visibility":"list","default_reasoning_level":"medium",'
+        '"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},'
+        '{"slug":"hidden-model","display_name":"Hidden",'
+        '"visibility":"hide","supported_reasoning_levels":[]}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"models\":[{\"slug\":\"legacy-bundled\"}]}'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["runtime"] = {"codex_binary": str(fake_codex)}
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    async def effective_config(*_args):
+        return {}
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.read_codex_effective_config",
+        effective_config,
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        result = client.get("/api/codex/runtime-options").json()
+
+    assert result["catalog_source"] == "account_cache"
+    assert result["catalog_error"] is None
+    assert result["models"] == [
+        {
+            "slug": "gpt-5.3-codex-spark",
+            "display_name": "GPT-5.3-Codex-Spark",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": ["low", "high"],
+            "supports_fast_mode": False,
+        }
+    ]
 
 
 def test_codex_runtime_options_degrades_when_app_server_diagnostics_fail(

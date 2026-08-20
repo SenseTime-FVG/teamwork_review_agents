@@ -16,6 +16,8 @@ export type RepositoryPreflightStep = {
 
 export type RepositoryPreflight = {
   enabled?: boolean;
+  cache_enabled?: boolean;
+  publish_failure_comment?: boolean;
   status_context?: string;
   timeout_seconds?: number;
   max_output_bytes?: number;
@@ -104,6 +106,7 @@ export type Agent = {
 export type CodexConfigValue = string | number | boolean | Array<string | number | boolean>;
 
 export type CodexRuntimeConfig = {
+  execution_mode?: "cli" | "model";
   model?: string;
   model_reasoning_effort?: string;
   fast_mode?: "inherit" | "standard" | "fast";
@@ -147,6 +150,7 @@ export type CodexRuntimeOptions = {
     supported_reasoning_levels: string[];
     supports_fast_mode: boolean;
   }>;
+  catalog_source: "account_cache" | "bundled" | "unavailable";
   inherited_model: {
     value?: string | null;
     source: "runtime" | "codex" | "user" | "builtin";
@@ -191,6 +195,14 @@ export type CodexRuntimeOptions = {
     backend?: string | null;
     error?: string | null;
   };
+};
+
+export type CodexConnectionTestResult = {
+  success: true;
+  mode: "cli" | "model";
+  model?: string | null;
+  reply: string;
+  elapsed_seconds: number;
 };
 
 export type CodexRateLimitWindow = {
@@ -326,6 +338,10 @@ export type ChangeRequestRecord = {
   } | null;
 };
 
+export type ChangeRequestDetailRecord = ChangeRequestRecord & {
+  events: EventRecord[];
+};
+
 export type ManualLatestEventBatchResult = {
   repository_id: string;
   number: number;
@@ -369,6 +385,18 @@ export type RunSummary = {
   finished_at?: number | null;
 };
 
+export type AgentModelSnapshot = {
+  execution_mode: "cli" | "model";
+  model?: string | null;
+  model_source: "agent" | "runtime" | "codex_user" | "codex_default" | string;
+  reasoning_effort?: string | null;
+  reasoning_effort_source: string;
+  fast_mode?: string | null;
+  fast_mode_source: string;
+  verbosity?: string | null;
+  verbosity_source: string;
+};
+
 export type RunDetail = RunSummary & {
   prompt: string;
   environment: Record<string, string>;
@@ -376,6 +404,7 @@ export type RunDetail = RunSummary & {
   final_message?: string | null;
   thread_id?: string | null;
   usage?: Record<string, unknown>;
+  model_snapshot?: AgentModelSnapshot | null;
   children: RunSummary[];
 };
 
@@ -398,6 +427,7 @@ export type EventRecord = {
   error?: string | null;
   queue_reason?: string | null;
   trigger_count: number;
+  sub_agent_count: number;
   agent_queued_count: number;
   agent_preparing_count: number;
   agent_running_count: number;
@@ -410,6 +440,117 @@ export type EventRecord = {
   source_activity_id?: string | null;
   source_activity_type?: string | null;
   source_occurred_at?: string | null;
+  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | "superseded" | null;
+  preflight_run_id?: string | null;
+  preflight_exit_code?: number | null;
+  preflight_failed_step?: string | null;
+  preflight_error?: string | null;
+  preflight_status_published?: number | boolean | null;
+  preflight_reused?: number | boolean | null;
   created_at: number;
   updated_at: number;
+};
+
+export type EventDispatchDetail = {
+  idempotency_key: string;
+  rule_name: string;
+  agent_name: string;
+  created_at: number;
+  run_id?: string | null;
+  root_run_id?: string | null;
+  parent_run_id?: string | null;
+  run_status?: string | null;
+  run_error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+};
+
+export type EventAgentRunSummary = {
+  run_id: string;
+  root_run_id: string;
+  parent_run_id?: string | null;
+  idempotency_key: string;
+  rule_name?: string | null;
+  agent_name: string;
+  run_status: string;
+  run_error?: string | null;
+  started_at: number;
+  finished_at?: number | null;
+};
+
+export type EventPreflightSummary = {
+  run_id: string;
+  repository_id: string;
+  number: number;
+  head_sha: string;
+  config_revision: string;
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "superseded";
+  attempts: number;
+  failed_step?: string | null;
+  exit_code?: number | null;
+  error?: string | null;
+  status_published: number | boolean;
+  started_at: number;
+  finished_at?: number | null;
+  reused: number | boolean;
+  linked_at: number;
+};
+
+export type EventDetailRecord = EventRecord & {
+  dispatches: EventDispatchDetail[];
+  agent_runs: EventAgentRunSummary[];
+  preflights: EventPreflightSummary[];
+  preflight?: EventPreflightSummary | null;
+};
+
+export type PreflightRunSummary = {
+  run_id: string;
+  event_id?: string | null;
+  repository_id: string;
+  number?: number | null;
+  head_sha: string;
+  config_revision: string;
+  trigger_source: "event" | "manual";
+  branch?: string | null;
+  phase: string;
+  cache_path?: string | null;
+  cancel_requested: number | boolean;
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "superseded";
+  attempts: number;
+  failed_step?: string | null;
+  exit_code?: number | null;
+  error?: string | null;
+  status_published: number | boolean;
+  started_at: number;
+  finished_at?: number | null;
+  event_type?: string | null;
+  change_request_title?: string | null;
+  change_request_url?: string | null;
+  linked_event_count: number;
+  reused_event_count: number;
+};
+
+export type PreflightStepRunDetail = {
+  step_index: number;
+  name: string;
+  command: string[];
+  status: "pending" | "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "skipped";
+  timeout_seconds?: number | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+};
+
+export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
+  output: string;
+  steps: PreflightStepRunDetail[];
+  linked_events: Array<{
+    event_id: string;
+    event_type: string;
+    status: string;
+    occurred_at: string;
+    reused: number | boolean;
+    linked_at: number;
+  }>;
 };

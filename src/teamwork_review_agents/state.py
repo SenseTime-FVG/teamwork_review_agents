@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 from .events import TARGET_COMMITS_CHANGED_EVENT, activity_event_type
 from .models import (
@@ -96,6 +96,9 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_event_inbox_status
                 ON event_inbox(status, updated_at);
 
+                CREATE INDEX IF NOT EXISTS idx_event_inbox_change_request
+                ON event_inbox(repository_id, number, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS event_agent_dispatches (
                     event_id TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
@@ -136,6 +139,7 @@ class StateStore:
                     prompt TEXT NOT NULL,
                     environment TEXT NOT NULL DEFAULT '{}',
                     config_revision TEXT,
+                    model_snapshot TEXT,
                     final_message TEXT,
                     thread_id TEXT,
                     usage TEXT,
@@ -158,11 +162,16 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS preflight_runs (
                     run_id TEXT PRIMARY KEY,
                     idempotency_key TEXT NOT NULL UNIQUE,
-                    event_id TEXT NOT NULL,
+                    event_id TEXT,
                     repository_id TEXT NOT NULL,
-                    number INTEGER NOT NULL,
+                    number INTEGER,
                     head_sha TEXT NOT NULL,
                     config_revision TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL DEFAULT 'event',
+                    branch TEXT,
+                    phase TEXT NOT NULL DEFAULT 'queued',
+                    cache_path TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 1,
                     failed_step TEXT,
@@ -176,6 +185,68 @@ class StateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_change_request
                 ON preflight_runs(repository_id, number, head_sha);
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_runs_event_started
+                ON preflight_runs(event_id, started_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_runs_started
+                ON preflight_runs(started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS preflight_step_runs (
+                    run_id TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timeout_seconds REAL,
+                    started_at REAL,
+                    finished_at REAL,
+                    exit_code INTEGER,
+                    error TEXT,
+                    PRIMARY KEY(run_id, step_index),
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_step_runs_status
+                ON preflight_step_runs(run_id, status, step_index);
+
+                CREATE TABLE IF NOT EXISTS preflight_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    stream TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_preflight_logs_cursor
+                ON preflight_logs(run_id, id);
+
+                CREATE TABLE IF NOT EXISTS preflight_failure_comments (
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    status_context TEXT NOT NULL,
+                    remote_comment_id TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(repository_id, number)
+                );
+
+                CREATE TABLE IF NOT EXISTS event_preflight_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    reused INTEGER NOT NULL DEFAULT 0,
+                    linked_at REAL NOT NULL,
+                    UNIQUE(event_id, run_id),
+                    FOREIGN KEY(event_id) REFERENCES event_inbox(event_id) ON DELETE CASCADE,
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_preflight_links_event
+                ON event_preflight_links(event_id, linked_at DESC);
 
                 CREATE TABLE IF NOT EXISTS run_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,6 +284,7 @@ class StateStore:
                 );
                 """
             )
+            self._migrate_preflight_runs_for_manual(connection)
             self._ensure_column(
                 connection,
                 "agent_runs",
@@ -260,6 +332,7 @@ class StateStore:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "agent_runs", "queue_reason", "TEXT")
+            self._ensure_column(connection, "agent_runs", "model_snapshot", "TEXT")
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             cancel_source_added = self._ensure_column(
                 connection,
@@ -273,8 +346,113 @@ class StateStore:
                 "status_published",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_column(
+                connection,
+                "preflight_runs",
+                "trigger_source",
+                "TEXT NOT NULL DEFAULT 'event'",
+            )
+            self._ensure_column(connection, "preflight_runs", "branch", "TEXT")
+            self._ensure_column(
+                connection,
+                "preflight_runs",
+                "phase",
+                "TEXT NOT NULL DEFAULT 'queued'",
+            )
+            self._ensure_column(connection, "preflight_runs", "cache_path", "TEXT")
+            self._ensure_column(
+                connection,
+                "preflight_runs",
+                "cancel_requested",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT preflight.event_id, preflight.run_id, 0,
+                       preflight.started_at
+                FROM preflight_runs AS preflight
+                JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                """
+            )
             if cancel_source_added:
                 self._recover_legacy_shutdown_cancellations(connection)
+
+    @staticmethod
+    def _migrate_preflight_runs_for_manual(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """把旧版强制绑定事件和编号的 CI 表迁移为通用运行表。"""
+
+        columns = {
+            str(row["name"]): row
+            for row in connection.execute(
+                "PRAGMA table_info(preflight_runs)"
+            ).fetchall()
+        }
+        if not columns or (
+            not int(columns["event_id"]["notnull"])
+            and not int(columns["number"]["notnull"])
+        ):
+            return
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE preflight_runs_migrated (
+                    run_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    event_id TEXT,
+                    repository_id TEXT NOT NULL,
+                    number INTEGER,
+                    head_sha TEXT NOT NULL,
+                    config_revision TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL DEFAULT 'event',
+                    branch TEXT,
+                    phase TEXT NOT NULL DEFAULT 'finished',
+                    cache_path TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    failed_step TEXT,
+                    exit_code INTEGER,
+                    output TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    status_published INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL NOT NULL,
+                    finished_at REAL
+                );
+                INSERT INTO preflight_runs_migrated (
+                    run_id, idempotency_key, event_id, repository_id, number,
+                    head_sha, config_revision, trigger_source, phase, status,
+                    attempts, failed_step, exit_code, output, error,
+                    status_published, started_at, finished_at
+                )
+                SELECT run_id, idempotency_key, event_id, repository_id, number,
+                       head_sha, config_revision, 'event',
+                       CASE WHEN status = 'running' THEN 'running_steps'
+                            ELSE 'finished' END,
+                       status, attempts, failed_step, exit_code, output, error,
+                       status_published, started_at, finished_at
+                FROM preflight_runs;
+                DROP TABLE preflight_runs;
+                ALTER TABLE preflight_runs_migrated RENAME TO preflight_runs;
+                CREATE INDEX idx_preflight_runs_change_request
+                ON preflight_runs(repository_id, number, head_sha);
+                CREATE INDEX idx_preflight_runs_event_started
+                ON preflight_runs(event_id, started_at DESC);
+                CREATE INDEX idx_preflight_runs_started
+                ON preflight_runs(started_at DESC);
+                COMMIT;
+                """
+            )
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
 
     @staticmethod
     def _ensure_column(
@@ -395,9 +573,29 @@ class StateStore:
             )
             connection.execute(
                 """
-                UPDATE preflight_runs
-                SET status = 'error', error = '服务异常退出，CI 运行未正常结束',
+                UPDATE preflight_step_runs
+                SET status = 'error',
+                    error = COALESCE(error, '服务异常退出，CI 步骤未正常结束'),
                     finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = 'skipped',
+                    error = COALESCE(error, '服务异常退出，步骤未执行'),
+                    finished_at = ?
+                WHERE status = 'pending'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_runs
+                SET status = 'error', phase = 'finished',
+                    error = '服务异常退出，CI 运行未正常结束', finished_at = ?
                 WHERE status = 'running'
                 """,
                 (now,),
@@ -625,6 +823,7 @@ class StateStore:
         limit: int | None = 100,
         *,
         repository_id: str | None = None,
+        number: int | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
@@ -636,6 +835,11 @@ class StateStore:
                 "json_extract(snapshots.payload, '$.repository_id') = ?"
             )
             parameters.append(repository_id)
+        if number is not None:
+            conditions.append(
+                "CAST(json_extract(snapshots.payload, '$.number') AS INTEGER) = ?"
+            )
+            parameters.append(number)
         if status:
             conditions.append("json_extract(snapshots.payload, '$.state') = ?")
             parameters.append(status)
@@ -717,6 +921,29 @@ class StateStore:
             )
             results.append(summary)
         return results
+
+    def get_change_request_detail(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> dict[str, Any] | None:
+        """按需返回 MR/PR 当前快照及其全部关联事件摘要。"""
+
+        snapshots = self.list_snapshots(
+            None,
+            repository_id=repository_id,
+            number=number,
+        )
+        if not snapshots:
+            return None
+        return {
+            **snapshots[0],
+            "events": self.list_events(
+                None,
+                repository_id=repository_id,
+                number=number,
+            ),
+        }
 
     def save_snapshot_and_events(
         self,
@@ -1042,8 +1269,10 @@ class StateStore:
                     """
                     INSERT INTO preflight_runs (
                         run_id, idempotency_key, event_id, repository_id, number,
-                        head_sha, config_revision, status, attempts, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 1, ?)
+                        head_sha, config_revision, trigger_source, phase,
+                        status, attempts, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'event', 'preparing',
+                              'running', 1, ?)
                     """,
                     (
                         proposed_run_id,
@@ -1056,6 +1285,18 @@ class StateStore:
                         now,
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO event_preflight_links (
+                        event_id, run_id, reused, linked_at
+                    )
+                    SELECT ?, ?, 0, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM event_inbox WHERE event_id = ?
+                    )
+                    """,
+                    (event_id, proposed_run_id, now, event_id),
+                )
                 connection.commit()
                 return PreflightReservation(proposed_run_id, 1)
 
@@ -1067,14 +1308,229 @@ class StateStore:
                 """
                 UPDATE preflight_runs
                 SET status = 'running', attempts = ?, event_id = ?,
+                    trigger_source = 'event', phase = 'preparing',
+                    branch = NULL, cache_path = NULL, cancel_requested = 0,
                     failed_step = NULL, exit_code = NULL, output = '', error = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
                 (attempts, event_id, now, row["run_id"]),
             )
+            connection.execute(
+                """
+                INSERT INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT ?, ?, 0, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM event_inbox WHERE event_id = ?
+                )
+                ON CONFLICT(event_id, run_id) DO UPDATE SET
+                    reused = 0,
+                    linked_at = excluded.linked_at
+                """,
+                (event_id, row["run_id"], now, event_id),
+            )
             connection.commit()
             return PreflightReservation(str(row["run_id"]), attempts)
+
+    def create_manual_preflight_run(
+        self,
+        *,
+        run_id: str,
+        repository_id: str,
+        config_revision: str,
+    ) -> None:
+        """创建一次不绑定 MR / PR 事件的手动 CI 运行。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO preflight_runs (
+                    run_id, idempotency_key, event_id, repository_id, number,
+                    head_sha, config_revision, trigger_source, phase,
+                    status, attempts, started_at
+                ) VALUES (?, ?, NULL, ?, NULL, '', ?, 'manual', 'queued',
+                          'running', 1, ?)
+                """,
+                (
+                    run_id,
+                    f"manual:{run_id}",
+                    repository_id,
+                    config_revision,
+                    time.time(),
+                ),
+            )
+
+    def set_preflight_phase(
+        self,
+        run_id: str,
+        phase: str,
+        *,
+        branch: str | None = None,
+        head_sha: str | None = None,
+        cache_path: str | None = None,
+    ) -> None:
+        """更新 CI 当前阶段，并按需补充实际分支、提交和缓存目录。"""
+
+        assignments = ["phase = ?"]
+        parameters: list[Any] = [phase]
+        for column, value in (
+            ("branch", branch),
+            ("head_sha", head_sha),
+            ("cache_path", cache_path),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                parameters.append(value)
+        parameters.append(run_id)
+        with self.connect() as connection:
+            connection.execute(
+                f"UPDATE preflight_runs SET {', '.join(assignments)} "
+                "WHERE run_id = ?",
+                parameters,
+            )
+
+    def preflight_cancel_requested(self, run_id: str) -> bool:
+        """返回手动 CI 是否已收到取消请求。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_requested FROM preflight_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return row is not None and bool(row["cancel_requested"])
+
+    def request_cancel_preflight(self, run_id: str) -> bool:
+        """为仍在运行的手动 CI 设置取消标记。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE preflight_runs
+                SET cancel_requested = 1, phase = 'cancelling'
+                WHERE run_id = ? AND trigger_source = 'manual'
+                  AND status = 'running'
+                """,
+                (run_id,),
+            )
+        return cursor.rowcount > 0
+
+    def link_events_to_preflight(
+        self,
+        event_ids: Iterable[str],
+        run_id: str,
+        *,
+        reused: bool,
+    ) -> None:
+        """把一次新执行或复用的 CI 结果关联到当前匹配事件。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return
+        now = time.time()
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO event_preflight_links (
+                    event_id, run_id, reused, linked_at
+                )
+                SELECT ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM event_inbox WHERE event_id = ?
+                ) AND EXISTS (
+                    SELECT 1 FROM preflight_runs WHERE run_id = ?
+                )
+                ON CONFLICT(event_id, run_id) DO UPDATE SET
+                    reused = excluded.reused,
+                    linked_at = excluded.linked_at
+                """,
+                [
+                    (event_id, run_id, int(reused), now, event_id, run_id)
+                    for event_id in ids
+                ],
+            )
+
+    def initialize_preflight_steps(
+        self,
+        run_id: str,
+        steps: Iterable[dict[str, Any]],
+    ) -> None:
+        """为当前 Preflight 尝试重建不可变的命令步骤快照。"""
+
+        records = tuple(steps)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM preflight_step_runs WHERE run_id = ?",
+                (run_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO preflight_step_runs (
+                    run_id, step_index, name, command, status, timeout_seconds
+                ) VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                [
+                    (
+                        run_id,
+                        index,
+                        str(step["name"]),
+                        json.dumps(list(step["command"]), ensure_ascii=False),
+                        step.get("timeout_seconds"),
+                    )
+                    for index, step in enumerate(records)
+                ],
+            )
+
+    def update_preflight_step(
+        self,
+        run_id: str,
+        step_index: int,
+        *,
+        status: str,
+        timeout_seconds: float | None = None,
+        exit_code: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """更新单个 CI 步骤的实时状态与最终结果。"""
+
+        now = time.time()
+        terminal = status in {
+            "success",
+            "failure",
+            "timed_out",
+            "error",
+            "cancelled",
+            "skipped",
+        }
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = ?,
+                    timeout_seconds = COALESCE(?, timeout_seconds),
+                    started_at = CASE
+                        WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                        ELSE started_at
+                    END,
+                    finished_at = CASE WHEN ? THEN ? ELSE NULL END,
+                    exit_code = ?, error = ?
+                WHERE run_id = ? AND step_index = ?
+                """,
+                (
+                    status,
+                    timeout_seconds,
+                    status,
+                    now,
+                    int(terminal),
+                    now,
+                    exit_code,
+                    error,
+                    run_id,
+                    step_index,
+                ),
+            )
 
     def load_preflight_result(self, idempotency_key: str) -> PreflightResult | None:
         """按幂等键读取当前 CI 结果。"""
@@ -1093,7 +1549,7 @@ class StateStore:
         return PreflightResult(
             run_id=str(row["run_id"]),
             repository_id=str(row["repository_id"]),
-            number=int(row["number"]),
+            number=None if row["number"] is None else int(row["number"]),
             head_sha=str(row["head_sha"]),
             status=str(row["status"]),
             failed_step=row["failed_step"],
@@ -1106,12 +1562,15 @@ class StateStore:
     def finish_preflight_run(self, result: PreflightResult) -> None:
         """保存一次 CI 运行的终态与有界输出。"""
 
+        finished_at = time.time()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 UPDATE preflight_runs
                 SET status = ?, failed_step = ?, exit_code = ?, output = ?,
-                    error = ?, status_published = ?, finished_at = ?
+                    error = ?, status_published = ?, phase = 'finished',
+                    finished_at = ?
                 WHERE run_id = ?
                 """,
                 (
@@ -1121,7 +1580,45 @@ class StateStore:
                     result.output,
                     result.error,
                     int(result.status_published),
-                    time.time(),
+                    finished_at,
+                    result.run_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE preflight_step_runs
+                SET status = CASE
+                        WHEN ? = 'cancelled' AND status = 'running'
+                        THEN 'cancelled'
+                        WHEN status = 'running' THEN 'error'
+                        ELSE 'skipped'
+                    END,
+                    error = COALESCE(
+                        error,
+                        CASE
+                            WHEN status = 'running'
+                            THEN CASE
+                                WHEN ? = 'cancelled' THEN '用户取消了手动 CI'
+                                WHEN ? = 'superseded'
+                                THEN '事件 Head 已更新，本步骤未执行'
+                                ELSE 'Preflight 已结束，但步骤未正常收尾'
+                            END
+                            ELSE CASE
+                                WHEN ? = 'superseded'
+                                THEN '事件 Head 已更新，本步骤未执行'
+                                ELSE '前序步骤结束后未执行'
+                            END
+                        END
+                    ),
+                    finished_at = ?
+                WHERE run_id = ? AND status IN ('pending', 'running')
+                """,
+                (
+                    result.status,
+                    result.status,
+                    result.status,
+                    result.status,
+                    finished_at,
                     result.run_id,
                 ),
             )
@@ -1139,6 +1636,78 @@ class StateStore:
                 (run_id,),
             )
 
+    def get_preflight_failure_comment(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> dict[str, object] | None:
+        """读取一个 MR/PR 当前由服务维护的失败评论映射。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT repository_id, number, status_context, remote_comment_id,
+                       head_sha, content_hash, updated_at
+                FROM preflight_failure_comments
+                WHERE repository_id = ? AND number = ?
+                """,
+                (repository_id, number),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_preflight_failure_comment(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        status_context: str,
+        remote_comment_id: str,
+        head_sha: str,
+        content_hash: str,
+    ) -> None:
+        """保存或更新失败评论映射，确保后续失败复用同一条评论。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO preflight_failure_comments (
+                    repository_id, number, status_context, remote_comment_id,
+                    head_sha, content_hash, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository_id, number) DO UPDATE SET
+                    status_context = excluded.status_context,
+                    remote_comment_id = excluded.remote_comment_id,
+                    head_sha = excluded.head_sha,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    repository_id,
+                    number,
+                    status_context,
+                    remote_comment_id,
+                    head_sha,
+                    content_hash,
+                    time.time(),
+                ),
+            )
+
+    def delete_preflight_failure_comment(
+        self,
+        repository_id: str,
+        number: int,
+    ) -> None:
+        """删除本地失败评论映射；远端删除应由调用方先完成。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM preflight_failure_comments
+                WHERE repository_id = ? AND number = ?
+                """,
+                (repository_id, number),
+            )
+
     def begin_agent_run(
         self,
         *,
@@ -1154,6 +1723,7 @@ class StateStore:
         environment: dict[str, str] | None = None,
         config_revision: str | None = None,
         max_attempts: int,
+        model_snapshot: dict[str, Any] | None = None,
     ) -> RunReservation | None:
         """幂等创建 Agent 运行，失败记录可在上限内复用重试。"""
 
@@ -1175,8 +1745,9 @@ class StateStore:
                     INSERT INTO agent_runs (
                         run_id, root_run_id, parent_run_id, idempotency_key,
                         event_id, rule_name, agent_name, resource_key,
-                        status, attempts, prompt, environment, config_revision, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)
+                        status, attempts, prompt, environment, config_revision,
+                        model_snapshot, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?)
                     """,
                     (
                         proposed_run_id,
@@ -1190,6 +1761,11 @@ class StateStore:
                         prompt,
                         json.dumps(environment or {}, ensure_ascii=False),
                         config_revision,
+                        (
+                            json.dumps(model_snapshot, ensure_ascii=False)
+                            if model_snapshot is not None
+                            else None
+                        ),
                         now,
                     ),
                 )
@@ -1216,7 +1792,7 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = 'queued', attempts = ?, prompt = ?, environment = ?,
-                    config_revision = ?, error = NULL,
+                    config_revision = ?, model_snapshot = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
@@ -1230,6 +1806,11 @@ class StateStore:
                     prompt,
                     json.dumps(environment or {}, ensure_ascii=False),
                     config_revision,
+                    (
+                        json.dumps(model_snapshot, ensure_ascii=False)
+                        if model_snapshot is not None
+                        else None
+                    ),
                     now,
                     row["run_id"],
                 ),
@@ -1776,6 +2357,53 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def append_preflight_log(
+        self,
+        run_id: str,
+        *,
+        stream: str,
+        event_type: str,
+        payload: str | dict[str, Any] | list[Any],
+    ) -> int:
+        """追加一条可供 CI 详情页按游标实时读取的日志。"""
+
+        encoded = (
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False)
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO preflight_logs (
+                    run_id, created_at, stream, event_type, payload
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_id, time.time(), stream, event_type, encoded),
+            )
+        return int(cursor.lastrowid)
+
+    def list_preflight_logs(
+        self,
+        run_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """返回某次 CI 在指定游标之后产生的实时日志。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, run_id, created_at, stream, event_type, payload
+                FROM preflight_logs
+                WHERE run_id = ? AND id > ?
+                ORDER BY id ASC LIMIT ?
+                """,
+                (run_id, after_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """返回运行详情和直属 sub-agent。"""
 
@@ -1804,7 +2432,7 @@ class StateStore:
                 (run_id,),
             ).fetchall()
         result = self._decorate_run_record(dict(row))
-        for key in ("environment", "usage"):
+        for key in ("environment", "usage", "model_snapshot"):
             if result.get(key):
                 result[key] = json.loads(result[key])
         result.pop("events", None)
@@ -1843,27 +2471,52 @@ class StateStore:
 
     def list_runs(
         self,
-        limit: int = 20,
+        limit: int | None = 20,
         *,
         status: str | None = None,
+        statuses: Sequence[str] | None = None,
         agent_name: str | None = None,
         repository_id: str | None = None,
+        number: int | None = None,
     ) -> list[dict[str, Any]]:
         """按可选条件返回最近 Agent 运行摘要。"""
 
         conditions: list[str] = []
         parameters: list[Any] = []
-        if status:
+        if statuses is not None:
+            if not statuses:
+                conditions.append("1 = 0")
+            else:
+                placeholders = ", ".join("?" for _ in statuses)
+                conditions.append(f"agent_runs.status IN ({placeholders})")
+                parameters.extend(statuses)
+        elif status:
             conditions.append("agent_runs.status = ?")
             parameters.append(status)
         if agent_name:
             conditions.append("agent_runs.agent_name = ?")
             parameters.append(agent_name)
         if repository_id:
-            conditions.append("agent_runs.resource_key LIKE ?")
-            parameters.append(f"%:{repository_id}:%")
+            conditions.append(
+                "(agent_runs.repository_id = ? OR event_inbox.repository_id = ? "
+                "OR (agent_runs.repository_id IS NULL "
+                "AND event_inbox.repository_id IS NULL "
+                "AND agent_runs.resource_key LIKE ?))"
+            )
+            parameters.extend(
+                (repository_id, repository_id, f"%:{repository_id}:%")
+            )
+        if number is not None:
+            conditions.append(
+                "(agent_runs.change_request_number = ? "
+                "OR event_inbox.number = ?)"
+            )
+            parameters.extend((number, number))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        parameters.append(limit)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
 
         with self.connect() as connection:
             rows = connection.execute(
@@ -1886,7 +2539,9 @@ class StateStore:
                        event_inbox.payload AS event_payload
                 FROM agent_runs
                 LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
-                {where} ORDER BY agent_runs.started_at DESC LIMIT ?
+                {where}
+                ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()
@@ -1921,6 +2576,8 @@ class StateStore:
         *,
         status: str | None = None,
         repository_id: str | None = None,
+        number: int | None = None,
+        event_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
 
@@ -1932,6 +2589,12 @@ class StateStore:
         if repository_id:
             conditions.append("event_inbox.repository_id = ?")
             parameters.append(repository_id)
+        if number is not None:
+            conditions.append("event_inbox.number = ?")
+            parameters.append(number)
+        if event_id:
+            conditions.append("event_inbox.event_id = ?")
+            parameters.append(event_id)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
@@ -1958,7 +2621,16 @@ class StateStore:
                            AS source_activity_type,
                        json_extract(event_inbox.payload, '$.source_occurred_at')
                            AS source_occurred_at,
+                       preflight.status AS preflight_status,
+                       preflight.run_id AS preflight_run_id,
+                       preflight.exit_code AS preflight_exit_code,
+                       preflight.failed_step AS preflight_failed_step,
+                       preflight.error AS preflight_error,
+                       preflight.status_published AS preflight_status_published,
+                       preflight_link.reused AS preflight_reused,
                        COALESCE(dispatch_stats.trigger_count, 0) AS trigger_count,
+                       COALESCE(dispatch_stats.sub_agent_count, 0)
+                           AS sub_agent_count,
                        COALESCE(dispatch_stats.agent_queued_count, 0)
                            AS agent_queued_count,
                        COALESCE(dispatch_stats.agent_preparing_count, 0)
@@ -1976,31 +2648,51 @@ class StateStore:
                 FROM event_inbox
                 LEFT JOIN (
                     SELECT dispatch.event_id,
-                           COUNT(*) AS trigger_count,
+                           COUNT(DISTINCT dispatch.idempotency_key)
+                               AS trigger_count,
                            SUM(
                                CASE
-                                   WHEN run.run_id IS NULL OR run.status = 'queued'
+                                   WHEN family.parent_run_id IS NOT NULL
+                                   THEN 1 ELSE 0
+                               END
+                           ) AS sub_agent_count,
+                           SUM(
+                               CASE
+                                   WHEN family.run_id IS NULL
+                                     OR family.status = 'queued'
                                    THEN 1 ELSE 0
                                END
                            ) AS agent_queued_count,
-                           SUM(CASE WHEN run.status = 'preparing' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'preparing' THEN 1 ELSE 0 END)
                                AS agent_preparing_count,
-                           SUM(CASE WHEN run.status = 'running' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'running' THEN 1 ELSE 0 END)
                                AS agent_running_count,
-                           SUM(CASE WHEN run.status = 'completed' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'completed' THEN 1 ELSE 0 END)
                                AS agent_completed_count,
-                           SUM(CASE WHEN run.status = 'failed' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'failed' THEN 1 ELSE 0 END)
                                AS agent_failed_count,
-                           SUM(CASE WHEN run.status = 'timed_out' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'timed_out' THEN 1 ELSE 0 END)
                                AS agent_timed_out_count,
-                           SUM(CASE WHEN run.status = 'cancelled' THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN family.status = 'cancelled' THEN 1 ELSE 0 END)
                                AS agent_cancelled_count
                     FROM event_agent_dispatches AS dispatch
-                    LEFT JOIN agent_runs AS run
-                        ON run.idempotency_key = dispatch.idempotency_key
+                    LEFT JOIN agent_runs AS root_run
+                        ON root_run.idempotency_key = dispatch.idempotency_key
+                    LEFT JOIN agent_runs AS family
+                        ON family.root_run_id = root_run.run_id
                     GROUP BY dispatch.event_id
                 ) AS dispatch_stats
                     ON dispatch_stats.event_id = event_inbox.event_id
+                LEFT JOIN event_preflight_links AS preflight_link
+                    ON preflight_link.id = (
+                        SELECT candidate.id
+                        FROM event_preflight_links AS candidate
+                        WHERE candidate.event_id = event_inbox.event_id
+                        ORDER BY candidate.linked_at DESC, candidate.id DESC
+                        LIMIT 1
+                    )
+                LEFT JOIN preflight_runs AS preflight
+                    ON preflight.run_id = preflight_link.run_id
                 {where}
                 ORDER BY julianday(
                              json_extract(event_inbox.payload, '$.occurred_at')
@@ -2012,6 +2704,227 @@ class StateStore:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
+        """按需返回单个事件、Agent 调度和全部 CI 摘要。"""
+
+        records = self.list_events(None, event_id=event_id)
+        if not records:
+            return None
+        with self.connect() as connection:
+            dispatch_rows = connection.execute(
+                """
+                SELECT dispatch.idempotency_key, dispatch.rule_name,
+                       dispatch.agent_name, dispatch.created_at,
+                       run.run_id, run.root_run_id, run.parent_run_id,
+                       run.status AS run_status,
+                       run.error AS run_error, run.started_at,
+                       run.finished_at
+                FROM event_agent_dispatches AS dispatch
+                LEFT JOIN agent_runs AS run
+                    ON run.idempotency_key = dispatch.idempotency_key
+                WHERE dispatch.event_id = ?
+                ORDER BY dispatch.created_at, dispatch.rule_name,
+                         dispatch.agent_name
+                """,
+                (event_id,),
+            ).fetchall()
+            agent_run_rows = connection.execute(
+                """
+                SELECT family.run_id, family.root_run_id,
+                       family.parent_run_id, family.idempotency_key,
+                       family.rule_name, family.agent_name,
+                       family.status AS run_status,
+                       family.error AS run_error, family.started_at,
+                       family.finished_at
+                FROM event_agent_dispatches AS dispatch
+                JOIN agent_runs AS root_run
+                    ON root_run.idempotency_key = dispatch.idempotency_key
+                JOIN agent_runs AS family
+                    ON family.root_run_id = root_run.run_id
+                WHERE dispatch.event_id = ?
+                ORDER BY family.started_at, family.run_id
+                """,
+                (event_id,),
+            ).fetchall()
+            preflight_rows = connection.execute(
+                """
+                SELECT preflight.run_id, preflight.repository_id,
+                       preflight.number, preflight.head_sha,
+                       preflight.config_revision, preflight.status,
+                       preflight.attempts, preflight.failed_step,
+                       preflight.exit_code,
+                       preflight.error, preflight.status_published,
+                       preflight.started_at, preflight.finished_at,
+                       link.reused, link.linked_at
+                FROM event_preflight_links AS link
+                JOIN preflight_runs AS preflight
+                    ON preflight.run_id = link.run_id
+                WHERE link.event_id = ?
+                ORDER BY link.linked_at DESC, link.id DESC
+                """,
+                (event_id,),
+            ).fetchall()
+        preflights = [dict(row) for row in preflight_rows]
+        return {
+            **records[0],
+            "dispatches": [dict(row) for row in dispatch_rows],
+            "agent_runs": [dict(row) for row in agent_run_rows],
+            "preflights": preflights,
+            # 保留最新单条字段，兼容只识别旧事件详情结构的客户端。
+            "preflight": preflights[0] if preflights else None,
+        }
+
+    def list_preflight_runs(
+        self,
+        limit: int | None = 100,
+        *,
+        status: str | None = None,
+        statuses: Sequence[str] | None = None,
+        repository_id: str | None = None,
+        number: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """按可选条件返回最近本地 Preflight / CI 运行摘要。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if statuses is not None:
+            if not statuses:
+                conditions.append("1 = 0")
+            else:
+                placeholders = ", ".join("?" for _ in statuses)
+                conditions.append(f"preflight.status IN ({placeholders})")
+                parameters.extend(statuses)
+        elif status:
+            conditions.append("preflight.status = ?")
+            parameters.append(status)
+        if repository_id:
+            conditions.append("preflight.repository_id = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append("preflight.number = ?")
+            parameters.append(number)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT preflight.run_id, preflight.event_id,
+                       preflight.repository_id, preflight.number,
+                       preflight.head_sha, preflight.config_revision,
+                       preflight.trigger_source, preflight.branch,
+                       preflight.phase, preflight.cache_path,
+                       preflight.cancel_requested,
+                       preflight.status, preflight.attempts,
+                       preflight.failed_step, preflight.exit_code,
+                       preflight.error, preflight.status_published,
+                       preflight.started_at, preflight.finished_at,
+                       event.event_type,
+                       json_extract(snapshot.payload, '$.title')
+                           AS change_request_title,
+                       json_extract(snapshot.payload, '$.web_url')
+                           AS change_request_url,
+                       COALESCE(link_stats.linked_event_count, 0)
+                           AS linked_event_count,
+                       COALESCE(link_stats.reused_event_count, 0)
+                           AS reused_event_count
+                FROM preflight_runs AS preflight
+                LEFT JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                LEFT JOIN snapshots AS snapshot
+                    ON snapshot.snapshot_key = (
+                        preflight.repository_id || ':' || preflight.number
+                    )
+                LEFT JOIN (
+                    SELECT run_id, COUNT(*) AS linked_event_count,
+                           SUM(CASE WHEN reused = 1 THEN 1 ELSE 0 END)
+                               AS reused_event_count
+                    FROM event_preflight_links
+                    GROUP BY run_id
+                ) AS link_stats ON link_stats.run_id = preflight.run_id
+                {where}
+                ORDER BY preflight.started_at DESC, preflight.run_id DESC
+                {limit_clause}
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_preflight_run(self, run_id: str) -> dict[str, Any] | None:
+        """按需返回单次本地 Preflight / CI 的完整结果与事件关联。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT preflight.run_id, preflight.event_id,
+                       preflight.repository_id, preflight.number,
+                       preflight.head_sha, preflight.config_revision,
+                       preflight.trigger_source, preflight.branch,
+                       preflight.phase, preflight.cache_path,
+                       preflight.cancel_requested,
+                       preflight.status, preflight.attempts,
+                       preflight.failed_step, preflight.exit_code,
+                       preflight.output, preflight.error,
+                       preflight.status_published, preflight.started_at,
+                       preflight.finished_at,
+                       event.event_type,
+                       json_extract(snapshot.payload, '$.title')
+                           AS change_request_title,
+                       json_extract(snapshot.payload, '$.web_url')
+                           AS change_request_url
+                FROM preflight_runs AS preflight
+                LEFT JOIN event_inbox AS event
+                    ON event.event_id = preflight.event_id
+                LEFT JOIN snapshots AS snapshot
+                    ON snapshot.snapshot_key = (
+                        preflight.repository_id || ':' || preflight.number
+                    )
+                WHERE preflight.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            event_rows = connection.execute(
+                """
+                SELECT event.event_id, event.event_type, event.status,
+                       json_extract(event.payload, '$.occurred_at')
+                           AS occurred_at,
+                       link.reused, link.linked_at
+                FROM event_preflight_links AS link
+                JOIN event_inbox AS event ON event.event_id = link.event_id
+                WHERE link.run_id = ?
+                ORDER BY link.linked_at DESC, link.id DESC
+                """,
+                (run_id,),
+            ).fetchall()
+            step_rows = connection.execute(
+                """
+                SELECT step_index, name, command, status, timeout_seconds,
+                       started_at, finished_at, exit_code, error
+                FROM preflight_step_runs
+                WHERE run_id = ?
+                ORDER BY step_index
+                """,
+                (run_id,),
+            ).fetchall()
+        steps: list[dict[str, Any]] = []
+        for step_row in step_rows:
+            step = dict(step_row)
+            try:
+                command = json.loads(str(step["command"]))
+            except (TypeError, ValueError):
+                command = []
+            step["command"] = command if isinstance(command, list) else []
+            steps.append(step)
+        return {
+            **dict(row),
+            "linked_events": [dict(event_row) for event_row in event_rows],
+            "steps": steps,
+        }
 
     def save_config_version(
         self,
@@ -2087,11 +3000,15 @@ class StateStore:
         return payload
 
     def prune_run_logs(self, older_than: float) -> int:
-        """删除超过保留期的运行日志。"""
+        """删除超过保留期的 Agent 与 CI 实时日志。"""
 
         with self.connect() as connection:
-            cursor = connection.execute(
+            run_cursor = connection.execute(
                 "DELETE FROM run_logs WHERE created_at < ?",
                 (older_than,),
             )
-        return cursor.rowcount
+            preflight_cursor = connection.execute(
+                "DELETE FROM preflight_logs WHERE created_at < ?",
+                (older_than,),
+            )
+        return run_cursor.rowcount + preflight_cursor.rowcount

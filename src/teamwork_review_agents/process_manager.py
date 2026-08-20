@@ -40,6 +40,7 @@ class RuntimePaths:
     pid_file: Path
     lock_file: Path
     log_file: Path
+    stop_file: Path
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,59 @@ def runtime_paths(config_path: str | Path) -> RuntimePaths:
         pid_file=directory / f"{prefix}.pid",
         lock_file=directory / f"{prefix}.lock",
         log_file=directory / f"{prefix}.log",
+        stop_file=directory / f"{prefix}.stop.json",
     )
+
+
+def _read_stop_targets(path: Path) -> set[tuple[int, str]]:
+    """读取停止请求中的进程身份，损坏或陈旧文件按空请求处理。"""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_targets = payload["targets"]
+    except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
+        return set()
+    targets: set[tuple[int, str]] = set()
+    if not isinstance(raw_targets, list):
+        return targets
+    for item in raw_targets:
+        if not isinstance(item, dict):
+            continue
+        try:
+            targets.add((int(item["pid"]), str(item["process_started_at"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return targets
+
+
+def _write_stop_request(paths: RuntimePaths, records: list[ProcessRecord]) -> None:
+    """原子写入绑定 PID 与启动时间的服务停止请求。"""
+
+    paths.directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "requested_at": datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
+        "targets": [
+            {
+                "pid": record.pid,
+                "process_started_at": record.process_started_at,
+            }
+            for record in records
+        ],
+    }
+    temporary = paths.stop_file.with_name(
+        f".{paths.stop_file.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, paths.stop_file)
+
+
+def _is_native_windows() -> bool:
+    """隔离平台判断，便于验证 Windows 不提前强制结束服务。"""
+
+    return os.name == "nt"
 
 
 def _process_started_at(pid: int) -> str | None:
@@ -298,6 +351,9 @@ class ServiceLease:
             lock_file.close()
             return None
 
+        # 只有成功取得单实例锁的新服务才能清理上次遗留的停止请求。
+        paths.stop_file.unlink(missing_ok=True)
+
         started_at = _process_started_at(os.getpid())
         if not started_at:
             portalocker.unlock(lock_file)
@@ -318,6 +374,14 @@ class ServiceLease:
         )
         os.replace(temporary, paths.pid_file)
         return cls(paths, lock_file, record)
+
+    def stop_requested(self) -> bool:
+        """确认当前服务身份是否出现在停止请求中。"""
+
+        return (
+            self.record.pid,
+            self.record.process_started_at,
+        ) in _read_stop_targets(self.paths.stop_file)
 
     def release(self) -> None:
         """删除属于当前进程的 PID 文件并释放锁。"""
@@ -510,23 +574,25 @@ def stop_managed_process(
     for record in records:
         for identity in descendant_process_identities(record.pid):
             descendant_identities[identity.pid] = identity
-    for record in records:
-        if not _record_is_running(record):
-            continue
-        try:
-            terminate_process(
-                record.pid,
-                force=False,
-                tree=os.name == "nt",
-            )
-        except ProcessLookupError:
-            continue
-        except PermissionError as exc:
-            return ProcessActionResult(
-                1,
-                f"无权结束服务进程 PID {record.pid}：{exc}",
-                record,
-            )
+    try:
+        _write_stop_request(paths, records)
+    except OSError as exc:
+        return ProcessActionResult(1, f"无法写入服务停止请求：{exc}", records[0])
+
+    if not _is_native_windows():
+        for record in records:
+            if not _record_is_running(record):
+                continue
+            try:
+                terminate_process(record.pid, force=False, tree=False)
+            except ProcessLookupError:
+                continue
+            except PermissionError as exc:
+                return ProcessActionResult(
+                    1,
+                    f"无权结束服务进程 PID {record.pid}：{exc}",
+                    record,
+                )
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -590,6 +656,7 @@ def stop_managed_process(
             current = _read_record(paths)
             if current and current.pid in target_pids:
                 paths.pid_file.unlink(missing_ok=True)
+            paths.stop_file.unlink(missing_ok=True)
             pids = ", ".join(str(record.pid) for record in records)
             return ProcessActionResult(0, f"服务已停止：PID {pids}", records[0])
         time.sleep(0.1)
@@ -656,6 +723,7 @@ def stop_managed_process(
             f"无法结束服务或 Agent/Codex 后代进程：PID {pids}",
             remaining[0] if remaining else records[0],
         )
+    paths.stop_file.unlink(missing_ok=True)
     pids = ", ".join(str(record.pid) for record in records)
     return ProcessActionResult(
         0,

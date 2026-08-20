@@ -18,6 +18,7 @@ CodexConfigPrimitive = str | int | float | bool
 CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
 
 CODEX_STRUCTURED_CONFIG_KEYS = {
+    "execution_mode",
     "model",
     "model_reasoning_effort",
     "model_verbosity",
@@ -121,8 +122,9 @@ class ScannerConfig(BaseModel):
 
 
 class CodexRuntimeConfig(BaseModel):
-    """Teamwork 启动 Codex CLI 时注入的默认运行参数。"""
+    """Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认运行参数。"""
 
+    execution_mode: Literal["cli", "model"] = "cli"
     model: str | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
@@ -286,6 +288,8 @@ class PreflightConfig(BaseModel):
     """仓库级 CI 能力与执行步骤配置。"""
 
     enabled: bool = False
+    cache_enabled: bool = True
+    publish_failure_comment: bool = False
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
     timeout_seconds: PositiveInt = 1800
     max_output_bytes: PositiveInt = 1_000_000

@@ -194,6 +194,19 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 ## Teamwork 跨平台外层沙盒
 
+运行时配置中的“Codex 仅作为模型基座”默认关闭。关闭时继续使用完整的 `codex exec` 运行时，包括 Codex CLI 自己的 Agent 循环、内置工具和允许的 MCP；开启后，Teamwork 不再启动 `codex exec`，而是直接读取 `runtime.codex_home`（或 `CODEX_HOME` / `~/.codex`）中的现有 ChatGPT OAuth 登录，并在进程内访问 Codex Responses 模型。该模式不启动或请求本机、外部的 `codex-api-service`，只把 Codex 用作模型基座。
+
+模型基座模式由 Teamwork 提供 `execute_command`、`apply_patch` 和白名单 `invoke_agent`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它不会继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`；模型必须在 Agent、`runtime.codex.model` 或用户 `config.toml` 顶层明确配置。OAuth token 只用于宿主模型请求，不进入 Prompt、工具环境和运行日志。
+
+受限 Agent 在模型基座模式下没有 Codex 内层沙盒可回退，因此 `read-only` 和 `workspace-write` 的每个命令、补丁进程都必须成功进入 Teamwork 外层沙盒；即使 `fail_closed` 配成 `false`，该模式仍失败关闭。`danger-full-access` 继续表示管理员明确允许工具直接访问宿主环境。配置文件等价写法如下：
+
+```yaml
+runtime:
+  codex:
+    execution_mode: model  # 默认 cli
+    model: gpt-5.6-sol
+```
+
 受限 Agent 默认不再直接依赖 `codex exec --sandbox` 保护本地文件。Teamwork 先根据 Agent 的文件与网络权限生成本轮权限档案，再调用当前 `runtime.codex_binary` 提供的 `codex sandbox` 建立操作系统级外层沙盒：macOS 使用 Seatbelt，Linux 和 WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。外层沙盒建立成功后，内层 `codex exec` 才关闭自己的重复沙盒，避免 Codex 对 `.git` 的额外保护阻止本次独立 clone 执行正常 Git 写操作。
 
 ```yaml
@@ -247,6 +260,10 @@ repositories:
     workspace: ./workspaces/example-github
     preflight:
       enabled: true
+      # 按仓库共享多语言依赖下载缓存，不按分支重复下载。
+      cache_enabled: true
+      # 可选：失败时维护一条 PR 评论，后续通过后自动删除；默认关闭。
+      publish_failure_comment: false
       status_context: teamwork/local-ci
       timeout_seconds: 1800
       max_output_bytes: 1000000
@@ -317,9 +334,13 @@ teamwork-review-agents scan-once -c /path/to/review.config.yaml
 
 Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent 运行工作区。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
 
+默认启用的 `cache_enabled` 会为每个仓库建立稳定缓存根目录，并把 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer、Playwright、Puppeteer 和 Deno 等常见缓存定向到该目录。同一仓库跨分支、跨 PR 共享下载缓存，但临时 worktree、HOME 和安装产物仍按运行隔离。仓库详情中的“执行 CI / 预热缓存”会针对远端默认分支最新提交启动不限时、可取消的手动 CI；它不创建 MR / PR 事件、不触发 Agent，也不回写 Commit Status。运行概览、事件详情和运行与日志页使用同一个 CI 详情抽屉持续显示 Git 阶段、当前步骤与命令输出。
+
+可选的 `publish_failure_comment` 默认关闭。开启后，自动 MR / PR CI 首次失败会创建一条包含 Head SHA、失败步骤、退出码和有界末尾输出的评论，连续失败只更新同一条评论；后续 CI 通过时删除旧失败评论，不发布成功评论。手动仓库 CI 没有关联 PR，因此始终不评论。评论回写异常只记录在 CI 日志中，不会改变真实 CI 结论。
+
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 
 Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 

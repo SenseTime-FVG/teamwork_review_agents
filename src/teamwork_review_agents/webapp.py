@@ -20,6 +20,11 @@ from .codex_account import (
     inspect_codex_account,
     read_codex_effective_config,
 )
+from .codex_connection import (
+    CodexConnectionTestError,
+    CodexConnectionTestTimeout,
+    test_codex_connection,
+)
 from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import codex_home, inspect_runtime_options
 from .environment import PromptRenderError, render_prompt
@@ -30,6 +35,7 @@ from .events import (
     detect_events,
 )
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
+from .preflight_manager import ManualPreflightManager
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
 from .skill_files import (
@@ -40,6 +46,34 @@ from .skill_files import (
     inspect_skill_path,
     list_skill_directories,
 )
+
+
+ExecutionStatusGroup = Literal[
+    "waiting",
+    "running",
+    "success",
+    "failure",
+    "timed_out",
+    "cancelled",
+]
+
+AGENT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
+    "waiting": ("queued", "preparing"),
+    "running": ("running",),
+    "success": ("completed",),
+    "failure": ("failed",),
+    "timed_out": ("timed_out",),
+    "cancelled": ("cancelled",),
+}
+
+PREFLIGHT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
+    "waiting": (),
+    "running": ("running",),
+    "success": ("success",),
+    "failure": ("failure", "error"),
+    "timed_out": ("timed_out",),
+    "cancelled": ("cancelled",),
+}
 
 
 class ConfigDocumentRequest(BaseModel):
@@ -72,6 +106,20 @@ class RuleConfigRequest(BaseModel):
 
 class RuleDeleteRequest(BaseModel):
     """UI 删除单条触发规则时提交的配置版本。"""
+
+    revision: str
+
+
+class ProviderConfigRequest(BaseModel):
+    """UI 提交的单个平台连接配置。"""
+
+    revision: str
+    name: str
+    provider: dict[str, Any]
+
+
+class ProviderDeleteRequest(BaseModel):
+    """UI 删除单个平台连接时提交的配置版本。"""
 
     revision: str
 
@@ -127,6 +175,7 @@ def create_app(
     runtime = BackgroundRuntime(manager)
     login_manager = CodexLoginManager()
     repository_initialization_manager = RepositoryInitializationManager(manager)
+    manual_preflight_manager = ManualPreflightManager(manager)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -135,6 +184,7 @@ def create_app(
         try:
             yield
         finally:
+            await manual_preflight_manager.close()
             await repository_initialization_manager.close()
             await login_manager.close()
             if start_scheduler:
@@ -149,6 +199,7 @@ def create_app(
     app.state.runtime = runtime
     app.state.codex_login_manager = login_manager
     app.state.repository_initialization_manager = repository_initialization_manager
+    app.state.manual_preflight_manager = manual_preflight_manager
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -366,6 +417,68 @@ def create_app(
                 detail="仓库正在执行 Git 操作，请等待完成或先取消操作",
             )
 
+    @app.post("/api/config/providers")
+    async def create_provider(body: ProviderConfigRequest) -> dict[str, Any]:
+        """基于指定版本创建一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_provider,
+                expected_revision=body.revision,
+                name=body.name,
+                provider=body.provider,
+                source="ui-provider-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/providers/{provider_name:path}")
+    async def update_provider(
+        provider_name: str,
+        body: ProviderConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新或重命名一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_provider,
+                expected_revision=body.revision,
+                original_name=provider_name,
+                name=body.name,
+                provider=body.provider,
+                source="ui-provider-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/providers/{provider_name:path}")
+    async def delete_provider(
+        provider_name: str,
+        body: ProviderDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本安全删除一个平台连接。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_provider,
+                expected_revision=body.revision,
+                name=provider_name,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
     @app.post("/api/config/repositories")
     async def create_repository(body: RepositoryConfigRequest) -> dict[str, Any]:
         """基于指定版本创建一个仓库。"""
@@ -515,6 +628,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="仓库配置不存在")
         return result
 
+    @app.post("/api/repositories/{repository_id}/preflight/start")
+    async def start_manual_preflight(repository_id: str) -> dict[str, object]:
+        """对仓库远端默认分支最新提交启动一次不限时手动 CI。"""
+
+        try:
+            return await manual_preflight_manager.start(repository_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/codex/runtime-options")
     async def codex_runtime_options() -> dict[str, Any]:
         """返回本机 Codex 模型目录和当前可验证的继承模型来源。"""
@@ -539,6 +663,17 @@ def create_app(
             effective_config_error,
             manager.config.runtime.managed_sandbox,
         )
+
+    @app.post("/api/codex/connection-test")
+    async def codex_connection_test() -> dict[str, Any]:
+        """使用当前已保存配置完成一次真实的最小 Codex 模型回合。"""
+
+        try:
+            return await test_codex_connection(manager.config)
+        except CodexConnectionTestTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except CodexConnectionTestError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/api/codex/account")
     async def codex_account() -> dict[str, Any]:
@@ -686,17 +821,33 @@ def create_app(
 
     @app.get("/api/runs")
     async def runs(
-        limit: int = Query(default=50, ge=1, le=500),
+        limit: int = Query(default=50, ge=1),
+        all_records: bool = False,
         status: str | None = None,
+        status_group: ExecutionStatusGroup | None = None,
         agent_name: str | None = None,
         repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
     ):
+        """返回支持统一状态分组的 Agent 运行摘要。"""
+
+        if status and status_group:
+            raise HTTPException(
+                status_code=422,
+                detail="status 与 status_group 不能同时使用",
+            )
         return await asyncio.to_thread(
             manager.store.list_runs,
-            limit,
+            None if all_records else limit,
             status=status,
+            statuses=(
+                AGENT_EXECUTION_STATUS_GROUPS[status_group]
+                if status_group
+                else None
+            ),
             agent_name=agent_name,
             repository_id=repository_id,
+            number=number,
         )
 
     @app.get("/api/runs/{run_id}")
@@ -705,6 +856,150 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="运行记录不存在")
         return run
+
+    @app.get("/api/preflight-runs")
+    async def preflight_runs(
+        limit: int = Query(default=100, ge=1),
+        all_records: bool = False,
+        status: Literal[
+            "running",
+            "success",
+            "failure",
+            "timed_out",
+            "error",
+            "cancelled",
+            "superseded",
+        ]
+        | None = None,
+        status_group: ExecutionStatusGroup | None = None,
+        repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
+    ):
+        """返回本地 Preflight / CI 运行摘要，不包含完整输出。"""
+
+        if status and status_group:
+            raise HTTPException(
+                status_code=422,
+                detail="status 与 status_group 不能同时使用",
+            )
+        return await asyncio.to_thread(
+            manager.store.list_preflight_runs,
+            None if all_records else limit,
+            status=status,
+            statuses=(
+                PREFLIGHT_EXECUTION_STATUS_GROUPS[status_group]
+                if status_group
+                else None
+            ),
+            repository_id=repository_id,
+            number=number,
+        )
+
+    @app.get("/api/preflight-runs/{run_id}")
+    async def preflight_run_detail(run_id: str):
+        """按需返回本地 Preflight / CI 完整结果。"""
+
+        run = await asyncio.to_thread(manager.store.get_preflight_run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        return run
+
+    @app.post("/api/preflight-runs/{run_id}/cancel")
+    async def cancel_preflight_run(run_id: str) -> dict[str, object]:
+        """取消仍在执行的手动 CI；自动事件 CI 不允许从此接口中止。"""
+
+        run = await asyncio.to_thread(manager.store.get_preflight_run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        if run.get("trigger_source") != "manual":
+            raise HTTPException(status_code=409, detail="自动事件 CI 不支持手动取消")
+        accepted = await manual_preflight_manager.cancel(run_id)
+        return {
+            "accepted": accepted,
+            "run_id": run_id,
+            "reason": "已请求取消手动 CI" if accepted else "手动 CI 已经结束",
+        }
+
+    @app.get("/api/preflight-runs/{run_id}/logs")
+    async def preflight_run_logs(
+        run_id: str,
+        after_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=500, ge=1, le=2000),
+    ):
+        """按游标返回 CI 实时日志。"""
+
+        if await asyncio.to_thread(manager.store.get_preflight_run, run_id) is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+        return await asyncio.to_thread(
+            manager.store.list_preflight_logs,
+            run_id,
+            after_id=after_id,
+            limit=limit,
+        )
+
+    @app.get("/api/preflight-runs/{run_id}/stream")
+    async def stream_preflight_logs(
+        run_id: str,
+        after_id: int = Query(default=0, ge=0),
+    ) -> StreamingResponse:
+        """持续推送 CI 阶段与命令输出，终态日志排空后主动结束。"""
+
+        if await asyncio.to_thread(manager.store.get_preflight_run, run_id) is None:
+            raise HTTPException(status_code=404, detail="本地 CI 运行记录不存在")
+
+        async def generate() -> AsyncIterator[str]:
+            cursor = after_id
+            idle_after_terminal = 0
+            heartbeat_ticks = 0
+            while True:
+                logs = await asyncio.to_thread(
+                    manager.store.list_preflight_logs,
+                    run_id,
+                    after_id=cursor,
+                    limit=500,
+                )
+                for log in logs:
+                    cursor = int(log["id"])
+                    heartbeat_ticks = 0
+                    yield (
+                        f"id: {cursor}\n"
+                        f"event: {log['event_type']}\n"
+                        f"data: {json.dumps(log, ensure_ascii=False)}\n\n"
+                    )
+                run = await asyncio.to_thread(
+                    manager.store.get_preflight_run,
+                    run_id,
+                )
+                terminal = run and run.get("status") in {
+                    "success",
+                    "failure",
+                    "timed_out",
+                    "error",
+                    "cancelled",
+                    "superseded",
+                }
+                if terminal and not logs:
+                    idle_after_terminal += 1
+                    if idle_after_terminal >= 2:
+                        yield "event: end\ndata: {}\n\n"
+                        return
+                else:
+                    idle_after_terminal = 0
+                if not logs and not terminal:
+                    heartbeat_ticks += 1
+                    if heartbeat_ticks >= 30:
+                        yield ": heartbeat\n\n"
+                        heartbeat_ticks = 0
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:
@@ -805,6 +1100,7 @@ def create_app(
         limit: int = Query(default=50, ge=1),
         all_records: bool = False,
         repository_id: str | None = None,
+        number: int | None = Query(default=None, ge=1),
         status: Literal[
             "pending",
             "processing",
@@ -821,7 +1117,17 @@ def create_app(
             None if all_records else limit,
             status=status,
             repository_id=repository_id,
+            number=number,
         )
+
+    @app.get("/api/events/{event_id}")
+    async def event_detail(event_id: str):
+        """按需返回事件处理、Agent 调度和本地 CI 详情。"""
+
+        detail = await asyncio.to_thread(manager.store.get_event_detail, event_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="事件不存在")
+        return detail
 
     @app.get("/api/change-requests")
     async def change_requests(
@@ -845,6 +1151,26 @@ def create_app(
                 provider is not None and provider.kind == "github"
             )
         return records
+
+    @app.get("/api/change-request-detail")
+    async def change_request_detail(
+        repository_id: str,
+        number: int = Query(ge=1),
+    ):
+        """按需返回 MR/PR 当前快照与关联事件摘要。"""
+
+        detail = await asyncio.to_thread(
+            manager.store.get_change_request_detail,
+            repository_id,
+            number,
+        )
+        if detail is None:
+            raise HTTPException(status_code=404, detail="MR/PR 快照不存在")
+        provider = manager.config.providers.get(str(detail.get("provider") or ""))
+        detail["latest_event_supported"] = bool(
+            provider is not None and provider.kind == "github"
+        )
+        return detail
 
     @app.post("/api/change-requests/{repository_id}/{number}/emit-discovered")
     async def emit_discovered(repository_id: str, number: int):

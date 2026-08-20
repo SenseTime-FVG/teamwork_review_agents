@@ -537,11 +537,32 @@ class Orchestrator:
             service_interrupted_event_ids: set[str] = set()
             administrator_cancelled_event_ids: set[str] = set()
             matched_event_ids: set[str] = set()
+            settled_unmatched_event_ids: set[str] = set()
             task_items: list[
                 tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
             ] = []
             try:
                 invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                planned_matched_event_ids = {
+                    event.id
+                    for invocation in invocations
+                    for event in invocation.events
+                }
+                for event in claimed_events:
+                    if event.id in planned_matched_event_ids:
+                        continue
+                    # 同批次其他事件的 Agent 或 CI 不应延迟本事件的未匹配结论。
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="unmatched",
+                    )
+                    settled_unmatched_event_ids.add(event.id)
+                    await asyncio.to_thread(
+                        self.store.cleanup_terminal_transient_event,
+                        event.id,
+                    )
+                    summary.processed_events += 1
                 direct_invocations = [
                     invocation
                     for invocation in invocations
@@ -552,6 +573,13 @@ class Orchestrator:
                     for invocation in invocations
                     if invocation.rule.run_preflight
                 ]
+                preflight_matched_event_ids = tuple(
+                    dict.fromkeys(
+                        event.id
+                        for invocation in preflight_invocations
+                        for event in invocation.events
+                    )
+                )
                 representative = claimed_events[0]
                 direct_dispatches = [
                     (
@@ -563,12 +591,16 @@ class Orchestrator:
                     for invocation in direct_invocations
                     for event in invocation.events
                 ]
-                matched_event_ids.update(item[0] for item in direct_dispatches)
-                await asyncio.to_thread(
-                    self.store.record_event_dispatches,
-                    tuple(event.id for event in claimed_events),
-                    direct_dispatches,
+                direct_event_ids = tuple(
+                    dict.fromkeys(item[0] for item in direct_dispatches)
                 )
+                if direct_event_ids:
+                    matched_event_ids.update(direct_event_ids)
+                    await asyncio.to_thread(
+                        self.store.record_event_dispatches,
+                        direct_event_ids,
+                        direct_dispatches,
+                    )
                 task_items.extend(
                     (invocation, asyncio.create_task(self._run_agent(invocation)))
                     for invocation in direct_invocations
@@ -591,8 +623,20 @@ class Orchestrator:
                                 matched_event_ids.add(event.id)
                                 errors_by_event[event.id].append(str(exc))
                     else:
+                        await asyncio.to_thread(
+                            self.store.link_events_to_preflight,
+                            preflight_matched_event_ids,
+                            preflight_result.run_id,
+                            reused=preflight_result.reused,
+                        )
                         if preflight_result.status in {"failure", "timed_out"}:
                             summary.preflight_failures += 1
+                            ready_preflight_invocations = []
+                            for invocation in preflight_invocations:
+                                matched_event_ids.update(
+                                    event.id for event in invocation.events
+                                )
+                        elif preflight_result.status == "superseded":
                             ready_preflight_invocations = []
                             for invocation in preflight_invocations:
                                 matched_event_ids.update(
@@ -687,6 +731,8 @@ class Orchestrator:
                         errors_by_event[event.id].append(error)
 
             for event in claimed_events:
+                if event.id in settled_unmatched_event_ids:
+                    continue
                 if event.id in service_interrupted_event_ids:
                     await asyncio.to_thread(
                         self.store.release_event_after_service_shutdown,
@@ -705,6 +751,11 @@ class Orchestrator:
                     continue
                 error = "; ".join(errors_by_event[event.id]) or None
                 if event.id not in matched_event_ids and error is None:
+                    await asyncio.to_thread(
+                        self.store.finish_event,
+                        event.id,
+                        status="unmatched",
+                    )
                     await asyncio.to_thread(
                         self.store.cleanup_terminal_transient_event,
                         event.id,

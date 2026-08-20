@@ -13,6 +13,9 @@ export type RunMessage = {
   detail: string;
   raw: string;
   repeatCount: number;
+  toolCallId?: string;
+  linkedRunId?: string;
+  linkedAgentName?: string;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -94,12 +97,30 @@ function itemMessage(log: RunLog, item: JsonObject): RunMessage {
   }
   if (itemType === "mcp_tool_call") {
     const toolName = [item.server, item.tool].filter(Boolean).map(textValue).join(" / ");
+    const argumentsObject = asObject(item.arguments);
+    const linkedRun = asObject(item.linked_run);
+    const result = asObject(item.result);
+    const invokeAgent = (
+      item.server === "teamwork_runtime"
+      || item.server === "teamwork_agent_gateway"
+    ) && item.tool === "invoke_agent";
+    const linkedRunIdValue = linkedRun?.run_id ?? result?.run_id;
+    const linkedAgentNameValue = linkedRun?.agent_name ?? argumentsObject?.agent_name;
     return {
       ...base,
       kind: item.error ? "error" : "tool",
       title: item.error ? `工具调用失败${toolName ? ` · ${toolName}` : ""}` : `调用工具${toolName ? ` · ${toolName}` : ""}`,
       body: prettyValue(item.arguments),
       detail: prettyValue(item.error ?? item.result),
+      ...(invokeAgent && typeof item.call_id === "string" && item.call_id
+        ? { toolCallId: item.call_id }
+        : {}),
+      ...(invokeAgent && typeof linkedRunIdValue === "string" && linkedRunIdValue
+        ? { linkedRunId: linkedRunIdValue }
+        : {}),
+      ...(invokeAgent && typeof linkedAgentNameValue === "string" && linkedAgentNameValue
+        ? { linkedAgentName: linkedAgentNameValue }
+        : {}),
     };
   }
   if (itemType === "file_change") {
@@ -187,7 +208,12 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
 function toRunMessage(log: RunLog): RunMessage {
   const payload = parsePayload(log.payload);
   const object = asObject(payload);
-  if ((log.event_type === "item.completed" || log.event_type === "item.started") && object) {
+  if (
+    (log.event_type === "item.completed"
+      || log.event_type === "item.started"
+      || log.event_type === "item.updated")
+    && object
+  ) {
     const item = asObject(object.item);
     if (item) return itemMessage(log, item);
   }
@@ -196,8 +222,26 @@ function toRunMessage(log: RunLog): RunMessage {
 
 export function presentRunLogs(logs: RunLog[]): RunMessage[] {
   const messages: RunMessage[] = [];
+  const invokeAgentMessageIndexes = new Map<string, number>();
   for (const log of logs) {
+    // Responses SSE 属于模型基座的底层协议，用户时间线只展示统一 Agent 语义事件。
+    if (log.event_type.startsWith("response.")) continue;
     const message = toRunMessage(log);
+    if (message.toolCallId && message.linkedAgentName) {
+      const existingIndex = invokeAgentMessageIndexes.get(message.toolCallId);
+      if (existingIndex !== undefined) {
+        const existing = messages[existingIndex];
+        messages[existingIndex] = {
+          ...message,
+          id: existing.id,
+          createdAt: existing.createdAt,
+          linkedRunId: message.linkedRunId ?? existing.linkedRunId,
+          linkedAgentName: message.linkedAgentName ?? existing.linkedAgentName,
+        };
+        continue;
+      }
+      invokeAgentMessageIndexes.set(message.toolCallId, messages.length);
+    }
     const previous = messages.at(-1);
     if (previous && previous.eventType === message.eventType && previous.raw === message.raw) {
       previous.repeatCount += 1;

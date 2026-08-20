@@ -69,8 +69,12 @@ database:
 #     fail_closed: true
 #     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
 #     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。
-#   # Teamwork 发起 Codex CLI 时使用的默认参数；不会修改 ~/.codex/config.toml。
+#   # Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认参数；不会修改 config.toml。
 #   codex:
+#     # cli：保持当前 codex exec 完整运行时；model：Codex 只作为模型基座，
+#     # Teamwork 直接使用现有 OAuth 登录并负责命令、补丁和 sub-agent 工具。
+#     # model 不请求本机或外部 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
+#     execution_mode: cli
 #     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
 #     model: gpt-5.6-sol
 #     # 可选：默认推理强度。具体可用值取决于模型，常见值如下。
@@ -182,6 +186,11 @@ web:
 #     # run_preflight 的 Agent 才会等待门禁；具体命令和 CI 脚本由目标仓库维护。
 #     preflight:
 #       enabled: true
+#       # 同一仓库的全部分支和 MR / PR 共享常用依赖下载缓存；工作区仍逐次隔离。
+#       cache_enabled: true
+#       # 自动 MR / PR CI 失败时创建或更新同一条评论；后续通过后删除。
+#       # 成功结果和手动仓库 CI 不发布评论。
+#       publish_failure_comment: false
 #       # 仅运行可信内部 PR；环境会过滤，但这不是容器或系统级安全沙箱。
 #       # 应同时将此名称配置为 GitHub Ruleset 的 required status check。
 #       status_context: teamwork/local-ci

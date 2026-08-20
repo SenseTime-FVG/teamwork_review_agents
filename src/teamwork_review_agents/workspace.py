@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -17,6 +16,7 @@ from typing import Callable, Iterator, Literal
 from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
+from .filesystem import remove_tree, temporary_directory
 from .models import ChangeRequestSnapshot
 from .process_control import process_group_options, terminate_process
 
@@ -27,6 +27,18 @@ class WorkspaceError(RuntimeError):
 
 class WorkspaceCancelled(WorkspaceError):
     """表示管理员在 Git 工作区准备期间取消了运行。"""
+
+
+class WorkspaceSnapshotSuperseded(WorkspaceError):
+    """表示事件快照提交已被远端更新取代且无法再获取。"""
+
+    def __init__(self, expected_head: str, current_head: str) -> None:
+        self.expected_head = expected_head
+        self.current_head = current_head
+        super().__init__(
+            "事件 Head 已被后续提交取代，跳过旧快照："
+            f"期望 {expected_head}，当前 {current_head}"
+        )
 
 
 GitCancelCheck = Callable[[], bool]
@@ -268,11 +280,11 @@ def ensure_repository_workspace(
     if not workspace.exists():
         workspace.parent.mkdir(parents=True, exist_ok=True)
         clone_url = repository_clone_url(provider, repository)
-        with tempfile.TemporaryDirectory(
-            dir=workspace.parent,
+        with temporary_directory(
+            directory=workspace.parent,
             prefix=f".{workspace.name}.clone-",
         ) as temporary_root:
-            checkout = Path(temporary_root) / "repository"
+            checkout = temporary_root / "repository"
             _run_git(
                 ["clone", "--origin", "origin", "--", clone_url, str(checkout)],
                 timeout_seconds=initialization_timeout_seconds,
@@ -554,11 +566,11 @@ def ensure_isolated_clone(
         revision,
         timeout_seconds=timeout_seconds,
     )
-    with tempfile.TemporaryDirectory(
-        dir=target.parent,
+    with temporary_directory(
+        directory=target.parent,
         prefix=f".{target.name}.clone-",
     ) as temporary_root:
-        staged = Path(temporary_root) / "checkout"
+        staged = temporary_root / "checkout"
         clone_result = _run_git(
             [
                 "clone",
@@ -813,7 +825,7 @@ def _remove_run_workspace(
         workspace,
         timeout_seconds=timeout_seconds,
     )
-    shutil.rmtree(target)
+    remove_tree(target)
     clear_retained_marker(target)
 
 
@@ -1008,32 +1020,64 @@ def prepare_change_request_workspace(
         cancel_check=cancel_check,
         progress_callback=progress_callback,
     )
-    if fetch_result.returncode != 0:
+    current_head = ""
+    if fetch_result.returncode == 0:
+        current_ref = _run_git(
+            ["-C", str(workspace), "rev-parse", destination_ref],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="读取变更请求当前提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        if current_ref.returncode == 0:
+            current_head = current_ref.stdout.strip()
+
+    existing_commit = _run_git(
+        ["-C", str(workspace), "cat-file", "-e", f"{snapshot.head_sha}^{{commit}}"],
+        check=False,
+        timeout_seconds=timeout_seconds,
+        operation="校验事件快照提交",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    if existing_commit.returncode != 0:
+        _run_git(
+            ["-C", str(workspace), "fetch", "origin", snapshot.head_sha],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="获取事件快照提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
         existing_commit = _run_git(
             ["-C", str(workspace), "cat-file", "-e", f"{snapshot.head_sha}^{{commit}}"],
             check=False,
             timeout_seconds=timeout_seconds,
-            operation="校验变更请求提交",
+            operation="复核事件快照提交",
             cancel_check=cancel_check,
             progress_callback=progress_callback,
         )
-        if existing_commit.returncode != 0:
-            raise WorkspaceError(
-                "无法获取 MR/PR 代码引用，请检查远端权限或平台引用格式"
-            )
-        _run_git(
-            [
-                "-C",
-                str(workspace),
-                "update-ref",
-                destination_ref,
-                snapshot.head_sha,
-            ],
-            timeout_seconds=timeout_seconds,
-            operation="校准变更请求引用",
-            cancel_check=cancel_check,
-            progress_callback=progress_callback,
+    if existing_commit.returncode != 0:
+        if current_head and current_head != snapshot.head_sha:
+            raise WorkspaceSnapshotSuperseded(snapshot.head_sha, current_head)
+        raise WorkspaceError(
+            "无法获取 MR/PR 事件快照提交，请检查远端权限、平台引用格式或提交是否仍可访问"
         )
+
+    _run_git(
+        [
+            "-C",
+            str(workspace),
+            "update-ref",
+            destination_ref,
+            snapshot.head_sha,
+        ],
+        timeout_seconds=timeout_seconds,
+        operation="固定变更请求事件提交",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
     return destination_ref
 
 
@@ -1042,16 +1086,29 @@ def temporary_change_request_worktree(
     provider: ProviderConfig,
     repository: RepositoryConfig,
     snapshot: ChangeRequestSnapshot,
+    *,
+    timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
 ) -> Iterator[Path]:
     """在临时 worktree 中检出准确的 MR/PR Head，并在退出时清理。"""
 
-    change_ref = prepare_change_request_workspace(provider, repository, snapshot)
+    prepare_change_request_workspace(
+        provider,
+        repository,
+        snapshot,
+        timeout_seconds=timeout_seconds,
+        initialization_timeout_seconds=initialization_timeout_seconds,
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
     workspace = repository.workspace.resolve()
-    with tempfile.TemporaryDirectory(
-        dir=workspace.parent,
+    with temporary_directory(
+        directory=workspace.parent,
         prefix=f".{workspace.name}.preflight-",
     ) as temporary_root:
-        checkout = Path(temporary_root) / "checkout"
+        checkout = temporary_root / "checkout"
         _run_git(
             [
                 "-C",
@@ -1060,12 +1117,20 @@ def temporary_change_request_worktree(
                 "add",
                 "--detach",
                 str(checkout),
-                change_ref,
-            ]
+                snapshot.head_sha,
+            ],
+            timeout_seconds=timeout_seconds,
+            operation="创建 Preflight 工作区",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
         try:
             actual_head = _run_git(
-                ["-C", str(checkout), "rev-parse", "HEAD"]
+                ["-C", str(checkout), "rev-parse", "HEAD"],
+                timeout_seconds=timeout_seconds,
+                operation="校验 Preflight 提交",
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
             ).stdout.strip()
             if actual_head != snapshot.head_sha:
                 raise WorkspaceError(
@@ -1079,7 +1144,11 @@ def temporary_change_request_worktree(
                     "update",
                     "--init",
                     "--recursive",
-                ]
+                ],
+                timeout_seconds=timeout_seconds,
+                operation="初始化 Preflight 子模块",
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
             )
             yield checkout
         finally:
@@ -1093,6 +1162,151 @@ def temporary_change_request_worktree(
                     str(checkout),
                 ],
                 check=False,
+                timeout_seconds=timeout_seconds,
+                operation="清理 Preflight 工作区",
+            )
+            _run_git(
+                ["-C", str(workspace), "worktree", "prune"],
+                check=False,
+            )
+
+
+@contextmanager
+def temporary_default_branch_worktree(
+    provider: ProviderConfig,
+    repository: RepositoryConfig,
+    *,
+    timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
+) -> Iterator[tuple[Path, str, str]]:
+    """更新基础仓库，并在临时 worktree 检出远端默认分支最新提交。"""
+
+    workspace, _ = initialize_repository_workspace(
+        provider,
+        repository,
+        timeout_seconds=timeout_seconds,
+        initialization_timeout_seconds=initialization_timeout_seconds,
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    symbolic = _run_git(
+        [
+            "-C",
+            str(workspace),
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        check=False,
+        timeout_seconds=timeout_seconds,
+        operation="识别远端默认分支",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    if symbolic.returncode != 0 or not symbolic.stdout.strip():
+        _run_git(
+            ["-C", str(workspace), "remote", "set-head", "origin", "--auto"],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="同步远端默认分支",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        symbolic = _run_git(
+            [
+                "-C",
+                str(workspace),
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="读取远端默认分支",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+    remote_ref = symbolic.stdout.strip()
+    if not remote_ref:
+        for candidate in ("origin/main", "origin/master", "HEAD"):
+            exists = _run_git(
+                ["-C", str(workspace), "rev-parse", "--verify", candidate],
+                check=False,
+                timeout_seconds=timeout_seconds,
+                operation="查找默认分支提交",
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+            if exists.returncode == 0 and exists.stdout.strip():
+                remote_ref = candidate
+                break
+    if not remote_ref:
+        raise WorkspaceError("无法识别仓库远端默认分支")
+    head_sha = _run_git(
+        ["-C", str(workspace), "rev-parse", remote_ref],
+        timeout_seconds=timeout_seconds,
+        operation="读取默认分支提交",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    ).stdout.strip()
+    branch = (
+        remote_ref.removeprefix("origin/")
+        if remote_ref.startswith("origin/")
+        else remote_ref
+    )
+    with temporary_directory(
+        directory=workspace.parent,
+        prefix=f".{workspace.name}.manual-preflight-",
+    ) as temporary_root:
+        checkout = temporary_root / "checkout"
+        _run_git(
+            [
+                "-C",
+                str(workspace),
+                "worktree",
+                "add",
+                "--detach",
+                str(checkout),
+                head_sha,
+            ],
+            timeout_seconds=timeout_seconds,
+            operation="创建手动 CI 工作区",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        try:
+            _run_git(
+                [
+                    "-C",
+                    str(checkout),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                ],
+                timeout_seconds=timeout_seconds,
+                operation="初始化子模块",
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+            yield checkout, branch, head_sha
+        finally:
+            _run_git(
+                [
+                    "-C",
+                    str(workspace),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(checkout),
+                ],
+                check=False,
+                timeout_seconds=timeout_seconds,
+                operation="清理手动 CI 工作区",
             )
             _run_git(
                 ["-C", str(workspace), "worktree", "prune"],

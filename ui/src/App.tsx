@@ -1,18 +1,23 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import {
   api,
   getToken,
   setToken as persistToken,
+  streamPreflightLogs,
   streamRunLogs,
   uploadPromptFile,
   uploadSkillDirectory,
 } from "./api";
 import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
+import { presentRunLogs } from "./runLogPresentation";
 import type {
   Agent,
+  ChangeRequestDetailRecord,
   ChangeRequestRecord,
   CodexAccountStatus,
+  CodexConnectionTestResult,
   CodexInheritedSetting,
   CodexLoginSession,
   CodexRuntimeConfig,
@@ -20,8 +25,13 @@ import type {
   ConfigDocument,
   EnvironmentMap,
   EnvironmentVariable,
+  EventAgentRunSummary,
+  EventDetailRecord,
+  EventDispatchDetail,
   EventRecord,
   ManualLatestEventBatchResponse,
+  PreflightRunDetail,
+  PreflightRunSummary,
   Repository,
   RepositoryGitDetail,
   RepositoryPreflight,
@@ -41,8 +51,21 @@ type OverviewLimit = number | null;
 
 type OverviewFilter = {
   repositoryId: string;
+  number: string;
   status: string;
   limit: OverviewLimit;
+};
+
+type ExecutionTypeFilter = "all" | "agent" | "preflight";
+
+type ExecutionStatusFilter = "" | "waiting" | "running" | "success" | "failure" | "timed_out" | "cancelled";
+
+type ExecutionFilter = {
+  repositoryId: string;
+  number: string;
+  type: ExecutionTypeFilter;
+  status: ExecutionStatusFilter;
+  limit: number | null;
 };
 
 type OverviewConfirmation = {
@@ -72,9 +95,30 @@ type AgentActionConfirmation = {
 
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   repositoryId: "",
+  number: "",
   status: "",
   limit: 10,
 };
+
+const DEFAULT_EXECUTION_FILTER: ExecutionFilter = {
+  repositoryId: "",
+  number: "",
+  type: "all",
+  status: "",
+  limit: 20,
+};
+
+const EXECUTION_STATUS_OPTIONS: Array<{
+  value: Exclude<ExecutionStatusFilter, "">;
+  label: string;
+}> = [
+  { value: "waiting", label: "等待中" },
+  { value: "running", label: "执行中" },
+  { value: "success", label: "成功" },
+  { value: "failure", label: "失败" },
+  { value: "timed_out", label: "超时" },
+  { value: "cancelled", label: "已取消" },
+];
 
 const CHANGE_REQUEST_STATUS_OPTIONS = [
   { value: "opened", label: "打开" },
@@ -130,6 +174,7 @@ const EMPTY_STATUS: RuntimeStatus = {
 
 const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
   models: [],
+  catalog_source: "unavailable",
   inherited_model: {
     value: null,
     source: "builtin",
@@ -221,6 +266,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
         ...(runtimeInput.managed_sandbox ?? {}),
       },
       codex: {
+        execution_mode: "cli",
         fast_mode: "inherit",
         extra_config: {},
         ...codexInput,
@@ -265,7 +311,7 @@ function dateTimeText(value?: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
 }
 
-function overviewQuery(filter: OverviewFilter): string {
+function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   const parameters = new URLSearchParams();
   if (filter.limit === null) {
     parameters.set("all_records", "true");
@@ -273,8 +319,52 @@ function overviewQuery(filter: OverviewFilter): string {
     parameters.set("limit", String(filter.limit));
   }
   if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
+  if (includeNumber && /^\d+$/.test(filter.number) && Number(filter.number) > 0) {
+    parameters.set("number", filter.number);
+  }
   if (filter.status) parameters.set("status", filter.status);
   return parameters.toString();
+}
+
+function executionQuery(filter: ExecutionFilter): string {
+  const parameters = new URLSearchParams();
+  if (filter.limit === null) {
+    parameters.set("all_records", "true");
+  } else {
+    parameters.set("limit", String(filter.limit));
+  }
+  if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
+  if (/^\d+$/.test(filter.number) && Number(filter.number) > 0) {
+    parameters.set("number", filter.number);
+  }
+  if (filter.status) parameters.set("status_group", filter.status);
+  return parameters.toString();
+}
+
+function executionStatusMatches(
+  kind: "agent" | "preflight",
+  status: string,
+  filter: ExecutionStatusFilter,
+): boolean {
+  if (!filter) return true;
+  const groups: Record<Exclude<ExecutionStatusFilter, "">, string[]> = kind === "agent"
+    ? {
+        waiting: ["queued", "preparing"],
+        running: ["running"],
+        success: ["completed"],
+        failure: ["failed"],
+        timed_out: ["timed_out"],
+        cancelled: ["cancelled"],
+      }
+    : {
+        waiting: [],
+        running: ["running"],
+        success: ["success"],
+        failure: ["failure", "error"],
+        timed_out: ["timed_out"],
+        cancelled: ["cancelled"],
+      };
+  return groups[filter].includes(status);
 }
 
 function shortRevision(revision?: string): string {
@@ -343,14 +433,158 @@ function SelectField(props: {
   options: Array<{ value: string; label: string }>;
   help?: string;
 }) {
+  const fieldId = useId();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [openUpward, setOpenUpward] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const listboxId = `${fieldId}-options`;
+  const selectedIndex = props.options.findIndex((option) => option.value === props.value);
+  const selectedOption = selectedIndex >= 0 ? props.options[selectedIndex] : props.options[0];
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    const updatePlacement = () => {
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const bounds = trigger.getBoundingClientRect();
+      const spaceAbove = bounds.top;
+      const spaceBelow = window.innerHeight - bounds.bottom;
+      setOpenUpward(spaceBelow < menu.offsetHeight + 8 && spaceAbove > spaceBelow);
+    };
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    window.addEventListener("scroll", updatePlacement, true);
+    return () => {
+      window.removeEventListener("resize", updatePlacement);
+      window.removeEventListener("scroll", updatePlacement, true);
+    };
+  }, [open, props.options.length]);
+
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    document.getElementById(`${fieldId}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, fieldId, open]);
+
+  function openOptions(direction: "first" | "last" = "first") {
+    const fallbackIndex = direction === "last" ? props.options.length - 1 : 0;
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : fallbackIndex);
+    setOpen(true);
+  }
+
+  function selectOption(index: number) {
+    const option = props.options[index];
+    if (!option) return;
+    props.onChange(option.value);
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <select value={props.value} onChange={(event) => props.onChange(event.target.value)}>
-        {props.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-      </select>
+    <div className={`field select-field ${open ? "open" : ""}`} ref={containerRef}>
+      <span id={`${fieldId}-label`}>{props.label}</span>
+      <div className="select-combobox">
+        <button
+          ref={triggerRef}
+          className="select-combobox-trigger"
+          type="button"
+          role="combobox"
+          aria-labelledby={`${fieldId}-label`}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-haspopup="listbox"
+          aria-activedescendant={open && activeIndex >= 0 ? `${fieldId}-option-${activeIndex}` : undefined}
+          onClick={() => {
+            if (open) setOpen(false);
+            else openOptions();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setOpen(false);
+              return;
+            }
+            if (event.key === "Tab") {
+              setOpen(false);
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) {
+                openOptions(event.key === "ArrowUp" ? "last" : "first");
+                return;
+              }
+              if (!props.options.length) return;
+              const offset = event.key === "ArrowDown" ? 1 : -1;
+              setActiveIndex((current) => (
+                current < 0
+                  ? 0
+                  : (current + offset + props.options.length) % props.options.length
+              ));
+              return;
+            }
+            if (open && event.key === "Home") {
+              event.preventDefault();
+              setActiveIndex(0);
+              return;
+            }
+            if (open && event.key === "End") {
+              event.preventDefault();
+              setActiveIndex(props.options.length - 1);
+              return;
+            }
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              if (open) selectOption(activeIndex);
+              else openOptions();
+            }
+          }}
+        >
+          <span>{selectedOption?.label ?? props.value}</span>
+          <span className="select-combobox-chevron" aria-hidden="true">⌄</span>
+        </button>
+        {open && (
+          <div
+            ref={menuRef}
+            id={listboxId}
+            className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
+            role="listbox"
+            aria-labelledby={`${fieldId}-label`}
+          >
+            {props.options.map((option, index) => (
+              <button
+                id={`${fieldId}-option-${index}`}
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={option.value === props.value}
+                className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${option.value === props.value ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => selectOption(index)}
+              >
+                <span className="select-combobox-check" aria-hidden="true">{option.value === props.value ? "✓" : ""}</span>
+                <span>{option.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
       {props.help && <small>{props.help}</small>}
-    </label>
+    </div>
   );
 }
 
@@ -363,20 +597,156 @@ function ModelField(props: {
   onChange: (value: string) => void;
   help?: string;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const listboxId = `${props.id}-options`;
+  const filteredModels = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return props.models;
+    return props.models.filter((model) => (
+      model.slug.toLowerCase().includes(normalized)
+      || model.display_name.toLowerCase().includes(normalized)
+    ));
+  }, [props.models, query]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const currentIndex = filteredModels.findIndex((model) => model.slug === props.value);
+    setActiveIndex(currentIndex >= 0 ? currentIndex : filteredModels.length ? 0 : -1);
+  }, [filteredModels, open, props.value]);
+
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    document.getElementById(`${props.id}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, open, props.id]);
+
+  function openAllModels() {
+    setQuery("");
+    setOpen(true);
+  }
+
+  function selectModel(model: CodexRuntimeOptions["models"][number]) {
+    props.onChange(model.slug);
+    setOpen(false);
+    setQuery("");
+  }
+
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <input
-        list={props.id}
-        value={props.value}
-        placeholder={props.placeholder}
-        onChange={(event) => props.onChange(event.target.value)}
-      />
-      <datalist id={props.id}>
-        {props.models.map((model) => <option key={model.slug} value={model.slug}>{model.display_name}</option>)}
-      </datalist>
+    <div className="field model-field" ref={containerRef}>
+      <span id={`${props.id}-label`}>{props.label}</span>
+      <div className={`model-combobox ${open ? "open" : ""}`}>
+        <input
+          ref={inputRef}
+          id={props.id}
+          value={props.value}
+          placeholder={props.placeholder}
+          role="combobox"
+          aria-labelledby={`${props.id}-label`}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-autocomplete="list"
+          aria-activedescendant={open && activeIndex >= 0 ? `${props.id}-option-${activeIndex}` : undefined}
+          autoComplete="off"
+          onFocus={openAllModels}
+          onClick={() => {
+            if (!open) openAllModels();
+          }}
+          onChange={(event) => {
+            props.onChange(event.target.value);
+            setQuery(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setOpen(false);
+              setQuery("");
+              return;
+            }
+            if (event.key === "Tab") {
+              setOpen(false);
+              setQuery("");
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) {
+                openAllModels();
+                return;
+              }
+              if (!filteredModels.length) return;
+              const offset = event.key === "ArrowDown" ? 1 : -1;
+              setActiveIndex((current) => (
+                current < 0
+                  ? 0
+                  : (current + offset + filteredModels.length) % filteredModels.length
+              ));
+              return;
+            }
+            if (event.key === "Enter" && open && activeIndex >= 0) {
+              event.preventDefault();
+              const model = filteredModels[activeIndex];
+              if (model) selectModel(model);
+            }
+          }}
+        />
+        <button
+          className="model-combobox-toggle"
+          type="button"
+          aria-label={open ? "关闭模型候选" : "展开全部模型候选"}
+          aria-expanded={open}
+          aria-controls={listboxId}
+          onClick={() => {
+            if (open) {
+              setOpen(false);
+              setQuery("");
+            } else {
+              openAllModels();
+              inputRef.current?.focus();
+            }
+          }}
+        ><span aria-hidden="true">⌄</span></button>
+        {open && (
+          <div className="model-combobox-options" id={listboxId} role="listbox" aria-labelledby={`${props.id}-label`}>
+            {filteredModels.length ? filteredModels.map((model, index) => (
+              <button
+                id={`${props.id}-option-${index}`}
+                key={model.slug}
+                type="button"
+                role="option"
+                aria-selected={model.slug === props.value}
+                className={`model-combobox-option ${index === activeIndex ? "active" : ""} ${model.slug === props.value ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => selectModel(model)}
+              >
+                <span>{model.display_name}</span>
+                <small>{model.slug}</small>
+              </button>
+            )) : (
+              <div className="model-combobox-empty">
+                {props.models.length ? "没有匹配模型，可继续手工填写模型 ID" : "没有可用候选，可继续手工填写模型 ID"}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
       {props.help && <small>{props.help}</small>}
-    </label>
+    </div>
   );
 }
 
@@ -803,6 +1173,7 @@ function OverviewListControls(props: {
   repositories: Repository[];
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
+  showNumber?: boolean;
   onChange: (filter: OverviewFilter) => void;
 }) {
   const predefinedLimits = [10, 20, 50];
@@ -835,8 +1206,14 @@ function OverviewListControls(props: {
     setCustomLimit(String(fallback));
   }
 
+  const controlClassName = [
+    "overview-list-controls",
+    props.showNumber ? "overview-list-controls-numbered" : "",
+    limitMode === "custom" ? "overview-list-controls-custom-limit" : "",
+  ].filter(Boolean).join(" ");
+
   return (
-    <div className="overview-list-controls">
+    <div className={controlClassName}>
       <label>
         <span>仓库</span>
         <select
@@ -851,6 +1228,20 @@ function OverviewListControls(props: {
           ))}
         </select>
       </label>
+      {props.showNumber && (
+        <label className="overview-number-filter">
+          <span>编号</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            inputMode="numeric"
+            placeholder="全部"
+            value={props.filter.number}
+            onChange={(event) => props.onChange({ ...props.filter, number: event.target.value })}
+          />
+        </label>
+      )}
       <label>
         <span>状态</span>
         <select
@@ -1113,6 +1504,12 @@ function Overview(props: {
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
 }) {
+  const [selectedChangeRequest, setSelectedChangeRequest] = useState<ChangeRequestRecord | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
+  const [selectedExecution, setSelectedExecution] = useState<{
+    kind: "agent" | "preflight";
+    id: string;
+  } | null>(null);
   const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
@@ -1198,7 +1595,15 @@ function Overview(props: {
               {props.changeRequests.map((item) => (
                 <tr
                   key={item.snapshot_key}
-                  className={props.selectedSnapshotKeys.includes(item.snapshot_key) ? "overview-row-selected" : ""}
+                  className={`overview-detail-row ${props.selectedSnapshotKeys.includes(item.snapshot_key) ? "overview-row-selected" : ""}`}
+                  tabIndex={0}
+                  onClick={() => setSelectedChangeRequest(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedChangeRequest(item);
+                    }
+                  }}
                 >
                   {props.selectionMode && (
                     <td className="overview-selection-column">
@@ -1208,12 +1613,13 @@ function Overview(props: {
                         checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
                         disabled={!item.latest_event || props.triggeringKeys.length > 0}
                         title={item.latest_event ? "加入批量手动触发" : "尚无可触发的最新事件"}
+                        onClick={(event) => event.stopPropagation()}
                         onChange={() => props.onToggleSelection(item.snapshot_key)}
                       />
                     </td>
                   )}
                   <td>
-                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer">
+                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
                       <strong>#{item.number} {item.title}</strong>
                       <small>{item.source_branch} → {item.target_branch}</small>
                     </a>
@@ -1229,7 +1635,10 @@ function Overview(props: {
                       <button
                         className="button secondary compact"
                         disabled={props.emittingKey === item.snapshot_key}
-                        onClick={() => props.onEmitDiscovered(item)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          props.onEmitDiscovered(item);
+                        }}
                       >
                         {props.emittingKey === item.snapshot_key ? "补发中…" : "补发首次事件"}
                       </button>
@@ -1256,7 +1665,10 @@ function Overview(props: {
                       className="button secondary compact"
                       disabled={!item.latest_event || props.triggeringKeys.includes(item.snapshot_key)}
                       title={item.latest_event ? `手动发送 ${item.latest_event.event_type}` : "尚无可触发的最新事件"}
-                      onClick={() => props.onTriggerLatestEvent(item)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        props.onTriggerLatestEvent(item);
+                      }}
                     >
                       {props.triggeringKeys.includes(item.snapshot_key) ? "发送中…" : "手动触发"}
                     </button>
@@ -1281,6 +1693,7 @@ function Overview(props: {
             repositories={props.repositories}
             filter={props.eventFilter}
             statuses={EVENT_STATUS_OPTIONS}
+            showNumber
             onChange={props.onEventFilterChange}
           />
         </div>
@@ -1289,7 +1702,18 @@ function Overview(props: {
             <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th></tr></thead>
             <tbody>
               {props.events.map((event) => (
-                <tr key={event.event_id}>
+                <tr
+                  key={event.event_id}
+                  className="overview-detail-row"
+                  tabIndex={0}
+                  onClick={() => setSelectedEvent(event)}
+                  onKeyDown={(keyboardEvent) => {
+                    if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+                      keyboardEvent.preventDefault();
+                      setSelectedEvent(event);
+                    }
+                  }}
+                >
                   <td className="mono">
                     <span className="event-type-with-origin">
                       {event.event_type}
@@ -1298,7 +1722,9 @@ function Overview(props: {
                   </td>
                   <td>{event.repository_id}</td>
                   <td>#{event.number}</td>
-                  <td><EventStatusPill event={event} /></td>
+                  <td>
+                    <EventStatusPill event={event} />
+                  </td>
                   <td><EventAgentProgress event={event} /></td>
                   <td>{dateTimeText(event.occurred_at)}</td>
                 </tr>
@@ -1307,13 +1733,43 @@ function Overview(props: {
           </table>
           {props.events.length === 0 && (
             <div className="empty">
-              {props.eventFilter.repositoryId || props.eventFilter.status
+              {props.eventFilter.repositoryId || props.eventFilter.number || props.eventFilter.status
                 ? "当前筛选条件下没有变化事件。"
                 : "尚未产生事件"}
             </div>
           )}
         </div>
       </section>
+      <ChangeRequestDetailDrawer
+        changeRequest={selectedChangeRequest}
+        active={selectedEvent === null && selectedExecution === null}
+        depth={0}
+        onOpenEvent={setSelectedEvent}
+        onClose={() => setSelectedChangeRequest(null)}
+      />
+      <EventDetailDrawer
+        event={selectedEvent}
+        active={selectedExecution === null}
+        depth={selectedChangeRequest ? 1 : 0}
+        onOpenAgent={(runId) => setSelectedExecution({ kind: "agent", id: runId })}
+        onOpenPreflight={(runId) => setSelectedExecution({ kind: "preflight", id: runId })}
+        onClose={() => setSelectedEvent(null)}
+      />
+      {selectedExecution?.kind === "agent" && (
+        <AgentRunDetailDrawer
+          initialRunId={selectedExecution.id}
+          depth={(selectedChangeRequest ? 1 : 0) + (selectedEvent ? 1 : 0)}
+          onClose={() => setSelectedExecution(null)}
+          onRefresh={() => undefined}
+        />
+      )}
+      {selectedExecution?.kind === "preflight" && (
+        <PreflightRunDetailDrawer
+          runId={selectedExecution.id}
+          depth={(selectedChangeRequest ? 1 : 0) + (selectedEvent ? 1 : 0)}
+          onClose={() => setSelectedExecution(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1510,8 +1966,12 @@ function reasoningLevels(
 function CodexRuntimeEditor(props: {
   document: ConfigDocument;
   options: CodexRuntimeOptions;
+  editable: boolean;
   onChange: (document: ConfigDocument) => void;
 }) {
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionResult, setConnectionResult] = useState<CodexConnectionTestResult | null>(null);
+  const [connectionError, setConnectionError] = useState("");
   const codex = props.document.runtime.codex ?? {};
   const inherited = effectiveInheritedModel(props.document, props.options);
   const selectedModel = codex.model || props.options.codex_model;
@@ -1536,26 +1996,83 @@ function CodexRuntimeEditor(props: {
     patchRuntime({ codex: { ...codex, ...patch } });
   }
 
+  async function testConnection() {
+    if (testingConnection) return;
+    setTestingConnection(true);
+    setConnectionResult(null);
+    setConnectionError("");
+    try {
+      setConnectionResult(await api<CodexConnectionTestResult>("/api/codex/connection-test", { method: "POST" }));
+    } catch (reason) {
+      setConnectionError(reason instanceof Error ? reason.message : "Codex 连接测试失败");
+    } finally {
+      setTestingConnection(false);
+    }
+  }
+
   return (
     <div className="page-stack">
       <section className="section-card">
         <div className="section-title-row">
           <div>
-            <h2>Codex CLI 默认参数</h2>
-            <p>只影响 Teamwork 发起的 Codex 进程，不会修改你的 Codex 用户配置文件。</p>
+            <h2>Codex 运行方式与默认参数</h2>
+            <p>选择由 Codex CLI 托管完整 Agent，或只使用 Codex 模型并由 Teamwork 提供工具和运行环境。</p>
+          </div>
+          <div className="runtime-connection-test" aria-live="polite">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={testingConnection}
+              onClick={() => { void testConnection(); }}
+            >
+              {testingConnection ? "连接测试中…" : "连接测试"}
+            </button>
+            <small>测试当前已保存配置</small>
+            {connectionResult && (
+              <span className="runtime-connection-result success">
+                {connectionResult.mode === "model" ? "模型基座" : "Codex CLI"}
+                {` · ${connectionResult.model ?? "默认模型"} · ${connectionResult.elapsed_seconds.toFixed(2)} 秒 · 回复：${connectionResult.reply}`}
+              </span>
+            )}
+            {connectionError && <span className="runtime-connection-result error">{connectionError}</span>}
           </div>
         </div>
-        <div className="agent-workspace-note">
-          <strong>当前模型来源</strong>
-          <span>{inherited.label}。下面展示的是没有单一仓库上下文时的后台全局继承值；Agent 可以单独覆盖，仓库中的 `.codex/config.toml` 仍可能参与 Codex 原生合并。</span>
-        </div>
-        <div className="agent-workspace-note">
-          <strong>实际后台 CLI</strong>
-          <span>
-            {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
-            {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
-            {` · CODEX_HOME ${props.options.codex_home}`}
-          </span>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
+        <div className="runtime-mode-stack">
+          <div className="rule-option runtime-mode-option">
+            <Toggle
+              label="Codex 仅作为模型基座"
+              checked={(codex.execution_mode ?? "cli") === "model"}
+              onChange={(enabled) => patchCodex({ execution_mode: enabled ? "model" : "cli" })}
+            />
+            <p>
+              开启后不启动 <code>codex exec</code>，Teamwork 直接复用当前 Codex OAuth 登录并提供命令、补丁和 sub-agent 工具；
+              关闭后保持现有 Codex CLI 工具、MCP 与运行环境。
+            </p>
+          </div>
+          {(codex.execution_mode ?? "cli") === "model" && (
+            <div className="alert warning">
+              模型基座模式不会请求外部或本机 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
+              受限 Agent 必须成功启用下方 Teamwork 外层沙盒；默认模型需在本页、Agent 或 Codex config.toml 中明确配置。
+            </div>
+          )}
+          <div className="agent-workspace-note">
+            <strong>当前模型来源</strong>
+            <span>
+              {inherited.label}。下面展示的是后台全局继承值；Agent 可以单独覆盖。
+              {(codex.execution_mode ?? "cli") === "cli"
+                ? "仓库中的 .codex/config.toml 仍可能参与 Codex 原生合并。"
+                : "模型基座模式只读取配置的顶层模型默认值，不执行仓库 Codex 配置。"}
+            </span>
+          </div>
+          <div className="agent-workspace-note">
+            <strong>{(codex.execution_mode ?? "cli") === "model" ? "认证与沙盒 CLI" : "实际后台 CLI"}</strong>
+            <span>
+              {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
+              {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
+              {` · CODEX_HOME ${props.options.codex_home}`}
+            </span>
+          </div>
         </div>
         {props.options.version_warning && <div className="alert error">{props.options.version_warning}</div>}
         {props.options.effective_config_error && (
@@ -1619,7 +2136,13 @@ function CodexRuntimeEditor(props: {
             placeholder={inherited.label}
             models={props.options.models}
             onChange={(model) => patchCodex({ model: model || undefined })}
-            help={props.options.catalog_error ? "无法读取本机模型目录，仍可手工填写模型 ID" : "候选项来自当前服务使用的 Codex CLI"}
+            help={
+              props.options.catalog_error
+                ? "无法读取模型目录，仍可手工填写模型 ID"
+                : props.options.catalog_source === "account_cache"
+                  ? "候选项来自当前 Codex 账号模型缓存"
+                  : "候选项来自当前服务使用的 Codex CLI 内置目录"
+            }
           />
           <SelectField
             label="默认推理强度"
@@ -1689,8 +2212,10 @@ function CodexRuntimeEditor(props: {
               { value: "cached", label: "缓存搜索" },
               { value: "live", label: "实时搜索" },
             ]}
+            help={(codex.execution_mode ?? "cli") === "model" ? "模型基座模式不提供 Codex 托管搜索工具，此项仅用于 CLI 模式" : undefined}
           />
         </div>
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -1699,6 +2224,7 @@ function CodexRuntimeEditor(props: {
             <p>由 Teamwork 统一生成权限档案，再交给 Codex CLI 的 macOS、Linux / WSL 或 Windows 原生沙盒执行器。</p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="agent-workspace-note">
           <strong>当前能力</strong>
           <span>
@@ -1731,16 +2257,26 @@ function CodexRuntimeEditor(props: {
               },
             })}
           />
-          <small>关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。</small>
+          <small>
+            {(codex.execution_mode ?? "cli") === "model"
+              ? "模型基座模式没有 Codex 内层沙盒，因此受限 Agent 始终失败关闭，此开关只影响 CLI 模式。"
+              : "关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。"}
+          </small>
         </div>
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
           <div>
             <h2>后台 MCP 能力隔离</h2>
-            <p>默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。</p>
+            <p>
+              {(codex.execution_mode ?? "cli") === "model"
+                ? "模型基座模式不加载任何用户 MCP，sub-agent 由 Teamwork 内部执行器直接调度；以下设置留给 CLI 模式。"
+                : "默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。"}
+            </p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="toggle-grid">
           <Toggle
             label="继承全部用户 MCP（高风险）"
@@ -1757,14 +2293,19 @@ function CodexRuntimeEditor(props: {
             onChange={(allowed_user_mcp_servers) => patchRuntime({ allowed_user_mcp_servers })}
           />
         )}
+        </fieldset>
       </section>
       <section className="section-card">
         <div className="section-title-row">
           <div>
             <h2>高级 Codex 配置</h2>
-            <p>使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。</p>
+            <p>
+              使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。
+              {(codex.execution_mode ?? "cli") === "model" ? " 模型基座模式不解释这些 CLI 高级项。" : ""}
+            </p>
           </div>
         </div>
+        <fieldset className="config-editor-surface" disabled={!props.editable}>
         <JsonEditor
           label="额外配置（JSON）"
           value={codex.extra_config ?? {}}
@@ -1773,6 +2314,7 @@ function CodexRuntimeEditor(props: {
             extra_config: extra_config as CodexRuntimeConfig["extra_config"],
           })}
         />
+        </fieldset>
       </section>
     </div>
   );
@@ -2010,8 +2552,16 @@ function ConfigHistory() {
 
 function RepositoryConnectionsEditor(props: {
   document: ConfigDocument;
-  onChange: (document: ConfigDocument) => void;
+  revision: string;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
 }) {
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [draftProvider, setDraftProvider] = useState<Record<string, unknown> | null>(null);
+  const [saving, setSaving] = useState(false);
   const providerNames = Object.keys(props.document.providers);
   const repositoryCount = props.document.repositories.length;
 
@@ -2022,42 +2572,85 @@ function RepositoryConnectionsEditor(props: {
   }
 
   function addProvider() {
+    if (editingName !== null) return;
     let index = providerNames.length + 1;
     let name = `provider-${index}`;
     while (props.document.providers[name]) name = `provider-${++index}`;
-    props.onChange({
-      ...props.document,
-      providers: {
-        ...props.document.providers,
-        [name]: { kind: "github", ...providerDefaults("github") },
-      },
-    });
+    setCreating(true);
+    setEditingName(name);
+    setDraftName(name);
+    setDraftProvider({ kind: "github", ...providerDefaults("github") });
   }
 
-  function updateProvider(name: string, patch: Record<string, unknown>) {
-    props.onChange({
-      ...props.document,
-      providers: {
-        ...props.document.providers,
-        [name]: { ...props.document.providers[name], ...patch },
-      },
-    });
+  function beginEdit(name: string) {
+    if (editingName !== null) return;
+    setCreating(false);
+    setEditingName(name);
+    setDraftName(name);
+    setDraftProvider(structuredClone(props.document.providers[name]));
   }
 
-  function renameProvider(name: string, nextName: string): boolean {
-    if (!nextName || (nextName !== name && props.document.providers[nextName])) return false;
-    const providers = Object.fromEntries(
-      Object.entries(props.document.providers).map(([key, value]) => [
-        key === name ? nextName : key,
-        value,
-      ]),
-    );
-    const repositories = props.document.repositories.map((repository) => ({
-      ...repository,
-      provider: repository.provider === name ? nextName : repository.provider,
-    }));
-    props.onChange({ ...props.document, providers, repositories });
-    return true;
+  function clearDraft() {
+    setEditingName(null);
+    setCreating(false);
+    setDraftName("");
+    setDraftProvider(null);
+  }
+
+  function updateDraft(patch: Record<string, unknown>) {
+    setDraftProvider((current) => ({ ...(current ?? {}), ...patch }));
+  }
+
+  async function saveProvider() {
+    if (!editingName || !draftName.trim() || !draftProvider) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/providers"
+        : `/api/config/providers/${encodeURIComponent(editingName)}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          name: draftName.trim(),
+          provider: draftProvider,
+        }),
+      });
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(
+        creating
+          ? `平台连接 ${draftName.trim()} 已创建并热加载`
+          : `平台连接 ${draftName.trim()} 已保存并热加载`,
+      );
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存平台连接失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteProvider(name: string) {
+    if (saving) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/providers/${encodeURIComponent(name)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`平台连接 ${name} 已删除并热加载`);
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除平台连接失败");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -2082,7 +2675,7 @@ function RepositoryConnectionsEditor(props: {
             <h2>GitHub / GitLab 连接</h2>
             <p>后台使用这里的平台 API 和 Token 扫描远端 MR / PR；平台连接本身不会立即克隆代码，Agent 首次运行时才按仓库配置自动准备本地工作目录。</p>
           </div>
-          <button className="button secondary" onClick={addProvider}>+ 添加平台连接</button>
+          <button className="button secondary" disabled={editingName !== null} onClick={addProvider}>+ 添加平台连接</button>
         </div>
         <div className="card-list compact">
           {providerNames.length === 0 && (
@@ -2091,8 +2684,11 @@ function RepositoryConnectionsEditor(props: {
               <p>先点击“添加平台连接”，再配置平台 API 地址，以及宿主机中保存访问 Token 的环境变量名。</p>
             </div>
           )}
-          {providerNames.map((name) => {
-            const provider = props.document.providers[name];
+          {[...providerNames, ...(creating && editingName ? [editingName] : [])].map((name) => {
+            const isEditing = editingName === name;
+            const provider = isEditing && draftProvider
+              ? draftProvider
+              : props.document.providers[name];
             const tokenEnvironment = String(provider.token_env ?? "").trim();
             const hasGlobalToken = Boolean(tokenEnvironment)
               && Object.hasOwn(props.document.environment.global, tokenEnvironment);
@@ -2103,25 +2699,54 @@ function RepositoryConnectionsEditor(props: {
                 : `全局环境未配置；将从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
-              <div className="sub-card provider-row" key={name}>
-                <CommitField label="连接名称" value={name} onCommit={(nextName) => renameProvider(name, nextName)} />
-                <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
-                  const kind = event.target.value as "github" | "gitlab";
-                  updateProvider(name, { kind, ...providerDefaults(kind) });
-                }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
-                <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateProvider(name, { base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
-                <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateProvider(name, { token_env: value })} help={tokenHelp} />
-                <button
-                  className="icon-button danger align-end"
-                  disabled={referencedRepositories > 0}
-                  title={referencedRepositories > 0 ? `有 ${referencedRepositories} 个仓库正在使用此连接` : "删除连接"}
-                  onClick={() => {
-                    const providers = { ...props.document.providers };
-                    delete providers[name];
-                    props.onChange({ ...props.document, providers });
-                  }}
-                >×</button>
-              </div>
+              <article className={`sub-card provider-card ${isEditing ? "editing" : ""}`} key={name}>
+                <div className="sub-card-head provider-card-head">
+                  <div>
+                    <span className="eyebrow">{creating && isEditing ? "NEW PROVIDER" : "PROVIDER CONNECTION"}</span>
+                    <h3>{creating && isEditing ? "新建平台连接" : name}</h3>
+                  </div>
+                  <div className="button-group">
+                    {isEditing ? (
+                      <>
+                        {!creating && (
+                          <button
+                            type="button"
+                            className="button danger compact"
+                            disabled={saving || referencedRepositories > 0}
+                            title={referencedRepositories > 0 ? `有 ${referencedRepositories} 个仓库正在使用此连接` : "删除连接"}
+                            onClick={() => { void deleteProvider(name); }}
+                          >删除连接</button>
+                        )}
+                        <button type="button" className="button secondary compact" disabled={saving} onClick={clearDraft}>取消</button>
+                        <button
+                          type="button"
+                          className="button primary compact"
+                          disabled={saving || !draftName.trim()}
+                          onClick={() => { void saveProvider(); }}
+                        >{saving ? "保存中…" : "保存连接"}</button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="button secondary compact"
+                        disabled={editingName !== null}
+                        onClick={() => beginEdit(name)}
+                      >编辑</button>
+                    )}
+                  </div>
+                </div>
+                <fieldset className="config-editor-surface provider-editor-surface" disabled={!isEditing || saving}>
+                  <div className="provider-row">
+                    <Field label="连接名称" value={isEditing ? draftName : name} onChange={setDraftName} />
+                    <label className="field"><span>代码平台</span><select value={String(provider.kind)} onChange={(event) => {
+                      const kind = event.target.value as "github" | "gitlab";
+                      updateDraft({ kind, ...providerDefaults(kind) });
+                    }}><option value="github">GitHub</option><option value="gitlab">GitLab</option></select></label>
+                    <Field label="平台 API 地址" value={String(provider.base_url ?? "")} onChange={(value) => updateDraft({ base_url: value })} help="自建 GitHub Enterprise / GitLab 时改为实际 API 地址" />
+                    <Field label="Provider Token 变量名" value={String(provider.token_env ?? "")} onChange={(value) => updateDraft({ token_env: value })} help={tokenHelp} />
+                  </div>
+                </fieldset>
+              </article>
             );
           })}
         </div>
@@ -2455,6 +3080,8 @@ function RepositoryDetailEditor(props: {
   document: ConfigDocument;
   repositoryIndex: number;
   creating: boolean;
+  disabled: boolean;
+  preflightAction?: ReactNode;
   onIdChange: (repositoryId: string) => void;
   onChange: (document: ConfigDocument) => void;
 }) {
@@ -2467,6 +3094,8 @@ function RepositoryDetailEditor(props: {
     steps: RepositoryPreflightStep[];
   } = {
     enabled: repository.preflight?.enabled ?? false,
+    cache_enabled: repository.preflight?.cache_enabled ?? true,
+    publish_failure_comment: repository.preflight?.publish_failure_comment ?? false,
     status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
     timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
     max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
@@ -2520,84 +3149,108 @@ function RepositoryDetailEditor(props: {
   return (
     <section className="section-card repository-detail-form">
       <article className="sub-card repository-detail-card">
-        <div className="sub-card-head">
-          <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
-          <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
-        </div>
-        <div className="form-grid two">
-          {props.creating ? (
-            <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
-          ) : (
+        <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+          <div className="sub-card-head">
+            <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
+            <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
+          </div>
+          <div className="form-grid two">
+            {props.creating ? (
+              <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
+            ) : (
+              <label className="field">
+                <span>仓库 ID</span>
+                <input value={repository.id} disabled />
+                <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
+              </label>
+            )}
             <label className="field">
-              <span>仓库 ID</span>
-              <input value={repository.id} disabled />
-              <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
+              <span>所属 GitHub / GitLab 连接</span>
+              <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
+                {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
+              </select>
+              <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
             </label>
-          )}
-          <label className="field">
-            <span>所属 GitHub / GitLab 连接</span>
-            <select value={repository.provider} onChange={(event) => update({ provider: event.target.value })}>
-              {providerNames.map((provider) => <option key={provider}>{provider}</option>)}
-            </select>
-            <small>决定使用哪个平台 API 和 Token 扫描此仓库</small>
-          </label>
-          <Field
-            label="远端仓库地址 / 项目路径"
-            value={repository.clone_url ?? repository.project}
-            onChange={(project) => update({ project, clone_url: undefined })}
-            placeholder="git@github.com:owner/repository.git"
-            help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后自动解析平台项目路径"
-          />
-          <Field
-            label="基础 Git 仓库目录（自动管理）"
-            value={repository.workspace}
-            onChange={(workspace) => update({ workspace })}
-            help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
-          />
-        </div>
+            <Field
+              label="远端仓库地址 / 项目路径"
+              value={repository.clone_url ?? repository.project}
+              onChange={(project) => update({ project, clone_url: undefined })}
+              placeholder="git@github.com:owner/repository.git"
+              help="支持 owner/repository、group/project、SSH 或 HTTPS Git 地址；保存后自动解析平台项目路径"
+            />
+            <Field
+              label="基础 Git 仓库目录（自动管理）"
+              value={repository.workspace}
+              onChange={(workspace) => update({ workspace })}
+              help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
+            />
+          </div>
+        </fieldset>
         <section className="repository-preflight-section">
           <div className="repository-preflight-head">
             <div>
               <strong>本地 CI 门禁</strong>
               <p>声明此仓库可执行的本地 CI，当前仅支持 GitHub。只有明确选择“执行仓库 CI”的触发规则才会使用；未配置时对应 Agent 仍会直接运行。</p>
             </div>
-            <Toggle label={preflight.enabled ? "已启用" : "未启用"} checked={preflight.enabled} onChange={togglePreflight} />
+            <div className="repository-preflight-head-actions">
+              {props.preflightAction}
+              <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+                <Toggle label={preflight.enabled ? "已启用" : "未启用"} checked={preflight.enabled} onChange={togglePreflight} />
+              </fieldset>
+            </div>
           </div>
           {preflight.enabled && (
-            <div className="repository-preflight-content">
-              <div className="form-grid three">
-                <Field
-                  label="GitHub 状态名称"
-                  value={preflight.status_context}
-                  onChange={(status_context) => updatePreflight({ status_context })}
-                  help="建议同时配置为仓库 Ruleset 的 required status check"
-                />
-                <Field
-                  label="CI 总超时（秒）"
-                  type="number"
-                  value={preflight.timeout_seconds}
-                  onChange={(value) => updatePreflight({ timeout_seconds: Number(value) })}
-                />
-                <Field
-                  label="最大日志字节数"
-                  type="number"
-                  value={preflight.max_output_bytes}
-                  onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
-                />
-              </div>
-              <div className="repository-preflight-steps-head">
-                <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
-                <button
-                  type="button"
-                  className="button secondary compact"
-                  onClick={() => updatePreflight({
-                    steps: [...preflight.steps, { name: `step-${preflight.steps.length + 1}`, command: ["bash", "ci/preflight.sh"] }],
-                  })}
-                >+ 添加步骤</button>
-              </div>
-              <div className="repository-preflight-steps">
-                {preflight.steps.map((step, index) => (
-                  <article className="repository-preflight-step" key={index}>
+            <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+              <div className="repository-preflight-content">
+                <div className="form-grid three">
+                  <Field
+                    label="GitHub 状态名称"
+                    value={preflight.status_context}
+                    onChange={(status_context) => updatePreflight({ status_context })}
+                    help="建议同时配置为仓库 Ruleset 的 required status check"
+                  />
+                  <Field
+                    label="CI 总超时（秒）"
+                    type="number"
+                    value={preflight.timeout_seconds}
+                    onChange={(value) => updatePreflight({ timeout_seconds: Number(value) })}
+                  />
+                  <Field
+                    label="最大日志字节数"
+                    type="number"
+                    value={preflight.max_output_bytes}
+                    onChange={(value) => updatePreflight({ max_output_bytes: Number(value) })}
+                  />
+                </div>
+                <div className="repository-preflight-cache-option">
+                  <Toggle
+                    label={preflight.cache_enabled ? "仓库级依赖缓存已启用" : "仓库级依赖缓存已停用"}
+                    checked={preflight.cache_enabled}
+                    onChange={(cache_enabled) => updatePreflight({ cache_enabled })}
+                  />
+                  <p>同一仓库的不同分支和 MR / PR 共享下载缓存；每次 CI 的工作区与安装结果仍保持隔离。覆盖 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer 和常见浏览器缓存。</p>
+                </div>
+                <div className="repository-preflight-cache-option">
+                  <Toggle
+                    label="失败时发布 PR 评论"
+                    checked={preflight.publish_failure_comment}
+                    onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
+                  />
+                  <p>仅自动 MR / PR CI 失败、超时或异常时创建或更新同一条评论；后续通过后删除。成功结果和手动仓库 CI 不发布评论。</p>
+                </div>
+                <div className="repository-preflight-steps-head">
+                  <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
+                  <button
+                    type="button"
+                    className="button secondary compact"
+                    onClick={() => updatePreflight({
+                      steps: [...preflight.steps, { name: `step-${preflight.steps.length + 1}`, command: ["bash", "ci/preflight.sh"] }],
+                    })}
+                  >+ 添加步骤</button>
+                </div>
+                <div className="repository-preflight-steps">
+                  {preflight.steps.map((step, index) => (
+                    <article className="repository-preflight-step" key={index}>
                     <div className="repository-preflight-step-title">
                       <strong>步骤 {index + 1}</strong>
                       <div className="button-group">
@@ -2635,20 +3288,23 @@ function RepositoryDetailEditor(props: {
                       />
                       <small>每一行作为一个独立参数；例如 bash + ci/preflight.sh 等价于执行仓库脚本。</small>
                     </label>
-                  </article>
-                ))}
-                {preflight.steps.length === 0 && <div className="choice-empty">启用本地 CI 时至少需要添加一个命令步骤。</div>}
+                    </article>
+                  ))}
+                  {preflight.steps.length === 0 && <div className="choice-empty">启用本地 CI 时至少需要添加一个命令步骤。</div>}
+                </div>
               </div>
-            </div>
+            </fieldset>
           )}
         </section>
-        <EnvironmentEditor
-          compact
-          title="仓库环境变量"
-          value={repository.environment ?? {}}
-          protectedNames={protectedNames}
-          onChange={(environment) => update({ environment })}
-        />
+        <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+          <EnvironmentEditor
+            compact
+            title="仓库环境变量"
+            value={repository.environment ?? {}}
+            protectedNames={protectedNames}
+            onChange={(environment) => update({ environment })}
+          />
+        </fieldset>
       </article>
     </section>
   );
@@ -2657,7 +3313,6 @@ function RepositoryDetailEditor(props: {
 function RepositoriesView(props: {
   document: ConfigDocument;
   revision: string;
-  blocked: boolean;
   onSaved: (document: ConfigDocument, revision: string) => void;
   onDirtyChange: (dirty: boolean) => void;
   onDetailOpenChange: (open: boolean) => void;
@@ -2672,6 +3327,11 @@ function RepositoriesView(props: {
   const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
   const [draftId, setDraftId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [startingPreflight, setStartingPreflight] = useState(false);
+  const [checkingManualPreflight, setCheckingManualPreflight] = useState(false);
+  const [activeManualPreflightRunId, setActiveManualPreflightRunId] = useState<string | null>(null);
+  const [selectedPreflightRunId, setSelectedPreflightRunId] = useState<string | null>(null);
+  const [togglingRepositoryId, setTogglingRepositoryId] = useState<string | null>(null);
   const [workspaceItems, setWorkspaceItems] = useState<RepositoryWorkspaceStatus[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
   const [pendingAction, setPendingAction] = useState<
@@ -2693,6 +3353,44 @@ function RepositoriesView(props: {
     const timer = window.setInterval(() => { void refreshWorkspaceItems(); }, 2000);
     return () => window.clearInterval(timer);
   }, [refreshWorkspaceItems]);
+
+  const findActiveManualPreflight = useCallback(async (repositoryId: string): Promise<string | null> => {
+    const parameters = new URLSearchParams({
+      limit: "20",
+      status: "running",
+      repository_id: repositoryId,
+    });
+    const runs = await api<PreflightRunSummary[]>(`/api/preflight-runs?${parameters.toString()}`);
+    return runs.find((run) => run.trigger_source === "manual")?.run_id ?? null;
+  }, []);
+
+  useEffect(() => {
+    if (!detailId || editing || creating) {
+      if (!detailId) setActiveManualPreflightRunId(null);
+      setCheckingManualPreflight(false);
+      return;
+    }
+    let disposed = false;
+    let firstLoad = true;
+    const refresh = async () => {
+      if (firstLoad) setCheckingManualPreflight(true);
+      try {
+        const runId = await findActiveManualPreflight(detailId);
+        if (!disposed) setActiveManualPreflightRunId(runId);
+      } catch {
+        // 后台轮询失败不覆盖页面操作错误；启动或查看时仍会返回明确反馈。
+      } finally {
+        if (!disposed && firstLoad) setCheckingManualPreflight(false);
+        firstLoad = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [creating, detailId, editing, findActiveManualPreflight]);
 
   const repositories = useMemo(
     () => [...props.document.repositories].sort((left, right) => left.id.localeCompare(right.id)),
@@ -2757,6 +3455,8 @@ function RepositoriesView(props: {
 
   function openDetail(repositoryId: string) {
     clearDraft();
+    setCheckingManualPreflight(true);
+    setActiveManualPreflightRunId(null);
     setDetailId(repositoryId);
   }
 
@@ -2766,12 +3466,13 @@ function RepositoriesView(props: {
       return;
     }
     clearDraft();
+    setActiveManualPreflightRunId(null);
     setDetailId(null);
   }
 
   function beginCreate() {
     const providerNames = Object.keys(props.document.providers);
-    if (providerNames.length === 0 || props.blocked) return;
+    if (providerNames.length === 0) return;
     let index = props.document.repositories.length + 1;
     let repositoryId = `repository-${index}`;
     while (props.document.repositories.some((repository) => repository.id === repositoryId)) {
@@ -2783,12 +3484,13 @@ function RepositoriesView(props: {
       provider: providerNames[0],
       project: "owner/repository",
       workspace: `./workspaces/${repositoryId}`,
-      enabled: false,
+      enabled: true,
       environment: {},
     });
     setDetailId(null);
     setCreating(true);
     setEditing(true);
+    setActiveManualPreflightRunId(null);
     setDraftId(repositoryId);
     setDraftDocument(nextDocument);
   }
@@ -2865,6 +3567,70 @@ function RepositoriesView(props: {
     }
   }
 
+  async function toggleRepository(repository: Repository) {
+    if (togglingRepositoryId !== null) return;
+    const enabled = repository.enabled === false;
+    setTogglingRepositoryId(repository.id);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/repositories/${encodeURIComponent(repository.id)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            revision: props.revision,
+            repository_id: repository.id,
+            repository: { ...repository, enabled },
+          }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`仓库 ${repository.id} 已${enabled ? "启用" : "停用"}并热加载`);
+      await refreshWorkspaceItems();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "更新仓库启用状态失败");
+    } finally {
+      setTogglingRepositoryId(null);
+    }
+  }
+
+  async function startManualPreflight() {
+    if (!detailId || startingPreflight || dirty) return;
+    if (activeManualPreflightRunId) {
+      setSelectedPreflightRunId(activeManualPreflightRunId);
+      return;
+    }
+    setStartingPreflight(true);
+    props.onError("");
+    try {
+      const result = await api<{
+        accepted: boolean;
+        run_id: string;
+        reason: string;
+      }>(`/api/repositories/${encodeURIComponent(detailId)}/preflight/start`, {
+        method: "POST",
+      });
+      props.onNotice(result.reason);
+      setActiveManualPreflightRunId(result.run_id);
+      setSelectedPreflightRunId(result.run_id);
+    } catch (reason) {
+      try {
+        const runId = await findActiveManualPreflight(detailId);
+        if (runId) {
+          setActiveManualPreflightRunId(runId);
+          setSelectedPreflightRunId(runId);
+          props.onNotice("已打开该仓库正在运行的手动 CI");
+          return;
+        }
+      } catch {
+        // 保留原始启动错误，避免后续查询失败覆盖真正原因。
+      }
+      props.onError(reason instanceof Error ? reason.message : "启动手动 CI 失败");
+    } finally {
+      setStartingPreflight(false);
+    }
+  }
+
   const confirmation = useMemo<AgentActionConfirmation | null>(() => {
     if (!pendingAction) return null;
     if (pendingAction.kind === "discard") {
@@ -2923,8 +3689,8 @@ function RepositoriesView(props: {
           <button
             type="button"
             className="button primary"
-            disabled={!hasProviders || props.blocked}
-            title={!hasProviders ? "请先添加 GitHub / GitLab 连接" : props.blocked ? "请先保存或取消平台连接修改" : "添加仓库"}
+            disabled={!hasProviders}
+            title={!hasProviders ? "请先添加 GitHub / GitLab 连接" : "添加仓库"}
             onClick={beginCreate}
           >+ 添加仓库</button>
         </div>
@@ -2942,22 +3708,38 @@ function RepositoriesView(props: {
           <div className="repository-config-items">
             {visibleRepositories.map((repository) => {
               const workspace = workspaceById.get(repository.id);
+              const gitBusy = Boolean(workspace && ["waiting", "initializing", "updating"].includes(workspace.status));
+              const enabled = repository.enabled !== false;
+              const toggling = togglingRepositoryId === repository.id;
               return (
-                <button
-                  type="button"
+                <div
                   className="repository-config-row"
                   key={repository.id}
-                  disabled={props.blocked}
                   onClick={() => openDetail(repository.id)}
                 >
                   <span className="agent-config-identity"><span className="repository-config-avatar" aria-hidden="true">G</span><span><strong>{repository.id}</strong><small>{repository.environment && Object.keys(repository.environment).length > 0 ? `${Object.keys(repository.environment).length} 个环境变量` : "无仓库环境变量"}</small></span></span>
-                  <span><strong className={repository.enabled !== false ? "success-text" : "muted-text"}>{repository.enabled !== false ? "已启用" : "已停用"}</strong></span>
+                  <span className={`repository-config-status ${enabled ? "enabled" : ""}`} onClick={(event) => event.stopPropagation()}>
+                    <Toggle
+                      label={toggling ? "保存中…" : enabled ? "已启用" : "已停用"}
+                      checked={enabled}
+                      disabled={togglingRepositoryId !== null || gitBusy}
+                      onChange={() => { void toggleRepository(repository); }}
+                    />
+                  </span>
                   <span><strong>{repository.provider}</strong></span>
                   <span className="agent-config-summary"><strong>{repository.project}</strong><small>{repository.clone_url ?? "使用平台默认克隆地址"}</small></span>
                   <span className="agent-config-summary"><strong>{repository.workspace}</strong><small>基础 Git 仓库</small></span>
                   <span className="agent-config-summary"><strong>{workspaceLoading && !workspace ? "检查中" : workspace ? repositoryWorkspaceStatusLabel(workspace.status) : "未读取"}</strong><small>{workspace?.phase ?? "等待状态检查"}</small></span>
-                  <span className="agent-config-arrow" aria-hidden="true">›</span>
-                </button>
+                  <button
+                    type="button"
+                    className="agent-config-arrow repository-config-detail-button"
+                    aria-label={`查看仓库 ${repository.id}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openDetail(repository.id);
+                    }}
+                  >›</button>
+                </div>
               );
             })}
             {visibleRepositories.length === 0 && (
@@ -3016,17 +3798,46 @@ function RepositoriesView(props: {
           <span>仍被触发规则引用：{referencingRules.map((rule) => rule.name).join("、")}。请先修改这些规则的仓库范围。</span>
         </div>
       )}
-      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving || gitActive}>
-        {activeRepository && (
-          <RepositoryDetailEditor
-            document={activeDocument}
-            repositoryIndex={detailIndex}
-            creating={creating}
-            onIdChange={setDraftId}
-            onChange={setDraftDocument}
-          />
-        )}
-      </fieldset>
+      {activeRepository && (
+        <RepositoryDetailEditor
+          document={activeDocument}
+          repositoryIndex={detailIndex}
+          creating={creating}
+          disabled={!editing || saving || gitActive}
+          preflightAction={!editing ? (
+            <button
+              type="button"
+              className="button secondary"
+              disabled={
+                checkingManualPreflight
+                || (!activeManualPreflightRunId && (
+                  startingPreflight
+                  || gitActive
+                  || originalRepository?.enabled === false
+                  || !originalRepository?.preflight?.enabled
+                  || !originalRepository?.preflight?.steps?.length
+                ))
+              }
+              title={
+                activeManualPreflightRunId
+                  ? "重新打开该仓库正在运行的手动 CI"
+                  : originalRepository?.enabled === false
+                  ? "请先启用仓库"
+                  : !originalRepository?.preflight?.enabled
+                    ? "请先配置并启用本地 CI"
+                    : "不限时执行远端默认分支最新提交，用于验证 CI 并预热仓库级缓存"
+              }
+              onClick={() => { void startManualPreflight(); }}
+            >{checkingManualPreflight
+              ? "检查运行状态…"
+              : activeManualPreflightRunId
+                ? "查看运行中的 CI"
+                : startingPreflight ? "启动中…" : "执行 CI / 预热缓存"}</button>
+          ) : undefined}
+          onIdChange={setDraftId}
+          onChange={setDraftDocument}
+        />
+      )}
       {creating ? (
         <section className="section-card repository-workspace-manager">
           <div className="section-title-row"><div><h2>基础仓库状态</h2><p>保存仓库配置后才能初始化基础 Git 仓库。</p></div></div>
@@ -3052,6 +3863,20 @@ function RepositoriesView(props: {
         onCancel={() => { if (!saving) setPendingAction(null); }}
         onConfirm={confirmPendingAction}
       />
+      {selectedPreflightRunId && (
+        <PreflightRunDetailDrawer
+          runId={selectedPreflightRunId}
+          depth={0}
+          onClose={() => {
+            setSelectedPreflightRunId(null);
+            if (detailId) {
+              void findActiveManualPreflight(detailId)
+                .then(setActiveManualPreflightRunId)
+                .catch(() => undefined);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -3308,7 +4133,7 @@ function AgentsEditor(props: {
   return (
     <section className={`section-card ${props.showOverview === false ? "agent-detail-form" : ""}`}>
       {props.showOverview !== false && <div className="section-title-row">
-        <div><h2>Agent</h2><p>每个 Agent 由 Codex CLI 执行，并可通过白名单调用其他 Agent。</p></div>
+        <div><h2>Agent</h2><p>每个 Agent 使用当前 Codex 运行模式执行，并可通过白名单调用其他 Agent。</p></div>
         <button className="button primary" onClick={() => {
           let index = allNames.length + 1;
           let name = `agent-${index}`;
@@ -4433,31 +5258,86 @@ function queueReasonLabel(reason?: string | null): string | null {
   return labels[reason] ?? reason;
 }
 
-function EventStatusPill({ event }: { event: EventRecord }) {
+function eventStatusPresentation(event: EventRecord): {
+  label: string;
+  visualStatus: string;
+  details?: string;
+} {
   const labels: Record<string, string> = {
     pending: "待处理",
     processing: "规则匹配中",
     unmatched: "未触发",
     triggered: "已触发",
-    completed: event.trigger_count > 0 ? "已处理" : "历史已处理",
+    completed: event.trigger_count > 0 ? "已处理" : "已结束",
     failed: "处理失败",
     cancelled: "已取消",
   };
-  return (
-    <span className={`status-pill status-${event.status}`}>
-      {labels[event.status] ?? event.status}
+  let label = labels[event.status] ?? event.status;
+  let visualStatus = event.status;
+  if (event.error?.includes("状态回写失败")) {
+    label = "状态回写失败";
+    visualStatus = "failed";
+  } else if (event.status === "processing" && event.preflight_status === "running") {
+    label = "本地 CI 中";
+  } else if (event.status === "completed" && event.preflight_status === "failure") {
+    label = "本地 CI 未通过";
+    visualStatus = "failed";
+  } else if (event.status === "completed" && event.preflight_status === "timed_out") {
+    label = "本地 CI 超时";
+    visualStatus = "failed";
+  } else if (event.status === "completed" && event.preflight_status === "superseded") {
+    label = "Head 已更新，已跳过";
+    visualStatus = "unmatched";
+  } else if (event.status === "failed" && event.preflight_status === "error") {
+    label = "本地 CI 异常";
+  }
+  const details = event.error
+    ?? event.preflight_error
+    ?? (event.preflight_failed_step ? `失败步骤：${event.preflight_failed_step}` : undefined);
+  return { label, visualStatus, details };
+}
+
+function EventStatusPill({
+  event,
+  onClick,
+}: {
+  event: EventRecord;
+  onClick?: () => void;
+}) {
+  const presentation = eventStatusPresentation(event);
+  const content = (
+    <span
+      className={`status-pill status-${presentation.visualStatus}`}
+      title={presentation.details}
+    >
+      {presentation.label}
       {event.status === "pending" && queueReasonLabel(event.queue_reason)
         ? ` · ${queueReasonLabel(event.queue_reason)}`
         : ""}
     </span>
   );
+  if (!onClick) return content;
+  return (
+    <button
+      type="button"
+      className="event-status-trigger"
+      aria-label={`查看事件状态详情：${presentation.label}`}
+      title="查看事件状态详情"
+      onClick={onClick}
+    >
+      {content}
+    </button>
+  );
 }
 
 function EventAgentProgress({ event }: { event: EventRecord }) {
-  const total = event.trigger_count;
+  const rootCount = event.trigger_count;
+  const subAgentCount = event.sub_agent_count ?? 0;
+  const total = rootCount + subAgentCount;
   if (total === 0) {
     return <span className="event-agent-none">—</span>;
   }
+  const scope = `根 Agent ${rootCount} · sub-agent ${subAgentCount}`;
   const settled = event.agent_completed_count
     + event.agent_failed_count
     + event.agent_timed_out_count
@@ -4465,21 +5345,21 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   if (event.agent_running_count > 0) {
     return (
       <span className="event-agent-progress running">
-        执行中 {event.agent_running_count} · 已结束 {settled}/{total}
+        {scope} · 执行中 {event.agent_running_count} · 已结束 {settled}/{total}
       </span>
     );
   }
   if (event.agent_preparing_count > 0) {
     return (
       <span className="event-agent-progress preparing">
-        准备工作区 {event.agent_preparing_count} · 已结束 {settled}/{total}
+        {scope} · 准备工作区 {event.agent_preparing_count} · 已结束 {settled}/{total}
       </span>
     );
   }
   if (event.agent_queued_count > 0) {
     return (
       <span className="event-agent-progress queued">
-        排队中 {event.agent_queued_count} · 已结束 {settled}/{total}
+        {scope} · 排队中 {event.agent_queued_count} · 已结束 {settled}/{total}
       </span>
     );
   }
@@ -4489,14 +5369,676 @@ function EventAgentProgress({ event }: { event: EventRecord }) {
   if (failed > 0) {
     return (
       <span className="event-agent-progress failed">
-        异常 {failed} · 已结束 {settled}/{total}
+        {scope} · 异常 {failed} · 已结束 {settled}/{total}
       </span>
     );
   }
   return (
     <span className="event-agent-progress completed">
-      已完成 {event.agent_completed_count}/{total}
+      {scope} · 已完成 {event.agent_completed_count}/{total}
     </span>
+  );
+}
+
+type EventAgentTreeRow = {
+  key: string;
+  agentName: string;
+  description: string;
+  runId?: string | null;
+  status: string;
+  depth: number;
+};
+
+function buildEventAgentTreeRows(
+  dispatches: EventDispatchDetail[],
+  agentRuns: EventAgentRunSummary[],
+): EventAgentTreeRow[] {
+  const rows: EventAgentTreeRow[] = [];
+  const childrenByParent = new Map<string, EventAgentRunSummary[]>();
+  for (const run of agentRuns) {
+    if (!run.parent_run_id) continue;
+    const children = childrenByParent.get(run.parent_run_id) ?? [];
+    children.push(run);
+    childrenByParent.set(run.parent_run_id, children);
+  }
+
+  const visited = new Set<string>();
+  const appendChildren = (parentRunId: string, parentAgentName: string, depth: number) => {
+    for (const child of childrenByParent.get(parentRunId) ?? []) {
+      if (visited.has(child.run_id)) continue;
+      visited.add(child.run_id);
+      rows.push({
+        key: child.run_id,
+        agentName: child.agent_name,
+        description: `sub-agent · 由 ${parentAgentName} 触发`,
+        runId: child.run_id,
+        status: child.run_status,
+        depth: depth + 1,
+      });
+      appendChildren(child.run_id, child.agent_name, depth + 1);
+    }
+  };
+
+  for (const dispatch of dispatches) {
+    if (dispatch.run_id) visited.add(dispatch.run_id);
+    rows.push({
+      key: `${dispatch.idempotency_key}:${dispatch.agent_name}`,
+      agentName: dispatch.agent_name,
+      description: `根 Agent · 规则 ${dispatch.rule_name}`,
+      runId: dispatch.run_id,
+      status: dispatch.run_status ?? "queued",
+      depth: 0,
+    });
+    if (dispatch.run_id) appendChildren(dispatch.run_id, dispatch.agent_name, 0);
+  }
+
+  // 历史异常数据若缺失父节点，也应保留可追溯入口，不能静默隐藏运行记录。
+  for (const run of agentRuns) {
+    if (visited.has(run.run_id)) continue;
+    rows.push({
+      key: run.run_id,
+      agentName: run.agent_name,
+      description: run.parent_run_id ? "sub-agent · 父运行未找到" : "根 Agent",
+      runId: run.run_id,
+      status: run.run_status,
+      depth: run.parent_run_id ? 1 : 0,
+    });
+  }
+  return rows;
+}
+
+function preflightStatusLabel(status?: string | null): string {
+  const labels: Record<string, string> = {
+    running: "执行中",
+    success: "通过",
+    failure: "未通过",
+    timed_out: "超时",
+    error: "执行异常",
+    cancelled: "已取消",
+    superseded: "Head 已更新，已跳过",
+  };
+  return status ? labels[status] ?? status : "未执行";
+}
+
+function preflightStatusClass(status: string): string {
+  if (status === "success") return "completed";
+  if (status === "running") return "processing";
+  if (status === "superseded") return "unmatched";
+  if (status === "cancelled") return "cancelled";
+  return "failed";
+}
+
+function preflightPhaseLabel(phase?: string | null): string {
+  const labels: Record<string, string> = {
+    queued: "等待启动",
+    waiting_lock: "等待仓库锁",
+    preparing: "准备代码工作区",
+    preparing_cache: "准备依赖缓存",
+    running_steps: "执行 CI 步骤",
+    cancelling: "正在取消",
+    finished: "执行结束",
+  };
+  return phase ? labels[phase] ?? phase : "等待状态";
+}
+
+function preflightStepStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "等待执行",
+    running: "执行中",
+    success: "通过",
+    failure: "未通过",
+    timed_out: "超时",
+    error: "执行异常",
+    cancelled: "已取消",
+    skipped: "已跳过",
+  };
+  return labels[status] ?? status;
+}
+
+function preflightStepStatusClass(status: string): string {
+  if (status === "success") return "completed";
+  if (status === "running") return "processing";
+  if (status === "pending") return "queued";
+  if (status === "skipped") return "unmatched";
+  if (status === "cancelled") return "cancelled";
+  return "failed";
+}
+
+function eventDetailNeedsRefresh(detail: EventDetailRecord): boolean {
+  if (["pending", "processing"].includes(detail.status)) return true;
+  if (detail.preflights.some((preflight) => preflight.status === "running")) return true;
+  if (detail.agent_queued_count + detail.agent_preparing_count + detail.agent_running_count > 0) return true;
+  if (detail.dispatches.some((dispatch) => ["queued", "preparing", "running"].includes(dispatch.run_status ?? ""))) return true;
+  return (detail.agent_runs ?? []).some((run) => ["queued", "preparing", "running"].includes(run.run_status));
+}
+
+function eventStatusExplanation(event: EventRecord): string {
+  if (event.error?.includes("状态回写失败")) {
+    return "事件处理已结束，但向平台回写状态时失败。";
+  }
+  if (event.preflight_status === "running") {
+    return "本地 Preflight / CI 正在执行，规则将在检查结束后继续处理。";
+  }
+  if (event.preflight_status === "superseded") {
+    return "事件记录的 Head 已被后续提交取代且无法再获取，本次检查已跳过；同一 MR / PR 的后续事件会继续处理。";
+  }
+  if (["failure", "timed_out", "error"].includes(event.preflight_status ?? "")) {
+    return event.preflight_reused
+      ? "本事件复用了相同提交与配置的历史 Preflight / CI 结果，因此没有重复运行 Agent。"
+      : "本地 Preflight / CI 未通过，因此没有继续启动 Agent。";
+  }
+  if (event.status === "pending") {
+    return queueReasonLabel(event.queue_reason) ?? "事件正在等待调度。";
+  }
+  if (event.status === "processing") return "正在匹配触发规则并准备后续处理。";
+  if (event.status === "unmatched") return "没有启用的触发规则匹配这个事件。";
+  if (event.status === "triggered") return "规则已匹配，Agent 正在排队或运行。";
+  if (event.status === "failed") return "事件处理发生异常，详情见错误信息。";
+  if (event.status === "cancelled") return "事件关联的运行已被取消。";
+  if (event.trigger_count > 0) return "事件已完成规则匹配，关联的 Agent 调度已经结束。";
+  return "事件处理流程已结束，本次没有产生 Agent 调度或本地 CI 记录。";
+}
+
+function drawerLayerStyle(depth: number): { zIndex: number; "--drawer-width": string } {
+  const width = Math.max(44, 60 - depth * 4);
+  return {
+    zIndex: 80 + depth * 2,
+    "--drawer-width": `${width}vw`,
+  };
+}
+
+function ChangeRequestDetailDrawer(props: {
+  changeRequest: ChangeRequestRecord | null;
+  active: boolean;
+  depth: number;
+  onOpenEvent: (event: EventRecord) => void;
+  onClose: () => void;
+}) {
+  const { changeRequest, active, depth, onClose, onOpenEvent } = props;
+  const [detail, setDetail] = useState<ChangeRequestDetailRecord | null>(null);
+  const [error, setError] = useState("");
+
+  useBodyScrollLock(changeRequest !== null);
+
+  useEffect(() => {
+    if (!changeRequest) {
+      setDetail(null);
+      setError("");
+      return undefined;
+    }
+    let disposed = false;
+    const parameters = new URLSearchParams({
+      repository_id: changeRequest.repository_id,
+      number: String(changeRequest.number),
+    });
+    void api<ChangeRequestDetailRecord>(`/api/change-request-detail?${parameters.toString()}`)
+      .then((next) => {
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "MR/PR 详情加载失败");
+      });
+    return () => { disposed = true; };
+  }, [changeRequest]);
+
+  useEffect(() => {
+    if (!changeRequest || !active) return undefined;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [active, changeRequest, onClose]);
+
+  if (!changeRequest) return null;
+  const current = detail ?? changeRequest;
+  return (
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭 MR/PR 详情" disabled={!active} onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal={active} aria-label="MR/PR 详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{current.repository_id} · #{current.number}</span>
+            <h2>{current.title}</h2>
+            <p>{current.source_branch} → {current.target_branch}</p>
+          </div>
+          <div className="run-drawer-actions">
+            <StatusPill value={current.state} />
+            <button className="run-drawer-close" aria-label="关闭" disabled={!active} onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载 MR/PR 详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title"><div><span className="eyebrow">CHANGE REQUEST</span><h3>当前快照</h3></div></div>
+                <dl className="run-metadata">
+                  <div><dt>仓库</dt><dd>{detail.repository_id}</dd></div>
+                  <div><dt>编号</dt><dd>#{detail.number}</dd></div>
+                  <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
+                  <div><dt>远端更新</dt><dd>{dateTimeText(detail.updated_at)}</dd></div>
+                  <div><dt>最近扫描</dt><dd>{timeText(detail.scanned_at)}</dd></div>
+                  <div><dt>平台地址</dt><dd><a href={detail.web_url} target="_blank" rel="noreferrer">打开 MR / PR</a></dd></div>
+                </dl>
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENTS</span><h3>关联事件</h3></div>
+                  <span className="event-detail-count">{detail.events.length}</span>
+                </div>
+                {detail.events.length === 0 ? (
+                  <div className="event-detail-empty">当前 MR/PR 尚无关联事件。</div>
+                ) : (
+                  <div className="event-dispatch-list">
+                    {detail.events.map((event) => (
+                      <button type="button" className="event-record-card" key={event.event_id} onClick={() => onOpenEvent(event)}>
+                        <span><strong>{event.event_type}</strong><small>{dateTimeText(event.occurred_at)}</small></span>
+                        <EventStatusPill event={event} />
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function EventDetailDrawer(props: {
+  event: EventRecord | null;
+  active: boolean;
+  depth: number;
+  onOpenAgent: (runId: string) => void;
+  onOpenPreflight: (runId: string) => void;
+  onClose: () => void;
+}) {
+  const { event, active, depth, onClose, onOpenAgent, onOpenPreflight } = props;
+  const [detail, setDetail] = useState<EventDetailRecord | null>(null);
+  const [error, setError] = useState("");
+
+  useBodyScrollLock(event !== null);
+
+  useEffect(() => {
+    const eventId = event?.event_id;
+    if (!eventId) {
+      setDetail(null);
+      setError("");
+      return undefined;
+    }
+    let disposed = false;
+    let timer: number | undefined;
+    const load = async (): Promise<void> => {
+      let refreshAgain = true;
+      try {
+        const next = await api<EventDetailRecord>(`/api/events/${encodeURIComponent(eventId)}`);
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+          refreshAgain = eventDetailNeedsRefresh(next);
+        }
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "事件详情加载失败");
+      }
+      if (!disposed && refreshAgain) {
+        timer = window.setTimeout(() => { void load(); }, 3000);
+      }
+    };
+    setDetail(null);
+    setError("");
+    void load();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [event?.event_id]);
+
+  useEffect(() => {
+    if (!event || !active) return undefined;
+    const closeOnEscape = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [active, event, onClose]);
+
+  if (!event) return null;
+  const current = detail ?? event;
+  const preflights = detail?.preflights ?? (detail?.preflight ? [detail.preflight] : []);
+  const agentRows = detail
+    ? buildEventAgentTreeRows(detail.dispatches, detail.agent_runs ?? [])
+    : [];
+  return (
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭事件详情" disabled={!active} onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal={active} aria-label="事件状态详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{current.event_id}</span>
+            <h2>{current.event_type}</h2>
+            <p>{current.repository_id} · #{current.number} · {dateTimeText(current.occurred_at)}</p>
+          </div>
+          <div className="run-drawer-actions">
+            <EventStatusPill event={current} />
+            <button className="run-drawer-close" aria-label="关闭" disabled={!active} onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载事件详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENT</span><h3>处理结论</h3></div>
+                  <EventStatusPill event={detail} />
+                </div>
+                <p className="event-detail-explanation">{eventStatusExplanation(detail)}</p>
+                <dl className="run-metadata">
+                  <div><dt>来源</dt><dd>{detail.origin === "manual" ? "手动触发" : "扫描器"}</dd></div>
+                  <div><dt>事件状态</dt><dd>{detail.status}</dd></div>
+                  <div><dt>尝试次数</dt><dd>{detail.attempts}</dd></div>
+                  <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
+                  <div><dt>平台活动</dt><dd>{detail.source_activity_type ?? "—"}</dd></div>
+                  <div><dt>平台活动时间</dt><dd>{dateTimeText(detail.source_occurred_at)}</dd></div>
+                </dl>
+                {detail.error && <pre className="detail-pre detail-error">{detail.error}</pre>}
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">PREFLIGHT / CI</span><h3>本地检查记录</h3></div>
+                  <span className="event-detail-count">{preflights.length}</span>
+                </div>
+                {preflights.length === 0 ? (
+                  <div className="event-detail-empty">本事件没有关联的 Preflight / CI 记录。</div>
+                ) : (
+                  <div className="event-dispatch-list">
+                    {preflights.map((preflight) => (
+                      <button type="button" className="event-record-card" key={preflight.run_id} onClick={() => onOpenPreflight(preflight.run_id)}>
+                        <span>
+                          <strong>{preflight.reused ? "复用历史结果" : "本批次新执行"}</strong>
+                          <small>{preflight.failed_step ? `失败步骤：${preflight.failed_step}` : `开始于 ${timeText(preflight.started_at)}`}</small>
+                        </span>
+                        <span className={`status-pill status-${preflightStatusClass(preflight.status)}`}>{preflightStatusLabel(preflight.status)}</span>
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">AGENT</span><h3>规则与运行</h3></div>
+                  <span className="event-detail-count">{agentRows.length}</span>
+                </div>
+                {agentRows.length === 0 ? (
+                  <div className="event-detail-empty">本事件没有产生 Agent 调度。</div>
+                ) : (
+                  <div className="event-dispatch-list">
+                    {agentRows.map((run) => {
+                      const indent = Math.min(run.depth, 6) * 18;
+                      return (
+                      <button
+                        type="button"
+                        className={`event-record-card${run.depth > 0 ? " event-record-card-sub-agent" : ""}`}
+                        key={run.key}
+                        disabled={!run.runId}
+                        style={{ marginLeft: indent, width: `calc(100% - ${indent}px)` }}
+                        onClick={() => { if (run.runId) onOpenAgent(run.runId); }}
+                      >
+                        <span><strong>{run.depth > 0 ? "↳ " : ""}{run.agentName}</strong><small>{run.description}</small></span>
+                        <StatusPill value={run.status} />
+                        <span className="run-row-arrow" aria-hidden="true">›</span>
+                      </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function PreflightRunDetailDrawer(props: {
+  runId: string;
+  depth: number;
+  onClose: () => void;
+}) {
+  const { runId, depth, onClose } = props;
+  const [detail, setDetail] = useState<PreflightRunDetail | null>(null);
+  const [error, setError] = useState("");
+  const [logs, setLogs] = useState<RunLog[]>([]);
+  const [streamError, setStreamError] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const liveOutputRef = useRef<HTMLPreElement | null>(null);
+
+  useBodyScrollLock(Boolean(runId));
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | undefined;
+    const load = async (): Promise<void> => {
+      let refreshAgain = true;
+      try {
+        const next = await api<PreflightRunDetail>(`/api/preflight-runs/${encodeURIComponent(runId)}`);
+        if (!disposed) {
+          setDetail(next);
+          setError("");
+          refreshAgain = next.status === "running";
+        }
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "本地 CI 详情加载失败");
+      }
+      if (!disposed && refreshAgain) {
+        timer = window.setTimeout(() => { void load(); }, 1000);
+      }
+    };
+    setDetail(null);
+    setError("");
+    void load();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [runId]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let cursor = 0;
+    setLogs([]);
+    setStreamError("");
+    void streamPreflightLogs(
+      runId,
+      cursor,
+      controller.signal,
+      (log) => {
+        cursor = Math.max(cursor, log.id);
+        setLogs((current) => (
+          current.some((item) => item.id === log.id) ? current : [...current, log]
+        ));
+      },
+    ).catch((reason) => {
+      if (!controller.signal.aborted) {
+        setStreamError(reason instanceof Error ? reason.message : "CI 实时日志连接中断");
+      }
+    });
+    return () => controller.abort();
+  }, [runId]);
+
+  useEffect(() => {
+    const output = liveOutputRef.current;
+    if (output) output.scrollTop = output.scrollHeight;
+  }, [logs]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  async function cancelManualPreflight() {
+    if (!detail || detail.trigger_source !== "manual" || detail.status !== "running") return;
+    setCancelling(true);
+    setError("");
+    try {
+      const result = await api<{ accepted: boolean; reason: string }>(
+        `/api/preflight-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST" },
+      );
+      if (!result.accepted) setError(result.reason);
+      setDetail((current) => current ? { ...current, cancel_requested: true, phase: "cancelling" } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消手动 CI 失败");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  const liveOutput = logs.map((log) => {
+    if (log.event_type === "git_progress") {
+      try {
+        const progress = JSON.parse(log.payload) as {
+          operation?: string;
+          state?: string;
+          elapsed_seconds?: number;
+        };
+        return `[Git] ${progress.operation ?? "Git 操作"} · ${progress.state ?? "运行中"} · ${progress.elapsed_seconds ?? 0} 秒\n`;
+      } catch {
+        return `${log.payload}\n`;
+      }
+    }
+    if (log.event_type === "completed") {
+      try {
+        const result = JSON.parse(log.payload) as { status?: string };
+        return `\n[完成] ${preflightStatusLabel(result.status)}\n`;
+      } catch {
+        return `\n[完成] ${log.payload}\n`;
+      }
+    }
+    return log.payload;
+  }).join("");
+  const activeStep = detail?.steps.find((step) => step.status === "running");
+  const progressLabel = activeStep
+    ? `步骤 ${activeStep.step_index + 1}：${activeStep.name}`
+    : preflightPhaseLabel(detail?.phase);
+
+  return (
+    <div className="run-drawer-layer" style={drawerLayerStyle(depth)}>
+      <button type="button" className="run-drawer-backdrop" aria-label="关闭本地 CI 详情" onClick={onClose} />
+      <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal="true" aria-label="本地 CI 运行详情">
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">{runId}</span>
+            <h2>本地 Preflight / CI</h2>
+            {detail && <p>{detail.repository_id} · {detail.number ? `#${detail.number}` : detail.branch ?? "默认分支"} · {detail.trigger_source === "manual" ? "手动执行" : detail.event_type ?? "事件检查"}</p>}
+          </div>
+          <div className="run-drawer-actions">
+            {detail && <span className={`status-pill status-${preflightStatusClass(detail.status)}`}>{preflightStatusLabel(detail.status)}</span>}
+            {detail?.trigger_source === "manual" && detail.status === "running" && (
+              <button
+                type="button"
+                className="button danger compact"
+                disabled={cancelling || Boolean(detail.cancel_requested)}
+                onClick={() => { void cancelManualPreflight(); }}
+              >{detail.cancel_requested || cancelling ? "取消中…" : "取消 CI"}</button>
+            )}
+            <button className="run-drawer-close" aria-label="关闭" onClick={onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body event-detail-body">
+          {error && <div className="alert error">{error}</div>}
+          {!detail && !error && <div className="empty tall">正在加载本地 CI 详情…</div>}
+          {detail && (
+            <>
+              <section className="event-detail-section preflight-live-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">LIVE</span><h3>实时执行过程</h3></div>
+                  <span className="event-detail-count">{detail.status === "running" ? progressLabel : preflightStatusLabel(detail.status)}</span>
+                </div>
+                {streamError && <div className="alert error">{streamError}；步骤状态仍会继续刷新。</div>}
+                <pre ref={liveOutputRef} className="detail-pre preflight-live-output">{liveOutput || (detail.status === "running" ? "正在等待 CI 输出…" : detail.output || "该历史记录没有实时日志")}</pre>
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title"><div><span className="eyebrow">RESULT</span><h3>执行结论</h3></div></div>
+                <dl className="run-metadata">
+                  <div><dt>失败步骤</dt><dd>{detail.failed_step ?? "—"}</dd></div>
+                  <div><dt>退出码</dt><dd>{detail.exit_code ?? "—"}</dd></div>
+                  <div><dt>触发来源</dt><dd>{detail.trigger_source === "manual" ? "仓库手动执行" : "MR / PR 事件"}</dd></div>
+                  <div><dt>当前阶段</dt><dd>{progressLabel}</dd></div>
+                  <div><dt>分支</dt><dd>{detail.branch ?? "—"}</dd></div>
+                  <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
+                  <div><dt>依赖缓存</dt><dd>{detail.cache_path ?? "未启用"}</dd></div>
+                  <div><dt>配置版本</dt><dd>{detail.config_revision}</dd></div>
+                  <div><dt>执行次数</dt><dd>{detail.attempts}</dd></div>
+                  <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
+                  <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
+                  <div><dt>耗时</dt><dd>{durationText(detail.started_at, detail.finished_at)}</dd></div>
+                  <div><dt>平台状态回写</dt><dd>{detail.trigger_source === "manual" ? "手动 CI 不回写" : detail.status === "superseded" ? "Head 已更新，无需回写" : detail.status_published ? "成功" : "未完成"}</dd></div>
+                </dl>
+                {detail.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{detail.error}</pre></>}
+                <h4>命令步骤</h4>
+                {(detail.steps ?? []).length === 0 ? (
+                  <div className="event-detail-empty">该记录没有步骤级快照，可能由旧版本服务创建。</div>
+                ) : (
+                  <div className="preflight-step-run-list">
+                    {detail.steps.map((step) => (
+                      <article className="preflight-step-run-card" key={`${step.step_index}:${step.name}`}>
+                        <header>
+                          <span><strong>{step.step_index + 1}. {step.name}</strong><small>参数数组按本次运行配置固化</small></span>
+                          <span className={`status-pill status-${preflightStepStatusClass(step.status)}`}>{preflightStepStatusLabel(step.status)}</span>
+                        </header>
+                        <pre className="preflight-step-command">{JSON.stringify(step.command, null, 2)}</pre>
+                        <dl>
+                          <div><dt>超时</dt><dd>{step.timeout_seconds === null || step.timeout_seconds === undefined ? "—" : `${step.timeout_seconds} 秒`}</dd></div>
+                          <div><dt>耗时</dt><dd>{step.started_at ? durationText(step.started_at, step.finished_at) : "—"}</dd></div>
+                          <div><dt>退出码</dt><dd>{step.exit_code ?? "—"}</dd></div>
+                          <div><dt>开始时间</dt><dd>{timeText(step.started_at)}</dd></div>
+                        </dl>
+                        {step.error && <pre className="preflight-step-error">{step.error}</pre>}
+                      </article>
+                    ))}
+                  </div>
+                )}
+                <h4>检查输出</h4>
+                <pre className={`detail-pre ${["failure", "timed_out", "error"].includes(detail.status) ? "detail-error" : ""}`}>{detail.status === "running" ? "运行中，完整有界输出将在结束后固化；请查看上方实时执行过程。" : detail.output || "暂无输出"}</pre>
+              </section>
+              <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">EVENTS</span><h3>关联事件</h3></div>
+                  <span className="event-detail-count">{detail.linked_events.length}</span>
+                </div>
+                <div className="event-linked-list">
+                  {detail.linked_events.length === 0 && (
+                    <div className="event-detail-empty">
+                      {detail.trigger_source === "manual"
+                        ? "手动 CI 不绑定 MR / PR 事件，也不会触发 Agent。"
+                        : "当前 CI 记录没有可读取的关联事件。"}
+                    </div>
+                  )}
+                  {detail.linked_events.map((event) => (
+                    <div key={event.event_id}><strong>{event.event_type}</strong><span>{event.reused ? "复用历史结果" : "本批次新执行"} · {dateTimeText(event.occurred_at)}</span></div>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </div>
   );
 }
 
@@ -4512,6 +6054,41 @@ function durationText(startedAt: number, finishedAt?: number | null): string {
   return `${seconds}秒`;
 }
 
+function modelSettingSourceLabel(source?: string | null): string {
+  const labels: Record<string, string> = {
+    agent: "Agent 覆盖",
+    runtime: "运行时默认",
+    codex_user: "Codex 用户配置",
+    codex_default: "Codex / 账号默认",
+  };
+  return source ? labels[source] ?? source : "来源未记录";
+}
+
+function modelSettingText(
+  value: string | null | undefined,
+  source: string | null | undefined,
+  fallback = "模型默认",
+): string {
+  return `${value || fallback} · ${modelSettingSourceLabel(source)}`;
+}
+
+function modelExecutionModeLabel(mode?: string | null): string {
+  if (mode === "model") return "模型基座";
+  if (mode === "cli") return "Codex CLI";
+  return "历史运行未记录";
+}
+
+function modelFastModeLabel(mode?: string | null): string {
+  if (mode === "fast") return "快速";
+  if (mode === "standard") return "标准";
+  return mode || "模型默认";
+}
+
+function modelVerbosityLabel(verbosity?: string | null): string {
+  const labels: Record<string, string> = { low: "低", medium: "中", high: "高" };
+  return verbosity ? labels[verbosity] ?? verbosity : "模型默认";
+}
+
 function runTargetText(run: RunSummary): string {
   if (run.repository_id && run.change_request_number !== undefined && run.change_request_number !== null) {
     return `${run.repository_id} · #${run.change_request_number}`;
@@ -4519,44 +6096,46 @@ function runTargetText(run: RunSummary): string {
   return run.resource_key;
 }
 
-function RunsView(props: {
-  runs: RunSummary[];
-  requestedRunId?: string | null;
-  onRequestedRunOpened: () => void;
+function AgentRunDetailDrawer(props: {
+  initialRunId: string;
+  depth?: number;
+  onClose: () => void;
   onRefresh: () => void;
 }) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState(props.initialRunId);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<RunDrawerTab>("messages");
+  const [childRunId, setChildRunId] = useState<string | null>(null);
+  const visibleMessageCount = useMemo(() => presentRunLogs(logs).length, [logs]);
 
-  useBodyScrollLock(selectedId !== null);
+  useBodyScrollLock(true);
 
   function openRun(runId: string) {
-    setSelectedId(runId);
-    setDrawerTab("messages");
+    setCancelConfirmationOpen(false);
+    setChildRunId(runId);
   }
 
   function closeDrawer() {
     setCancelConfirmationOpen(false);
-    setSelectedId(null);
     setDetail(null);
     setLogs([]);
     setError("");
+    setChildRunId(null);
+    props.onClose();
   }
 
   useEffect(() => {
-    if (!props.requestedRunId) return;
-    setSelectedId(props.requestedRunId);
+    setSelectedId(props.initialRunId);
     setDrawerTab("messages");
-    props.onRequestedRunOpened();
-  }, [props.requestedRunId, props.onRequestedRunOpened]);
+    setChildRunId(null);
+  }, [props.initialRunId]);
 
   async function cancelSelectedRun() {
-    if (!selectedId || !detail) return;
+    if (!detail) return;
     setCancelling(true);
     setError("");
     try {
@@ -4576,7 +6155,7 @@ function RunsView(props: {
   }
 
   const cancelConfirmation = useMemo<AgentActionConfirmation | null>(() => {
-    if (!cancelConfirmationOpen || !selectedId || !detail) return null;
+    if (!cancelConfirmationOpen || !detail) return null;
     return {
       eyebrow: "RUN CANCELLATION",
       title: `取消 ${detail.agent_name} 的本次运行？`,
@@ -4595,7 +6174,6 @@ function RunsView(props: {
   }, [cancelConfirmationOpen, detail, selectedId]);
 
   useEffect(() => {
-    if (!selectedId) return;
     const controller = new AbortController();
     setDetail(null);
     setLogs([]);
@@ -4625,9 +6203,13 @@ function RunsView(props: {
   }, [selectedId]);
 
   useEffect(() => {
-    if (!selectedId) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !cancelConfirmationOpen && !cancelling) {
+      if (
+        event.key === "Escape"
+        && childRunId === null
+        && !cancelConfirmationOpen
+        && !cancelling
+      ) {
         closeDrawer();
       }
     };
@@ -4635,49 +6217,17 @@ function RunsView(props: {
     return () => {
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [cancelConfirmationOpen, cancelling, selectedId]);
+  }, [cancelConfirmationOpen, cancelling, selectedId, childRunId]);
 
   return (
     <>
-      <section className="section-card runs-list">
-        <div className="section-title-row">
-          <div><h2>Agent 运行记录</h2><p>按时间查看所有运行；点击一行后从右侧打开消息、结果与上下文。</p></div>
-          <button className="button secondary" onClick={props.onRefresh}>刷新</button>
-        </div>
-        <div className="run-table">
-          <div className="run-table-head" aria-hidden="true">
-            <span>Agent</span><span>仓库 / MR / PR</span><span>触发来源</span><span>状态</span><span>开始时间</span><span>耗时</span><span />
-          </div>
-          <div className="run-items">
-            {props.runs.map((run) => (
-              <button key={run.run_id} className={`run-row ${selectedId === run.run_id ? "selected" : ""}`} onClick={() => openRun(run.run_id)}>
-                <span className="run-agent-cell">
-                  <span className="run-status-dot" data-status={run.status} />
-                  <span><strong>{run.agent_name}</strong><small>{run.run_id.slice(0, 8)}</small></span>
-                </span>
-                <span className="run-target-cell">
-                  <strong>{runTargetText(run)}</strong>
-                  <small>{run.change_request_title ?? run.resource_key}</small>
-                </span>
-                <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
-                <span className="run-status-cell">
-                  <StatusPill value={run.status} />
-                  {run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}
-                  {run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}
-                </span>
-                <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
-                <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
-                <span className="run-row-arrow" aria-hidden="true">›</span>
-              </button>
-            ))}
-            {props.runs.length === 0 && <div className="empty">尚无 Agent 运行记录</div>}
-          </div>
-        </div>
-      </section>
-      {selectedId && (
-        <div className="run-drawer-layer">
-          <button className="run-drawer-backdrop" aria-label="关闭运行详情" onClick={closeDrawer} />
-          <aside className="run-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
+      <div
+        className={`run-drawer-layer${childRunId ? " run-drawer-layer-inactive" : ""}`}
+        style={drawerLayerStyle(props.depth ?? 0)}
+        aria-hidden={childRunId !== null}
+      >
+          <button className="run-drawer-backdrop" aria-label="关闭运行详情" disabled={childRunId !== null} onClick={closeDrawer} />
+          <aside className="run-drawer layered-detail-drawer" role="dialog" aria-modal="true" aria-label="Agent 运行详情">
             <header className="run-drawer-head">
               <div>
                 <span className="eyebrow">{detail?.run_id ?? selectedId}</span>
@@ -4695,14 +6245,20 @@ function RunsView(props: {
               </div>
             </header>
             <nav className="run-drawer-tabs" aria-label="运行详情分类">
-              <button className={drawerTab === "messages" ? "active" : ""} onClick={() => setDrawerTab("messages")}>消息 <span>{logs.length}</span></button>
+              <button className={drawerTab === "messages" ? "active" : ""} onClick={() => setDrawerTab("messages")}>消息 <span>{visibleMessageCount}</span></button>
               <button className={drawerTab === "result" ? "active" : ""} onClick={() => setDrawerTab("result")}>最终结果</button>
               <button className={drawerTab === "context" ? "active" : ""} onClick={() => setDrawerTab("context")}>运行详情</button>
             </nav>
             <div className="run-drawer-body">
               {error && <div className="alert error">{error}</div>}
               {!detail && !error && <div className="empty tall">正在加载运行详情…</div>}
-              {detail && drawerTab === "messages" && <RunMessageFeed logs={logs} />}
+              {detail && drawerTab === "messages" && (
+                <RunMessageFeed
+                  logs={logs}
+                  active={childRunId === null}
+                  onOpenRun={openRun}
+                />
+              )}
               {detail && drawerTab === "result" && (
                 <div className="run-result-panel">
                   <div className="run-result-summary">
@@ -4728,6 +6284,22 @@ function RunsView(props: {
                       <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                       <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
                       <div><dt>Codex 会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
+                      <div><dt>执行模式</dt><dd>{modelExecutionModeLabel(detail.model_snapshot?.execution_mode)}</dd></div>
+                      <div><dt>模型</dt><dd>{detail.model_snapshot
+                        ? detail.model_snapshot.model ?? "Codex CLI / 账号默认（未固定模型）"
+                        : "历史运行未记录"}</dd></div>
+                      <div><dt>模型来源</dt><dd>{detail.model_snapshot
+                        ? modelSettingSourceLabel(detail.model_snapshot.model_source)
+                        : "—"}</dd></div>
+                      <div><dt>推理强度</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(detail.model_snapshot.reasoning_effort, detail.model_snapshot.reasoning_effort_source)
+                        : "—"}</dd></div>
+                      <div><dt>快速模式</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(modelFastModeLabel(detail.model_snapshot.fast_mode), detail.model_snapshot.fast_mode_source)
+                        : "—"}</dd></div>
+                      <div><dt>输出详细度</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(modelVerbosityLabel(detail.model_snapshot.verbosity), detail.model_snapshot.verbosity_source)
+                        : "—"}</dd></div>
                     </dl>
                   </details>
                   <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>
@@ -4750,13 +6322,276 @@ function RunsView(props: {
             </div>
           </aside>
         </div>
-      )}
       <AgentActionConfirmationDialog
         model={cancelConfirmation}
         busy={cancelling}
         onCancel={() => { if (!cancelling) setCancelConfirmationOpen(false); }}
         onConfirm={() => { void cancelSelectedRun(); }}
       />
+      {childRunId && (
+        <AgentRunDetailDrawer
+          key={childRunId}
+          initialRunId={childRunId}
+          depth={(props.depth ?? 0) + 1}
+          onClose={() => setChildRunId(null)}
+          onRefresh={props.onRefresh}
+        />
+      )}
+    </>
+  );
+}
+
+type ExecutionSelection = { kind: "agent" | "preflight"; id: string };
+
+function RunsView(props: {
+  runs: RunSummary[];
+  preflightRuns: PreflightRunSummary[];
+  repositories: Repository[];
+  filter: ExecutionFilter;
+  requestedRunId?: string | null;
+  onRequestedRunOpened: () => void;
+  onFilterChange: (filter: ExecutionFilter) => void;
+  onRefresh: () => void;
+}) {
+  const [selected, setSelected] = useState<ExecutionSelection | null>(null);
+  const predefinedLimits = [10, 20, 50];
+  const limitMode = props.filter.limit === null
+    ? "all"
+    : predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "custom";
+  const [customLimit, setCustomLimit] = useState(
+    props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)
+      ? String(props.filter.limit)
+      : "100",
+  );
+
+  useEffect(() => {
+    if (props.filter.limit !== null && !predefinedLimits.includes(props.filter.limit)) {
+      setCustomLimit(String(props.filter.limit));
+    }
+  }, [props.filter.limit]);
+
+  function applyCustomLimit() {
+    const parsed = Number(customLimit);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      props.onFilterChange({ ...props.filter, limit: parsed });
+      return;
+    }
+    const fallback = props.filter.limit !== null && props.filter.limit > 0
+      ? props.filter.limit
+      : 100;
+    setCustomLimit(String(fallback));
+  }
+
+  const records = useMemo<Array<{
+    kind: "agent" | "preflight";
+    id: string;
+    startedAt: number;
+    agent?: RunSummary;
+    preflight?: PreflightRunSummary;
+  }>>(() => {
+    const agentRecords = props.runs.map((agent) => ({
+      kind: "agent" as const,
+      id: agent.run_id,
+      startedAt: agent.started_at,
+      agent,
+    }));
+    const preflightRecords = props.preflightRuns.map((preflight) => ({
+      kind: "preflight" as const,
+      id: preflight.run_id,
+      startedAt: preflight.started_at,
+      preflight,
+    }));
+    return [...agentRecords, ...preflightRecords]
+      .filter((record) => props.filter.type === "all" || record.kind === props.filter.type)
+      .filter((record) => {
+        const repositoryId = record.kind === "agent"
+          ? record.agent.repository_id
+          : record.preflight.repository_id;
+        return !props.filter.repositoryId || repositoryId === props.filter.repositoryId;
+      })
+      .filter((record) => {
+        if (!/^\d+$/.test(props.filter.number) || Number(props.filter.number) <= 0) {
+          return true;
+        }
+        const number = record.kind === "agent"
+          ? record.agent.change_request_number
+          : record.preflight.number;
+        return number === Number(props.filter.number);
+      })
+      .filter((record) => executionStatusMatches(
+        record.kind,
+        record.kind === "agent" ? record.agent.status : record.preflight.status,
+        props.filter.status,
+      ))
+      .sort((left, right) => right.startedAt - left.startedAt)
+      .slice(0, props.filter.limit ?? Number.MAX_SAFE_INTEGER);
+  }, [props.filter, props.preflightRuns, props.runs]);
+
+  useEffect(() => {
+    if (!props.requestedRunId) return;
+    setSelected({ kind: "agent", id: props.requestedRunId });
+    props.onRequestedRunOpened();
+  }, [props.requestedRunId, props.onRequestedRunOpened]);
+
+  return (
+    <>
+      <section className="section-card runs-list">
+        <div className="section-title-row">
+          <div><h2>执行记录</h2><p>按开始时间统一查看 Agent 与本地 Preflight / CI；点击一行打开详情。</p></div>
+          <div className="runs-list-actions">
+            <label className="runs-repository-filter">
+              <span>仓库</span>
+              <select
+                value={props.filter.repositoryId}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  repositoryId: event.target.value,
+                })}
+              >
+                <option value="">全部仓库</option>
+                {props.repositories.map((repository) => (
+                  <option key={repository.id} value={repository.id}>
+                    {repository.id} · {repository.project}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="runs-number-filter">
+              <span>编号</span>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                inputMode="numeric"
+                placeholder="全部"
+                value={props.filter.number}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  number: event.target.value,
+                })}
+              />
+            </label>
+            <label>
+              <span>类型</span>
+              <select
+                value={props.filter.type}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  type: event.target.value as ExecutionTypeFilter,
+                })}
+              >
+                <option value="all">全部</option>
+                <option value="agent">Agent</option>
+                <option value="preflight">本地 CI</option>
+              </select>
+            </label>
+            <label>
+              <span>状态</span>
+              <select
+                value={props.filter.status}
+                onChange={(event) => props.onFilterChange({
+                  ...props.filter,
+                  status: event.target.value as ExecutionStatusFilter,
+                })}
+              >
+                <option value="">全部状态</option>
+                {EXECUTION_STATUS_OPTIONS.map((status) => (
+                  <option key={status.value} value={status.value}>{status.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>展示</span>
+              <select
+                value={limitMode}
+                onChange={(event) => {
+                  if (event.target.value === "all") {
+                    props.onFilterChange({ ...props.filter, limit: null });
+                  } else if (event.target.value === "custom") {
+                    const parsed = Number(customLimit);
+                    props.onFilterChange({
+                      ...props.filter,
+                      limit: Number.isInteger(parsed) && parsed > 0 ? parsed : 100,
+                    });
+                  } else {
+                    props.onFilterChange({
+                      ...props.filter,
+                      limit: Number(event.target.value),
+                    });
+                  }
+                }}
+              >
+                <option value="10">10 条</option>
+                <option value="20">20 条</option>
+                <option value="50">50 条</option>
+                <option value="all">全部</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            {limitMode === "custom" && (
+              <label className="runs-custom-limit">
+                <span>自定义条数</span>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  inputMode="numeric"
+                  value={customLimit}
+                  onChange={(event) => setCustomLimit(event.target.value)}
+                  onBlur={applyCustomLimit}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      applyCustomLimit();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+              </label>
+            )}
+            <button className="button secondary" onClick={props.onRefresh}>刷新</button>
+          </div>
+        </div>
+        <div className="run-table">
+          <div className="run-table-head" aria-hidden="true">
+            <span>类型 / 名称</span><span>仓库 / MR / PR</span><span>触发来源</span><span>状态</span><span>开始时间</span><span>耗时</span><span />
+          </div>
+          <div className="run-items">
+            {records.map((record) => {
+              if (record.agent) {
+                const run = record.agent;
+                return (
+                  <button key={`agent:${run.run_id}`} className={`run-row ${selected?.kind === "agent" && selected.id === run.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "agent", id: run.run_id })}>
+                    <span className="run-agent-cell"><span className="run-status-dot" data-status={run.status} /><span><strong>{run.agent_name}</strong><small>Agent · {run.run_id.slice(0, 8)}</small></span></span>
+                    <span className="run-target-cell"><strong>{runTargetText(run)}</strong><small>{run.change_request_title ?? run.resource_key}</small></span>
+                    <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
+                    <span className="run-status-cell"><StatusPill value={run.status} />{run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
+                    <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
+                    <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
+                    <span className="run-row-arrow" aria-hidden="true">›</span>
+                  </button>
+                );
+              }
+              const preflight = record.preflight!;
+              return (
+                <button key={`preflight:${preflight.run_id}`} className={`run-row ${selected?.kind === "preflight" && selected.id === preflight.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "preflight", id: preflight.run_id })}>
+                  <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
+                  <span className="run-target-cell"><strong>{preflight.repository_id} · {preflight.number ? `#${preflight.number}` : preflight.branch ?? "默认分支"}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
+                  <span className="run-source-cell"><strong>{preflight.trigger_source === "manual" ? "仓库手动执行" : preflight.event_type ?? "事件检查"}</strong><small>{preflight.trigger_source === "manual" ? "不触发 Agent、不回写 PR 状态" : preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
+                  <span className="run-status-cell"><span className={`status-pill status-${preflightStatusClass(preflight.status)}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
+                  <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
+                  <span className="run-duration-cell"><strong>{durationText(preflight.started_at, preflight.finished_at)}</strong></span>
+                  <span className="run-row-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+            {records.length === 0 && <div className="empty">当前筛选下尚无执行记录</div>}
+          </div>
+        </div>
+      </section>
+      {selected?.kind === "agent" && <AgentRunDetailDrawer initialRunId={selected.id} onClose={() => setSelected(null)} onRefresh={props.onRefresh} />}
+      {selected?.kind === "preflight" && <PreflightRunDetailDrawer runId={selected.id} depth={0} onClose={() => setSelected(null)} />}
     </>
   );
 }
@@ -4767,6 +6602,7 @@ export default function App() {
   const [savedDocument, setSavedDocument] = useState<ConfigDocument | null>(null);
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [preflightRuns, setPreflightRuns] = useState<PreflightRunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
   const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
@@ -4775,6 +6611,11 @@ export default function App() {
   const [eventFilter, setEventFilter] = useState<OverviewFilter>(
     DEFAULT_OVERVIEW_FILTER,
   );
+  const [executionFilter, setExecutionFilter] = useState<ExecutionFilter>(
+    DEFAULT_EXECUTION_FILTER,
+  );
+  const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
+  const operationalRequestSequence = useRef(0);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
@@ -4801,17 +6642,30 @@ export default function App() {
   const [token, setToken] = useState(getToken());
 
   const refreshOperationalData = useCallback(async () => {
-    const [nextStatus, nextRuns] = await Promise.all([
+    const requestSequence = operationalRequestSequence.current + 1;
+    operationalRequestSequence.current = requestSequence;
+    const filter = { ...executionFilterRef.current };
+    const query = executionQuery(filter);
+    const runsRequest = filter.type === "preflight"
+      ? Promise.resolve<RunSummary[]>([])
+      : api<RunSummary[]>(`/api/runs?${query}`);
+    const preflightRunsRequest = filter.type === "agent"
+      ? Promise.resolve<PreflightRunSummary[]>([])
+      : api<PreflightRunSummary[]>(`/api/preflight-runs?${query}`);
+    const [nextStatus, nextRuns, nextPreflightRuns] = await Promise.all([
       api<RuntimeStatus>("/api/status"),
-      api<RunSummary[]>("/api/runs?limit=100"),
+      runsRequest,
+      preflightRunsRequest,
     ]);
+    if (requestSequence !== operationalRequestSequence.current) return;
     setStatus(nextStatus);
     setRuns(nextRuns);
+    setPreflightRuns(nextPreflightRuns);
   }, []);
 
   const refreshOverviewData = useCallback(async () => {
     const [nextEvents, nextChangeRequests] = await Promise.all([
-      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter)}`),
+      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter, true)}`),
       api<ChangeRequestRecord[]>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
     ]);
     setEvents(nextEvents);
@@ -4850,6 +6704,10 @@ export default function App() {
   }, [refreshOperationalData]);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    executionFilterRef.current = executionFilter;
+    void refreshOperationalData().catch(() => undefined);
+  }, [executionFilter, refreshOperationalData]);
   useEffect(() => {
     const timer = window.setInterval(() => { void refreshOperationalData().catch(() => undefined); }, 3000);
     return () => window.clearInterval(timer);
@@ -5178,6 +7036,11 @@ export default function App() {
         ? { ...current, repositoryId: "" }
         : current
     ));
+    setExecutionFilter((current) => (
+      current.repositoryId && !enabledIds.has(current.repositoryId)
+        ? { ...current, repositoryId: "" }
+        : current
+    ));
   }, [enabledRepositories]);
 
   const tabs = useMemo<Array<{ id: Tab; label: string; mark: string }>>(() => [
@@ -5191,8 +7054,7 @@ export default function App() {
     { id: "runs", label: "运行与日志", mark: "08" },
   ], []);
   const configurableTab = (
-    (tab === "repositories" && !repositoryDetailOpen)
-    || tab === "environment"
+    tab === "environment"
     || tab === "skills"
     || tab === "runtime"
   );
@@ -5256,12 +7118,19 @@ export default function App() {
                     <span>{editing ? "编辑模式" : "只读模式"}</span>
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
-                  <fieldset className="config-editor-surface" disabled={!editing}>
-                    {tab === "repositories" && <RepositoryConnectionsEditor document={document} onChange={changeDocument} />}
-                    {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
-                    {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
-                    {tab === "runtime" && <CodexRuntimeEditor document={document} options={codexOptions} onChange={changeDocument} />}
-                  </fieldset>
+                  {tab === "runtime" ? (
+                    <CodexRuntimeEditor
+                      document={document}
+                      options={codexOptions}
+                      editable={editing}
+                      onChange={changeDocument}
+                    />
+                  ) : (
+                    <fieldset className="config-editor-surface" disabled={!editing}>
+                      {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
+                      {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
+                    </fieldset>
+                  )}
                   {tab === "runtime" && (
                     <CodexAccountCard
                       configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}
@@ -5271,6 +7140,18 @@ export default function App() {
                   {tab === "environment" && <ConfigHistory />}
                 </>
               )}
+              <div hidden={tab !== "repositories" || repositoryDetailOpen}>
+                <RepositoryConnectionsEditor
+                  document={document}
+                  revision={revision}
+                  onSaved={acceptItemConfig}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                />
+              </div>
               {tab === "agents" && (
                 <AgentsView
                   document={document}
@@ -5289,7 +7170,6 @@ export default function App() {
                 <RepositoriesView
                   document={document}
                   revision={revision}
-                  blocked={editing}
                   onSaved={acceptItemConfig}
                   onDirtyChange={setRepositoryDetailDirty}
                   onDetailOpenChange={setRepositoryDetailOpen}
@@ -5321,8 +7201,12 @@ export default function App() {
               {tab === "runs" && (
                 <RunsView
                   runs={runs}
+                  preflightRuns={preflightRuns}
+                  repositories={enabledRepositories}
+                  filter={executionFilter}
                   requestedRunId={requestedRunId}
                   onRequestedRunOpened={() => setRequestedRunId(null)}
+                  onFilterChange={setExecutionFilter}
                   onRefresh={() => { void refreshOperationalData(); }}
                 />
               )}

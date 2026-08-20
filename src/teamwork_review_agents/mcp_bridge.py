@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .filesystem import remove_tree
 from .process_control import process_group_options, terminate_process
 
 
@@ -147,7 +147,8 @@ class McpBridgeChannel:
     def cleanup(self) -> None:
         """删除整条临时通道及其中的请求和响应。"""
 
-        shutil.rmtree(self.directory, ignore_errors=True)
+        with suppress(OSError):
+            remove_tree(self.directory)
 
 
 async def call_bridge(

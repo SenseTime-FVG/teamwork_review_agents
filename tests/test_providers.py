@@ -507,3 +507,76 @@ async def test_github_provider_publishes_bounded_commit_status() -> None:
     assert payload["state"] == "failure"
     assert payload["context"] == "teamwork/local-ci"
     assert len(payload["description"]) == 140
+
+
+async def test_github_provider_manages_pull_request_comments() -> None:
+    """GitHub Provider 应支持创建、更新、重建判断与幂等删除 PR 评论。"""
+
+    requests: list[httpx.Request] = []
+    patch_missing = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patch_missing
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(201, json={"id": 101})
+        if request.method == "PATCH":
+            if patch_missing:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"id": 101})
+        if request.method == "DELETE":
+            return httpx.Response(404, json={"message": "Not Found"})
+        raise AssertionError(f"未预期的请求：{request.method}")
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="https://api.github.com/",
+        transport=httpx.MockTransport(handler),
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    try:
+        comment_id = await provider.create_change_request_comment(
+            repository,
+            7,
+            "第一次失败",
+        )
+        assert comment_id == "101"
+        assert await provider.update_change_request_comment(
+            repository,
+            comment_id,
+            "第二次失败",
+        ) is True
+        patch_missing = True
+        assert await provider.update_change_request_comment(
+            repository,
+            comment_id,
+            "远端已删除",
+        ) is False
+        await provider.delete_change_request_comment(repository, comment_id)
+    finally:
+        await provider.close()
+
+    assert [request.method for request in requests] == [
+        "POST",
+        "PATCH",
+        "PATCH",
+        "DELETE",
+    ]
+    assert requests[0].url.path == "/repos/owner/demo/issues/7/comments"
+    assert requests[1].url.path == "/repos/owner/demo/issues/comments/101"
+    assert json.loads(requests[0].content)["body"] == "第一次失败"

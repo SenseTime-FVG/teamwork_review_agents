@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from teamwork_review_agents.codex_runner import CodexRunner
+from teamwork_review_agents.codex_settings import resolve_agent_model_snapshot
 from teamwork_review_agents.cli import (
     _configure_standard_streams,
     _server_settings,
@@ -173,6 +174,7 @@ def test_example_config_is_valid() -> None:
     assert config.runtime.worktree_retention_days == 7
     assert config.runtime.git_timeout_seconds == 600
     assert config.runtime.repository_initialization_timeout_seconds == 1800
+    assert config.runtime.codex.execution_mode == "cli"
     assert config.runtime.codex.fast_mode == "inherit"
     for agent_name in (
         "general-reviewer",
@@ -248,6 +250,7 @@ def test_repository_preflight_parses_ordered_commands(tmp_path) -> None:
 
     preflight = config.repositories[0].preflight
     assert preflight.enabled is True
+    assert preflight.publish_failure_comment is False
     assert preflight.status_context == "teamwork/local-ci"
     assert [step.name for step in preflight.steps] == ["install", "test"]
     assert preflight.steps[0].command == ["uv", "sync", "--frozen"]
@@ -328,16 +331,21 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
     monkeypatch.setenv("CODEX_API_KEY", "Codex 自身凭据")
     monkeypatch.setenv("HOME", "/tmp/gh-keychain-home")
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setenv("ComSpec", "C:/Windows/System32/cmd.exe")
     environment = CodexRunner(config).child_environment(
         {
-            "GITHUB_TOKEN": "Agent 环境也不能重新注入",
+            "Github_Token": "Agent 环境也不能重新注入",
             "VISIBLE_AGENT_VALUE": "允许进入 Codex",
         }
     )
     assert "GITHUB_TOKEN" not in environment
+    assert "Github_Token" not in environment
     assert "GITLAB_TOKEN" not in environment
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
     assert environment["HOME"] == "/tmp/gh-keychain-home"
+    assert environment["SYSTEMROOT"] == "C:/Windows"
+    assert environment["COMSPEC"] == "C:/Windows/System32/cmd.exe"
     assert environment["VISIBLE_AGENT_VALUE"] == "允许进入 Codex"
 
 
@@ -724,6 +732,61 @@ def test_codex_advanced_config_protects_managed_keys() -> None:
             CodexRuntimeConfig(extra_config={key: "blocked"})
 
 
+def test_agent_model_snapshot_follows_runtime_inheritance(tmp_path) -> None:
+    """模型快照应按 Agent、运行时和 Codex 用户配置顺序固化。"""
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        '\n'.join(
+            [
+                'model = "gpt-user"',
+                'model_reasoning_effort = "low"',
+                'service_tier = "fast"',
+                'model_verbosity = "medium"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runtime = CodexRuntimeConfig(
+        execution_mode="cli",
+        model="gpt-runtime",
+        model_reasoning_effort="medium",
+    )
+    agent = AgentConfig(
+        prompt="测试",
+        model="gpt-agent",
+        model_reasoning_effort="high",
+        model_verbosity="high",
+    )
+
+    snapshot = resolve_agent_model_snapshot(runtime, agent, home)
+
+    assert snapshot == {
+        "execution_mode": "cli",
+        "model": "gpt-agent",
+        "model_source": "agent",
+        "reasoning_effort": "high",
+        "reasoning_effort_source": "agent",
+        "fast_mode": "fast",
+        "fast_mode_source": "codex_user",
+        "verbosity": "high",
+        "verbosity_source": "agent",
+    }
+
+    inherited = resolve_agent_model_snapshot(
+        CodexRuntimeConfig(execution_mode="model"),
+        AgentConfig(prompt="测试"),
+        home,
+    )
+    assert inherited["execution_mode"] == "model"
+    assert inherited["model"] == "gpt-user"
+    assert inherited["model_source"] == "codex_user"
+    assert inherited["reasoning_effort"] == "low"
+    assert inherited["fast_mode"] == "fast"
+    assert inherited["verbosity"] == "medium"
+
+
 def test_root_and_sub_agent_prompt_contexts_are_separated(
     snapshot_factory,
     configured_app_factory,
@@ -825,6 +888,8 @@ async def test_executor_cancellation_interrupts_resource_lock_wait(
 
     config = configured_app_factory()
     config.agents["code-reviewer"].write_scopes = ["change_request"]
+    config.runtime.codex.model = "gpt-runtime"
+    config.agents["code-reviewer"].model = "gpt-agent"
     repository = config.repositories[0]
     snapshot = snapshot_factory(
         repository_id=repository.id,
@@ -856,6 +921,10 @@ async def test_executor_cancellation_interrupts_resource_lock_wait(
             await asyncio.sleep(0.05)
         assert runs
         run_id = str(runs[0]["run_id"])
+        detail = store.get_run(run_id)
+        assert detail is not None
+        assert detail["model_snapshot"]["model"] == "gpt-agent"
+        assert detail["model_snapshot"]["model_source"] == "agent"
         store.request_cancel_run(run_id)
 
         with pytest.raises(AgentExecutionError, match="管理员取消"):

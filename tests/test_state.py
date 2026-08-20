@@ -315,6 +315,10 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         item["snapshot_key"]
         for item in store.list_snapshots(None, status="opened")
     ] == [newest.key]
+    assert [
+        item["snapshot_key"]
+        for item in store.list_snapshots(None, number=2)
+    ] == [older.key]
 
     assert [item["event_id"] for item in store.list_events(None)] == [
         newest_event.id,
@@ -322,9 +326,16 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
     ]
     assert store.list_events(1)[0]["event_id"] == newest_event.id
     assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
+    assert store.list_events(None, number=2)[0]["event_id"] == older_event.id
     assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id
     assert store.list_events(None, status="pending")[0]["event_id"] == newest_event.id
     assert store.list_events(None)[0]["occurred_at"].startswith("2026-08-18T10:00:00")
+
+    detail = store.get_change_request_detail("second", 2)
+    assert detail is not None
+    assert detail["snapshot_key"] == older.key
+    assert [item["event_id"] for item in detail["events"]] == [older_event.id]
+    assert store.get_change_request_detail("second", 999) is None
 
 
 def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
@@ -489,6 +500,58 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["agent_running_count"] == 1
 
+    child = store.begin_agent_run(
+        proposed_run_id="run-security-review",
+        root_run_id=reservation.root_run_id,
+        parent_run_id=reservation.run_id,
+        idempotency_key="security-dispatch-key",
+        event_id=closed.id,
+        rule_name="close-review",
+        agent_name="security-reviewer",
+        resource_key=closed.resource_key,
+        prompt="",
+        max_attempts=1,
+    )
+    assert child is not None
+    store.mark_agent_run_running(child.run_id)
+
+    grandchild = store.begin_agent_run(
+        proposed_run_id="run-license-review",
+        root_run_id=reservation.root_run_id,
+        parent_run_id=child.run_id,
+        idempotency_key="license-dispatch-key",
+        event_id=closed.id,
+        rule_name="close-review",
+        agent_name="license-reviewer",
+        resource_key=closed.resource_key,
+        prompt="",
+        max_attempts=1,
+    )
+    assert grandchild is not None
+    store.mark_agent_run_running(grandchild.run_id)
+    records = {item["event_type"]: item for item in store.list_events()}
+    assert records["change_request.closed"]["trigger_count"] == 1
+    assert records["change_request.closed"]["sub_agent_count"] == 2
+    assert records["change_request.closed"]["agent_running_count"] == 3
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=grandchild.run_id,
+            root_run_id=grandchild.root_run_id,
+            agent_name="license-reviewer",
+            status="completed",
+        )
+    )
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=child.run_id,
+            root_run_id=child.root_run_id,
+            agent_name="security-reviewer",
+            status="completed",
+        )
+    )
+
     store.finish_agent_run(
         AgentResult(
             run_id=reservation.run_id,
@@ -500,15 +563,38 @@ def test_event_dispatch_and_agent_progress_are_tracked_separately(
     store.finish_event(closed.id)
     records = {item["event_type"]: item for item in store.list_events()}
     assert records["change_request.closed"]["status"] == "completed"
-    assert records["change_request.closed"]["agent_completed_count"] == 1
+    assert records["change_request.closed"]["agent_completed_count"] == 3
     summary = store.list_runs()[0]
     detail = store.get_run(reservation.run_id)
     assert summary["repository_id"] == new.repository_id
     assert summary["change_request_number"] == new.number
     assert summary["change_request_title"] == new.title
     assert summary["change_request_url"] == new.web_url
+    filtered_runs = store.list_runs(
+        statuses=("completed",),
+        repository_id=new.repository_id,
+        number=new.number,
+    )
+    assert {item["run_id"] for item in filtered_runs} == {
+        reservation.run_id,
+        child.run_id,
+        grandchild.run_id,
+    }
+    assert store.list_runs(statuses=()) == []
+    assert len(store.list_runs(limit=None)) == 3
     assert detail is not None
     assert detail["change_request_title"] == new.title
+    event_detail = store.get_event_detail(closed.id)
+    assert event_detail is not None
+    assert len(event_detail["dispatches"]) == 1
+    assert {
+        run["run_id"]: run["parent_run_id"]
+        for run in event_detail["agent_runs"]
+    } == {
+        reservation.run_id: None,
+        child.run_id: reservation.run_id,
+        grandchild.run_id: child.run_id,
+    }
 
 
 def test_agent_run_exposes_workspace_cleanup_status(tmp_path) -> None:
@@ -726,6 +812,89 @@ def test_service_shutdown_cancelled_run_reuses_attempt_and_run_id(tmp_path) -> N
     assert detail["cancel_source"] is None
 
 
+def test_agent_run_model_snapshot_is_persisted_and_updated_on_retry(tmp_path) -> None:
+    """运行详情应固化模型快照，业务失败重试时更新为本次设置。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = store.begin_agent_run(
+        proposed_run_id="model-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="model-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:12",
+        prompt="首次执行",
+        max_attempts=2,
+        model_snapshot={
+            "execution_mode": "cli",
+            "model": "gpt-first",
+            "model_source": "runtime",
+        },
+    )
+    assert first is not None
+    first_detail = store.get_run(first.run_id)
+    assert first_detail is not None
+    assert first_detail["model_snapshot"]["model"] == "gpt-first"
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=first.run_id,
+            root_run_id=first.root_run_id,
+            agent_name="reviewer",
+            status="failed",
+            error="首次失败",
+        )
+    )
+    retried = store.begin_agent_run(
+        proposed_run_id="unused-model-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="model-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:12",
+        prompt="重试执行",
+        max_attempts=2,
+        model_snapshot={
+            "execution_mode": "model",
+            "model": "gpt-second",
+            "model_source": "agent",
+        },
+    )
+
+    assert retried is not None
+    assert retried.run_id == first.run_id
+    retried_detail = store.get_run(first.run_id)
+    assert retried_detail is not None
+    assert retried_detail["model_snapshot"] == {
+        "execution_mode": "model",
+        "model": "gpt-second",
+        "model_source": "agent",
+    }
+
+
+def test_initialize_adds_model_snapshot_to_existing_agent_runs(tmp_path) -> None:
+    """旧数据库缺少模型快照列时，初始化应执行兼容补列。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    with store.connect() as connection:
+        connection.execute("ALTER TABLE agent_runs DROP COLUMN model_snapshot")
+
+    store.initialize()
+
+    with store.connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(agent_runs)").fetchall()
+        }
+    assert "model_snapshot" in columns
+
+
 def test_manual_cancelled_run_is_not_automatically_reused(tmp_path) -> None:
     """管理员取消保持终态，不能由幂等重试自动恢复。"""
 
@@ -914,6 +1083,258 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert changed.run_id == "preflight-2"
 
 
+def test_preflight_failure_comment_mapping_has_one_record_per_change_request(
+    tmp_path,
+) -> None:
+    """同一 MR/PR 只能保存一条失败评论映射，并可在成功后删除。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.save_preflight_failure_comment(
+        repository_id="demo",
+        number=7,
+        status_context="teamwork/local-ci",
+        remote_comment_id="101",
+        head_sha="a" * 40,
+        content_hash="first",
+    )
+    first = store.get_preflight_failure_comment("demo", 7)
+    assert first is not None
+    assert first["remote_comment_id"] == "101"
+
+    store.save_preflight_failure_comment(
+        repository_id="demo",
+        number=7,
+        status_context="teamwork/local-ci",
+        remote_comment_id="101",
+        head_sha="b" * 40,
+        content_hash="second",
+    )
+    updated = store.get_preflight_failure_comment("demo", 7)
+    assert updated is not None
+    assert updated["head_sha"] == "b" * 40
+    assert updated["content_hash"] == "second"
+
+    store.delete_preflight_failure_comment("demo", 7)
+    assert store.get_preflight_failure_comment("demo", 7) is None
+
+
+def test_manual_preflight_supports_nullable_pr_live_logs_and_cancel(tmp_path) -> None:
+    """手动 CI 不绑定事件或编号，并能持久化阶段、日志与取消终态。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.create_manual_preflight_run(
+        run_id="manual-preflight",
+        repository_id="demo",
+        config_revision="revision-manual",
+    )
+    store.initialize_preflight_steps(
+        "manual-preflight",
+        [{"name": "install", "command": ["uv", "sync"]}],
+    )
+    store.set_preflight_phase(
+        "manual-preflight",
+        "running_steps",
+        branch="main",
+        head_sha="b" * 40,
+        cache_path=str(tmp_path / "cache"),
+    )
+    first_log = store.append_preflight_log(
+        "manual-preflight",
+        stream="stdout",
+        event_type="output",
+        payload="downloading dependencies\n",
+    )
+    second_log = store.append_preflight_log(
+        "manual-preflight",
+        stream="system",
+        event_type="message",
+        payload={"phase": "install"},
+    )
+
+    assert store.request_cancel_preflight("manual-preflight") is True
+    assert store.preflight_cancel_requested("manual-preflight") is True
+    store.update_preflight_step(
+        "manual-preflight",
+        0,
+        status="running",
+    )
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id="manual-preflight",
+            repository_id="demo",
+            number=None,
+            head_sha="b" * 40,
+            status="cancelled",
+            error="用户取消了手动 CI",
+        )
+    )
+
+    detail = store.get_preflight_run("manual-preflight")
+    assert detail is not None
+    assert detail["event_id"] is None
+    assert detail["number"] is None
+    assert detail["trigger_source"] == "manual"
+    assert detail["branch"] == "main"
+    assert detail["phase"] == "finished"
+    assert detail["status"] == "cancelled"
+    assert detail["steps"][0]["status"] == "cancelled"
+    assert detail["linked_events"] == []
+    assert [item["id"] for item in store.list_preflight_logs(
+        "manual-preflight",
+        after_id=first_log,
+    )] == [second_log]
+    assert store.request_cancel_preflight("manual-preflight") is False
+
+
+def test_event_list_exposes_linked_preflight_summary(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """事件列表只暴露关联 CI 摘要，不携带完整命令输出。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store.save_snapshot_and_events(snapshot, [event])
+    assert store.claim_event(event.id, max_attempts=2) is True
+    reservation = store.begin_preflight_run(
+        proposed_run_id="preflight-event-summary",
+        idempotency_key="demo:7:event-summary",
+        event_id=event.id,
+        repository_id="demo",
+        number=event.number,
+        head_sha=event.new.head_sha,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+
+    running = store.list_events()[0]
+    assert running["status"] == "processing"
+    assert running["preflight_status"] == "running"
+    assert running["preflight_run_id"] == reservation.run_id
+    assert running["preflight_reused"] == 0
+    assert running["preflight_failed_step"] is None
+
+    store.initialize_preflight_steps(
+        reservation.run_id,
+        [
+            {"name": "format", "command": ["python", "-m", "ruff"], "timeout_seconds": 30},
+            {"name": "tests", "command": ["python", "-m", "pytest"], "timeout_seconds": None},
+            {"name": "package", "command": ["python", "-m", "build"], "timeout_seconds": 60},
+        ],
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="running",
+        timeout_seconds=30,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="success",
+        timeout_seconds=30,
+        exit_code=0,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        1,
+        status="running",
+        timeout_seconds=45,
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        1,
+        status="failure",
+        timeout_seconds=45,
+        exit_code=1,
+    )
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id=reservation.run_id,
+            repository_id="demo",
+            number=event.number,
+            head_sha=event.new.head_sha,
+            status="failure",
+            failed_step="tests",
+            exit_code=1,
+            output="不应进入事件列表的完整输出",
+        )
+    )
+    failed = store.list_events()[0]
+    assert failed["preflight_status"] == "failure"
+    assert failed["preflight_exit_code"] == 1
+    assert failed["preflight_failed_step"] == "tests"
+    assert failed["preflight_error"] is None
+    assert failed["preflight_status_published"] == 0
+    assert "output" not in failed
+
+    detail = store.get_event_detail(event.id)
+    assert detail is not None
+    assert detail["dispatches"] == []
+    assert "output" not in detail["preflight"]
+    assert detail["preflight"]["reused"] == 0
+    assert detail["preflights"][0]["run_id"] == reservation.run_id
+
+    summaries = store.list_preflight_runs()
+    assert summaries[0]["run_id"] == reservation.run_id
+    assert summaries[0]["event_type"] == event.type
+    assert summaries[0]["linked_event_count"] == 1
+    assert summaries[0]["reused_event_count"] == 0
+    assert "output" not in summaries[0]
+
+    preflight_detail = store.get_preflight_run(reservation.run_id)
+    assert preflight_detail is not None
+    assert preflight_detail["event_type"] == event.type
+    assert preflight_detail["output"] == "不应进入事件列表的完整输出"
+    assert preflight_detail["linked_events"][0]["event_id"] == event.id
+    assert [step["status"] for step in preflight_detail["steps"]] == [
+        "success",
+        "failure",
+        "skipped",
+    ]
+    assert preflight_detail["steps"][0]["command"] == ["python", "-m", "ruff"]
+    assert preflight_detail["steps"][1]["timeout_seconds"] == 45
+    assert preflight_detail["steps"][1]["exit_code"] == 1
+    assert preflight_detail["steps"][2]["error"] == "前序步骤结束后未执行"
+
+    reused_event = create_manual_activity_event(
+        snapshot,
+        ChangeRequestActivity(
+            id="manual-reuse",
+            type="committed",
+            occurred_at="2026-08-18T10:00:00Z",
+        ),
+    )
+    store.save_snapshot_and_events(snapshot, [reused_event])
+    store.link_events_to_preflight(
+        [reused_event.id],
+        reservation.run_id,
+        reused=True,
+    )
+    reused_detail = store.get_event_detail(reused_event.id)
+    assert reused_detail is not None
+    assert reused_detail["preflight"]["run_id"] == reservation.run_id
+    assert reused_detail["preflight"]["reused"] == 1
+    assert store.list_preflight_runs(number=event.number)[0][
+        "linked_event_count"
+    ] == 2
+    assert store.list_preflight_runs(number=event.number)[0][
+        "reused_event_count"
+    ] == 1
+    assert store.list_preflight_runs(statuses=("failure",))[0][
+        "run_id"
+    ] == reservation.run_id
+    assert store.list_preflight_runs(statuses=()) == []
+    assert len(store.list_preflight_runs(limit=None)) == 1
+    assert store.list_preflight_runs(number=999) == []
+    assert store.get_preflight_run("missing-preflight") is None
+
+
 def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
     """服务异常退出后的 CI 应转成 error，并允许按次数限制复用运行记录。"""
 
@@ -930,12 +1351,30 @@ def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
         max_attempts=2,
     )
     assert reservation is not None
+    store.initialize_preflight_steps(
+        reservation.run_id,
+        [
+            {"name": "active", "command": ["python", "active.py"]},
+            {"name": "waiting", "command": ["python", "waiting.py"]},
+        ],
+    )
+    store.update_preflight_step(
+        reservation.run_id,
+        0,
+        status="running",
+        timeout_seconds=120,
+    )
 
     store.recover_interrupted_work()
 
     recovered = store.load_preflight_result("demo:7:sha-a:revision-a")
     assert recovered is not None
     assert recovered.status == "error"
+    detail = store.get_preflight_run(reservation.run_id)
+    assert detail is not None
+    assert [step["status"] for step in detail["steps"]] == ["error", "skipped"]
+    assert detail["steps"][0]["error"] == "服务异常退出，CI 步骤未正常结束"
+    assert detail["steps"][1]["error"] == "服务异常退出，步骤未执行"
     retried = store.begin_preflight_run(
         proposed_run_id="unused-new-id",
         idempotency_key="demo:7:sha-a:revision-a",
@@ -949,3 +1388,36 @@ def test_recovery_marks_running_preflight_as_retryable_error(tmp_path) -> None:
     assert retried is not None
     assert retried.run_id == "preflight-1"
     assert retried.attempts == 2
+
+
+def test_initialize_backfills_legacy_event_preflight_links(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """升级旧数据库时应恢复原事件与 CI 运行的详情关联。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    store.save_snapshot_and_events(snapshot, [event])
+    reservation = store.begin_preflight_run(
+        proposed_run_id="legacy-preflight",
+        idempotency_key="demo:7:legacy-preflight",
+        event_id=event.id,
+        repository_id="demo",
+        number=event.number,
+        head_sha=event.new.head_sha,
+        config_revision="revision-a",
+        max_attempts=2,
+    )
+    assert reservation is not None
+    with store.connect() as connection:
+        connection.execute("DROP TABLE event_preflight_links")
+
+    store.initialize()
+
+    detail = store.get_event_detail(event.id)
+    assert detail is not None
+    assert detail["preflight"]["run_id"] == reservation.run_id
+    assert detail["preflight"]["reused"] == 0

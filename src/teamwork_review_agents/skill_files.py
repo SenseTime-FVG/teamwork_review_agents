@@ -13,6 +13,8 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
+from .filesystem import remove_tree
+
 
 MAX_SKILL_FILES = 512
 MAX_SKILL_FILE_BYTES = 8 * 1024 * 1024
@@ -223,7 +225,7 @@ def import_skill_directory(
         }
     finally:
         if staging.exists():
-            shutil.rmtree(staging)
+            remove_tree(staging)
 
 
 def _projection_name(skill_id: str, revision: str) -> str:
@@ -294,7 +296,7 @@ class SkillProjection:
             return
         for path in reversed(self._created):
             if path.exists():
-                shutil.rmtree(path)
+                remove_tree(path)
         if self.marker.exists() and (self._owned or force):
             self.marker.unlink()
         for directory in (self.root, self.root.parent):

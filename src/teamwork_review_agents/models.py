@@ -98,7 +98,7 @@ class ChangeEvent(BaseModel):
 
 
 class AgentResult(BaseModel):
-    """Codex CLI 单次运行的结构化结果。"""
+    """Codex CLI 或内嵌模型单次运行的结构化结果。"""
 
     run_id: str
     root_run_id: str
@@ -117,14 +117,23 @@ class PreflightResult(BaseModel):
 
     run_id: str
     repository_id: str
-    number: int
+    number: int | None = None
     head_sha: str
-    status: Literal["running", "success", "failure", "timed_out", "error"]
+    status: Literal[
+        "running",
+        "success",
+        "failure",
+        "timed_out",
+        "error",
+        "cancelled",
+        "superseded",
+    ]
     failed_step: str | None = None
     exit_code: int | None = None
     output: str = ""
     error: str | None = None
     status_published: bool = False
+    reused: bool = False
 
 
 class InvocationContext(BaseModel):

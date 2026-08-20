@@ -12,6 +12,10 @@
 
 执行器先写入 `pending` Commit Status，再更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule，然后按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。
 
+`cache_enabled: true` 时，依赖下载缓存按仓库稳定身份隔离并跨分支共享，避免同一仓库的不同 PR 重复下载；临时 worktree、HOME 与安装目录不共享。系统会为常见 Python、Node.js、Rust、Go、Java、.NET、PHP 和浏览器工具注入其标准缓存变量。仓库详情还可以手动执行远端默认分支最新提交，用于提前填充缓存；手动运行不设 CI 步骤总限时，但可以取消，且不会触发 Agent 或发布 PR Commit Status。
+
+所有新运行都会把 Git 准备阶段、当前步骤状态及合并后的 stdout/stderr 按游标写入实时日志。仓库手动执行入口、运行概览事件详情和“运行与日志”页复用同一详情视图；终态仍额外固化有界完整输出，旧记录没有实时日志时自动回退到终态输出。
+
 本地命令终态和 Commit Status 发布标记分别持久化。终态已经生成但 GitHub 回写失败时，后续重试只补发状态，不重新执行仓库命令。
 
 ## 状态映射
