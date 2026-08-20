@@ -24,6 +24,20 @@ export type RepositoryPreflight = {
   steps?: RepositoryPreflightStep[];
 };
 
+export type RepositoryAgentWorkspacePrepareStep = {
+  name: string;
+  cwd?: string;
+  command: string[];
+  timeout_seconds?: number;
+};
+
+export type RepositoryAgentWorkspace = {
+  cache_enabled?: boolean;
+  timeout_seconds?: number;
+  max_output_bytes?: number;
+  prepare_steps?: RepositoryAgentWorkspacePrepareStep[];
+};
+
 export type Repository = {
   id: string;
   provider: string;
@@ -32,6 +46,7 @@ export type Repository = {
   clone_url?: string;
   enabled?: boolean;
   environment?: EnvironmentMap;
+  agent_workspace?: RepositoryAgentWorkspace;
   preflight?: RepositoryPreflight;
 };
 

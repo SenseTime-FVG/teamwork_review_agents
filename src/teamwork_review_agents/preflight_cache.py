@@ -1,4 +1,4 @@
-"""仓库级 Preflight 依赖缓存目录与安全环境。"""
+"""仓库级依赖下载缓存目录与安全环境。"""
 
 from __future__ import annotations
 
@@ -66,6 +66,8 @@ def build_repository_cache_environment(root: Path) -> dict[str, str]:
 
     maven_option = f'-Dmaven.repo.local="{directories["maven"]}"'
     return {
+        "TEAMWORK_REPOSITORY_CACHE_DIR": str(resolved),
+        # 保留旧变量，避免现有仓库脚本和已落地的 Preflight 配置失效。
         "TEAMWORK_PREFLIGHT_CACHE_DIR": str(resolved),
         "XDG_CACHE_HOME": str(directories["xdg"]),
         "UV_CACHE_DIR": str(directories["uv"]),

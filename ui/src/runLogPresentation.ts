@@ -28,6 +28,12 @@ const SYSTEM_TITLES: Record<string, string> = {
   "workspace.git.timed_out": "Git 工作区操作超时",
   "workspace.git.cancelled": "Git 工作区操作已取消",
   "workspace.prepared": "工作区已准备",
+  "workspace.prepare.started": "开始准备 Agent 工作区",
+  "workspace.prepare.step_started": "开始执行准备步骤",
+  "workspace.prepare.output": "准备步骤输出",
+  "workspace.prepare.step_completed": "准备步骤已结束",
+  "workspace.prepare.completed": "Agent 工作区准备完成",
+  "workspace.prepare.failed": "Agent 工作区准备失败",
   "run.home_prepared": "临时 HOME 已准备",
   "run.home_cleaned": "临时 HOME 已清理",
   "run.home_cleanup_failed": "临时 HOME 清理失败",
@@ -168,6 +174,34 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     detail = [object.path ? `路径：${textValue(object.path)}` : "", object.mode ? `模式：${textValue(object.mode)}` : ""]
       .filter(Boolean)
       .join("\n");
+  } else if (log.event_type.startsWith("workspace.prepare.step_") && object) {
+    body = [object.name, object.cwd ? `目录：${textValue(object.cwd)}` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    detail = [
+      Array.isArray(object.command) ? JSON.stringify(object.command, null, 2) : "",
+      object.status ? `状态：${textValue(object.status)}` : "",
+      object.timeout_seconds ? `超时：${textValue(object.timeout_seconds)} 秒` : "",
+      object.exit_code !== undefined && object.exit_code !== null ? `退出码：${textValue(object.exit_code)}` : "",
+      object.error ? `错误：${textValue(object.error)}` : "",
+    ].filter(Boolean).join("\n");
+  } else if (
+    (log.event_type === "workspace.prepare.started"
+      || log.event_type === "workspace.prepare.completed"
+      || log.event_type === "workspace.prepare.failed")
+    && object
+  ) {
+    body = object.failed_step
+      ? `失败步骤：${textValue(object.failed_step)}`
+      : object.steps !== undefined
+      ? `准备步骤：${textValue(object.steps)} 个`
+      : "";
+    detail = [
+      object.cache_path ? `仓库缓存：${textValue(object.cache_path)}` : "",
+      object.status ? `状态：${textValue(object.status)}` : "",
+      object.exit_code !== undefined && object.exit_code !== null ? `退出码：${textValue(object.exit_code)}` : "",
+      object.error ? `错误：${textValue(object.error)}` : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type.startsWith("run.home_") && object) {
     body = object.path ? `路径：${textValue(object.path)}` : "";
     detail = [

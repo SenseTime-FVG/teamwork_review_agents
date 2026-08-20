@@ -164,12 +164,13 @@ def permission_profile_override(
     *,
     ipc_directory: Path | None = None,
     codex_runtime_directory: Path | None = None,
+    writable_directories: tuple[Path, ...] = (),
 ) -> str:
     """生成只描述当前 Agent 文件与网络边界的命名权限档案。"""
 
     extra_filesystem_entries = [
         f"{_toml_string(str(path.resolve()))}=\"write\""
-        for path in (ipc_directory, codex_runtime_directory)
+        for path in (ipc_directory, codex_runtime_directory, *writable_directories)
         if path is not None
     ]
     if agent.sandbox == "read-only":
@@ -209,6 +210,10 @@ def wrap_managed_sandbox_command(
 ) -> list[str]:
     """用 Codex 原生平台沙盒包裹已关闭内层沙盒的执行命令。"""
 
+    repository_cache = environment.get("TEAMWORK_REPOSITORY_CACHE_DIR")
+    writable_directories = (
+        (Path(repository_cache),) if repository_cache else ()
+    )
     command = [
         codex_binary,
         "sandbox",
@@ -221,6 +226,7 @@ def wrap_managed_sandbox_command(
             agent,
             ipc_directory=ipc_directory,
             codex_runtime_directory=codex_runtime_directory,
+            writable_directories=writable_directories,
         ),
     ]
     if agent.network_access and agent.network_domains:

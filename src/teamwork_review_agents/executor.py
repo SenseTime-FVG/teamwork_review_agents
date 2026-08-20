@@ -9,6 +9,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
+from .agent_workspace import (
+    agent_repository_cache_environment,
+    prepare_agent_workspace,
+)
 from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
 from .codex_settings import resolve_agent_model_snapshot
@@ -49,6 +53,14 @@ from .workspace import (
 
 class AgentExecutionError(RuntimeError):
     """表示 Agent 配置、限额、资源或 Codex 执行失败。"""
+
+
+class AgentWorkspacePreparationError(RuntimeError):
+    """表示模型启动前的仓库工作区准备未成功。"""
+
+    def __init__(self, message: str, *, status: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _action_name(event_type: str) -> str:
@@ -657,6 +669,19 @@ class AgentExecutor:
                     include_change_request=task is None,
                 )
                 redactor = SecretRedactor(resolved_environment.secret_values)
+                cache_root, cache_environment = agent_repository_cache_environment(
+                    self.config,
+                    repository,
+                )
+                process_environment = {
+                    **resolved_environment.process_values,
+                    **cache_environment,
+                }
+                audit_environment = dict(resolved_environment.audit_values)
+                if cache_root is not None:
+                    audit_environment["TEAMWORK_REPOSITORY_CACHE_DIR"] = str(
+                        cache_root.resolve()
+                    )
                 effective_actions = tuple(actions or (event.type,))
                 if task is None and target_head_sha is None:
                     target_head_sha = await asyncio.to_thread(
@@ -680,7 +705,7 @@ class AgentExecutor:
                     self.store.update_agent_run_inputs,
                     reservation.run_id,
                     prompt=redactor.text(prompt),
-                    environment=resolved_environment.audit_values,
+                    environment=audit_environment,
                     config_revision=self.config.revision,
                 )
                 await asyncio.to_thread(
@@ -690,6 +715,29 @@ class AgentExecutor:
                     status="inherited" if not owned_workspace else "active",
                     reason=workspace_reason,
                 )
+                preparation = await prepare_agent_workspace(
+                    config=self.config,
+                    repository=repository,
+                    agent=agent,
+                    process_environment=process_environment,
+                    redactor=redactor,
+                    log_callback=persist_log,
+                    cancel_check=lambda: self._cancel_requested(
+                        reservation.run_id
+                    ),
+                )
+                if preparation.outcome.status != "success":
+                    detail = preparation.outcome.error or (
+                        f"步骤 {preparation.outcome.failed_step or 'unknown'} 失败"
+                    )
+                    if preparation.outcome.exit_code is not None:
+                        detail = (
+                            f"{detail}，退出码 {preparation.outcome.exit_code}"
+                        )
+                    raise AgentWorkspacePreparationError(
+                        detail,
+                        status=preparation.outcome.status,
+                    )
                 workspace_prepared = True
                 await persist_log(
                     "system",
@@ -726,7 +774,7 @@ class AgentExecutor:
                             "agent_name": agent_name,
                             "execution_mode": self.config.runtime.codex.execution_mode,
                             "config_revision": self.config.revision,
-                            "environment": resolved_environment.audit_values,
+                            "environment": audit_environment,
                             "workspace_mode": workspace_mode,
                             "workspace": str(active_workspace),
                         },
@@ -751,7 +799,7 @@ class AgentExecutor:
                         repository=repository,
                         context=context,
                         prompt=prompt,
-                        process_environment=resolved_environment.process_values,
+                        process_environment=process_environment,
                         redactor=redactor,
                         log_callback=persist_log,
                         cancel_check=lambda: asyncio.to_thread(
@@ -762,6 +810,22 @@ class AgentExecutor:
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
+        except AgentWorkspacePreparationError as exc:
+            mapped_status = (
+                "cancelled"
+                if exc.status == "cancelled"
+                else "timed_out"
+                if exc.status == "timed_out"
+                else "failed"
+            )
+            result = AgentResult(
+                run_id=reservation.run_id,
+                root_run_id=reservation.root_run_id,
+                parent_run_id=reservation.parent_run_id,
+                agent_name=agent_name,
+                status=mapped_status,
+                error=redactor.text(str(exc)),
+            )
         except WorkspaceCancelled as exc:
             source = await cancellation_source()
             result = AgentResult(
