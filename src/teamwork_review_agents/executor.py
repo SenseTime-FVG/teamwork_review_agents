@@ -725,6 +725,7 @@ class AgentExecutor:
                     cancel_check=lambda: self._cancel_requested(
                         reservation.run_id
                     ),
+                    inherited_workspace=task is not None and inherit_workspace,
                 )
                 if preparation.outcome.status != "success":
                     detail = preparation.outcome.error or (
@@ -746,6 +747,8 @@ class AgentExecutor:
                         "mode": workspace_mode,
                         "path": str(active_workspace),
                         "reason": workspace_reason,
+                        "snapshot_status": preparation.snapshot_status,
+                        "snapshot_fingerprint": preparation.snapshot_fingerprint,
                     },
                 )
                 started = await asyncio.to_thread(

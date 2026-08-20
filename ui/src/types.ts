@@ -69,6 +69,36 @@ export type RepositoryWorkspaceStatus = {
   detail_run_id?: string | null;
 };
 
+export type RepositoryWorkspaceWarmupStatus = {
+  repository_id: string;
+  status: "disabled" | "unconfigured" | "uninitialized" | "outdated" | "waiting" | "preparing" | "ready" | "failed" | "cancelled";
+  phase: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  elapsed_seconds: number;
+  error?: string | null;
+  cancel_requested: boolean;
+  branch?: string | null;
+  head_sha?: string | null;
+  snapshot_count: number;
+  total_size_bytes: number;
+  latest?: {
+    fingerprint?: string;
+    created_at?: number;
+    last_used_at?: number;
+    size_bytes?: number;
+    artifact_count?: number;
+    source_head?: string | null;
+  } | null;
+  logs: Array<{
+    id: string;
+    stream: string;
+    event_type: string;
+    payload: unknown;
+    created_at: number;
+  }>;
+};
+
 export type GitCommandDetail = {
   command_id: string;
   operation: string;

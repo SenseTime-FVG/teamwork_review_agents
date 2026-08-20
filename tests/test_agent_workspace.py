@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +16,10 @@ from teamwork_review_agents.config import (
     AgentWorkspacePrepareStepConfig,
 )
 from teamwork_review_agents.environment import SecretRedactor
+from teamwork_review_agents.workspace_snapshot import (
+    ARCHIVE_FILE_NAME,
+    workspace_snapshot_root,
+)
 
 
 @pytest.mark.parametrize("cwd", ["/tmp", "../ui", "C:\\temp"])
@@ -53,6 +58,11 @@ async def test_prepare_agent_workspace_runs_in_configured_directory_and_reuses_c
     repository.workspace = tmp_path / "agent-worktree"
     step_directory = repository.workspace / "ui"
     step_directory.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", str(repository.workspace)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
     repository.agent_workspace = AgentWorkspaceConfig(
         cache_enabled=True,
         prepare_steps=[
@@ -104,13 +114,182 @@ async def test_prepare_agent_workspace_runs_in_configured_directory_and_reuses_c
     )
     event_types = [event_type for _, event_type, _ in events]
     assert event_types == [
+        "workspace.snapshot.lookup",
+        "workspace.snapshot.missed",
         "workspace.prepare.started",
         "workspace.prepare.output",
         "workspace.prepare.step_started",
         "workspace.prepare.output",
         "workspace.prepare.step_completed",
         "workspace.prepare.completed",
+        "workspace.snapshot.created",
     ]
+    assert result.snapshot_status == "created"
+
+    (step_directory / "prepared.txt").unlink()
+    restored_events: list[str] = []
+
+    async def restored_log_callback(
+        _stream: str,
+        event_type: str,
+        _payload: str | dict[str, object],
+    ) -> None:
+        """第二次运行应直接恢复，不再执行准备命令。"""
+
+        restored_events.append(event_type)
+
+    restored = await prepare_agent_workspace(
+        config=config,
+        repository=repository,
+        agent=agent,
+        process_environment={},
+        redactor=SecretRedactor(()),
+        log_callback=restored_log_callback,
+        cancel_check=lambda: False,
+    )
+
+    assert restored.outcome.status == "success"
+    assert restored.snapshot_status == "restored"
+    assert (step_directory / "prepared.txt").exists()
+    assert restored_events == [
+        "workspace.snapshot.lookup",
+        "workspace.snapshot.restored",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inherited_workspace_skips_repeated_prepare_steps(
+    tmp_path: Path,
+    configured_app_factory,
+) -> None:
+    """继承父 Agent 工作区的 sub-agent 不应再次执行依赖安装。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    repository.workspace = tmp_path / "inherited-worktree"
+    repository.workspace.mkdir()
+    repository.agent_workspace = AgentWorkspaceConfig(
+        cache_enabled=True,
+        prepare_steps=[
+            AgentWorkspacePrepareStepConfig(
+                name="不应重复执行",
+                command=[
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('unexpected').touch()",
+                ],
+            )
+        ],
+    )
+    events: list[str] = []
+
+    async def log_callback(
+        _stream: str,
+        event_type: str,
+        _payload: str | dict[str, object],
+    ) -> None:
+        """只记录继承判定事件。"""
+
+        events.append(event_type)
+
+    result = await prepare_agent_workspace(
+        config=config,
+        repository=repository,
+        agent=AgentConfig(prompt="测试", sandbox="danger-full-access"),
+        process_environment={},
+        redactor=SecretRedactor(()),
+        log_callback=log_callback,
+        cancel_check=lambda: False,
+        inherited_workspace=True,
+    )
+
+    assert result.outcome.status == "success"
+    assert result.snapshot_status == "inherited"
+    assert events == ["workspace.prepare.inherited"]
+    assert not (repository.workspace / "unexpected").exists()
+
+
+@pytest.mark.asyncio
+async def test_corrupted_snapshot_falls_back_to_prepare_steps(
+    tmp_path: Path,
+    configured_app_factory,
+) -> None:
+    """快照损坏时应清理旧归档并重新执行用户准备步骤。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    repository.workspace = tmp_path / "corrupted-worktree"
+    repository.workspace.mkdir()
+    subprocess.run(
+        ["git", "init", str(repository.workspace)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    repository.agent_workspace = AgentWorkspaceConfig(
+        cache_enabled=True,
+        prepare_steps=[
+            AgentWorkspacePrepareStepConfig(
+                name="重新准备",
+                command=[
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('prepared.bin').write_bytes(b'ok')",
+                ],
+            )
+        ],
+    )
+
+    async def discard_log(
+        _stream: str,
+        _event_type: str,
+        _payload: str | dict[str, object],
+    ) -> None:
+        """首次运行不需要检查日志内容。"""
+
+    first = await prepare_agent_workspace(
+        config=config,
+        repository=repository,
+        agent=AgentConfig(prompt="测试", sandbox="danger-full-access"),
+        process_environment={},
+        redactor=SecretRedactor(()),
+        log_callback=discard_log,
+        cancel_check=lambda: False,
+    )
+    assert first.snapshot_fingerprint is not None
+    archive = (
+        workspace_snapshot_root(config, repository)
+        / first.snapshot_fingerprint
+        / ARCHIVE_FILE_NAME
+    )
+    archive.write_bytes(b"corrupted")
+    (repository.workspace / "prepared.bin").unlink()
+    events: list[str] = []
+
+    async def collect_log(
+        _stream: str,
+        event_type: str,
+        _payload: str | dict[str, object],
+    ) -> None:
+        """记录缓存回退路径。"""
+
+        events.append(event_type)
+
+    second = await prepare_agent_workspace(
+        config=config,
+        repository=repository,
+        agent=AgentConfig(prompt="测试", sandbox="danger-full-access"),
+        process_environment={},
+        redactor=SecretRedactor(()),
+        log_callback=collect_log,
+        cancel_check=lambda: False,
+    )
+
+    assert second.outcome.status == "success"
+    assert second.snapshot_status == "created"
+    assert (repository.workspace / "prepared.bin").read_bytes() == b"ok"
+    assert "workspace.snapshot.restore_failed" in events
+    assert "workspace.prepare.started" in events
 
 
 @pytest.mark.asyncio

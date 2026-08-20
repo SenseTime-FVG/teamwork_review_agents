@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .agent_workspace_manager import AgentWorkspaceWarmupManager
 from .codex_account import (
     CodexAccountError,
     CodexLoginManager,
@@ -176,6 +177,7 @@ def create_app(
     login_manager = CodexLoginManager()
     repository_initialization_manager = RepositoryInitializationManager(manager)
     manual_preflight_manager = ManualPreflightManager(manager)
+    agent_workspace_warmup_manager = AgentWorkspaceWarmupManager(manager)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -185,6 +187,7 @@ def create_app(
             yield
         finally:
             await manual_preflight_manager.close()
+            await agent_workspace_warmup_manager.close()
             await repository_initialization_manager.close()
             await login_manager.close()
             if start_scheduler:
@@ -200,6 +203,7 @@ def create_app(
     app.state.codex_login_manager = login_manager
     app.state.repository_initialization_manager = repository_initialization_manager
     app.state.manual_preflight_manager = manual_preflight_manager
+    app.state.agent_workspace_warmup_manager = agent_workspace_warmup_manager
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -624,6 +628,40 @@ def create_app(
         """取消仍在进行的基础仓库初始化或更新。"""
 
         result = await repository_initialization_manager.cancel(repository_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.get("/api/repositories/{repository_id}/workspace/warmup")
+    async def repository_workspace_warmup(repository_id: str) -> dict[str, Any]:
+        """返回仓库级 Agent 依赖快照及当前预热状态。"""
+
+        result = await agent_workspace_warmup_manager.get(repository_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.post("/api/repositories/{repository_id}/workspace/warmup/start")
+    async def start_repository_workspace_warmup(
+        repository_id: str,
+    ) -> dict[str, Any]:
+        """在远端默认分支启动一次 Agent 工作区准备与快照预热。"""
+
+        try:
+            result = await agent_workspace_warmup_manager.start(repository_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="仓库配置不存在")
+        return result
+
+    @app.post("/api/repositories/{repository_id}/workspace/warmup/cancel")
+    async def cancel_repository_workspace_warmup(
+        repository_id: str,
+    ) -> dict[str, Any]:
+        """取消仍在进行的 Agent 工作区快照预热。"""
+
+        result = await agent_workspace_warmup_manager.cancel(repository_id)
         if result is None:
             raise HTTPException(status_code=404, detail="仓库配置不存在")
         return result

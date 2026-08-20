@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,14 @@ from .preflight_cache import (
     repository_cache_root,
 )
 from .subprocess_utils import resolve_executable
+from .workspace_snapshot import (
+    WorkspaceSnapshotCancelled,
+    WorkspaceSnapshotError,
+    create_workspace_snapshot,
+    invalidate_workspace_snapshot,
+    restore_workspace_snapshot,
+    workspace_snapshot_fingerprint,
+)
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
@@ -34,6 +43,9 @@ class AgentWorkspacePreparationResult:
     outcome: StepExecutionOutcome
     cache_environment: dict[str, str]
     cache_root: Path | None
+    snapshot_status: str = "disabled"
+    snapshot_fingerprint: str | None = None
+    snapshot_metadata: dict[str, Any] | None = None
 
 
 def agent_repository_cache_environment(
@@ -57,6 +69,7 @@ async def prepare_agent_workspace(
     redactor: SecretRedactor,
     log_callback: LogCallback,
     cancel_check: CancelCheck,
+    inherited_workspace: bool = False,
 ) -> AgentWorkspacePreparationResult:
     """在模型启动前通过外层沙盒执行仓库声明的准备步骤。"""
 
@@ -72,6 +85,119 @@ async def prepare_agent_workspace(
             cache_environment=cache_environment,
             cache_root=cache_root,
         )
+
+    if inherited_workspace and steps:
+        await log_callback(
+            "system",
+            "workspace.prepare.inherited",
+            {
+                "steps": len(steps),
+                "reason": "当前 sub-agent 继承父 Agent 已准备的同一工作区",
+            },
+        )
+        return AgentWorkspacePreparationResult(
+            outcome=StepExecutionOutcome(status="success"),
+            cache_environment=cache_environment,
+            cache_root=cache_root,
+            snapshot_status="inherited",
+        )
+
+    snapshot_fingerprint: str | None = None
+    preparation_signature: str | None = None
+    if steps and cache_root is not None:
+        try:
+            fingerprint_environment = build_preflight_environment(
+                cache_environment=cache_environment,
+            )
+            fingerprint_environment.update(process_environment)
+            snapshot_fingerprint, preparation_signature = await asyncio.to_thread(
+                workspace_snapshot_fingerprint,
+                repository,
+                fingerprint_environment,
+            )
+            await log_callback(
+                "system",
+                "workspace.snapshot.lookup",
+                {"fingerprint": snapshot_fingerprint},
+            )
+            metadata = await asyncio.to_thread(
+                restore_workspace_snapshot,
+                config,
+                repository,
+                snapshot_fingerprint,
+                cancel_check=cancel_check,
+            )
+            if metadata is not None:
+                await log_callback(
+                    "system",
+                    "workspace.snapshot.restored",
+                    {
+                        "fingerprint": snapshot_fingerprint,
+                        "size_bytes": metadata.get("size_bytes"),
+                        "artifact_count": metadata.get("artifact_count"),
+                    },
+                )
+                return AgentWorkspacePreparationResult(
+                    outcome=StepExecutionOutcome(status="success"),
+                    cache_environment=cache_environment,
+                    cache_root=cache_root,
+                    snapshot_status="restored",
+                    snapshot_fingerprint=snapshot_fingerprint,
+                    snapshot_metadata=metadata,
+                )
+            await log_callback(
+                "system",
+                "workspace.snapshot.missed",
+                {"fingerprint": snapshot_fingerprint},
+            )
+        except WorkspaceSnapshotCancelled as exc:
+            await log_callback(
+                "system",
+                "workspace.snapshot.cancelled",
+                {
+                    "fingerprint": snapshot_fingerprint,
+                    "error": redactor.text(str(exc)),
+                },
+            )
+            return AgentWorkspacePreparationResult(
+                outcome=StepExecutionOutcome(
+                    status="cancelled",
+                    error="Agent 工作区准备已由管理员取消",
+                ),
+                cache_environment=cache_environment,
+                cache_root=cache_root,
+                snapshot_status="cancelled",
+                snapshot_fingerprint=snapshot_fingerprint,
+            )
+        except (OSError, WorkspaceSnapshotError) as exc:
+            await log_callback(
+                "stderr",
+                "workspace.snapshot.restore_failed",
+                {
+                    "fingerprint": snapshot_fingerprint,
+                    "error": redactor.text(str(exc)),
+                    "fallback": "execute_prepare_steps",
+                },
+            )
+            if snapshot_fingerprint is not None:
+                try:
+                    await asyncio.to_thread(
+                        invalidate_workspace_snapshot,
+                        config,
+                        repository,
+                        snapshot_fingerprint,
+                    )
+                except OSError as invalidate_error:
+                    # 清理失败不应阻断实际准备步骤，后续仍可覆盖该快照。
+                    await log_callback(
+                        "stderr",
+                        "workspace.snapshot.invalidate_failed",
+                        {
+                            "fingerprint": snapshot_fingerprint,
+                            "error": redactor.text(str(invalidate_error)),
+                            "agent_continues": True,
+                        },
+                    )
 
     restricted = agent.sandbox != "danger-full-access"
     if restricted:
@@ -246,8 +372,71 @@ async def prepare_agent_workspace(
             }
         ),
     )
+    snapshot_metadata: dict[str, Any] | None = None
+    snapshot_status = "disabled" if cache_root is None else "not_created"
+    if (
+        outcome.status == "success"
+        and snapshot_fingerprint is not None
+        and preparation_signature is not None
+    ):
+        try:
+            snapshot_metadata = await asyncio.to_thread(
+                create_workspace_snapshot,
+                config,
+                repository,
+                snapshot_fingerprint,
+                preparation_signature,
+                cancel_check=cancel_check,
+            )
+            snapshot_status = "created" if snapshot_metadata is not None else "empty"
+            await log_callback(
+                "system",
+                "workspace.snapshot.created",
+                {
+                    "fingerprint": snapshot_fingerprint,
+                    "status": snapshot_status,
+                    "size_bytes": (
+                        snapshot_metadata.get("size_bytes")
+                        if snapshot_metadata is not None
+                        else 0
+                    ),
+                    "artifact_count": (
+                        snapshot_metadata.get("artifact_count")
+                        if snapshot_metadata is not None
+                        else 0
+                    ),
+                },
+            )
+        except WorkspaceSnapshotCancelled as exc:
+            snapshot_status = "cancelled"
+            outcome = StepExecutionOutcome(
+                status="cancelled",
+                error="Agent 工作区准备已由管理员取消",
+            )
+            await log_callback(
+                "system",
+                "workspace.snapshot.cancelled",
+                {
+                    "fingerprint": snapshot_fingerprint,
+                    "error": redactor.text(str(exc)),
+                },
+            )
+        except (OSError, WorkspaceSnapshotError) as exc:
+            snapshot_status = "create_failed"
+            await log_callback(
+                "stderr",
+                "workspace.snapshot.create_failed",
+                {
+                    "fingerprint": snapshot_fingerprint,
+                    "error": redactor.text(str(exc)),
+                    "agent_continues": True,
+                },
+            )
     return AgentWorkspacePreparationResult(
         outcome=outcome,
         cache_environment=cache_environment,
         cache_root=cache_root,
+        snapshot_status=snapshot_status,
+        snapshot_fingerprint=snapshot_fingerprint,
+        snapshot_metadata=snapshot_metadata,
     )
