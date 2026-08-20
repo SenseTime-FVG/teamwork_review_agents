@@ -15,6 +15,7 @@ from .state import StateStore
 
 
 _COMMENT_LIMIT_BYTES = 60 * 1024
+_UNKNOWN_MODEL_SIGNATURE = "Codex 账号默认（未记录具体模型）"
 
 
 class ManagedCommentService:
@@ -49,6 +50,8 @@ class ManagedCommentService:
             raise RuntimeError(
                 f"Agent {context.current_agent} 缺少稳定的托管评论槽位"
             )
+        if agent.managed_comment_model_signature:
+            body = await self._append_model_signature(context.run_id, body)
         snapshot = context.event.current_snapshot
         return await self.publish(
             repository_id=context.event.repository_id,
@@ -59,6 +62,40 @@ class ManagedCommentService:
             source_head_sha=snapshot.head_sha,
             body=body,
         )
+
+    async def _append_model_signature(self, run_id: str, body: str) -> str:
+        """使用本轮固化的模型快照为非空评论正文追加签名。"""
+
+        if not body.strip():
+            return body
+        run = await asyncio.to_thread(self.store.get_run, run_id)
+        model_snapshot = run.get("model_snapshot") if run else None
+        signature = self._format_model_signature(model_snapshot)
+        return f"{body.rstrip()}\n\n---\n_模型：`{signature}`_"
+
+    @staticmethod
+    def _format_model_signature(model_snapshot: Any) -> str:
+        """把可信模型快照规范为不会破坏 Markdown 的单行签名。"""
+
+        snapshot = model_snapshot if isinstance(model_snapshot, dict) else {}
+        model = ManagedCommentService._signature_part(snapshot.get("model"))
+        reasoning_effort = ManagedCommentService._signature_part(
+            snapshot.get("reasoning_effort")
+        )
+        if not model:
+            return _UNKNOWN_MODEL_SIGNATURE
+        if reasoning_effort:
+            return f"{model} ({reasoning_effort})"
+        return model
+
+    @staticmethod
+    def _signature_part(value: Any) -> str:
+        """压缩空白并替换反引号，避免配置文本逃逸 Markdown 代码片段。"""
+
+        if value is None:
+            return ""
+        normalized = " ".join(str(value).split())[:256]
+        return normalized.replace("`", "ˋ")
 
     async def publish(
         self,

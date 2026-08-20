@@ -402,6 +402,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .network-permission-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .network-permission-head strong { color: var(--bright); font-size: 12px; }
 .network-permission-head p { margin: 5px 0 0; color: #6e7d91; font-size: 10px; line-height: 1.55; }
+.managed-comment-toggles { display: flex; align-items: center; justify-content: flex-end; gap: 18px; flex-wrap: wrap; }
 .network-domain-field { margin-top: 14px; }
 .network-domain-field textarea { resize: vertical; font: 400 11px/1.6 "SFMono-Regular", Consolas, monospace; }
 .network-permission-state { margin: 13px 0 0; padding: 10px 11px; border: 1px dashed #29394a; border-radius: 7px; color: #718096; font-size: 10px; }
@@ -874,6 +875,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .form-grid.two, .form-grid.three, .provider-row, .setup-flow { grid-template-columns: 1fr; }
   .permissions-grid, .prompt-file-picker { grid-template-columns: 1fr; }
   .network-permission-head { align-items: stretch; flex-direction: column; }
+  .managed-comment-toggles { align-items: flex-start; justify-content: flex-start; flex-direction: column; gap: 10px; }
   .skill-heading { grid-template-columns: 1fr; }
   .managed-skill { align-items: stretch; flex-direction: column; }
   .prompt-file-actions { align-items: stretch; flex-direction: column; }

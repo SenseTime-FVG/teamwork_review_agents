@@ -401,6 +401,7 @@ class AgentConfig(BaseModel):
     max_concurrent_runs: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     managed_comment: bool = False
+    managed_comment_model_signature: bool = False
     managed_comment_slot: str | None = Field(default=None, min_length=1, max_length=128)
     allowed_sub_agents: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
