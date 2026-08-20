@@ -956,7 +956,7 @@ class StateStore:
         offset: int = 0,
         repository_id: str | None = None,
         number: int | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
 
@@ -972,9 +972,13 @@ class StateStore:
                 "CAST(json_extract(snapshots.payload, '$.number') AS INTEGER) = ?"
             )
             parameters.append(number)
-        if status:
-            conditions.append("json_extract(snapshots.payload, '$.state') = ?")
-            parameters.append(status)
+        statuses = [status] if isinstance(status, str) else list(status or ())
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(
+                f"json_extract(snapshots.payload, '$.state') IN ({placeholders})"
+            )
+            parameters.extend(statuses)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
@@ -1059,7 +1063,7 @@ class StateStore:
         *,
         repository_id: str | None = None,
         number: int | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
     ) -> int:
         """返回与快照列表筛选条件一致的记录总数。"""
 
@@ -1073,9 +1077,13 @@ class StateStore:
                 "CAST(json_extract(payload, '$.number') AS INTEGER) = ?"
             )
             parameters.append(number)
-        if status:
-            conditions.append("json_extract(payload, '$.state') = ?")
-            parameters.append(status)
+        statuses = [status] if isinstance(status, str) else list(status or ())
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(
+                f"json_extract(payload, '$.state') IN ({placeholders})"
+            )
+            parameters.extend(statuses)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self.connect() as connection:
             row = connection.execute(

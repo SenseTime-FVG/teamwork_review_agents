@@ -1540,7 +1540,9 @@ def create_app(
         all_records: bool = False,
         page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
-        status: Literal["opened", "closed", "merged"] | None = None,
+        status: list[Literal["opened", "closed", "merged"]] | None = Query(
+            default=None
+        ),
     ):
         """返回扫描器已经建立基线的 MR/PR 最新快照。"""
 

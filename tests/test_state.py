@@ -398,6 +398,7 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
     ] == [older.key]
     assert store.count_snapshots() == 2
     assert store.count_snapshots(repository_id="second", status="closed") == 1
+    assert store.count_snapshots(status=["opened", "closed"]) == 2
     assert [
         item["snapshot_key"]
         for item in store.list_snapshots(None, repository_id="second")
@@ -406,6 +407,10 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         item["snapshot_key"]
         for item in store.list_snapshots(None, status="opened")
     ] == [newest.key]
+    assert [
+        item["snapshot_key"]
+        for item in store.list_snapshots(None, status=["opened", "closed"])
+    ] == [newest.key, older.key]
     assert [
         item["snapshot_key"]
         for item in store.list_snapshots(None, number=2)

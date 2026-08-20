@@ -1033,6 +1033,18 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/change-requests?repository_id=second&status=closed&limit=10"
         ).json()
         assert [item["snapshot_key"] for item in filtered_snapshots] == [second.key]
+        multi_status_snapshots = client.get(
+            "/api/change-requests?status=opened&status=closed&limit=10"
+        ).json()
+        assert [item["snapshot_key"] for item in multi_status_snapshots] == [
+            first.key,
+            second.key,
+        ]
+        multi_status_page = client.get(
+            "/api/change-requests?status=opened&status=closed&page=1&limit=1"
+        ).json()
+        assert multi_status_page["total"] == 2
+        assert multi_status_page["total_pages"] == 2
         first_snapshot_page = client.get(
             "/api/change-requests?page=1&limit=1"
         ).json()
