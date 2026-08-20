@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -13,7 +14,9 @@ import yaml
 
 from .config import (
     AppConfig,
+    BUILTIN_CODEX_CLI_PROVIDER_ID,
     load_config,
+    normalize_model_provider_document,
     parse_config_data,
     protect_provider_credentials,
 )
@@ -52,7 +55,7 @@ class ConfigManager:
             raw = yaml.safe_load(file) or {}
         if not isinstance(raw, dict):
             raise ValueError("配置文件顶层必须是对象")
-        return raw
+        return normalize_model_provider_document(raw)
 
     @staticmethod
     def _mask_secrets(value: Any) -> Any:
@@ -411,6 +414,89 @@ class ConfigManager:
                 for provider_name, value in providers.items()
                 if provider_name != name
             }
+            return self._persist_locked(document, source=source)
+
+    def save_model_provider(
+        self,
+        *,
+        expected_revision: str,
+        provider_id: str,
+        provider: dict[str, Any],
+        source: str = "ui-model-provider",
+    ) -> AppConfig:
+        """基于最新配置创建或更新一个模型 Provider。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            normalized_id = provider_id.strip()
+            if not normalized_id:
+                raise ValueError("模型 Provider ID 不能为空")
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", normalized_id) is None:
+                raise ValueError(
+                    "模型 Provider ID 只能包含字母、数字、点、下划线和短横线，"
+                    "且必须以字母开头"
+                )
+            model_providers = current_raw.get("model_providers", {})
+            if not isinstance(model_providers, dict):
+                raise ValueError("model_providers 配置必须是对象")
+            next_provider = copy.deepcopy(provider)
+            if normalized_id == BUILTIN_CODEX_CLI_PROVIDER_ID:
+                existing = model_providers.get(normalized_id)
+                if not isinstance(existing, dict):
+                    raise ValueError("内置 Codex CLI Provider 不存在")
+                if next_provider.get("driver") != "codex_cli":
+                    raise ValueError("内置 Codex CLI Provider 不允许改变驱动类型")
+
+            document = copy.deepcopy(current_raw)
+            document["model_providers"] = {
+                **copy.deepcopy(model_providers),
+                normalized_id: next_provider,
+            }
+            return self._persist_locked(document, source=source)
+
+    def delete_model_provider(
+        self,
+        *,
+        expected_revision: str,
+        provider_id: str,
+        source: str = "ui-model-provider-delete",
+    ) -> AppConfig:
+        """删除外部模型 Provider，并原子迁移默认模型和 Agent 引用。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            normalized_id = provider_id.strip()
+            if normalized_id == BUILTIN_CODEX_CLI_PROVIDER_ID:
+                raise ValueError("内置 Codex CLI Provider 不允许删除")
+            model_providers = current_raw.get("model_providers", {})
+            if not isinstance(model_providers, dict) or normalized_id not in model_providers:
+                raise ValueError(f"模型 Provider 不存在：{normalized_id}")
+
+            document = copy.deepcopy(current_raw)
+            document["model_providers"] = {
+                key: copy.deepcopy(value)
+                for key, value in model_providers.items()
+                if key != normalized_id
+            }
+            runtime = document.setdefault("runtime", {})
+            default_model = runtime.get("default_model") if isinstance(runtime, dict) else None
+            if (
+                isinstance(default_model, dict)
+                and default_model.get("provider") == normalized_id
+            ):
+                runtime["default_model"] = {
+                    "provider": BUILTIN_CODEX_CLI_PROVIDER_ID,
+                }
+            agents = document.get("agents", {})
+            if isinstance(agents, dict):
+                for agent in agents.values():
+                    if not isinstance(agent, dict):
+                        continue
+                    if agent.get("model_provider") == normalized_id:
+                        agent.pop("model_provider", None)
+                        agent.pop("model", None)
             return self._persist_locked(document, source=source)
 
     def save_repository(

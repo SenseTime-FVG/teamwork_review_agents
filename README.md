@@ -4,7 +4,7 @@
 
 PR / MR 越来越快、越来越多，但审核、CI、合并门禁和文档同步仍靠人工。结果是审核缺少上下文、旧结论误用于新提交、合并后文档过期。
 
-Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转换为事件，再按规则启动隔离的 Codex Agent，完成审核、合并和文档更新。
+Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转换为事件，再按规则启动隔离的模型 Agent，完成审核、合并和文档更新。
 
 ## 方案
 
@@ -14,7 +14,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 - 快照、事件、规则、运行和日志统一写入 SQLite，并在管理界面展示。
 - GitHub PR 可在 Review Agent 前执行仓库自定义的确定性 Preflight CI。
 
-主链路：`扫描 PR/MR → 语义事件 → 规则匹配 → Codex Agent → 审计与日志`
+主链路：`扫描 PR/MR → 语义事件 → 规则匹配 → 模型 Agent → 审计与日志`
 
 ![Teamwork Review Agents 的当前架构与 Agent 流程](docs/assets/teamwork-review-agents-architecture.png)
 
@@ -28,7 +28,7 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 
 ## 快速开始
 
-运行端支持 Linux、macOS、原生 Windows 和 WSL2，需要 Python 3.11+、Git、已登录的 Codex CLI，以及 GitHub / GitLab Token。
+运行端支持 Linux、macOS、原生 Windows 和 WSL2，需要 Python 3.11+、Git、Codex CLI，以及 GitHub / GitLab Token。默认内置 Provider 使用 Codex CLI，选择它时还需要完成 Codex 登录；使用 API Provider 时需要在管理页单独配置对应 API Key。
 
 > [!IMPORTANT]
 > 使用 GitHub 仓库前，必须为启动 Teamwork 服务的同一系统用户安装并登录 `gh`；使用 GitLab 仓库前，必须以相同方式配置 `glab`。否则 Agent 无法通过平台 CLI 读取或执行评论、审批、标签、合并等操作。具体命令见[配置 `gh` / `glab`](docs/platform-cli-auth.md)。
@@ -59,9 +59,10 @@ teamwork-review-agents start
 
 1. 添加 GitHub / GitLab 连接，填写 API 地址和 Token 变量名。
 2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
-3. 在全局环境中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`。
-4. 检查 Codex、Agent 权限和 Prompt，保存后执行“立即扫描”。
-5. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
+3. 在“全局配置与环境”中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`，并确认全局默认模型。
+4. 在“Provider”页检查不可删除的内置 Codex CLI，或新增 API Provider、配置 API Key 和模型目录。
+5. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
+6. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
 
 平台连接与仓库配置：
 
@@ -175,15 +176,15 @@ GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产�
 
 ## Agent 运行状态与 Git 超时
 
-Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，Codex CLI 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，Teamwork 外层沙盒会允许该 clone 及其独立 `.git` 写入，因此 Agent 可以执行 fetch、建分支和提交；Codex 的工作区权限档案还允许系统临时目录写入，用于每轮临时 HOME 和工具缓存，但基础仓库不在可写范围内。只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
+Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，所选模型 Provider 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，Teamwork 外层沙盒会允许该 clone 及其独立 `.git` 写入，因此 Agent 可以执行 fetch、建分支和提交；Codex 的工作区权限档案还允许系统临时目录写入，用于每轮临时 HOME 和工具缓存，但基础仓库不在可写范围内。只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
-不同 PR / MR 的事件批次可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。全局环境页的 `runtime.max_concurrent_agents` 和运行时配置页的 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
+不同 PR / MR 的事件批次可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。“全局配置与环境”页的 `runtime.max_concurrent_agents` 和 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
 
 排队记录会说明当前是在等待全局/运行时额度、此 Agent 额度、同一 PR / MR 前序批次、前序事件重试、业务资源锁还是基础仓库锁。前序事件发生可重试失败时只短暂延迟当前 PR / MR，其他变更请求继续使用空闲额度；达到重试上限后，该失败事件保留终态并立即继续同一 PR / MR 的后续批次。修改并发配置只影响尚未取得额度的新运行，不会强制终止已经开始准备或执行的任务。
 
 `runtime.repository_initialization_timeout_seconds` 控制基础仓库首次克隆的最长等待时间，默认 `1800` 秒；基础仓库就绪后，`runtime.git_timeout_seconds` 控制 fetch、引用获取、运行 clone 和 worktree 等单次 Git 操作，默认 `600` 秒。等待仓库锁不计入这两个超时。排队、准备工作区和执行中的运行均可取消；准备阶段取消或 Git 超时时会终止整个 Git 进程组，避免遗留 ssh、index-pack 等子进程。
 
-这两个超时可以在管理界面左侧“运行时配置”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
+这两个超时可以在管理界面左侧“全局配置与环境”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
 
 Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktree，所以 Git、测试
 和平台 CLI 都会作用于正确仓库。Teamwork 会在每次 `codex exec` 最后强制设置
@@ -192,20 +193,19 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 仓库页的“基础仓库状态”可以提前初始化尚不存在的基础 Git 仓库，也可以对已就绪仓库执行增量更新。初始化完成后，Agent 不会再次完整下载仓库，而是复用基础仓库中的 Git 对象并执行增量 fetch；可写 Agent 创建拥有独立 `.git` 的运行 clone，只读 Agent 创建 linked worktree。这样既减少网络传输，也不会让 Agent 修改基础仓库工作文件或共享 Git 元数据。初始化与 Agent 准备过程使用同一仓库锁，支持查看阶段、耗时、磁盘占用、失败原因以及取消操作。点击仓库状态或仓库行可以查看每条脱敏 Git 命令的实时状态；若操作来自 Agent，可继续进入对应运行记录。
 
+## 模型 Provider 与全局默认模型
+
+“Provider”页管理 Agent 的模型执行后端。`codex-cli` 是系统自动补齐的内置 Provider：可以停用，但不能删除，初始全局默认模型也指向它。API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议，可分别配置 Base URL、默认模型、模型目录、超时和并发上限。API Key 与 `config.yaml`、配置历史分开保存；列表只显示掩码，管理员主动点击小眼睛时才通过受管理 API 临时读取明文，Key 不进入 Prompt、工具子进程、运行快照或日志。
+
+Agent 可以显式选择 Provider 和模型，也可以继承“全局配置与环境”页的全局默认模型。选择框会把继承结果显示为具体值，例如 `继承全局默认（Codex CLI / gpt-5.6-sol）` 或 `Codex CLI / CLI 默认模型（gpt-5.6-sol）`；无法从 Codex 配置和账号可靠解析时会明确显示原因。运行开始后会把实际 Provider、驱动和模型固化到运行快照，后续修改或删除 Provider 不会改写历史记录。
+
+删除 API Provider 时，如果全局默认模型引用它，全局默认会先回退到 `codex-cli`；所有显式引用它的 Agent 会清除自己的 Provider 与模型并改为继承新的全局默认。停用与删除不同：停用会保留全部引用，新运行直接明确失败，不会悄悄改用其他模型。如果回退后的 Codex CLI 本身处于停用状态，配置迁移仍会完成，但需要重新启用或更换全局默认后才能运行。
+
+外部 API Provider 和 Codex OAuth 模型基座由 Teamwork 提供 `execute_command`、`apply_patch`、白名单 `invoke_agent`，以及按 Agent 配置开放的 `publish_comment`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它们不继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`。Codex OAuth token 和外部 API Key 都只用于宿主模型请求。
+
 ## Teamwork 跨平台外层沙盒
 
-运行时配置中的“Codex 仅作为模型基座”默认关闭。关闭时继续使用完整的 `codex exec` 运行时，包括 Codex CLI 自己的 Agent 循环、内置工具和允许的 MCP；开启后，Teamwork 不再启动 `codex exec`，而是直接读取 `runtime.codex_home`（或 `CODEX_HOME` / `~/.codex`）中的现有 ChatGPT OAuth 登录，并在进程内访问 Codex Responses 模型。该模式不启动或请求本机、外部的 `codex-api-service`，只把 Codex 用作模型基座。
-
-模型基座模式由 Teamwork 提供 `execute_command`、`apply_patch`、白名单 `invoke_agent`，以及按 Agent 配置开放的 `publish_comment`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它不会继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`；模型必须在 Agent、`runtime.codex.model` 或用户 `config.toml` 顶层明确配置。OAuth token 只用于宿主模型请求，不进入 Prompt、工具环境和运行日志。
-
-受限 Agent 在模型基座模式下没有 Codex 内层沙盒可回退，因此 `read-only` 和 `workspace-write` 的每个命令、补丁进程都必须成功进入 Teamwork 外层沙盒；即使 `fail_closed` 配成 `false`，该模式仍失败关闭。`danger-full-access` 继续表示管理员明确允许工具直接访问宿主环境。配置文件等价写法如下：
-
-```yaml
-runtime:
-  codex:
-    execution_mode: model  # 默认 cli
-    model: gpt-5.6-sol
-```
+受限 Agent 在模型基座驱动下没有 Codex 内层沙盒可回退，因此 `read-only` 和 `workspace-write` 的每个命令、补丁进程都必须成功进入 Teamwork 外层沙盒；即使 `fail_closed` 配成 `false`，该驱动仍失败关闭。`danger-full-access` 继续表示管理员明确允许工具直接访问宿主环境。
 
 受限 Agent 默认不再直接依赖 `codex exec --sandbox` 保护本地文件。Teamwork 先根据 Agent 的文件与网络权限生成本轮权限档案，再调用当前 `runtime.codex_binary` 提供的 `codex sandbox` 建立操作系统级外层沙盒：macOS 使用 Seatbelt，Linux 和 WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。外层沙盒建立成功后，内层 `codex exec` 才关闭自己的重复沙盒，避免 Codex 对 `.git` 的额外保护阻止本次独立 clone 执行正常 Git 写操作。
 
@@ -233,7 +233,7 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 可同时开启“附加模型签名”。Teamwork 会读取本轮 Agent 启动时固化的模型快照，在 `publish_comment` 正文末尾自动追加如 `gpt-5.6-sol (high)` 或 `deepseek-v4-pro` 的签名；无法解析具体模型时明确显示账号默认且未记录型号。签名不依赖 Prompt，也不会附加到没有模型运行的 Preflight / CI 评论。
 
-`fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时才回退到原来的 Codex 内层同级沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“运行时配置”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
+`fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时，Codex CLI 驱动才回退到自己的同级内层沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“全局配置与环境”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
 
 ## GitHub 本地 CI 门禁
 

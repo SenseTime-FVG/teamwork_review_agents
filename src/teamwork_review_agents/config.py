@@ -8,7 +8,7 @@ import hashlib
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator
@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field, PositiveInt, field_validator, model_valid
 
 CodexConfigPrimitive = str | int | float | bool
 CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
+
+BUILTIN_CODEX_CLI_PROVIDER_ID = "codex-cli"
+BUILTIN_CODEX_OAUTH_PROVIDER_ID = "codex-oauth"
 
 CODEX_STRUCTURED_CONFIG_KEYS = {
     "execution_mode",
@@ -172,6 +175,74 @@ class ManagedSandboxConfig(BaseModel):
     fail_closed: bool = True
 
 
+class ModelSelectionConfig(BaseModel):
+    """由 Provider 与模型 ID 共同组成的模型身份。"""
+
+    provider: str = BUILTIN_CODEX_CLI_PROVIDER_ID
+    model: str | None = None
+
+
+class ModelProviderConfig(BaseModel):
+    """一个可供 Agent 选择的模型执行后端。"""
+
+    display_name: str = Field(min_length=1)
+    driver: Literal[
+        "codex_cli",
+        "codex_oauth",
+        "openai_responses",
+        "openai_chat_completions",
+        "anthropic_messages",
+        "gemini_generate_content",
+    ]
+    enabled: bool = True
+    base_url: str | None = None
+    default_model: str | None = None
+    models: list[str] = Field(default_factory=list)
+    request_timeout_seconds: PositiveInt = 120
+    max_concurrency: PositiveInt | None = None
+    model_reasoning_effort: str | None = None
+    model_verbosity: Literal["low", "medium", "high"] | None = None
+    personality: Literal["none", "friendly", "pragmatic"] | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str | None) -> str | None:
+        """规范化外部模型服务根地址。"""
+
+        if value is None or not value.strip():
+            return None
+        text = value.strip().rstrip("/")
+        parsed = urlsplit(text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("模型 Provider Base URL 必须是 HTTP(S) 绝对地址")
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+    @field_validator("models")
+    @classmethod
+    def normalize_models(cls, value: list[str]) -> list[str]:
+        """去除空模型与重复模型，同时保留配置顺序。"""
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw_model in value:
+            model = raw_model.strip()
+            if model and model not in seen:
+                seen.add(model)
+                result.append(model)
+        return result
+
+    @model_validator(mode="after")
+    def validate_driver_fields(self) -> "ModelProviderConfig":
+        """外部 API 驱动必须配置服务地址和可用默认模型。"""
+
+        if self.driver not in {"codex_cli", "codex_oauth"}:
+            if self.base_url is None:
+                raise ValueError("外部模型 Provider 必须配置 Base URL")
+            if self.default_model is None and not self.models:
+                raise ValueError("外部模型 Provider 必须配置默认模型或模型目录")
+        return self
+
+
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
@@ -193,6 +264,9 @@ class RuntimeConfig(BaseModel):
     agent_idle_timeout_seconds: PositiveInt = 300
     managed_sandbox: ManagedSandboxConfig = Field(
         default_factory=ManagedSandboxConfig,
+    )
+    default_model: ModelSelectionConfig = Field(
+        default_factory=ModelSelectionConfig,
     )
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
@@ -382,10 +456,11 @@ class RepositoryConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    """一个可执行 Codex CLI Agent 的配置。"""
+    """一个可由模型 Provider 执行的 Agent 配置。"""
 
     prompt_file: Path | None = None
     prompt: str | None = None
+    model_provider: str | None = None
     model: str | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
@@ -538,6 +613,7 @@ class AppConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    model_providers: dict[str, ModelProviderConfig] = Field(default_factory=dict)
     repositories: list[RepositoryConfig] = Field(default_factory=list)
     skills: dict[str, SkillConfig] = Field(default_factory=dict)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
@@ -552,6 +628,25 @@ class AppConfig(BaseModel):
         repository_ids = [repository.id for repository in self.repositories]
         if len(repository_ids) != len(set(repository_ids)):
             raise ValueError("repositories 中存在重复 id")
+
+        builtin_codex = self.model_providers.get(BUILTIN_CODEX_CLI_PROVIDER_ID)
+        if builtin_codex is None or builtin_codex.driver != "codex_cli":
+            raise ValueError("内置 codex-cli 模型 Provider 缺失或驱动类型无效")
+        invalid_model_provider_ids = sorted(
+            provider_id
+            for provider_id in self.model_providers
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", provider_id) is None
+        )
+        if invalid_model_provider_ids:
+            raise ValueError(
+                "模型 Provider ID 只能包含字母、数字、点、下划线和短横线，"
+                f"且必须以字母开头：{invalid_model_provider_ids}"
+            )
+        if self.runtime.default_model.provider not in self.model_providers:
+            raise ValueError(
+                "全局默认模型引用了不存在的 Provider："
+                f"{self.runtime.default_model.provider}"
+            )
 
         reserved_token_names = {"CODEX_API_KEY", "OPENAI_API_KEY"}
         provider_token_names = {
@@ -624,6 +719,18 @@ class AppConfig(BaseModel):
                 )
             skill_metadata_names[metadata.name] = skill_id
         for agent_name, agent in self.agents.items():
+            if (
+                agent.model_provider is not None
+                and agent.model_provider not in self.model_providers
+            ):
+                raise ValueError(
+                    f"Agent {agent_name} 引用了不存在的模型 Provider："
+                    f"{agent.model_provider}"
+                )
+            if agent.model is not None and agent.model_provider is None:
+                raise ValueError(
+                    f"Agent {agent_name} 指定模型时必须同时指定模型 Provider"
+                )
             unknown = set(agent.allowed_sub_agents) - agent_names
             if unknown:
                 raise ValueError(
@@ -737,6 +844,88 @@ def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
+    """为旧配置补齐内置 Provider、全局默认和 Agent Provider 引用。"""
+
+    data = copy.deepcopy(raw)
+    had_model_providers = isinstance(raw.get("model_providers"), dict)
+    runtime = data.setdefault("runtime", {})
+    if not isinstance(runtime, dict):
+        return data
+    codex = runtime.setdefault("codex", {})
+    if not isinstance(codex, dict):
+        codex = {}
+        runtime["codex"] = codex
+    providers = data.setdefault("model_providers", {})
+    if not isinstance(providers, dict):
+        return data
+    providers.setdefault(
+        BUILTIN_CODEX_CLI_PROVIDER_ID,
+        {
+            "display_name": "Codex CLI",
+            "driver": "codex_cli",
+            "enabled": True,
+            **(
+                {"default_model": codex.get("model")}
+                if codex.get("model")
+                else {}
+            ),
+        },
+    )
+    legacy_model = codex.get("model")
+    builtin_provider = providers.get(BUILTIN_CODEX_CLI_PROVIDER_ID)
+    if (
+        isinstance(builtin_provider, dict)
+        and legacy_model
+        and not builtin_provider.get("default_model")
+    ):
+        builtin_provider["default_model"] = legacy_model
+
+    legacy_mode = str(codex.get("execution_mode") or "cli")
+    legacy_default_provider = BUILTIN_CODEX_CLI_PROVIDER_ID
+    if legacy_mode == "model" and not had_model_providers:
+        providers.setdefault(
+            BUILTIN_CODEX_OAUTH_PROVIDER_ID,
+            {
+                "display_name": "Codex OAuth 模型基座",
+                "driver": "codex_oauth",
+                "enabled": True,
+                **(
+                    {"default_model": codex.get("model")}
+                    if codex.get("model")
+                    else {}
+                ),
+            },
+        )
+        legacy_default_provider = BUILTIN_CODEX_OAUTH_PROVIDER_ID
+    runtime.setdefault(
+        "default_model",
+        {
+            "provider": legacy_default_provider,
+            **({"model": codex.get("model")} if codex.get("model") else {}),
+        },
+    )
+    # 旧字段已经迁移到 Provider 与全局默认模型，避免后续形成隐藏的第二默认值。
+    codex.pop("model", None)
+
+    default_model = runtime.get("default_model")
+    default_provider = (
+        str(default_model.get("provider"))
+        if isinstance(default_model, dict) and default_model.get("provider")
+        else BUILTIN_CODEX_CLI_PROVIDER_ID
+    )
+    agents = data.get("agents", {})
+    if isinstance(agents, dict):
+        for value in agents.values():
+            if (
+                isinstance(value, dict)
+                and value.get("model")
+                and not value.get("model_provider")
+            ):
+                value["model_provider"] = default_provider
+    return data
+
+
 def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     """原地复制并规范化所有文件系统路径。"""
 
@@ -786,7 +975,8 @@ def parse_config_data(raw: dict[str, Any], config_path: str | Path) -> AppConfig
     resolved_path = Path(config_path).expanduser().resolve()
     if not isinstance(raw, dict):
         raise ValueError("配置文件顶层必须是对象")
-    protected = protect_provider_credentials(raw)
+    normalized = normalize_model_provider_document(raw)
+    protected = protect_provider_credentials(normalized)
     resolved = _resolve_config_paths(protected, resolved_path.parent)
     serialized = yaml.safe_dump(protected, allow_unicode=True, sort_keys=False)
     resolved["config_path"] = resolved_path

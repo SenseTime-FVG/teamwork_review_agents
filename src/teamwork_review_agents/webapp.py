@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -36,6 +36,8 @@ from .events import (
     detect_events,
 )
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
+from .model_provider_client import ExternalModelClient, discover_provider_models
+from .model_provider_credentials import ModelProviderCredentialStore
 from .preflight_manager import ManualPreflightManager
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
@@ -125,6 +127,33 @@ class ProviderDeleteRequest(BaseModel):
     revision: str
 
 
+class ModelProviderConfigRequest(BaseModel):
+    """UI 提交的单个模型 Provider 配置。"""
+
+    revision: str
+    provider_id: str
+    provider: dict[str, Any]
+    api_key: str | None = None
+
+
+class ModelProviderDeleteRequest(BaseModel):
+    """UI 删除模型 Provider 时提交的配置版本。"""
+
+    revision: str
+
+
+class ModelProviderKeyRequest(BaseModel):
+    """UI 创建或替换模型 Provider API Key。"""
+
+    api_key: str = Field(min_length=1)
+
+
+class ModelProviderRefreshRequest(BaseModel):
+    """刷新模型目录时绑定的配置版本。"""
+
+    revision: str
+
+
 class RepositoryConfigRequest(BaseModel):
     """UI 提交的单个仓库配置。"""
 
@@ -165,6 +194,22 @@ class SkillInspectRequest(BaseModel):
     path: str
 
 
+def _provider_response_text(response: dict[str, Any]) -> str:
+    """从统一模型响应中提取连接测试回复。"""
+
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    texts: list[str] = []
+    for item in response.get("output", []):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content", []):
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    return "".join(texts).strip()
+
+
 def create_app(
     config_path: str | Path,
     *,
@@ -178,6 +223,9 @@ def create_app(
     repository_initialization_manager = RepositoryInitializationManager(manager)
     manual_preflight_manager = ManualPreflightManager(manager)
     agent_workspace_warmup_manager = AgentWorkspaceWarmupManager(manager)
+    model_provider_credentials = ModelProviderCredentialStore(
+        manager.config.database.path.parent / "model-provider-credentials"
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -204,6 +252,7 @@ def create_app(
     app.state.repository_initialization_manager = repository_initialization_manager
     app.state.manual_preflight_manager = manual_preflight_manager
     app.state.agent_workspace_warmup_manager = agent_workspace_warmup_manager
+    app.state.model_provider_credentials = model_provider_credentials
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
@@ -483,6 +532,294 @@ def create_app(
         runtime.notify_config_changed()
         return await item_config_response(config.revision)
 
+    def model_provider_snapshot() -> dict[str, Any]:
+        """返回 Provider 配置、凭据掩码与引用数量。"""
+
+        config = manager.config
+        referenced_agents: dict[str, list[str]] = {
+            provider_id: [] for provider_id in config.model_providers
+        }
+        for agent_name, agent in config.agents.items():
+            if agent.model_provider in referenced_agents:
+                referenced_agents[agent.model_provider].append(agent_name)
+        providers: list[dict[str, Any]] = []
+        for provider_id, provider in config.model_providers.items():
+            is_external = provider.driver not in {"codex_cli", "codex_oauth"}
+            providers.append(
+                {
+                    "id": provider_id,
+                    **provider.model_dump(mode="json"),
+                    "builtin": provider_id == "codex-cli",
+                    "deletable": provider_id != "codex-cli",
+                    "api_key_configured": (
+                        model_provider_credentials.configured(provider_id)
+                        if is_external
+                        else False
+                    ),
+                    "masked_key": (
+                        model_provider_credentials.masked(provider_id)
+                        if is_external
+                        else None
+                    ),
+                    "referenced_agents": sorted(referenced_agents[provider_id]),
+                    "is_global_default": (
+                        config.runtime.default_model.provider == provider_id
+                    ),
+                }
+            )
+        return {
+            "providers": providers,
+            "default_model": config.runtime.default_model.model_dump(mode="json"),
+        }
+
+    @app.get("/api/model-providers")
+    async def list_model_providers() -> dict[str, Any]:
+        """返回模型 Provider 管理页快照。"""
+
+        return await asyncio.to_thread(model_provider_snapshot)
+
+    @app.post("/api/model-providers")
+    async def create_model_provider(
+        body: ModelProviderConfigRequest,
+    ) -> dict[str, Any]:
+        """创建模型 Provider，并可同时写入首个 API Key。"""
+
+        try:
+            if body.provider_id in manager.config.model_providers:
+                raise ValueError(f"模型 Provider 已存在：{body.provider_id}")
+            config = await asyncio.to_thread(
+                manager.save_model_provider,
+                expected_revision=body.revision,
+                provider_id=body.provider_id,
+                provider=body.provider,
+                source="ui-model-provider-create",
+            )
+            if body.api_key:
+                await asyncio.to_thread(
+                    model_provider_credentials.replace,
+                    body.provider_id,
+                    body.api_key,
+                )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return {
+            **(await item_config_response(config.revision)),
+            "model_providers": await asyncio.to_thread(model_provider_snapshot),
+        }
+
+    @app.put("/api/model-providers/{provider_id}")
+    async def update_model_provider(
+        provider_id: str,
+        body: ModelProviderConfigRequest,
+    ) -> dict[str, Any]:
+        """更新模型 Provider；稳定 ID 不允许重命名。"""
+
+        if body.provider_id != provider_id:
+            raise HTTPException(status_code=422, detail="模型 Provider ID 不允许修改")
+        try:
+            config = await asyncio.to_thread(
+                manager.save_model_provider,
+                expected_revision=body.revision,
+                provider_id=provider_id,
+                provider=body.provider,
+                source="ui-model-provider-update",
+            )
+            if body.api_key:
+                await asyncio.to_thread(
+                    model_provider_credentials.replace,
+                    provider_id,
+                    body.api_key,
+                )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return {
+            **(await item_config_response(config.revision)),
+            "model_providers": await asyncio.to_thread(model_provider_snapshot),
+        }
+
+    @app.delete("/api/model-providers/{provider_id}")
+    async def delete_model_provider(
+        provider_id: str,
+        body: ModelProviderDeleteRequest,
+    ) -> dict[str, Any]:
+        """删除外部 Provider，并按约定回退默认模型和 Agent。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_model_provider,
+                expected_revision=body.revision,
+                provider_id=provider_id,
+            )
+            await asyncio.to_thread(model_provider_credentials.delete, provider_id)
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return {
+            **(await item_config_response(config.revision)),
+            "model_providers": await asyncio.to_thread(model_provider_snapshot),
+        }
+
+    @app.get("/api/model-providers/{provider_id}/key")
+    async def reveal_model_provider_key(
+        provider_id: str,
+        response: Response,
+    ) -> dict[str, str]:
+        """为管理页小眼睛按需返回模型 API Key 明文。"""
+
+        if provider_id not in manager.config.model_providers:
+            raise HTTPException(status_code=404, detail="模型 Provider 不存在")
+        try:
+            api_key = await asyncio.to_thread(
+                model_provider_credentials.reveal,
+                provider_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="API Key 尚未配置") from exc
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return {"api_key": api_key}
+
+    @app.put("/api/model-providers/{provider_id}/key")
+    async def replace_model_provider_key(
+        provider_id: str,
+        body: ModelProviderKeyRequest,
+    ) -> dict[str, Any]:
+        """创建或替换外部模型 Provider API Key。"""
+
+        provider = manager.config.model_providers.get(provider_id)
+        if provider is None:
+            raise HTTPException(status_code=404, detail="模型 Provider 不存在")
+        if provider.driver in {"codex_cli", "codex_oauth"}:
+            raise HTTPException(status_code=422, detail="内置 Codex Provider 不使用 API Key")
+        await asyncio.to_thread(
+            model_provider_credentials.replace,
+            provider_id,
+            body.api_key,
+        )
+        return await asyncio.to_thread(model_provider_snapshot)
+
+    @app.post("/api/model-providers/{provider_id}/refresh-models")
+    async def refresh_model_provider_models(
+        provider_id: str,
+        body: ModelProviderRefreshRequest,
+    ) -> dict[str, Any]:
+        """从外部 Provider 刷新模型目录并保存。"""
+
+        provider = manager.config.model_providers.get(provider_id)
+        if provider is None:
+            raise HTTPException(status_code=404, detail="模型 Provider 不存在")
+        try:
+            api_key = await asyncio.to_thread(
+                model_provider_credentials.reveal,
+                provider_id,
+            )
+            models = await discover_provider_models(provider, api_key)
+            provider_document = provider.model_dump(mode="json")
+            provider_document["models"] = models
+            config = await asyncio.to_thread(
+                manager.save_model_provider,
+                expected_revision=body.revision,
+                provider_id=provider_id,
+                provider=provider_document,
+                source="ui-model-provider-model-refresh",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return {
+            "models": models,
+            **(await item_config_response(config.revision)),
+            "model_providers": await asyncio.to_thread(model_provider_snapshot),
+        }
+
+    @app.post("/api/model-providers/{provider_id}/connection-test")
+    async def test_model_provider_connection(provider_id: str) -> dict[str, Any]:
+        """使用已保存配置完成一次不调用工具的最小模型回合。"""
+
+        config = manager.config
+        provider = config.model_providers.get(provider_id)
+        if provider is None:
+            raise HTTPException(status_code=404, detail="模型 Provider 不存在")
+        if not provider.enabled:
+            raise HTTPException(status_code=422, detail="模型 Provider 已停用")
+        model = provider.default_model or next(iter(provider.models), None)
+        started_at = asyncio.get_running_loop().time()
+        try:
+            if provider.driver in {"codex_cli", "codex_oauth"}:
+                test_config = config.model_copy(deep=True)
+                test_config.runtime.codex.execution_mode = (
+                    "cli" if provider.driver == "codex_cli" else "model"
+                )
+                if model:
+                    test_config.runtime.codex.model = model
+                result = await test_codex_connection(test_config)
+                return {
+                    **result,
+                    "provider_id": provider_id,
+                    "provider_driver": provider.driver,
+                }
+            if model is None:
+                raise ValueError("Provider 尚未配置可用于测试的模型")
+            api_key = await asyncio.to_thread(
+                model_provider_credentials.reveal,
+                provider_id,
+            )
+            client = ExternalModelClient(
+                provider,
+                api_key,
+                timeout_seconds=min(float(provider.request_timeout_seconds), 30.0),
+                idle_timeout_seconds=30.0,
+            )
+            response = await asyncio.wait_for(
+                client.create_response(
+                    {
+                        "model": model,
+                        "instructions": "只回复 hi，不调用任何工具。",
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "hi"}],
+                            }
+                        ],
+                        "tools": [],
+                        "tool_choice": "none",
+                        "stream": False,
+                        "store": False,
+                        "reasoning": {"effort": "minimal"},
+                    }
+                ),
+                timeout=30.0,
+            )
+            reply = _provider_response_text(response)
+            if not reply:
+                raise ValueError("模型连接测试没有返回文本")
+            return {
+                "success": True,
+                "provider_id": provider_id,
+                "provider_driver": provider.driver,
+                "mode": "model",
+                "model": model,
+                "reply": reply[:200],
+                "elapsed_seconds": round(
+                    asyncio.get_running_loop().time() - started_at,
+                    3,
+                ),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.post("/api/config/repositories")
     async def create_repository(body: RepositoryConfigRequest) -> dict[str, Any]:
         """基于指定版本创建一个仓库。"""
@@ -691,9 +1028,13 @@ def create_app(
         except (CodexAccountError, OSError) as exc:
             effective_config_error = str(exc)
 
+        codex_provider = manager.config.model_providers["codex-cli"]
+        codex_settings = manager.config.runtime.codex.model_copy(
+            update={"model": codex_provider.default_model}
+        )
         return await asyncio.to_thread(
             inspect_runtime_options,
-            manager.config.runtime.codex,
+            codex_settings,
             manager.config.runtime.codex_binary,
             manager.config.runtime.codex_home,
             manager.config.runtime.expected_codex_version,

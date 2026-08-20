@@ -26,6 +26,8 @@ from .codex_settings import (
 )
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .environment import SecretRedactor
+from .model_provider_client import ExternalModelClient
+from .model_provider_credentials import ModelProviderCredentialStore
 from .managed_sandbox import inspect_managed_sandbox
 from .model_tools import (
     CancelCheck,
@@ -74,10 +76,32 @@ class CodexModelRunner:
         self,
         config: AppConfig,
         *,
+        provider_id: str = "codex-oauth",
         invoke_agent_callback: InvokeAgentCallback | None = None,
     ) -> None:
         self.config = config
+        self.provider_id = provider_id
+        provider = config.model_providers.get(provider_id)
+        self._legacy_runtime_provider = provider is None and provider_id == "codex-oauth"
+        if provider is None and provider_id == "codex-oauth":
+            provider = config.model_providers["codex-cli"].model_copy(
+                update={
+                    "display_name": "Codex OAuth 模型基座",
+                    "driver": "codex_oauth",
+                }
+            )
+        if provider is None:
+            raise KeyError(provider_id)
+        self.provider = provider
         self.invoke_agent_callback = invoke_agent_callback
+        self.credential_store = ModelProviderCredentialStore(
+            config.database.path.parent / "model-provider-credentials"
+        )
+        self._provider_semaphore = (
+            asyncio.Semaphore(self.provider.max_concurrency)
+            if self.provider.max_concurrency is not None
+            else None
+        )
         cleanup_stale_agent_homes_once()
 
     async def run(
@@ -98,7 +122,16 @@ class CodexModelRunner:
     ) -> AgentResult:
         """准备投影与临时 HOME，然后执行带看门狗的模型工具循环。"""
 
-        active_redactor = redactor or SecretRedactor(())
+        provider_api_key: str | None = None
+        if self.provider.driver not in {"codex_cli", "codex_oauth"}:
+            try:
+                provider_api_key = self.credential_store.reveal(self.provider_id)
+            except KeyError:
+                provider_api_key = None
+        inherited_secrets = list((redactor or SecretRedactor(())).secret_values)
+        if provider_api_key:
+            inherited_secrets.append(provider_api_key)
+        active_redactor = SecretRedactor(inherited_secrets)
 
         async def emit(
             stream: str,
@@ -154,27 +187,28 @@ class CodexModelRunner:
             if projection.marker.is_file():
                 _add_git_excludes_file(environment, projection.marker)
 
-            version_error = await asyncio.to_thread(
-                validate_codex_version,
-                self.config.runtime.codex_binary,
-                self.config.runtime.expected_codex_version,
-                self.config.runtime.codex_home,
-            )
-            if version_error:
-                await emit("system", "run.version_mismatch", version_error)
-                return _failed_result(
-                    run_id,
-                    root_run_id,
-                    parent_run_id,
-                    agent_name,
-                    version_error,
+            if self.provider.driver == "codex_oauth":
+                version_error = await asyncio.to_thread(
+                    validate_codex_version,
+                    self.config.runtime.codex_binary,
+                    self.config.runtime.expected_codex_version,
+                    self.config.runtime.codex_home,
                 )
+                if version_error:
+                    await emit("system", "run.version_mismatch", version_error)
+                    return _failed_result(
+                        run_id,
+                        root_run_id,
+                        parent_run_id,
+                        agent_name,
+                        version_error,
+                    )
 
             managed_sandbox = False
             if agent.sandbox != "danger-full-access":
                 if not self.config.runtime.managed_sandbox.enabled:
                     error = (
-                        "Codex 模型基座模式下，受限 Agent 必须启用 Teamwork 外层沙盒"
+                        "模型 Provider 驱动下，受限 Agent 必须启用 Teamwork 外层沙盒"
                     )
                     await emit("system", "run.sandbox_unavailable", error)
                     return _failed_result(
@@ -463,17 +497,37 @@ class CodexModelRunner:
             agent=agent,
             personality=personality,
             skill_files=skill_files,
+            provider_name=self.provider.display_name,
         )
-        oauth = CodexOAuthStore(codex_home(self.config.runtime.codex_home))
-        client = CodexResponsesClient(
-            oauth=oauth,
-            codex_binary=self.config.runtime.codex_binary,
-            timeout_seconds=float(agent.timeout_seconds),
-            idle_timeout_seconds=float(
-                agent.idle_timeout_seconds
-                or self.config.runtime.agent_idle_timeout_seconds
-            ),
-        )
+        if self.provider.driver == "codex_oauth":
+            oauth = CodexOAuthStore(codex_home(self.config.runtime.codex_home))
+            client = CodexResponsesClient(
+                oauth=oauth,
+                codex_binary=self.config.runtime.codex_binary,
+                timeout_seconds=float(agent.timeout_seconds),
+                idle_timeout_seconds=float(
+                    agent.idle_timeout_seconds
+                    or self.config.runtime.agent_idle_timeout_seconds
+                ),
+            )
+        else:
+            try:
+                api_key = self.credential_store.reveal(self.provider_id)
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"模型 Provider {self.provider.display_name} 尚未配置 API Key"
+                ) from exc
+            client = ExternalModelClient(
+                self.provider,
+                api_key,
+                timeout_seconds=float(
+                    min(agent.timeout_seconds, self.provider.request_timeout_seconds)
+                ),
+                idle_timeout_seconds=float(
+                    agent.idle_timeout_seconds
+                    or self.config.runtime.agent_idle_timeout_seconds
+                ),
+            )
         tools = teamwork_function_tools(
             allow_sub_agents=bool(agent.allowed_sub_agents),
             allow_publish_comment=agent.managed_comment,
@@ -508,6 +562,8 @@ class CodexModelRunner:
             "turn.started",
             {
                 "execution_mode": "model",
+                "provider_id": self.provider_id,
+                "provider_driver": self.provider.driver,
                 "model": model,
                 "tool_count": len(tools),
                 "skill_count": len(agent.skills),
@@ -563,22 +619,31 @@ class CodexModelRunner:
                 "parallel_tool_calls": False,
                 "stream": True,
                 "store": False,
-                "reasoning": {
+            }
+            if reasoning_effort:
+                payload["reasoning"] = {
                     "effort": reasoning_effort,
                     "summary": "auto",
-                },
-                "include": ["reasoning.encrypted_content"],
-            }
+                }
+            if self.provider.driver == "codex_oauth":
+                payload["include"] = ["reasoning.encrypted_content"]
             if fast_mode:
                 payload["service_tier"] = "priority"
             if text_config:
                 payload["text"] = text_config
             round_message_keys.clear()
             round_message_parts.clear()
-            response = await client.create_response(
-                payload,
-                event_callback=receive_event,
-            )
+            if self._provider_semaphore is None:
+                response = await client.create_response(
+                    payload,
+                    event_callback=receive_event,
+                )
+            else:
+                async with self._provider_semaphore:
+                    response = await client.create_response(
+                        payload,
+                        event_callback=receive_event,
+                    )
             response_id = str(response.get("id") or response_id or "") or None
             response_usage = response.get("usage")
             if isinstance(response_usage, dict):
@@ -703,15 +768,23 @@ class CodexModelRunner:
     def _settings(
         self,
         agent: AgentConfig,
-    ) -> tuple[str, str, bool, str | None, str | None]:
+    ) -> tuple[str, str | None, bool, str | None, str | None]:
         """按 Agent、Teamwork 和 Codex 用户配置顺序解析模型参数。"""
 
         home = codex_home(self.config.runtime.codex_home)
         user_model, _, _ = read_user_model(home)
-        model = agent.model or self.config.runtime.codex.model or user_model
+        model = agent.model or self.provider.default_model
+        if model is None and self.provider.models:
+            model = self.provider.models[0]
+        if model is None and self.provider.driver == "codex_oauth":
+            model = (
+                self.config.runtime.codex.model
+                if self._legacy_runtime_provider
+                else None
+            ) or user_model
         if not model:
             raise RuntimeError(
-                "Codex 模型基座模式需要在 Agent、runtime.codex.model 或 Codex config.toml 中配置模型"
+                f"模型 Provider {self.provider.display_name} 没有可解析的模型"
             )
         inherited, _ = read_user_inherited_settings(home)
 
@@ -720,23 +793,31 @@ class CodexModelRunner:
             value = item.get("value") if isinstance(item, dict) else None
             return value if isinstance(value, str) and value else None
 
-        reasoning = (
-            agent.model_reasoning_effort
-            or self.config.runtime.codex.model_reasoning_effort
-            or inherited_value("model_reasoning_effort")
-            or "medium"
-        )
+        codex_provider = self.provider.driver == "codex_oauth"
+        reasoning = agent.model_reasoning_effort or self.provider.model_reasoning_effort
+        if reasoning is None and codex_provider:
+            reasoning = (
+                self.config.runtime.codex.model_reasoning_effort
+                or inherited_value("model_reasoning_effort")
+            )
+        if reasoning is None and codex_provider:
+            reasoning = "medium"
         fast_setting = agent.fast_mode
-        if fast_setting == "inherit":
+        if fast_setting == "inherit" and codex_provider:
             fast_setting = self.config.runtime.codex.fast_mode
-        if fast_setting == "inherit":
+        if fast_setting == "inherit" and codex_provider:
             fast_setting = inherited_value("fast_mode") or "standard"
-        verbosity = (
-            agent.model_verbosity
-            or self.config.runtime.codex.model_verbosity
-            or inherited_value("model_verbosity")
-        )
-        personality = agent.personality or self.config.runtime.codex.personality
+        if fast_setting == "inherit":
+            fast_setting = "standard"
+        verbosity = agent.model_verbosity or self.provider.model_verbosity
+        if verbosity is None and codex_provider:
+            verbosity = (
+                self.config.runtime.codex.model_verbosity
+                or inherited_value("model_verbosity")
+            )
+        personality = agent.personality or self.provider.personality
+        if personality is None and codex_provider:
+            personality = self.config.runtime.codex.personality
         return model, reasoning, fast_setting == "fast", verbosity, personality
 
 
@@ -765,11 +846,12 @@ def _instructions(
     agent: AgentConfig,
     personality: str | None,
     skill_files: Mapping[str, Path],
+    provider_name: str = "Codex",
 ) -> str:
     """构造 Teamwork 运行时边界并内联已选 Skill 指令。"""
 
     sections = [
-        "你是 Codex 编码 Agent，但当前只使用 Codex 模型基座。",
+        f"你是由 Teamwork 编排的编码 Agent，当前模型由 {provider_name} 提供。",
         (
             "Teamwork 提供工作区和全部可用工具；不要假设存在 Codex CLI 内置工具、"
             "用户 MCP、浏览器或未列出的能力。"
