@@ -306,7 +306,7 @@ async def discover_provider_models(
 ) -> list[str]:
     """按协议读取模型目录；不支持时由调用方保留手工模型。"""
 
-    if provider.driver in {"codex_cli", "codex_oauth"}:
+    if provider.driver == "codex_cli":
         return list(provider.models)
     if provider.driver == "gemini_generate_content":
         url = _api_url(provider, "/v1beta/models")

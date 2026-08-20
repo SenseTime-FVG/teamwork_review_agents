@@ -131,6 +131,56 @@ def test_legacy_config_adds_builtin_provider_and_agent_reference(tmp_path) -> No
     assert config.agents["reviewer"].model == "gpt-agent"
 
 
+def test_legacy_oauth_provider_collapses_into_codex_cli(tmp_path) -> None:
+    """历史 OAuth Provider 应并入 Codex CLI，并迁移全部活动引用。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "runtime": {
+                "codex": {"execution_mode": "cli"},
+                "default_model": {"provider": "codex-oauth"},
+            },
+            "model_providers": {
+                "codex-cli": {
+                    "display_name": "Codex CLI",
+                    "driver": "codex_cli",
+                    "default_model": "cli-model",
+                },
+                "codex-oauth": {
+                    "display_name": "Codex OAuth 模型基座",
+                    "driver": "codex_oauth",
+                    "default_model": "oauth-model",
+                    "models": ["oauth-model", "oauth-next"],
+                    "model_reasoning_effort": "high",
+                },
+            },
+            "agents": {
+                "reviewer": {
+                    "prompt": "测试。",
+                    "model_provider": "codex-oauth",
+                }
+            },
+        },
+        tmp_path / "config.yaml",
+    )
+
+    assert set(config.model_providers) == {"codex-cli"}
+    assert config.runtime.codex.execution_mode == "model"
+    assert config.runtime.default_model.provider == "codex-cli"
+    assert config.agents["reviewer"].model_provider == "codex-cli"
+    assert config.model_providers["codex-cli"].default_model == "oauth-model"
+    assert config.model_providers["codex-cli"].models == [
+        "oauth-model",
+        "oauth-next",
+    ]
+    assert config.model_providers["codex-cli"].model_reasoning_effort == "high"
+    snapshot = resolve_model_snapshot(config, config.agents["reviewer"])
+    assert snapshot["provider_id"] == "codex-cli"
+    assert snapshot["provider_driver"] == "codex_cli"
+    assert snapshot["execution_mode"] == "model"
+
+
 def test_deleted_provider_references_fall_back_atomically(tmp_path) -> None:
     """删除 Provider 时应同时回退全局默认和所有 Agent 引用。"""
 
@@ -191,10 +241,14 @@ def test_executor_routes_each_agent_to_its_effective_provider(tmp_path) -> None:
 
     cli_runner = executor._runner_for_provider("codex-cli")
     api_runner = executor._runner_for_provider("external-openai")
-    assert isinstance(cli_runner, CodexRunner)
+    assert isinstance(cli_runner, CodexModelRunner)
     assert isinstance(api_runner, CodexModelRunner)
     assert api_runner.provider_id == "external-openai"
     assert executor._runner_for_provider("external-openai") is api_runner
+
+    config.runtime.codex.execution_mode = "cli"
+    cli_executor = AgentExecutor(config, store)
+    assert isinstance(cli_executor._runner_for_provider("codex-cli"), CodexRunner)
 
 
 def test_model_snapshot_records_provider_and_resolved_inheritance(tmp_path) -> None:
@@ -491,6 +545,10 @@ def test_model_provider_web_api_masks_reveals_and_deletes(tmp_path) -> None:
     with TestClient(app) as client:
         snapshot = client.get("/api/model-providers")
         assert snapshot.status_code == 200
+        assert [item["id"] for item in snapshot.json()["providers"]] == [
+            "codex-cli",
+            "external-openai",
+        ]
         external = next(
             item
             for item in snapshot.json()["providers"]
@@ -516,6 +574,35 @@ def test_model_provider_web_api_masks_reveals_and_deletes(tmp_path) -> None:
         assert revealed.json() == {"api_key": "sk-web-secret"}
         assert revealed.headers["cache-control"] == "no-store"
 
+        current = client.get("/api/config").json()
+        codex_provider = current["document"]["model_providers"]["codex-cli"]
+        updated_codex = client.put(
+            "/api/model-providers/codex-cli",
+            json={
+                "revision": current["revision"],
+                "provider_id": "codex-cli",
+                "provider": codex_provider,
+                "codex_runtime": {
+                    "codex_binary": "codex-custom",
+                    "codex_home": None,
+                    "expected_codex_version": "1.2.3",
+                    "inherit_user_mcp_servers": False,
+                    "allowed_user_mcp_servers": [],
+                    "codex": {
+                        "execution_mode": "cli",
+                        "fast_mode": "inherit",
+                        "extra_config": {},
+                    },
+                },
+            },
+        )
+        assert updated_codex.status_code == 200
+        assert updated_codex.json()["document"]["runtime"]["codex"][
+            "execution_mode"
+        ] == "cli"
+        assert updated_codex.json()["document"]["runtime"][
+            "codex_binary"
+        ] == "codex-custom"
         current = client.get("/api/config").json()
         deleted = client.request(
             "DELETE",

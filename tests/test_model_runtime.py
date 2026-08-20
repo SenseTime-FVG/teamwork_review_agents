@@ -69,10 +69,10 @@ def _context(config, snapshot_factory) -> InvocationContext:
     )
 
 
-def test_execution_mode_defaults_to_cli_and_rejects_unknown_value() -> None:
-    """旧配置必须继续进入 Codex CLI，枚举之外的值应被拒绝。"""
+def test_execution_mode_defaults_to_model_and_rejects_unknown_value() -> None:
+    """Codex CLI 默认使用基座模式，枚举之外的值应被拒绝。"""
 
-    assert CodexRuntimeConfig().execution_mode == "cli"
+    assert CodexRuntimeConfig().execution_mode == "model"
     assert CodexRuntimeConfig(execution_mode="model").execution_mode == "model"
     with pytest.raises(ValueError):
         CodexRuntimeConfig(execution_mode="external-api")

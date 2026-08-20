@@ -304,7 +304,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
         provider: "codex-cli",
       },
       codex: {
-        execution_mode: "cli",
+        execution_mode: "model",
         fast_mode: "inherit",
         extra_config: {},
         ...codexInput,
@@ -2129,7 +2129,7 @@ function GlobalEnvironment(props: {
   const defaultSelection = props.document.runtime.default_model ?? { provider: "codex-cli" };
   const defaultProvider = props.document.model_providers[defaultSelection.provider]
     ?? props.document.model_providers["codex-cli"];
-  const providerModels = defaultProvider?.driver === "codex_cli" || defaultProvider?.driver === "codex_oauth"
+  const providerModels = defaultProvider?.driver === "codex_cli"
     ? props.codexOptions.models
     : (defaultProvider?.models ?? []).map((model) => ({
         slug: model,
@@ -2139,11 +2139,11 @@ function GlobalEnvironment(props: {
       }));
   const resolvedDefaultModel = defaultSelection.model
     || defaultProvider?.default_model
-    || (defaultProvider?.driver === "codex_cli" || defaultProvider?.driver === "codex_oauth"
+    || (defaultProvider?.driver === "codex_cli"
       ? props.codexOptions.inherited_model.value
       : undefined);
   const defaultModelPlaceholder = defaultProvider?.driver === "codex_cli"
-    ? `CLI 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`
+    ? `${props.document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（${resolvedDefaultModel ?? "暂未解析"}）`
     : `Provider 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`;
   function patchSection(section: "scanner" | "runtime" | "web", key: string, value: unknown) {
     props.onChange({
@@ -2244,7 +2244,6 @@ const MODEL_PROVIDER_DRIVER_OPTIONS: Array<{ value: ModelProviderDriver; label: 
   { value: "openai_chat_completions", label: "OpenAI Chat Completions" },
   { value: "anthropic_messages", label: "Anthropic Messages" },
   { value: "gemini_generate_content", label: "Gemini GenerateContent" },
-  { value: "codex_oauth", label: "Codex OAuth 模型基座" },
 ];
 
 function modelProviderDriverLabel(driver: ModelProviderDriver): string {
@@ -2254,26 +2253,32 @@ function modelProviderDriverLabel(driver: ModelProviderDriver): string {
 
 function ModelProvidersEditor(props: {
   document: ConfigDocument;
-  savedDocument: ConfigDocument | null;
   revision: string;
   codexOptions: CodexRuntimeOptions;
-  editable: boolean;
-  onChange: (document: ConfigDocument) => void;
   onSaved: (document: ConfigDocument, revision: string) => void;
   onError: (message: string) => void;
   onNotice: (message: string) => void;
 }) {
-  const providerIds = Object.keys(props.document.model_providers);
-  const [selectedId, setSelectedId] = useState("codex-cli");
+  const providerIds = useMemo(
+    () => Object.keys(props.document.model_providers).sort((left, right) => {
+      if (left === "codex-cli") return -1;
+      if (right === "codex-cli") return 1;
+      return left.localeCompare(right);
+    }),
+    [props.document.model_providers],
+  );
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [draftId, setDraftId] = useState("");
+  const [draftDocument, setDraftDocument] = useState<ConfigDocument | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
   const [snapshot, setSnapshot] = useState<ModelProviderSnapshot | null>(null);
   const [visibleKey, setVisibleKey] = useState("");
   const [keyInput, setKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [connectionResult, setConnectionResult] = useState("");
-  const selected = props.document.model_providers[selectedId]
-    ?? props.document.model_providers[providerIds[0]];
-  const selectedSnapshot = snapshot?.providers.find((item) => item.id === selectedId);
-  const external = selected && !["codex_cli", "codex_oauth"].includes(selected.driver);
+
+  useBodyScrollLock(selectedId !== null);
 
   const reloadSnapshot = useCallback(async () => {
     try {
@@ -2291,51 +2296,192 @@ function ModelProvidersEditor(props: {
     setVisibleKey("");
   }, [props.revision]);
 
+  const activeDocument = editing && draftDocument ? draftDocument : props.document;
+  const activeId = editing ? draftId : selectedId ?? "";
+  const selected = activeDocument.model_providers[activeId];
+  const original = selectedId ? props.document.model_providers[selectedId] : undefined;
+  const selectedSnapshot = snapshot?.providers.find((item) => item.id === selectedId);
+  const external = selected?.driver !== "codex_cli";
+
+  function codexRuntimePayload(document: ConfigDocument) {
+    return {
+      codex_binary: document.runtime.codex_binary ?? "codex",
+      codex_home: document.runtime.codex_home ?? null,
+      expected_codex_version: document.runtime.expected_codex_version ?? null,
+      inherit_user_mcp_servers: document.runtime.inherit_user_mcp_servers ?? false,
+      allowed_user_mcp_servers: document.runtime.allowed_user_mcp_servers ?? [],
+      codex: document.runtime.codex ?? {
+        execution_mode: "model",
+        fast_mode: "inherit",
+        extra_config: {},
+      },
+    };
+  }
+
+  const dirty = editing && Boolean(
+    creating
+    || draftId !== selectedId
+    || JSON.stringify(selected) !== JSON.stringify(original)
+    || (
+      selected?.driver === "codex_cli"
+      && JSON.stringify(codexRuntimePayload(activeDocument))
+        !== JSON.stringify(codexRuntimePayload(props.document))
+    ),
+  );
+  const idConflict = creating
+    && draftId.trim() !== ""
+    && Object.hasOwn(props.document.model_providers, draftId.trim());
+
+  function clearDraft() {
+    setCreating(false);
+    setEditing(false);
+    setDraftDocument(null);
+    setDraftId("");
+    setKeyInput("");
+  }
+
+  function confirmDiscard(): boolean {
+    return !dirty || window.confirm("当前 Provider 有未保存修改，确认放弃这些修改？");
+  }
+
+  function openDetail(providerId: string) {
+    if (!confirmDiscard()) return;
+    clearDraft();
+    setSelectedId(providerId);
+    setVisibleKey("");
+    setConnectionResult("");
+  }
+
+  function closeDetail() {
+    if (!confirmDiscard()) return;
+    clearDraft();
+    setSelectedId(null);
+    setVisibleKey("");
+    setConnectionResult("");
+  }
+
   useEffect(() => {
-    if (!props.document.model_providers[selectedId]) {
-      setSelectedId(providerIds[0] ?? "codex-cli");
+    if (selectedId === null) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) closeDetail();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedId, busy, dirty]);
+
+  function beginCreate() {
+    if (!confirmDiscard()) return;
+    let index = 1;
+    while (props.document.model_providers[`provider-${index}`]) index += 1;
+    const providerId = `provider-${index}`;
+    const nextDocument = structuredClone(props.document);
+    nextDocument.model_providers[providerId] = {
+      display_name: `API Provider ${index}`,
+      driver: "openai_responses",
+      enabled: true,
+      base_url: "https://api.openai.com",
+      request_timeout_seconds: 120,
+      models: [],
+    };
+    setSelectedId(providerId);
+    setDraftId(providerId);
+    setDraftDocument(nextDocument);
+    setCreating(true);
+    setEditing(true);
+    setVisibleKey("");
+    setKeyInput("");
+    setConnectionResult("");
+  }
+
+  function beginEdit() {
+    if (!selectedId || !props.document.model_providers[selectedId]) return;
+    setDraftId(selectedId);
+    setDraftDocument(structuredClone(props.document));
+    setCreating(false);
+    setEditing(true);
+    setVisibleKey("");
+    setConnectionResult("");
+  }
+
+  function cancelEdit() {
+    if (creating) {
+      clearDraft();
+      setSelectedId(null);
+      return;
     }
-  }, [providerIds, props.document.model_providers, selectedId]);
+    clearDraft();
+  }
 
   function updateProvider(patch: Partial<ModelProviderConfig>) {
-    if (!selected) return;
-    props.onChange({
-      ...props.document,
+    if (!draftDocument || !selected) return;
+    setDraftDocument({
+      ...draftDocument,
       model_providers: {
-        ...props.document.model_providers,
-        [selectedId]: { ...selected, ...patch },
+        ...draftDocument.model_providers,
+        [draftId]: { ...selected, ...patch },
       },
     });
   }
 
-  function addProvider() {
-    let index = 1;
-    while (props.document.model_providers[`provider-${index}`]) index += 1;
-    const id = `provider-${index}`;
-    props.onChange({
-      ...props.document,
-      model_providers: {
-        ...props.document.model_providers,
-        [id]: {
-          display_name: `API Provider ${index}`,
-          driver: "openai_responses",
-          enabled: true,
-          base_url: "https://api.openai.com",
-          request_timeout_seconds: 120,
-          models: [],
-        },
-      },
-    });
-    setSelectedId(id);
+  function updateDraftProviderId(nextId: string) {
+    if (!creating || !draftDocument || !selected) return;
+    const nextProviders = { ...draftDocument.model_providers };
+    delete nextProviders[draftId];
+    nextProviders[nextId] = selected;
+    setDraftId(nextId);
+    setSelectedId(nextId);
+    setDraftDocument({ ...draftDocument, model_providers: nextProviders });
+  }
+
+  async function saveProvider() {
+    if (!editing || !draftDocument || !selected || !draftId.trim()) return;
+    setBusy(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/model-providers"
+        : `/api/model-providers/${encodeURIComponent(selectedId ?? "")}`;
+      const result = await api<{
+        revision: string;
+        document: ConfigDocument;
+        model_providers: ModelProviderSnapshot;
+      }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          provider_id: draftId.trim(),
+          provider: selected,
+          codex_runtime: selected.driver === "codex_cli"
+            ? codexRuntimePayload(draftDocument)
+            : undefined,
+          api_key: external && keyInput.trim() ? keyInput : undefined,
+        }),
+      });
+      const normalized = normalizeDocument(result.document);
+      props.onSaved(normalized, result.revision);
+      setSnapshot(result.model_providers);
+      setSelectedId(draftId.trim());
+      clearDraft();
+      props.onNotice(creating
+        ? `Provider ${draftId.trim()} 已创建并热加载`
+        : `Provider ${draftId.trim()} 已保存并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "Provider 保存失败");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function revealKey() {
+    if (!selectedId) return;
     if (visibleKey) {
       setVisibleKey("");
       return;
     }
     try {
-      const result = await api<{ api_key: string }>(`/api/model-providers/${encodeURIComponent(selectedId)}/key`);
+      const result = await api<{ api_key: string }>(
+        `/api/model-providers/${encodeURIComponent(selectedId)}/key`,
+      );
       setVisibleKey(result.api_key);
     } catch (reason) {
       props.onError(reason instanceof Error ? reason.message : "API Key 查看失败");
@@ -2343,13 +2489,16 @@ function ModelProvidersEditor(props: {
   }
 
   async function replaceKey() {
-    if (!keyInput.trim()) return;
+    if (!selectedId || !keyInput.trim()) return;
     setBusy(true);
     try {
-      const result = await api<ModelProviderSnapshot>(`/api/model-providers/${encodeURIComponent(selectedId)}/key`, {
-        method: "PUT",
-        body: JSON.stringify({ api_key: keyInput }),
-      });
+      const result = await api<ModelProviderSnapshot>(
+        `/api/model-providers/${encodeURIComponent(selectedId)}/key`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ api_key: keyInput }),
+        },
+      );
       setSnapshot(result);
       setKeyInput("");
       setVisibleKey("");
@@ -2362,12 +2511,17 @@ function ModelProvidersEditor(props: {
   }
 
   async function refreshModels() {
+    if (!selectedId) return;
     setBusy(true);
     try {
-      const result = await api<{ revision: string; document: ConfigDocument; model_providers: ModelProviderSnapshot }>(
-        `/api/model-providers/${encodeURIComponent(selectedId)}/refresh-models`,
-        { method: "POST", body: JSON.stringify({ revision: props.revision }) },
-      );
+      const result = await api<{
+        revision: string;
+        document: ConfigDocument;
+        model_providers: ModelProviderSnapshot;
+      }>(`/api/model-providers/${encodeURIComponent(selectedId)}/refresh-models`, {
+        method: "POST",
+        body: JSON.stringify({ revision: props.revision }),
+      });
       props.onSaved(normalizeDocument(result.document), result.revision);
       setSnapshot(result.model_providers);
       props.onNotice("模型目录已刷新");
@@ -2379,6 +2533,7 @@ function ModelProvidersEditor(props: {
   }
 
   async function testConnection() {
+    if (!selectedId) return;
     setBusy(true);
     setConnectionResult("");
     try {
@@ -2386,7 +2541,9 @@ function ModelProvidersEditor(props: {
         `/api/model-providers/${encodeURIComponent(selectedId)}/connection-test`,
         { method: "POST" },
       );
-      setConnectionResult(`${result.model ?? "默认模型"} · ${result.elapsed_seconds.toFixed(2)} 秒 · ${result.reply}`);
+      setConnectionResult(
+        `${result.model ?? "默认模型"} · ${result.elapsed_seconds.toFixed(2)} 秒 · ${result.reply}`,
+      );
     } catch (reason) {
       props.onError(reason instanceof Error ? reason.message : "Provider 连接测试失败");
     } finally {
@@ -2395,24 +2552,28 @@ function ModelProvidersEditor(props: {
   }
 
   async function deleteProvider() {
-    if (!selectedSnapshot?.deletable) return;
+    if (!selectedId || !selectedSnapshot?.deletable || !selected) return;
     const impacts = [
       selectedSnapshot.is_global_default ? "全局默认模型将回退到 Codex CLI" : "",
       selectedSnapshot.referenced_agents.length
-        ? `${selectedSnapshot.referenced_agents.length} 个显式引用它的 Agent 将改为继承全局默认模型`
+        ? `${selectedSnapshot.referenced_agents.length} 个 Agent 将改为继承全局默认模型`
         : "",
     ].filter(Boolean).join("；");
-    const affected = impacts ? `；${impacts}` : "";
-    if (!window.confirm(`删除 ${selected.display_name}${affected}？`)) return;
+    if (!window.confirm(`删除 ${selected.display_name}${impacts ? `；${impacts}` : ""}？`)) return;
     setBusy(true);
     try {
-      const result = await api<{ revision: string; document: ConfigDocument; model_providers: ModelProviderSnapshot }>(
-        `/api/model-providers/${encodeURIComponent(selectedId)}`,
-        { method: "DELETE", body: JSON.stringify({ revision: props.revision }) },
-      );
+      const result = await api<{
+        revision: string;
+        document: ConfigDocument;
+        model_providers: ModelProviderSnapshot;
+      }>(`/api/model-providers/${encodeURIComponent(selectedId)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ revision: props.revision }),
+      });
       props.onSaved(normalizeDocument(result.document), result.revision);
       setSnapshot(result.model_providers);
-      setSelectedId("codex-cli");
+      clearDraft();
+      setSelectedId(null);
       setVisibleKey("");
       props.onNotice("Provider 已删除，相关引用已回退");
     } catch (reason) {
@@ -2422,138 +2583,254 @@ function ModelProvidersEditor(props: {
     }
   }
 
-  if (!selected) return null;
-  const modelOptions = (selected.models ?? []).map((model) => ({
-    slug: model,
-    display_name: model,
-    supported_reasoning_levels: [],
-    supports_fast_mode: false,
-  }));
-  const selectedResolved = resolvedProviderModel(
-    props.document,
-    props.codexOptions,
-    selectedId,
-  );
+  const selectedResolved = selected
+    ? resolvedProviderModel(activeDocument, props.codexOptions, activeId)
+    : null;
+  const modelOptions = selected
+    ? (selected.models ?? []).map((model) => ({
+        slug: model,
+        display_name: model,
+        supported_reasoning_levels: [],
+        supports_fast_mode: false,
+      }))
+    : [];
 
   return (
-    <div className="provider-layout">
-      <section className="section-card provider-list-card">
-        <div className="section-title-row">
-          <div><h2>Provider</h2><p>为不同 Agent 提供独立模型与执行协议。</p></div>
-          {props.editable && <button className="button secondary" type="button" onClick={addProvider}>新增 API Provider</button>}
+    <>
+      <section className="section-card provider-list-page">
+        <div className="section-title-row provider-list-title">
+          <div>
+            <h2>Provider</h2>
+            <p>点击一行查看详情；每个 Provider 独立编辑、保存和测试连接。</p>
+          </div>
+          <button className="button primary" type="button" onClick={beginCreate}>+ 新增 API Provider</button>
         </div>
-        <div className="provider-list">
-          {Object.entries(props.document.model_providers).map(([id, provider]) => (
-            <button key={id} type="button" className={id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(id); setVisibleKey(""); setConnectionResult(""); }}>
-              <span><strong>{provider.display_name}</strong><small>{modelProviderDriverLabel(provider.driver)} · {provider.enabled === false ? "已停用" : "已启用"}</small></span>
-              {id === "codex-cli" && <em>内置</em>}
-            </button>
-          ))}
+        <div className="provider-config-table">
+          <div className="provider-config-table-head" aria-hidden="true">
+            <span>Provider</span><span>协议 / 模式</span><span>默认模型</span><span>状态</span><span />
+          </div>
+          <div className="provider-config-items">
+            {providerIds.map((providerId) => {
+              const provider = props.document.model_providers[providerId];
+              const item = snapshot?.providers.find((candidate) => candidate.id === providerId);
+              const resolved = resolvedProviderModel(
+                props.document,
+                props.codexOptions,
+                providerId,
+              );
+              const mode = provider.driver === "codex_cli"
+                ? props.document.runtime.codex?.execution_mode === "cli"
+                  ? "完整 CLI 模式"
+                  : "基座模式"
+                : modelProviderDriverLabel(provider.driver);
+              return (
+                <button
+                  key={providerId}
+                  type="button"
+                  className="provider-config-row"
+                  onClick={() => openDetail(providerId)}
+                >
+                  <span className="provider-config-identity">
+                    <span className="provider-config-avatar" aria-hidden="true">P</span>
+                    <span>
+                      <strong>{provider.display_name}</strong>
+                      <small>{providerId}</small>
+                    </span>
+                  </span>
+                  <span><strong>{provider.driver === "codex_cli" ? "Codex CLI" : modelProviderDriverLabel(provider.driver)}</strong><small>{mode}</small></span>
+                  <span><strong>{resolved.concrete}</strong><small>{provider.default_model ? "Provider 默认" : "动态解析"}</small></span>
+                  <span className="provider-config-badges">
+                    <em className={provider.enabled === false ? "disabled" : "enabled"}>
+                      {provider.enabled === false ? "已停用" : "已启用"}
+                    </em>
+                    {item?.is_global_default && <em>全局默认</em>}
+                    {item?.builtin && <em>内置</em>}
+                  </span>
+                  <span className="provider-config-arrow" aria-hidden="true">›</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </section>
-      <div className="page-stack provider-detail-stack">
-        <section className="section-card">
-          <div className="section-title-row">
-            <div><span className="eyebrow">{selectedId}</span><h2>{selected.display_name}</h2><p>{modelProviderDriverLabel(selected.driver)}</p></div>
-            <div className="button-group">
-              <button className="button secondary" type="button" disabled={busy || props.editable || !selectedSnapshot} onClick={() => void testConnection()}>{busy ? "处理中…" : "连接测试"}</button>
-              {selectedSnapshot?.deletable && <button className="button danger" type="button" disabled={busy || props.editable} onClick={() => void deleteProvider()}>删除</button>}
-            </div>
-          </div>
-          {connectionResult && <div className="alert success">{connectionResult}</div>}
-          <fieldset className="config-editor-surface" disabled={!props.editable}>
-            <div className="form-grid three">
-              <Field label="显示名称" value={selected.display_name} onChange={(display_name) => updateProvider({ display_name })} />
-              <SelectField
-                label="驱动协议"
-                value={selected.driver}
-                disabled={selectedId === "codex-cli"}
-                onChange={(driver) => updateProvider({ driver: driver as ModelProviderDriver })}
-                options={selectedId === "codex-cli"
-                  ? [{ value: "codex_cli", label: "Codex CLI（内置）" }]
-                  : MODEL_PROVIDER_DRIVER_OPTIONS}
-              />
-              <Toggle label="启用 Provider" checked={selected.enabled !== false} onChange={(enabled) => updateProvider({ enabled })} />
-              {external && <Field label="Base URL" value={selected.base_url ?? ""} onChange={(base_url) => updateProvider({ base_url })} placeholder="https://api.example.com" />}
-              <ModelField
-                id={`provider-model-${selectedId}`}
-                label="Provider 默认模型"
-                value={selected.default_model ?? ""}
-                placeholder={selectedResolved.defaultLabel}
-                models={selected.driver === "codex_cli" || selected.driver === "codex_oauth" ? props.codexOptions.models : modelOptions}
-                onChange={(default_model) => updateProvider({ default_model: default_model || undefined })}
-                help={`当前显示：${selected.display_name} / ${selected.default_model || selectedResolved.defaultLabel}`}
-              />
-              {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
-              {external && <Field label="并发上限（可选）" type="number" value={selected.max_concurrency ?? ""} onChange={(value) => updateProvider({ max_concurrency: value ? Number(value) : null })} />}
+
+      {selectedId !== null && selected && (
+        <div className="run-drawer-layer provider-detail-layer">
+          <button
+            type="button"
+            className="run-drawer-backdrop"
+            aria-label="关闭 Provider 详情"
+            onClick={closeDetail}
+          />
+          <aside
+            className="run-drawer provider-detail-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${selected.display_name} Provider 详情`}
+          >
+            <header className="run-drawer-head provider-detail-head">
+              <div>
+                <span className="eyebrow">{activeId}</span>
+                <h2>{selected.display_name}</h2>
+                <p>{creating ? "尚未保存的新 Provider" : editing ? "当前修改仅保存在详情草稿" : "当前已保存配置"}</p>
+              </div>
+              <div className="run-drawer-actions provider-detail-actions">
+                {editing ? (
+                  <>
+                    <button className="button secondary" type="button" disabled={busy} onClick={cancelEdit}>取消</button>
+                    <button className="button primary" type="button" disabled={busy || !dirty || !draftId.trim() || idConflict} onClick={() => void saveProvider()}>
+                      {busy ? "保存中…" : "保存 Provider"}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className="button secondary" type="button" disabled={busy || !selectedSnapshot} onClick={() => void testConnection()}>
+                      {busy ? "测试中…" : "连接测试"}
+                    </button>
+                    {selectedSnapshot?.deletable && <button className="button danger" type="button" disabled={busy} onClick={() => void deleteProvider()}>删除</button>}
+                    <button className="button primary" type="button" onClick={beginEdit}>编辑 Provider</button>
+                  </>
+                )}
+                <button className="run-drawer-close" type="button" aria-label="关闭" disabled={busy} onClick={closeDetail}>×</button>
+              </div>
+            </header>
+            <div className="run-drawer-body provider-detail-body">
+              {connectionResult && <div className="alert success">{connectionResult}</div>}
+              <section className="section-card">
+                <div className="section-title-row">
+                  <div><h2>基本配置</h2><p>Provider 身份稳定；保存只更新当前 Provider。</p></div>
+                </div>
+                <fieldset className="config-editor-surface" disabled={!editing || busy}>
+                  <div className="form-grid three">
+                    {creating ? (
+                      <Field label="Provider ID" value={draftId} onChange={updateDraftProviderId} help={idConflict ? "该 Provider ID 已存在" : "保存后不可修改"} />
+                    ) : (
+                      <Field label="Provider ID" value={activeId} disabled onChange={() => undefined} />
+                    )}
+                    <Field label="显示名称" value={selected.display_name} onChange={(display_name) => updateProvider({ display_name })} />
+                    <SelectField
+                      label="驱动协议"
+                      value={selected.driver}
+                      disabled={activeId === "codex-cli"}
+                      onChange={(driver) => updateProvider({ driver: driver as ModelProviderDriver })}
+                      options={activeId === "codex-cli"
+                        ? [{ value: "codex_cli", label: "Codex CLI（内置）" }]
+                        : MODEL_PROVIDER_DRIVER_OPTIONS}
+                    />
+                    <Toggle label="启用 Provider" checked={selected.enabled !== false} onChange={(enabled) => updateProvider({ enabled })} />
+                    {external && <Field label="Base URL" value={selected.base_url ?? ""} onChange={(base_url) => updateProvider({ base_url })} placeholder="https://api.example.com" />}
+                    <ModelField
+                      id={`provider-model-${activeId}`}
+                      label="Provider 默认模型"
+                      value={selected.default_model ?? ""}
+                      placeholder={selectedResolved?.defaultLabel ?? "Provider 默认模型"}
+                      models={selected.driver === "codex_cli" ? props.codexOptions.models : modelOptions}
+                      onChange={(default_model) => updateProvider({ default_model: default_model || undefined })}
+                      help={`当前解析：${selected.display_name} / ${selectedResolved?.concrete ?? "暂未解析"}`}
+                    />
+                    {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
+                    {external && <Field label="并发上限（可选）" type="number" value={selected.max_concurrency ?? ""} onChange={(value) => updateProvider({ max_concurrency: value ? Number(value) : null })} />}
+                    {external && (
+                      <SelectField
+                        label="默认推理强度（可选）"
+                        value={selected.model_reasoning_effort ?? ""}
+                        onChange={(model_reasoning_effort) => updateProvider({ model_reasoning_effort: model_reasoning_effort || undefined })}
+                        options={[
+                          { value: "", label: "不向上游显式传递" },
+                          ...REASONING_LEVELS.map((value) => ({ value, label: value })),
+                        ]}
+                      />
+                    )}
+                    {external && (
+                      <SelectField
+                        label="默认输出详细度（可选）"
+                        value={selected.model_verbosity ?? ""}
+                        onChange={(model_verbosity) => updateProvider({ model_verbosity: model_verbosity ? model_verbosity as ModelProviderConfig["model_verbosity"] : undefined })}
+                        options={[
+                          { value: "", label: "使用 Provider / 模型默认" },
+                          { value: "low", label: "低" },
+                          { value: "medium", label: "中" },
+                          { value: "high", label: "高" },
+                        ]}
+                      />
+                    )}
+                    {external && (
+                      <SelectField
+                        label="默认交互风格（可选）"
+                        value={selected.personality ?? ""}
+                        onChange={(personality) => updateProvider({ personality: personality ? personality as ModelProviderConfig["personality"] : undefined })}
+                        options={[
+                          { value: "", label: "无 Provider 预设" },
+                          { value: "none", label: "无预设" },
+                          { value: "friendly", label: "友好" },
+                          { value: "pragmatic", label: "务实" },
+                        ]}
+                      />
+                    )}
+                  </div>
+                  {external && (
+                    <label className="field provider-model-list-field">
+                      <span>手工模型目录</span>
+                      <textarea
+                        rows={5}
+                        value={(selected.models ?? []).join("\n")}
+                        onChange={(event) => updateProvider({
+                          models: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean),
+                        })}
+                        placeholder="每行一个模型 ID"
+                      />
+                      <small>保存后可使用“检测并刷新模型”读取上游目录。</small>
+                    </label>
+                  )}
+                </fieldset>
+              </section>
+
               {external && (
-                <SelectField
-                  label="默认推理强度（可选）"
-                  value={selected.model_reasoning_effort ?? ""}
-                  onChange={(model_reasoning_effort) => updateProvider({ model_reasoning_effort: model_reasoning_effort || undefined })}
-                  options={[
-                    { value: "", label: "不向上游显式传递" },
-                    ...REASONING_LEVELS.map((value) => ({ value, label: value })),
-                  ]}
-                />
+                <section className="section-card">
+                  <div className="section-title-row">
+                    <div><h2>API Key</h2><p>默认脱敏；小眼睛只在当前详情临时显示明文。</p></div>
+                    {!creating && (
+                      <button className="button secondary" type="button" disabled={!selectedSnapshot?.api_key_configured} onClick={() => void revealKey()}>
+                        {visibleKey ? "隐藏明文" : "查看明文"}
+                      </button>
+                    )}
+                  </div>
+                  {!creating && <div className="credential-value mono">{visibleKey || selectedSnapshot?.masked_key || "尚未配置"}</div>}
+                  <div className="form-grid two">
+                    <Field
+                      label={selectedSnapshot?.api_key_configured ? "替换 API Key" : "API Key"}
+                      type="password"
+                      value={keyInput}
+                      onChange={setKeyInput}
+                      help={creating ? "将与新 Provider 一起安全保存" : undefined}
+                    />
+                    <div className="field-action">
+                      {!creating && <button className="button secondary" type="button" disabled={busy || !keyInput.trim()} onClick={() => void replaceKey()}>安全保存</button>}
+                      {!creating && <button className="button secondary" type="button" disabled={busy || editing || !selectedSnapshot?.api_key_configured} onClick={() => void refreshModels()}>检测并刷新模型</button>}
+                    </div>
+                  </div>
+                </section>
               )}
-              {external && (
-                <SelectField
-                  label="默认输出详细度（可选）"
-                  value={selected.model_verbosity ?? ""}
-                  onChange={(model_verbosity) => updateProvider({ model_verbosity: model_verbosity ? model_verbosity as ModelProviderConfig["model_verbosity"] : undefined })}
-                  options={[
-                    { value: "", label: "使用 Provider / 模型默认" },
-                    { value: "low", label: "低" },
-                    { value: "medium", label: "中" },
-                    { value: "high", label: "高" },
-                  ]}
-                />
-              )}
-              {external && (
-                <SelectField
-                  label="默认交互风格（可选）"
-                  value={selected.personality ?? ""}
-                  onChange={(personality) => updateProvider({ personality: personality ? personality as ModelProviderConfig["personality"] : undefined })}
-                  options={[
-                    { value: "", label: "无 Provider 预设" },
-                    { value: "none", label: "无预设" },
-                    { value: "friendly", label: "友好" },
-                    { value: "pragmatic", label: "务实" },
-                  ]}
-                />
+
+              {selected.driver === "codex_cli" && (
+                <>
+                  <CodexRuntimeEditor
+                    document={activeDocument}
+                    options={props.codexOptions}
+                    editable={editing && !busy}
+                    onChange={setDraftDocument}
+                  />
+                  <CodexAccountCard
+                    configuredHome={props.document.runtime.codex_home ? String(props.document.runtime.codex_home) : undefined}
+                    homeHasUnsavedChange={String(activeDocument.runtime.codex_home ?? "") !== String(props.document.runtime.codex_home ?? "")}
+                  />
+                </>
               )}
             </div>
-            {external && (
-              <label className="field provider-model-list-field">
-                <span>手工模型目录</span>
-                <textarea rows={5} value={(selected.models ?? []).join("\n")} onChange={(event) => updateProvider({ models: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean) })} placeholder="每行一个模型 ID" />
-                <small>保存 Provider 后可使用“检测并刷新模型”覆盖为上游目录。</small>
-              </label>
-            )}
-          </fieldset>
-        </section>
-        {external && (
-          <section className="section-card">
-            <div className="section-title-row"><div><h2>API Key</h2><p>默认脱敏；小眼睛仅在当前详情临时显示明文。</p></div><button className="button secondary" type="button" disabled={!selectedSnapshot?.api_key_configured} onClick={() => void revealKey()}>{visibleKey ? "隐藏明文" : "查看明文"}</button></div>
-            <div className="credential-value mono">{visibleKey || selectedSnapshot?.masked_key || "尚未配置"}</div>
-            <div className="form-grid two">
-              <Field label={selectedSnapshot?.api_key_configured ? "替换 API Key" : "API Key"} type="password" value={keyInput} onChange={setKeyInput} />
-              <div className="field-action"><button className="button secondary" type="button" disabled={busy || !selectedSnapshot || !keyInput.trim()} onClick={() => void replaceKey()}>安全保存</button><button className="button secondary" type="button" disabled={busy || props.editable || !selectedSnapshot?.api_key_configured} onClick={() => void refreshModels()}>检测并刷新模型</button></div>
-            </div>
-          </section>
-        )}
-        {selected.driver === "codex_cli" && (
-          <>
-            <CodexRuntimeEditor document={props.document} options={props.codexOptions} editable={props.editable} onChange={props.onChange} />
-            <CodexAccountCard
-              configuredHome={props.savedDocument?.runtime.codex_home ? String(props.savedDocument.runtime.codex_home) : undefined}
-              homeHasUnsavedChange={String(props.document.runtime.codex_home ?? "") !== String(props.savedDocument?.runtime.codex_home ?? "")}
-            />
-          </>
-        )}
-      </div>
-    </div>
+          </aside>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -2565,7 +2842,7 @@ function effectiveInheritedModel(
   if (providerModel) {
     return {
       value: providerModel,
-      label: `Codex CLI 默认模型（${providerModel}）`,
+      label: `${document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（${providerModel}）`,
     };
   }
   if (options.codex_model) {
@@ -2578,7 +2855,7 @@ function effectiveInheritedModel(
   }
   return {
     value: null,
-    label: "Codex CLI 默认模型（暂未解析）",
+    label: `${document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（暂未解析）`,
   };
 }
 
@@ -2595,7 +2872,7 @@ function resolvedProviderModel(
   models: CodexRuntimeOptions["models"];
 } {
   const provider = document.model_providers[providerId];
-  const codexProvider = provider?.driver === "codex_cli" || provider?.driver === "codex_oauth";
+  const codexProvider = provider?.driver === "codex_cli";
   const model = configuredModel
     || provider?.default_model
     || (codexProvider ? options.inherited_model.value ?? undefined : undefined);
@@ -2615,7 +2892,7 @@ function resolvedProviderModel(
     model,
     concrete,
     defaultLabel: provider?.driver === "codex_cli"
-      ? `CLI 默认模型（${concrete}）`
+      ? `${document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（${concrete}）`
       : `Provider 默认模型（${concrete}）`,
     models,
   };
@@ -2719,7 +2996,7 @@ function runtimeInheritedSetting(
   sandbox?: Agent["sandbox"],
   provider?: ModelProviderConfig,
 ): CodexInheritedSetting {
-  if (provider && provider.driver !== "codex_cli" && provider.driver !== "codex_oauth") {
+  if (provider && provider.driver !== "codex_cli") {
     const providerValues: Partial<Record<InheritedSettingKey, string | undefined>> = {
       model_reasoning_effort: provider.model_reasoning_effort,
       fast_mode: "standard",
@@ -2838,6 +3115,16 @@ function CodexRuntimeEditor(props: {
           </div>
         )}
         <div className="form-grid three runtime-config-grid">
+          <SelectField
+            label="Codex 执行模式"
+            value={codex.execution_mode ?? "model"}
+            onChange={(value) => patchCodex({ execution_mode: value as CodexRuntimeConfig["execution_mode"] })}
+            options={[
+              { value: "model", label: "基座模式（默认）" },
+              { value: "cli", label: "完整 Codex CLI 模式" },
+            ]}
+            help="基座模式复用 Codex OAuth 登录态并由 Teamwork 执行工具循环"
+          />
           <Field
             label="Codex CLI 命令"
             value={String(props.document.runtime.codex_binary ?? "codex")}
@@ -8108,7 +8395,6 @@ export default function App() {
   ], []);
   const configurableTab = (
     tab === "environment"
-    || tab === "model-providers"
     || tab === "skills"
   );
 
@@ -8133,7 +8419,7 @@ export default function App() {
           <div><span className="eyebrow">MR / PR AUTOMATION</span><h1>{tabs.find((item) => item.id === tab)?.label}</h1></div>
           <div className="top-actions">
             <label className="token-field"><span>管理 Token</span><input type="password" value={token} placeholder="本机模式可留空" onChange={(event) => setToken(event.target.value)} onBlur={() => { persistToken(token); if (!editing) void load(); }} /></label>
-            {(configurableTab || editing) && (
+            {tab !== "model-providers" && (configurableTab || editing) && (
               editing ? (
                 <div className="button-group edit-actions">
                   <button className="button secondary" disabled={saving} onClick={cancelEditing}>取消</button>
@@ -8184,29 +8470,25 @@ export default function App() {
                     <span>{editing ? "编辑模式" : "只读模式"}</span>
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
-                  {tab === "model-providers" ? (
-                    <ModelProvidersEditor
-                      document={document}
-                      savedDocument={savedDocument}
-                      revision={revision}
-                      codexOptions={codexOptions}
-                      editable={editing}
-                      onChange={changeDocument}
-                      onSaved={acceptItemConfig}
-                      onError={setError}
-                      onNotice={(message) => {
-                        setNotice(message);
-                        window.setTimeout(() => setNotice(""), 3500);
-                      }}
-                    />
-                  ) : (
-                    <fieldset className="config-editor-surface" disabled={!editing}>
-                      {tab === "environment" && <GlobalEnvironment document={document} codexOptions={codexOptions} onChange={changeDocument} />}
-                      {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
-                    </fieldset>
-                  )}
+                  <fieldset className="config-editor-surface" disabled={!editing}>
+                    {tab === "environment" && <GlobalEnvironment document={document} codexOptions={codexOptions} onChange={changeDocument} />}
+                    {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
+                  </fieldset>
                   {tab === "environment" && <ConfigHistory />}
                 </>
+              )}
+              {tab === "model-providers" && (
+                <ModelProvidersEditor
+                  document={document}
+                  revision={revision}
+                  codexOptions={codexOptions}
+                  onSaved={acceptItemConfig}
+                  onError={setError}
+                  onNotice={(message) => {
+                    setNotice(message);
+                    window.setTimeout(() => setNotice(""), 3500);
+                  }}
+                />
               )}
               <div hidden={tab !== "repositories" || repositoryDetailOpen}>
                 <RepositoryConnectionsEditor

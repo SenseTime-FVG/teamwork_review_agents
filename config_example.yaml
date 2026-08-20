@@ -75,8 +75,11 @@ database:
 #   default_model:
 #     provider: codex-cli
 #     # model: gpt-5.6-sol
-#   # Codex CLI 驱动专属参数；不会修改 config.toml。
+#   # Codex CLI 内部执行参数；不会修改 config.toml。
 #   codex:
+#     # 默认使用基座模式，由 Teamwork 复用 Codex OAuth 登录态执行模型工具循环；
+#     # 改为 cli 时才启动完整 Codex CLI 生命周期。
+#     execution_mode: model
 #     # 可选：默认推理强度。具体可用值取决于模型，常见值如下。
 #     model_reasoning_effort: high
 #     # inherit：继承 Codex 配置；standard：显式关闭；fast：显式开启快速模式。
@@ -107,6 +110,7 @@ database:
 #     driver: codex_cli
 #     # 内置 Provider 可以停用，但不能删除；被停用时引用它的新运行会明确失败。
 #     enabled: true
+#     # 执行模式由上方 runtime.codex.execution_mode 控制，默认是基座模式。
 #     # 留空时使用 Codex CLI、账号或用户配置解析出的默认模型。
 #     # default_model: gpt-5.6-sol
 #

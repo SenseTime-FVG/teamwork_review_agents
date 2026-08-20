@@ -422,6 +422,7 @@ class ConfigManager:
         expected_revision: str,
         provider_id: str,
         provider: dict[str, Any],
+        codex_runtime: dict[str, Any] | None = None,
         source: str = "ui-model-provider",
     ) -> AppConfig:
         """基于最新配置创建或更新一个模型 Provider。"""
@@ -447,12 +448,34 @@ class ConfigManager:
                     raise ValueError("内置 Codex CLI Provider 不存在")
                 if next_provider.get("driver") != "codex_cli":
                     raise ValueError("内置 Codex CLI Provider 不允许改变驱动类型")
+            elif codex_runtime is not None:
+                raise ValueError("只有内置 Codex CLI Provider 可以更新 Codex 运行参数")
 
             document = copy.deepcopy(current_raw)
             document["model_providers"] = {
                 **copy.deepcopy(model_providers),
                 normalized_id: next_provider,
             }
+            if codex_runtime is not None:
+                runtime = document.setdefault("runtime", {})
+                if not isinstance(runtime, dict):
+                    raise ValueError("runtime 配置必须是对象")
+                allowed_keys = {
+                    "codex_binary",
+                    "codex_home",
+                    "expected_codex_version",
+                    "inherit_user_mcp_servers",
+                    "allowed_user_mcp_servers",
+                    "codex",
+                }
+                unknown_keys = sorted(set(codex_runtime) - allowed_keys)
+                if unknown_keys:
+                    raise ValueError(f"Codex Provider 运行参数包含未知字段：{unknown_keys}")
+                for key, value in codex_runtime.items():
+                    if value is None:
+                        runtime.pop(key, None)
+                    else:
+                        runtime[key] = copy.deepcopy(value)
             return self._persist_locked(document, source=source)
 
     def delete_model_provider(

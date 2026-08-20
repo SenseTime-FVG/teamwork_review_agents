@@ -76,23 +76,19 @@ class CodexModelRunner:
         self,
         config: AppConfig,
         *,
-        provider_id: str = "codex-oauth",
+        provider_id: str = "codex-cli",
         invoke_agent_callback: InvokeAgentCallback | None = None,
     ) -> None:
         self.config = config
         self.provider_id = provider_id
         provider = config.model_providers.get(provider_id)
-        self._legacy_runtime_provider = provider is None and provider_id == "codex-oauth"
-        if provider is None and provider_id == "codex-oauth":
-            provider = config.model_providers["codex-cli"].model_copy(
-                update={
-                    "display_name": "Codex OAuth 模型基座",
-                    "driver": "codex_oauth",
-                }
-            )
         if provider is None:
             raise KeyError(provider_id)
         self.provider = provider
+        self._uses_codex_model_base = (
+            provider.driver == "codex_cli"
+            and config.runtime.codex.execution_mode == "model"
+        )
         self.invoke_agent_callback = invoke_agent_callback
         self.credential_store = ModelProviderCredentialStore(
             config.database.path.parent / "model-provider-credentials"
@@ -123,7 +119,7 @@ class CodexModelRunner:
         """准备投影与临时 HOME，然后执行带看门狗的模型工具循环。"""
 
         provider_api_key: str | None = None
-        if self.provider.driver not in {"codex_cli", "codex_oauth"}:
+        if not self._uses_codex_model_base:
             try:
                 provider_api_key = self.credential_store.reveal(self.provider_id)
             except KeyError:
@@ -187,7 +183,7 @@ class CodexModelRunner:
             if projection.marker.is_file():
                 _add_git_excludes_file(environment, projection.marker)
 
-            if self.provider.driver == "codex_oauth":
+            if self._uses_codex_model_base:
                 version_error = await asyncio.to_thread(
                     validate_codex_version,
                     self.config.runtime.codex_binary,
@@ -499,7 +495,7 @@ class CodexModelRunner:
             skill_files=skill_files,
             provider_name=self.provider.display_name,
         )
-        if self.provider.driver == "codex_oauth":
+        if self._uses_codex_model_base:
             oauth = CodexOAuthStore(codex_home(self.config.runtime.codex_home))
             client = CodexResponsesClient(
                 oauth=oauth,
@@ -625,7 +621,7 @@ class CodexModelRunner:
                     "effort": reasoning_effort,
                     "summary": "auto",
                 }
-            if self.provider.driver == "codex_oauth":
+            if self._uses_codex_model_base:
                 payload["include"] = ["reasoning.encrypted_content"]
             if fast_mode:
                 payload["service_tier"] = "priority"
@@ -776,12 +772,8 @@ class CodexModelRunner:
         model = agent.model or self.provider.default_model
         if model is None and self.provider.models:
             model = self.provider.models[0]
-        if model is None and self.provider.driver == "codex_oauth":
-            model = (
-                self.config.runtime.codex.model
-                if self._legacy_runtime_provider
-                else None
-            ) or user_model
+        if model is None and self._uses_codex_model_base:
+            model = self.config.runtime.codex.model or user_model
         if not model:
             raise RuntimeError(
                 f"模型 Provider {self.provider.display_name} 没有可解析的模型"
@@ -793,7 +785,7 @@ class CodexModelRunner:
             value = item.get("value") if isinstance(item, dict) else None
             return value if isinstance(value, str) and value else None
 
-        codex_provider = self.provider.driver == "codex_oauth"
+        codex_provider = self._uses_codex_model_base
         reasoning = agent.model_reasoning_effort or self.provider.model_reasoning_effort
         if reasoning is None and codex_provider:
             reasoning = (

@@ -195,13 +195,13 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 ## 模型 Provider 与全局默认模型
 
-“Provider”页管理 Agent 的模型执行后端。`codex-cli` 是系统自动补齐的内置 Provider：可以停用，但不能删除，初始全局默认模型也指向它。API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议，可分别配置 Base URL、默认模型、模型目录、超时和并发上限。API Key 与 `config.yaml`、配置历史分开保存；列表只显示掩码，管理员主动点击小眼睛时才通过受管理 API 临时读取明文，Key 不进入 Prompt、工具子进程、运行快照或日志。
+“Provider”页管理 Agent 的模型执行后端。页面使用整列列表直接展示每个 Provider 的协议或模式、具体默认模型和状态，点击一行后在详情抽屉中单独查看、编辑、保存或测试该 Provider。`codex-cli` 是系统自动补齐的内置 Provider：可以停用，但不能删除，初始全局默认模型也指向它。API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议，可分别配置 Base URL、默认模型、模型目录、超时和并发上限。API Key 与 `config.yaml`、配置历史分开保存；列表只显示掩码，管理员主动点击小眼睛时才通过受管理 API 临时读取明文，Key 不进入 Prompt、工具子进程、运行快照或日志。
 
-Agent 可以显式选择 Provider 和模型，也可以继承“全局配置与环境”页的全局默认模型。选择框会把继承结果显示为具体值，例如 `继承全局默认（Codex CLI / gpt-5.6-sol）` 或 `Codex CLI / CLI 默认模型（gpt-5.6-sol）`；无法从 Codex 配置和账号可靠解析时会明确显示原因。运行开始后会把实际 Provider、驱动和模型固化到运行快照，后续修改或删除 Provider 不会改写历史记录。
+Agent 可以显式选择 Provider 和模型，也可以继承“全局配置与环境”页的全局默认模型。选择框会把继承结果显示为具体值，例如 `继承全局默认（Codex CLI / gpt-5.6-sol）` 或 `Codex CLI / 基座默认模型（gpt-5.6-sol）`；无法从 Codex 配置和账号可靠解析时会明确显示原因。运行开始后会把实际 Provider、驱动和模型固化到运行快照，后续修改或删除 Provider 不会改写历史记录。
 
 删除 API Provider 时，如果全局默认模型引用它，全局默认会先回退到 `codex-cli`；所有显式引用它的 Agent 会清除自己的 Provider 与模型并改为继承新的全局默认。停用与删除不同：停用会保留全部引用，新运行直接明确失败，不会悄悄改用其他模型。如果回退后的 Codex CLI 本身处于停用状态，配置迁移仍会完成，但需要重新启用或更换全局默认后才能运行。
 
-外部 API Provider 和 Codex OAuth 模型基座由 Teamwork 提供 `execute_command`、`apply_patch`、白名单 `invoke_agent`，以及按 Agent 配置开放的 `publish_comment`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它们不继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`。Codex OAuth token 和外部 API Key 都只用于宿主模型请求。
+Codex CLI 内置 Provider 默认使用基座模式，也可以在详情中切换为完整 CLI 模式。基座模式和外部 API Provider 由 Teamwork 提供 `execute_command`、`apply_patch`、白名单 `invoke_agent`，以及按 Agent 配置开放的 `publish_comment`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量；它们不继承完整 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`。Codex OAuth token 和外部 API Key 都只用于宿主模型请求。
 
 ## Teamwork 跨平台外层沙盒
 

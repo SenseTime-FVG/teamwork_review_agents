@@ -18,7 +18,7 @@ CodexConfigPrimitive = str | int | float | bool
 CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
 
 BUILTIN_CODEX_CLI_PROVIDER_ID = "codex-cli"
-BUILTIN_CODEX_OAUTH_PROVIDER_ID = "codex-oauth"
+LEGACY_CODEX_OAUTH_PROVIDER_ID = "codex-oauth"
 
 CODEX_STRUCTURED_CONFIG_KEYS = {
     "execution_mode",
@@ -127,7 +127,7 @@ class ScannerConfig(BaseModel):
 class CodexRuntimeConfig(BaseModel):
     """Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认运行参数。"""
 
-    execution_mode: Literal["cli", "model"] = "cli"
+    execution_mode: Literal["cli", "model"] = "model"
     model: str | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
@@ -188,7 +188,6 @@ class ModelProviderConfig(BaseModel):
     display_name: str = Field(min_length=1)
     driver: Literal[
         "codex_cli",
-        "codex_oauth",
         "openai_responses",
         "openai_chat_completions",
         "anthropic_messages",
@@ -235,7 +234,7 @@ class ModelProviderConfig(BaseModel):
     def validate_driver_fields(self) -> "ModelProviderConfig":
         """外部 API 驱动必须配置服务地址和可用默认模型。"""
 
-        if self.driver not in {"codex_cli", "codex_oauth"}:
+        if self.driver != "codex_cli":
             if self.base_url is None:
                 raise ValueError("外部模型 Provider 必须配置 Base URL")
             if self.default_model is None and not self.models:
@@ -845,10 +844,9 @@ def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
-    """为旧配置补齐内置 Provider、全局默认和 Agent Provider 引用。"""
+    """补齐唯一内置 Provider，并折叠历史 OAuth Provider 引用。"""
 
     data = copy.deepcopy(raw)
-    had_model_providers = isinstance(raw.get("model_providers"), dict)
     runtime = data.setdefault("runtime", {})
     if not isinstance(runtime, dict):
         return data
@@ -881,27 +879,60 @@ def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
     ):
         builtin_provider["default_model"] = legacy_model
 
-    legacy_mode = str(codex.get("execution_mode") or "cli")
-    legacy_default_provider = BUILTIN_CODEX_CLI_PROVIDER_ID
-    if legacy_mode == "model" and not had_model_providers:
-        providers.setdefault(
-            BUILTIN_CODEX_OAUTH_PROVIDER_ID,
-            {
-                "display_name": "Codex OAuth 模型基座",
-                "driver": "codex_oauth",
-                "enabled": True,
-                **(
-                    {"default_model": codex.get("model")}
-                    if codex.get("model")
-                    else {}
-                ),
-            },
+    default_model = runtime.get("default_model")
+    agents = data.get("agents", {})
+    legacy_provider_ids = {
+        provider_id
+        for provider_id, value in providers.items()
+        if provider_id == LEGACY_CODEX_OAUTH_PROVIDER_ID
+        or (isinstance(value, dict) and value.get("driver") == "codex_oauth")
+    }
+    referenced_legacy_ids: set[str] = set()
+    if (
+        isinstance(default_model, dict)
+        and default_model.get("provider") in legacy_provider_ids
+    ):
+        referenced_legacy_ids.add(str(default_model["provider"]))
+    if isinstance(agents, dict):
+        referenced_legacy_ids.update(
+            str(value.get("model_provider"))
+            for value in agents.values()
+            if isinstance(value, dict)
+            and value.get("model_provider") in legacy_provider_ids
         )
-        legacy_default_provider = BUILTIN_CODEX_OAUTH_PROVIDER_ID
+
+    # 旧 OAuth Provider 的模型参数并入唯一的 Codex CLI Provider。
+    if isinstance(builtin_provider, dict):
+        for provider_id in sorted(
+            legacy_provider_ids,
+            key=lambda item: item not in referenced_legacy_ids,
+        ):
+            legacy_provider = providers.get(provider_id)
+            if not isinstance(legacy_provider, dict):
+                continue
+            for key in (
+                "default_model",
+                "models",
+                "model_reasoning_effort",
+                "model_verbosity",
+                "personality",
+            ):
+                legacy_value = legacy_provider.get(key)
+                if legacy_value in (None, "", []):
+                    continue
+                if provider_id in referenced_legacy_ids or not builtin_provider.get(key):
+                    builtin_provider[key] = copy.deepcopy(legacy_value)
+    for provider_id in legacy_provider_ids:
+        providers.pop(provider_id, None)
+
+    if referenced_legacy_ids:
+        codex["execution_mode"] = "model"
+    else:
+        codex.setdefault("execution_mode", "model")
     runtime.setdefault(
         "default_model",
         {
-            "provider": legacy_default_provider,
+            "provider": BUILTIN_CODEX_CLI_PROVIDER_ID,
             **({"model": codex.get("model")} if codex.get("model") else {}),
         },
     )
@@ -909,14 +940,23 @@ def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
     codex.pop("model", None)
 
     default_model = runtime.get("default_model")
+    if (
+        isinstance(default_model, dict)
+        and default_model.get("provider") in legacy_provider_ids
+    ):
+        default_model["provider"] = BUILTIN_CODEX_CLI_PROVIDER_ID
     default_provider = (
         str(default_model.get("provider"))
         if isinstance(default_model, dict) and default_model.get("provider")
         else BUILTIN_CODEX_CLI_PROVIDER_ID
     )
-    agents = data.get("agents", {})
     if isinstance(agents, dict):
         for value in agents.values():
+            if (
+                isinstance(value, dict)
+                and value.get("model_provider") in legacy_provider_ids
+            ):
+                value["model_provider"] = BUILTIN_CODEX_CLI_PROVIDER_ID
             if (
                 isinstance(value, dict)
                 and value.get("model")
