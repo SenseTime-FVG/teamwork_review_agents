@@ -53,6 +53,15 @@ def test_ignores_only_updated_timestamp(snapshot_factory) -> None:
     assert detect_events(old, new) == []
 
 
+def test_source_project_identity_does_not_create_semantic_event(snapshot_factory) -> None:
+    """升级后补齐跨 Fork 身份不应伪造一次 PR 内容变化。"""
+
+    old = snapshot_factory(source_project="")
+    new = snapshot_factory(source_project="fork-owner/demo")
+
+    assert detect_events(old, new) == []
+
+
 def test_target_branch_change_is_one_batch_scoped_event(snapshot_factory) -> None:
     """目标分支 Head 变化应独立成事件，并允许未来同值往返再次触发。"""
 

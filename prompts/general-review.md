@@ -92,7 +92,7 @@
 标题未命中跳过规则时，再获取以下状态和审核上下文，然后继续执行后续流程：
 
 - Draft/WIP 状态；
-- 源分支、目标分支；
+- 源分支、目标分支，以及跨 Fork / 跨项目时的源项目身份；
 - 当前源分支最新提交 SHA；
 - 当前目标分支最新提交 SHA；
 - 可合并状态及阻塞原因；
@@ -112,10 +112,11 @@
    - `REVIEW_HEAD_SHA` 对应的当前 CI 状态。
 6. 状态处理的优先级是：先比较源、目标 SHA，再判断可合并状态，最后处理 CI 状态。
 7. 查询当前目标分支 SHA 时，只能读取目标分支真实 ref，例如平台 Git refs API、`git ls-remote origin refs/heads/<目标分支>` 或语义等价的实时分支查询。GitHub PR 的 `base.sha`、GraphQL `baseRefOid` 以及其他平台中描述变更请求差异基准的字段可能不是目标分支当前 Head，禁止用它们建立 `REVIEW_TARGET_SHA` 或判断目标分支是否变化。
+8. 运行上下文只在跨 Fork / 跨项目时提供 `mr.source_project`。存在该字段时，查询当前源 SHA 必须读取当前 PR / MR 的平台 Head，或明确查询 `mr.source_project` 中的真实源分支；禁止把目标仓库 `origin` 中的同名分支当作源分支。该字段不存在时表示同仓库变更，继续使用当前仓库的源分支查询路径。
 
 ## 源或目标 SHA 变化规则
 
-只要当前源分支最新 SHA 不再等于 `REVIEW_HEAD_SHA`，或通过目标分支真实 ref 查询到的当前 SHA 不再等于 `REVIEW_TARGET_SHA`，说明本次审核结果已经失效。此时必须立即结束：
+只要按上述仓库身份规则查询到的当前源分支最新 SHA 不再等于 `REVIEW_HEAD_SHA`，或通过目标分支真实 ref 查询到的当前 SHA 不再等于 `REVIEW_TARGET_SHA`，说明本次审核结果已经失效。跨 Fork 时，目标仓库 `origin/<源分支>` 的 SHA 即使存在也不参与这一判断。此时必须立即结束：
 
 - 不发布任何审核评论；
 - 不继续等待 CI；

@@ -595,6 +595,12 @@ class GitHubProvider(BaseProvider):
 
         head = detail.get("head") or item.get("head") or {}
         base = detail.get("base") or item.get("base") or {}
+        head_repository = head.get("repo") or {}
+        source_project = ""
+        if isinstance(head_repository, dict):
+            head_project = str(head_repository.get("full_name") or "").strip()
+            if head_project and head_project.casefold() != repository.project.casefold():
+                source_project = head_project
         return ChangeRequestSnapshot(
             provider=self.name,
             repository_id=repository.id,
@@ -605,6 +611,7 @@ class GitHubProvider(BaseProvider):
             source_branch=str(head.get("ref") or ""),
             target_branch=str(base.get("ref") or ""),
             head_sha=str(head.get("sha") or ""),
+            source_project=source_project,
             labels=tuple(
                 sorted(
                     str(label.get("name"))

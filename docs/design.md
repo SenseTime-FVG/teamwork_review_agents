@@ -906,3 +906,11 @@ Windows 托管进程首次导入依赖、接受系统安全扫描并进入 FastA
 执行器按每次 Agent 的有效 Provider 选择 Runner，不能在服务加载时只创建一个全局 Runner。`codex-cli` 再按自身执行模式选择完整 CLI Runner 或 Codex OAuth 模型基座 Runner；外部 API Provider 复用 Teamwork 的工具循环、工作区、Skill、sub-agent、取消、超时、脱敏和日志语义，只替换模型协议客户端。配置升级时删除历史 `codex-oauth` Provider，把全局默认和 Agent 引用迁移到 `codex-cli`，保留模型与默认参数，并在需要保持旧行为时启用基座模式；已经固化的历史运行快照不回写。相同模型 ID 位于不同外部 Provider 时保持为不同身份，不照搬 TokenHub 的多上游自动路由；模型自动发现、Base URL 规范化、连接测试、掩码凭据和 Provider 级并发可以复用其经过验证的边界设计。
 
 Provider 管理页采用单列列表，每行直接显示 Provider 名称、协议或内置类型、启停状态、默认模型具体值以及全局默认标记。点击一行打开该 Provider 的详情抽屉；浏览、编辑、保存、取消、连接测试和删除都只作用于当前 Provider，不再依赖整页“编辑配置”模式。Codex CLI 详情额外编辑内部执行模式和 Codex 专属运行参数；API Provider 详情编辑协议、地址、模型目录和凭据。关闭或切换有未保存修改的详情前必须提示，避免草稿静默丢失。
+
+## 97. 跨 Fork 源仓库身份与源 SHA 校验
+
+MR / PR 的源分支名称不能脱离源仓库身份单独使用。目标仓库中可能存在与 Fork 源分支同名但提交历史完全不同的分支；跨 Fork 审核如果用目标仓库的 `origin/<source_branch>` 校验源 SHA，会把无关分支误判为当前变更请求的新 Head，并错误终止仍然有效的审核。
+
+Provider 在构建快照时只对跨 Fork / 跨项目变更补充可信的 `source_project`。GitHub 使用 PR `head.repo.full_name`，GitLab 在 `source_project_id` 与 `target_project_id` 不同时解析源项目路径；同仓库、同项目变更保持该字段为空，运行上下文不增加冗余源仓库字段，也不新增额外平台请求。历史快照缺少该字段时按同仓库语义兼容读取。
+
+审核运行上下文只在 `source_project` 非空时输出该字段。跨 Fork 的实时源 SHA 必须从当前 PR / MR 的平台 Head，或从明确指向 `source_project` 的源项目分支获取；禁止把目标仓库 `origin` 中的同名分支当作跨 Fork 源分支。字段为空时继续沿用既有同仓库校验路径。目标分支身份、目标 SHA 校验、不变审核基准和工作区精确提交逻辑保持不变。

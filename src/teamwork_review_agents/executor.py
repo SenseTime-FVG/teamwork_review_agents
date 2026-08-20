@@ -100,7 +100,7 @@ def _mr_payload(
     """返回根 Agent 所需的统一 MR / PR 当前信息。"""
 
     snapshot = event.current_snapshot
-    return {
+    payload = {
         "repository": _repository_payload(repository, provider),
         "number": snapshot.number,
         "title": snapshot.title,
@@ -120,6 +120,9 @@ def _mr_payload(
         "target_ref": f"refs/remotes/origin/{snapshot.target_branch}",
         "target_head_sha": target_head_sha,
     }
+    if snapshot.source_project:
+        payload["source_project"] = snapshot.source_project
+    return payload
 
 
 class AgentExecutor:
