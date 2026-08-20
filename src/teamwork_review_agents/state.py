@@ -139,6 +139,7 @@ class StateStore:
                     prompt TEXT NOT NULL,
                     environment TEXT NOT NULL DEFAULT '{}',
                     config_revision TEXT,
+                    model_snapshot TEXT,
                     final_message TEXT,
                     thread_id TEXT,
                     usage TEXT,
@@ -331,6 +332,7 @@ class StateStore:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "agent_runs", "queue_reason", "TEXT")
+            self._ensure_column(connection, "agent_runs", "model_snapshot", "TEXT")
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             cancel_source_added = self._ensure_column(
                 connection,
@@ -1708,6 +1710,7 @@ class StateStore:
         environment: dict[str, str] | None = None,
         config_revision: str | None = None,
         max_attempts: int,
+        model_snapshot: dict[str, Any] | None = None,
     ) -> RunReservation | None:
         """幂等创建 Agent 运行，失败记录可在上限内复用重试。"""
 
@@ -1729,8 +1732,9 @@ class StateStore:
                     INSERT INTO agent_runs (
                         run_id, root_run_id, parent_run_id, idempotency_key,
                         event_id, rule_name, agent_name, resource_key,
-                        status, attempts, prompt, environment, config_revision, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)
+                        status, attempts, prompt, environment, config_revision,
+                        model_snapshot, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?)
                     """,
                     (
                         proposed_run_id,
@@ -1744,6 +1748,11 @@ class StateStore:
                         prompt,
                         json.dumps(environment or {}, ensure_ascii=False),
                         config_revision,
+                        (
+                            json.dumps(model_snapshot, ensure_ascii=False)
+                            if model_snapshot is not None
+                            else None
+                        ),
                         now,
                     ),
                 )
@@ -1770,7 +1779,7 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = 'queued', attempts = ?, prompt = ?, environment = ?,
-                    config_revision = ?, error = NULL,
+                    config_revision = ?, model_snapshot = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
@@ -1784,6 +1793,11 @@ class StateStore:
                     prompt,
                     json.dumps(environment or {}, ensure_ascii=False),
                     config_revision,
+                    (
+                        json.dumps(model_snapshot, ensure_ascii=False)
+                        if model_snapshot is not None
+                        else None
+                    ),
                     now,
                     row["run_id"],
                 ),
@@ -2405,7 +2419,7 @@ class StateStore:
                 (run_id,),
             ).fetchall()
         result = self._decorate_run_record(dict(row))
-        for key in ("environment", "usage"):
+        for key in ("environment", "usage", "model_snapshot"):
             if result.get(key):
                 result[key] = json.loads(result[key])
         result.pop("events", None)

@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Sequence
 
 from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
+from .codex_settings import resolve_agent_model_snapshot
 from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
     PromptRenderError,
@@ -387,6 +388,12 @@ class AgentExecutor:
         configured_repository = self.repositories[event.repository_id]
         provider = self.config.providers[configured_repository.provider]
         agent = self.config.agents[agent_name]
+        model_snapshot = await asyncio.to_thread(
+            resolve_agent_model_snapshot,
+            self.config.runtime.codex,
+            agent,
+            self.config.runtime.codex_home,
+        )
         proposed_run_id = str(uuid.uuid4())
         reservation = await asyncio.to_thread(
             self.store.begin_agent_run,
@@ -402,6 +409,7 @@ class AgentExecutor:
             environment={},
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
+            model_snapshot=model_snapshot,
         )
         if reservation is None:
             status = await asyncio.to_thread(

@@ -899,6 +899,11 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
             environment={"SECRET": MASK},
             config_revision="revision-test",
             max_attempts=1,
+            model_snapshot={
+                "execution_mode": "cli",
+                "model": "gpt-web",
+                "model_source": "runtime",
+            },
         )
         assert reservation is not None
         store.append_run_log(
@@ -916,7 +921,13 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
                 final_message="完成",
             )
         )
-        assert client.get("/api/runs/run-web").json()["environment"] == {"SECRET": MASK}
+        run_detail = client.get("/api/runs/run-web").json()
+        assert run_detail["environment"] == {"SECRET": MASK}
+        assert run_detail["model_snapshot"] == {
+            "execution_mode": "cli",
+            "model": "gpt-web",
+            "model_source": "runtime",
+        }
         assert client.get("/api/runs/run-web/logs").json()[0]["event_type"] == "item.completed"
         stream = client.get("/api/runs/run-web/stream")
         assert "event: item.completed" in stream.text

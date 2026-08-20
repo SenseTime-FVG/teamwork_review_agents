@@ -6039,6 +6039,41 @@ function durationText(startedAt: number, finishedAt?: number | null): string {
   return `${seconds}秒`;
 }
 
+function modelSettingSourceLabel(source?: string | null): string {
+  const labels: Record<string, string> = {
+    agent: "Agent 覆盖",
+    runtime: "运行时默认",
+    codex_user: "Codex 用户配置",
+    codex_default: "Codex / 账号默认",
+  };
+  return source ? labels[source] ?? source : "来源未记录";
+}
+
+function modelSettingText(
+  value: string | null | undefined,
+  source: string | null | undefined,
+  fallback = "模型默认",
+): string {
+  return `${value || fallback} · ${modelSettingSourceLabel(source)}`;
+}
+
+function modelExecutionModeLabel(mode?: string | null): string {
+  if (mode === "model") return "模型基座";
+  if (mode === "cli") return "Codex CLI";
+  return "历史运行未记录";
+}
+
+function modelFastModeLabel(mode?: string | null): string {
+  if (mode === "fast") return "快速";
+  if (mode === "standard") return "标准";
+  return mode || "模型默认";
+}
+
+function modelVerbosityLabel(verbosity?: string | null): string {
+  const labels: Record<string, string> = { low: "低", medium: "中", high: "高" };
+  return verbosity ? labels[verbosity] ?? verbosity : "模型默认";
+}
+
 function runTargetText(run: RunSummary): string {
   if (run.repository_id && run.change_request_number !== undefined && run.change_request_number !== null) {
     return `${run.repository_id} · #${run.change_request_number}`;
@@ -6234,6 +6269,22 @@ function AgentRunDetailDrawer(props: {
                       <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                       <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
                       <div><dt>Codex 会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
+                      <div><dt>执行模式</dt><dd>{modelExecutionModeLabel(detail.model_snapshot?.execution_mode)}</dd></div>
+                      <div><dt>模型</dt><dd>{detail.model_snapshot
+                        ? detail.model_snapshot.model ?? "Codex CLI / 账号默认（未固定模型）"
+                        : "历史运行未记录"}</dd></div>
+                      <div><dt>模型来源</dt><dd>{detail.model_snapshot
+                        ? modelSettingSourceLabel(detail.model_snapshot.model_source)
+                        : "—"}</dd></div>
+                      <div><dt>推理强度</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(detail.model_snapshot.reasoning_effort, detail.model_snapshot.reasoning_effort_source)
+                        : "—"}</dd></div>
+                      <div><dt>快速模式</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(modelFastModeLabel(detail.model_snapshot.fast_mode), detail.model_snapshot.fast_mode_source)
+                        : "—"}</dd></div>
+                      <div><dt>输出详细度</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(modelVerbosityLabel(detail.model_snapshot.verbosity), detail.model_snapshot.verbosity_source)
+                        : "—"}</dd></div>
                     </dl>
                   </details>
                   <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>

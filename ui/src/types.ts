@@ -385,6 +385,18 @@ export type RunSummary = {
   finished_at?: number | null;
 };
 
+export type AgentModelSnapshot = {
+  execution_mode: "cli" | "model";
+  model?: string | null;
+  model_source: "agent" | "runtime" | "codex_user" | "codex_default" | string;
+  reasoning_effort?: string | null;
+  reasoning_effort_source: string;
+  fast_mode?: string | null;
+  fast_mode_source: string;
+  verbosity?: string | null;
+  verbosity_source: string;
+};
+
 export type RunDetail = RunSummary & {
   prompt: string;
   environment: Record<string, string>;
@@ -392,6 +404,7 @@ export type RunDetail = RunSummary & {
   final_message?: string | null;
   thread_id?: string | null;
   usage?: Record<string, unknown>;
+  model_snapshot?: AgentModelSnapshot | null;
   children: RunSummary[];
 };
 

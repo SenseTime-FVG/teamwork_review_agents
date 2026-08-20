@@ -812,6 +812,89 @@ def test_service_shutdown_cancelled_run_reuses_attempt_and_run_id(tmp_path) -> N
     assert detail["cancel_source"] is None
 
 
+def test_agent_run_model_snapshot_is_persisted_and_updated_on_retry(tmp_path) -> None:
+    """运行详情应固化模型快照，业务失败重试时更新为本次设置。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = store.begin_agent_run(
+        proposed_run_id="model-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="model-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:12",
+        prompt="首次执行",
+        max_attempts=2,
+        model_snapshot={
+            "execution_mode": "cli",
+            "model": "gpt-first",
+            "model_source": "runtime",
+        },
+    )
+    assert first is not None
+    first_detail = store.get_run(first.run_id)
+    assert first_detail is not None
+    assert first_detail["model_snapshot"]["model"] == "gpt-first"
+
+    store.finish_agent_run(
+        AgentResult(
+            run_id=first.run_id,
+            root_run_id=first.root_run_id,
+            agent_name="reviewer",
+            status="failed",
+            error="首次失败",
+        )
+    )
+    retried = store.begin_agent_run(
+        proposed_run_id="unused-model-run",
+        root_run_id=None,
+        parent_run_id=None,
+        idempotency_key="model-retry",
+        event_id=None,
+        rule_name="review",
+        agent_name="reviewer",
+        resource_key="github:demo:12",
+        prompt="重试执行",
+        max_attempts=2,
+        model_snapshot={
+            "execution_mode": "model",
+            "model": "gpt-second",
+            "model_source": "agent",
+        },
+    )
+
+    assert retried is not None
+    assert retried.run_id == first.run_id
+    retried_detail = store.get_run(first.run_id)
+    assert retried_detail is not None
+    assert retried_detail["model_snapshot"] == {
+        "execution_mode": "model",
+        "model": "gpt-second",
+        "model_source": "agent",
+    }
+
+
+def test_initialize_adds_model_snapshot_to_existing_agent_runs(tmp_path) -> None:
+    """旧数据库缺少模型快照列时，初始化应执行兼容补列。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    with store.connect() as connection:
+        connection.execute("ALTER TABLE agent_runs DROP COLUMN model_snapshot")
+
+    store.initialize()
+
+    with store.connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(agent_runs)").fetchall()
+        }
+    assert "model_snapshot" in columns
+
+
 def test_manual_cancelled_run_is_not_automatically_reused(tmp_path) -> None:
     """管理员取消保持终态，不能由幂等重试自动恢复。"""
 

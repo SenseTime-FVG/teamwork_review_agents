@@ -253,6 +253,86 @@ def read_user_inherited_settings(
     ), None
 
 
+def resolve_agent_model_snapshot(
+    runtime: CodexRuntimeConfig,
+    agent: AgentConfig,
+    configured_home: Path | None = None,
+) -> dict[str, Any]:
+    """按实际继承顺序返回可持久化的 Agent 模型设置快照。"""
+
+    home = codex_home(configured_home)
+    user_model, _, _ = read_user_model(home)
+    inherited, _ = read_user_inherited_settings(home)
+
+    if agent.model:
+        model = agent.model
+        model_source = "agent"
+    elif runtime.model:
+        model = runtime.model
+        model_source = "runtime"
+    elif user_model:
+        model = user_model
+        model_source = "codex_user"
+    else:
+        model = None
+        model_source = "codex_default"
+
+    def inherited_value(key: str) -> str | None:
+        item = inherited.get(key)
+        value = item.get("value") if isinstance(item, dict) else None
+        return str(value) if value is not None else None
+
+    if agent.model_reasoning_effort:
+        reasoning_effort = agent.model_reasoning_effort
+        reasoning_effort_source = "agent"
+    elif runtime.model_reasoning_effort:
+        reasoning_effort = runtime.model_reasoning_effort
+        reasoning_effort_source = "runtime"
+    else:
+        reasoning_effort = inherited_value("model_reasoning_effort")
+        reasoning_effort_source = (
+            "codex_user" if reasoning_effort is not None else "codex_default"
+        )
+
+    if agent.fast_mode != "inherit":
+        fast_mode = agent.fast_mode
+        fast_mode_source = "agent"
+    elif runtime.fast_mode != "inherit":
+        fast_mode = runtime.fast_mode
+        fast_mode_source = "runtime"
+    else:
+        fast_mode = inherited_value("fast_mode") or "standard"
+        fast_mode_source = (
+            "codex_user"
+            if inherited_value("fast_mode") is not None
+            else "codex_default"
+        )
+
+    if agent.model_verbosity:
+        verbosity = agent.model_verbosity
+        verbosity_source = "agent"
+    elif runtime.model_verbosity:
+        verbosity = runtime.model_verbosity
+        verbosity_source = "runtime"
+    else:
+        verbosity = inherited_value("model_verbosity")
+        verbosity_source = (
+            "codex_user" if verbosity is not None else "codex_default"
+        )
+
+    return {
+        "execution_mode": runtime.execution_mode,
+        "model": model,
+        "model_source": model_source,
+        "reasoning_effort": reasoning_effort,
+        "reasoning_effort_source": reasoning_effort_source,
+        "fast_mode": fast_mode,
+        "fast_mode_source": fast_mode_source,
+        "verbosity": verbosity,
+        "verbosity_source": verbosity_source,
+    }
+
+
 def _codex_environment(home: Path | None) -> dict[str, str]:
     """为诊断命令构造与后台 Agent 一致的 Codex Home 环境。"""
 
