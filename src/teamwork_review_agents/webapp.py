@@ -868,6 +868,7 @@ def create_app(
             "timed_out",
             "error",
             "cancelled",
+            "superseded",
         ]
         | None = None,
         status_group: ExecutionStatusGroup | None = None,
@@ -975,6 +976,7 @@ def create_app(
                     "timed_out",
                     "error",
                     "cancelled",
+                    "superseded",
                 }
                 if terminal and not logs:
                     idle_after_terminal += 1

@@ -1157,6 +1157,36 @@ def test_overview_api_filters_status_repository_and_limit(
                 "payload": "live pytest output\n",
             }
         ]
+        superseded = store.begin_preflight_run(
+            proposed_run_id="web-preflight-superseded",
+            idempotency_key="second:2:web-preflight-superseded",
+            event_id=second_event.id,
+            repository_id="second",
+            number=2,
+            head_sha=second.head_sha,
+            config_revision="revision-web",
+            max_attempts=2,
+        )
+        assert superseded is not None
+        store.finish_preflight_run(
+            PreflightResult(
+                run_id=superseded.run_id,
+                repository_id="second",
+                number=2,
+                head_sha=second.head_sha,
+                status="superseded",
+                error="事件 Head 已被后续提交取代",
+            )
+        )
+        superseded_runs = client.get(
+            "/api/preflight-runs?status=superseded"
+        ).json()
+        assert [item["run_id"] for item in superseded_runs] == [superseded.run_id]
+        superseded_detail = client.get(
+            f"/api/preflight-runs/{superseded.run_id}"
+        ).json()
+        assert superseded_detail["status"] == "superseded"
+        assert superseded_detail["error"] == "事件 Head 已被后续提交取代"
         assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422
         assert client.get("/api/events?number=0").status_code == 422

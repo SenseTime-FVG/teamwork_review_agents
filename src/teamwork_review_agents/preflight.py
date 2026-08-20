@@ -27,7 +27,11 @@ from .subprocess_utils import (
     resolve_executable,
     selected_environment,
 )
-from .workspace import GitProgressEvent, temporary_change_request_worktree
+from .workspace import (
+    GitProgressEvent,
+    WorkspaceSnapshotSuperseded,
+    temporary_change_request_worktree,
+)
 
 
 SAFE_HOST_ENVIRONMENT = {
@@ -414,6 +418,8 @@ def _status_description(result: PreflightResult) -> str:
         return f"步骤 {result.failed_step or 'unknown'} 失败{suffix}"
     if result.status == "timed_out":
         return f"步骤 {result.failed_step or 'unknown'} 超时"
+    if result.status == "superseded":
+        return "事件 Head 已更新，本地 CI 已跳过"
     return "本地 CI 基础设施错误"
 
 
@@ -670,6 +676,9 @@ class PreflightExecutor:
     ) -> PreflightResult:
         """发布已持久化的终态；失败时返回可重试错误但保留本地终态。"""
 
+        if result.status == "superseded":
+            return result
+
         remote_state = {
             "success": "success",
             "failure": "failure",
@@ -711,6 +720,8 @@ class PreflightExecutor:
         key = preflight_idempotency_key(self.config, event)
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
+            if cached.status == "superseded":
+                return cached.model_copy(update={"reused": True})
             if cached.status_published:
                 await self._sync_failure_comment_safely(repository, cached)
                 return cached.model_copy(update={"reused": True})
@@ -790,13 +801,6 @@ class PreflightExecutor:
                     event_type="output",
                 )
 
-            await self._set_remote_status(
-                repository,
-                event.new.head_sha,
-                state="pending",
-                description="本地 CI 正在运行",
-            )
-
             def record_git_progress(git_event: GitProgressEvent) -> None:
                 """从 Git 工作线程写入脱敏阶段，不保存认证和命令输出。"""
 
@@ -823,6 +827,12 @@ class PreflightExecutor:
             checkout: Path | None = None
             try:
                 checkout = await asyncio.to_thread(manager.__enter__)
+                await self._set_remote_status(
+                    repository,
+                    event.new.head_sha,
+                    state="pending",
+                    description="本地 CI 正在运行",
+                )
                 cache_environment: dict[str, str] = {}
                 cache_path: str | None = None
                 if repository.preflight.cache_enabled:
@@ -869,6 +879,21 @@ class PreflightExecutor:
                 output=outcome.output,
                 error=outcome.error,
             )
+        except WorkspaceSnapshotSuperseded as exc:
+            await self._append_log(
+                reservation.run_id,
+                str(exc),
+                stream="system",
+                event_type="superseded",
+            )
+            result = PreflightResult(
+                run_id=reservation.run_id,
+                repository_id=repository.id,
+                number=event.number,
+                head_sha=event.new.head_sha,
+                status="superseded",
+                error=str(exc),
+            )
         except Exception as exc:
             await self._append_log(
                 reservation.run_id,
@@ -896,4 +921,6 @@ class PreflightExecutor:
             },
             event_type="completed",
         )
+        if result.status == "superseded":
+            return result
         return await self._publish_terminal_result(repository, result)

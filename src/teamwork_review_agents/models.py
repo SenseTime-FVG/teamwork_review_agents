@@ -126,6 +126,7 @@ class PreflightResult(BaseModel):
         "timed_out",
         "error",
         "cancelled",
+        "superseded",
     ]
     failed_step: str | None = None
     exit_code: int | None = None

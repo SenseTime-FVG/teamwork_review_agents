@@ -588,6 +588,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-status-dot[data-status="failure"], .run-status-dot[data-status="error"] { background: var(--red); }
 .run-status-dot[data-status="success"] { background: var(--accent); }
 .run-status-dot[data-status="cancelled"] { background: var(--orange); }
+.run-status-dot[data-status="superseded"] { background: #66758a; }
 .run-drawer-layer { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; }
 .run-drawer-layer-inactive > .run-drawer-backdrop, .run-drawer-layer-inactive > .run-drawer { pointer-events: none; }
 .run-drawer-backdrop { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(2, 6, 11, .72); cursor: default; animation: drawer-fade-in .2s ease both; }

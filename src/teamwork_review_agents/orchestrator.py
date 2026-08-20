@@ -636,6 +636,12 @@ class Orchestrator:
                                 matched_event_ids.update(
                                     event.id for event in invocation.events
                                 )
+                        elif preflight_result.status == "superseded":
+                            ready_preflight_invocations = []
+                            for invocation in preflight_invocations:
+                                matched_event_ids.update(
+                                    event.id for event in invocation.events
+                                )
                         elif preflight_result.status != "success":
                             summary.preflight_errors += 1
                             ready_preflight_invocations = []

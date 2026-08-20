@@ -29,6 +29,18 @@ class WorkspaceCancelled(WorkspaceError):
     """表示管理员在 Git 工作区准备期间取消了运行。"""
 
 
+class WorkspaceSnapshotSuperseded(WorkspaceError):
+    """表示事件快照提交已被远端更新取代且无法再获取。"""
+
+    def __init__(self, expected_head: str, current_head: str) -> None:
+        self.expected_head = expected_head
+        self.current_head = current_head
+        super().__init__(
+            "事件 Head 已被后续提交取代，跳过旧快照："
+            f"期望 {expected_head}，当前 {current_head}"
+        )
+
+
 GitCancelCheck = Callable[[], bool]
 RunWorkspaceKind = Literal["worktree", "clone"]
 
@@ -1008,32 +1020,64 @@ def prepare_change_request_workspace(
         cancel_check=cancel_check,
         progress_callback=progress_callback,
     )
-    if fetch_result.returncode != 0:
+    current_head = ""
+    if fetch_result.returncode == 0:
+        current_ref = _run_git(
+            ["-C", str(workspace), "rev-parse", destination_ref],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="读取变更请求当前提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        if current_ref.returncode == 0:
+            current_head = current_ref.stdout.strip()
+
+    existing_commit = _run_git(
+        ["-C", str(workspace), "cat-file", "-e", f"{snapshot.head_sha}^{{commit}}"],
+        check=False,
+        timeout_seconds=timeout_seconds,
+        operation="校验事件快照提交",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
+    if existing_commit.returncode != 0:
+        _run_git(
+            ["-C", str(workspace), "fetch", "origin", snapshot.head_sha],
+            check=False,
+            timeout_seconds=timeout_seconds,
+            operation="获取事件快照提交",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
         existing_commit = _run_git(
             ["-C", str(workspace), "cat-file", "-e", f"{snapshot.head_sha}^{{commit}}"],
             check=False,
             timeout_seconds=timeout_seconds,
-            operation="校验变更请求提交",
+            operation="复核事件快照提交",
             cancel_check=cancel_check,
             progress_callback=progress_callback,
         )
-        if existing_commit.returncode != 0:
-            raise WorkspaceError(
-                "无法获取 MR/PR 代码引用，请检查远端权限或平台引用格式"
-            )
-        _run_git(
-            [
-                "-C",
-                str(workspace),
-                "update-ref",
-                destination_ref,
-                snapshot.head_sha,
-            ],
-            timeout_seconds=timeout_seconds,
-            operation="校准变更请求引用",
-            cancel_check=cancel_check,
-            progress_callback=progress_callback,
+    if existing_commit.returncode != 0:
+        if current_head and current_head != snapshot.head_sha:
+            raise WorkspaceSnapshotSuperseded(snapshot.head_sha, current_head)
+        raise WorkspaceError(
+            "无法获取 MR/PR 事件快照提交，请检查远端权限、平台引用格式或提交是否仍可访问"
         )
+
+    _run_git(
+        [
+            "-C",
+            str(workspace),
+            "update-ref",
+            destination_ref,
+            snapshot.head_sha,
+        ],
+        timeout_seconds=timeout_seconds,
+        operation="固定变更请求事件提交",
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
+    )
     return destination_ref
 
 
@@ -1050,7 +1094,7 @@ def temporary_change_request_worktree(
 ) -> Iterator[Path]:
     """在临时 worktree 中检出准确的 MR/PR Head，并在退出时清理。"""
 
-    change_ref = prepare_change_request_workspace(
+    prepare_change_request_workspace(
         provider,
         repository,
         snapshot,
@@ -1073,7 +1117,7 @@ def temporary_change_request_worktree(
                 "add",
                 "--detach",
                 str(checkout),
-                change_ref,
+                snapshot.head_sha,
             ],
             timeout_seconds=timeout_seconds,
             operation="创建 Preflight 工作区",

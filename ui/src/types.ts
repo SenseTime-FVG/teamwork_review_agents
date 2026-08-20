@@ -440,7 +440,7 @@ export type EventRecord = {
   source_activity_id?: string | null;
   source_activity_type?: string | null;
   source_occurred_at?: string | null;
-  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | null;
+  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | "superseded" | null;
   preflight_run_id?: string | null;
   preflight_exit_code?: number | null;
   preflight_failed_step?: string | null;
@@ -484,7 +484,7 @@ export type EventPreflightSummary = {
   number: number;
   head_sha: string;
   config_revision: string;
-  status: "running" | "success" | "failure" | "timed_out" | "error";
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "superseded";
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;
@@ -515,7 +515,7 @@ export type PreflightRunSummary = {
   phase: string;
   cache_path?: string | null;
   cancel_requested: number | boolean;
-  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled";
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "superseded";
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;

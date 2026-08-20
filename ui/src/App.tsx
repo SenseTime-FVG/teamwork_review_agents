@@ -5285,6 +5285,9 @@ function eventStatusPresentation(event: EventRecord): {
   } else if (event.status === "completed" && event.preflight_status === "timed_out") {
     label = "本地 CI 超时";
     visualStatus = "failed";
+  } else if (event.status === "completed" && event.preflight_status === "superseded") {
+    label = "Head 已更新，已跳过";
+    visualStatus = "unmatched";
   } else if (event.status === "failed" && event.preflight_status === "error") {
     label = "本地 CI 异常";
   }
@@ -5452,8 +5455,17 @@ function preflightStatusLabel(status?: string | null): string {
     timed_out: "超时",
     error: "执行异常",
     cancelled: "已取消",
+    superseded: "Head 已更新，已跳过",
   };
   return status ? labels[status] ?? status : "未执行";
+}
+
+function preflightStatusClass(status: string): string {
+  if (status === "success") return "completed";
+  if (status === "running") return "processing";
+  if (status === "superseded") return "unmatched";
+  if (status === "cancelled") return "cancelled";
+  return "failed";
 }
 
 function preflightPhaseLabel(phase?: string | null): string {
@@ -5506,6 +5518,9 @@ function eventStatusExplanation(event: EventRecord): string {
   }
   if (event.preflight_status === "running") {
     return "本地 Preflight / CI 正在执行，规则将在检查结束后继续处理。";
+  }
+  if (event.preflight_status === "superseded") {
+    return "事件记录的 Head 已被后续提交取代且无法再获取，本次检查已跳过；同一 MR / PR 的后续事件会继续处理。";
   }
   if (["failure", "timed_out", "error"].includes(event.preflight_status ?? "")) {
     return event.preflight_reused
@@ -5752,7 +5767,7 @@ function EventDetailDrawer(props: {
                           <strong>{preflight.reused ? "复用历史结果" : "本批次新执行"}</strong>
                           <small>{preflight.failed_step ? `失败步骤：${preflight.failed_step}` : `开始于 ${timeText(preflight.started_at)}`}</small>
                         </span>
-                        <span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>
+                        <span className={`status-pill status-${preflightStatusClass(preflight.status)}`}>{preflightStatusLabel(preflight.status)}</span>
                         <span className="run-row-arrow" aria-hidden="true">›</span>
                       </button>
                     ))}
@@ -5932,7 +5947,7 @@ function PreflightRunDetailDrawer(props: {
             {detail && <p>{detail.repository_id} · {detail.number ? `#${detail.number}` : detail.branch ?? "默认分支"} · {detail.trigger_source === "manual" ? "手动执行" : detail.event_type ?? "事件检查"}</p>}
           </div>
           <div className="run-drawer-actions">
-            {detail && <span className={`status-pill status-${detail.status === "success" ? "completed" : detail.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(detail.status)}</span>}
+            {detail && <span className={`status-pill status-${preflightStatusClass(detail.status)}`}>{preflightStatusLabel(detail.status)}</span>}
             {detail?.trigger_source === "manual" && detail.status === "running" && (
               <button
                 type="button"
@@ -5972,7 +5987,7 @@ function PreflightRunDetailDrawer(props: {
                   <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                   <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
                   <div><dt>耗时</dt><dd>{durationText(detail.started_at, detail.finished_at)}</dd></div>
-                  <div><dt>平台状态回写</dt><dd>{detail.trigger_source === "manual" ? "手动 CI 不回写" : detail.status_published ? "成功" : "未完成"}</dd></div>
+                  <div><dt>平台状态回写</dt><dd>{detail.trigger_source === "manual" ? "手动 CI 不回写" : detail.status === "superseded" ? "Head 已更新，无需回写" : detail.status_published ? "成功" : "未完成"}</dd></div>
                 </dl>
                 {detail.error && <><h4>错误信息</h4><pre className="detail-pre detail-error">{detail.error}</pre></>}
                 <h4>命令步骤</h4>
@@ -6564,7 +6579,7 @@ function RunsView(props: {
                   <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
                   <span className="run-target-cell"><strong>{preflight.repository_id} · {preflight.number ? `#${preflight.number}` : preflight.branch ?? "默认分支"}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
                   <span className="run-source-cell"><strong>{preflight.trigger_source === "manual" ? "仓库手动执行" : preflight.event_type ?? "事件检查"}</strong><small>{preflight.trigger_source === "manual" ? "不触发 Agent、不回写 PR 状态" : preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
-                  <span className="run-status-cell"><span className={`status-pill status-${preflight.status === "success" ? "completed" : preflight.status === "running" ? "processing" : "failed"}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
+                  <span className="run-status-cell"><span className={`status-pill status-${preflightStatusClass(preflight.status)}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
                   <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
                   <span className="run-duration-cell"><strong>{durationText(preflight.started_at, preflight.finished_at)}</strong></span>
                   <span className="run-row-arrow" aria-hidden="true">›</span>

@@ -1599,15 +1599,28 @@ class StateStore:
                             WHEN status = 'running'
                             THEN CASE
                                 WHEN ? = 'cancelled' THEN '用户取消了手动 CI'
+                                WHEN ? = 'superseded'
+                                THEN '事件 Head 已更新，本步骤未执行'
                                 ELSE 'Preflight 已结束，但步骤未正常收尾'
                             END
-                            ELSE '前序步骤结束后未执行'
+                            ELSE CASE
+                                WHEN ? = 'superseded'
+                                THEN '事件 Head 已更新，本步骤未执行'
+                                ELSE '前序步骤结束后未执行'
+                            END
                         END
                     ),
                     finished_at = ?
                 WHERE run_id = ? AND status IN ('pending', 'running')
                 """,
-                (result.status, result.status, finished_at, result.run_id),
+                (
+                    result.status,
+                    result.status,
+                    result.status,
+                    result.status,
+                    finished_at,
+                    result.run_id,
+                ),
             )
 
     def mark_preflight_status_published(self, run_id: str) -> None:

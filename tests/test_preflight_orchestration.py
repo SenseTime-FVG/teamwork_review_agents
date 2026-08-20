@@ -460,6 +460,103 @@ async def test_preflight_infrastructure_error_retries_without_running_agent(
     assert any("GitHub 状态 API 不可用" in error for error in summary.errors)
 
 
+async def test_superseded_preflight_completes_event_without_retrying_agent(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """被新 Head 取代的事件应终态跳过，并让资源队列继续向后处理。"""
+
+    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
+    event = enqueue_discovered(orchestrator, snapshot_factory)
+    agents = FakeAgentExecutor()
+    preflight = FakePreflightExecutor(
+        result(
+            "superseded",
+            error=f"事件 Head 已被后续提交取代：期望 {'a' * 40}，当前 {'b' * 40}",
+        )
+    )
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert agents.calls == []
+    assert preflight.calls == 1
+    assert orchestrator.store.pending_events() == []
+    record = orchestrator.store.list_events()[0]
+    assert record["status"] == "completed"
+    assert record["attempts"] == 1
+    assert record["error"] is None
+    assert summary.preflight_failures == 0
+    assert summary.preflight_errors == 0
+    assert summary.errors == []
+
+
+async def test_superseded_preflight_continues_with_newer_head_event(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """旧 Head 跳过后，同一变更请求的新 Head 批次必须在本轮继续执行。"""
+
+    config = preflight_config(tmp_path)
+    config.rules[0].events = [
+        "change_request.discovered",
+        "change_request.commits_changed",
+    ]
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    old_event = enqueue_discovered(orchestrator, snapshot_factory)
+    current = old_event.current_snapshot.model_copy(update={"head_sha": "c" * 40})
+    newer_events = detect_events(
+        old_event.current_snapshot,
+        current,
+        batch_id="newer-head-batch",
+    )
+    orchestrator.store.save_snapshot_and_events(current, newer_events)
+    agents = FakeAgentExecutor()
+
+    class SequencedPreflightExecutor:
+        def __init__(self) -> None:
+            self.heads: list[str] = []
+
+        async def ensure_passed(self, event):
+            self.heads.append(event.new.head_sha)
+            if len(self.heads) == 1:
+                return PreflightResult(
+                    run_id="preflight-old",
+                    repository_id=event.repository_id,
+                    number=event.number,
+                    head_sha=event.new.head_sha,
+                    status="superseded",
+                    error="事件 Head 已被后续提交取代",
+                )
+            return PreflightResult(
+                run_id="preflight-new",
+                repository_id=event.repository_id,
+                number=event.number,
+                head_sha=event.new.head_sha,
+                status="success",
+            )
+
+    preflight = SequencedPreflightExecutor()
+    orchestrator.executor = agents
+    orchestrator.preflight = preflight
+    summary = CycleSummary()
+
+    await orchestrator.process_events(summary)
+
+    assert preflight.heads == ["b" * 40, "c" * 40]
+    assert agents.calls == ["reviewer"]
+    assert orchestrator.store.pending_events() == []
+    records = {item["event_id"]: item for item in orchestrator.store.list_events()}
+    assert records[old_event.id]["status"] == "completed"
+    commits_event = next(
+        event for event in newer_events if event.type == "change_request.commits_changed"
+    )
+    assert records[commits_event.id]["status"] == "completed"
+    assert summary.preflight_errors == 0
+
+
 async def test_preflight_repository_emits_initial_event_without_global_opt_in(
     tmp_path,
     monkeypatch,

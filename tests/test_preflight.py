@@ -26,6 +26,7 @@ from teamwork_review_agents.preflight_cache import (
 )
 from teamwork_review_agents.preflight_manager import ManualPreflightManager
 from teamwork_review_agents.state import StateStore
+from teamwork_review_agents.workspace import WorkspaceSnapshotSuperseded
 
 
 async def test_preflight_stops_after_first_failed_step_and_preserves_output(tmp_path) -> None:
@@ -536,6 +537,96 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
     assert statuses == ["pending", "success"]
+
+
+async def test_preflight_superseded_head_is_terminal_and_not_published(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """不可获取的旧 Head 应一次收敛为已跳过，不执行命令或发布平台状态。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {
+                                "name": "never-run",
+                                "command": [sys.executable, "-c", "raise SystemExit(9)"],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    expected_head = "a" * 40
+    current_head = "b" * 40
+    event = detect_events(
+        None,
+        snapshot_factory(
+            provider="github-main",
+            repository_id="demo",
+            head_sha=expected_head,
+        ),
+        emit_initial=True,
+    )[0]
+
+    @contextmanager
+    def superseded_worktree(*_args, **_kwargs):
+        raise WorkspaceSnapshotSuperseded(expected_head, current_head)
+        yield tmp_path
+
+    published: list[str] = []
+
+    async def record_status(*_args, state, **_kwargs):
+        published.append(state)
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        superseded_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = PreflightExecutor(config, store)
+    monkeypatch.setattr(executor, "_set_remote_status", record_status)
+
+    first = await executor.ensure_passed(event)
+    second = await executor.ensure_passed(event)
+
+    assert first.status == "superseded"
+    assert first.reused is False
+    assert second.status == "superseded"
+    assert second.reused is True
+    assert second.run_id == first.run_id
+    assert published == []
+    detail = store.get_preflight_run(first.run_id)
+    assert detail is not None
+    assert detail["attempts"] == 1
+    assert detail["status"] == "superseded"
+    assert detail["status_published"] == 0
+    assert detail["steps"][0]["status"] == "skipped"
+    assert "Head 已更新" in detail["steps"][0]["error"]
+    assert any(
+        log["event_type"] == "superseded"
+        for log in store.list_preflight_logs(first.run_id)
+    )
 
 
 async def test_preflight_retries_only_final_status_delivery(
