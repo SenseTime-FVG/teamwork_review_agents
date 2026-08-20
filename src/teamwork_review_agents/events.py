@@ -464,6 +464,7 @@ def detect_events(
         "updated_at",
         "title",
         "web_url",
+        "source_project",
         "target_head_sha",
     }
     changed_fields = tuple(

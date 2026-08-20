@@ -13,6 +13,156 @@ from teamwork_review_agents.providers.github import GitHubProvider
 from teamwork_review_agents.providers.gitlab import GitLabProvider
 
 
+async def test_github_snapshot_only_records_cross_fork_source_project() -> None:
+    """GitHub 只有跨 Fork PR 才应补充源仓库身份。"""
+
+    provider = GitHubProvider(
+        "github-main",
+        ProviderConfig(
+            kind="github",
+            base_url="https://api.github.com",
+            token_env="GITHUB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="github-main",
+        project="owner/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    detail = {
+        "number": 7,
+        "title": "跨 Fork 审核",
+        "state": "open",
+        "draft": False,
+        "mergeable": True,
+        "mergeable_state": "clean",
+        "head": {
+            "ref": "feature/review",
+            "sha": "a" * 40,
+            "repo": {"full_name": "owner/demo"},
+        },
+        "base": {"ref": "main", "repo": {"full_name": "owner/demo"}},
+        "labels": [],
+        "created_at": "2026-08-17T07:00:00Z",
+        "updated_at": "2026-08-17T08:00:00Z",
+        "html_url": "https://github.com/owner/demo/pull/7",
+    }
+
+    async def fake_get_json(_: str, **__: object) -> object:
+        return detail
+
+    async def fake_get_optional_json(
+        path: str,
+        default: object,
+        **__: object,
+    ) -> object:
+        if path.endswith("/reviews"):
+            return []
+        if path.endswith("/status"):
+            return {"state": "success"}
+        return default
+
+    setattr(provider, "get_json", fake_get_json)
+    setattr(provider, "get_optional_json", fake_get_optional_json)
+    try:
+        same_repository = await provider._build_snapshot(
+            repository,
+            {"number": 7, "head": {"sha": "a" * 40}},
+        )
+        detail["head"]["repo"]["full_name"] = "fork-owner/demo"
+        cross_fork = await provider._build_snapshot(
+            repository,
+            {"number": 7, "head": {"sha": "a" * 40}},
+        )
+    finally:
+        await provider.close()
+
+    assert same_repository.source_project == ""
+    assert cross_fork.source_project == "fork-owner/demo"
+
+
+async def test_gitlab_snapshot_only_resolves_cross_project_source() -> None:
+    """GitLab 同项目 MR 不得额外查询源项目，跨项目时才解析身份。"""
+
+    provider = GitLabProvider(
+        "gitlab-main",
+        ProviderConfig(
+            kind="gitlab",
+            base_url="https://gitlab.example.com/api/v4",
+            token_env="GITLAB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="gitlab-main",
+        project="group/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    detail = {
+        "iid": 7,
+        "title": "跨项目审核",
+        "state": "opened",
+        "draft": False,
+        "source_branch": "feature/review",
+        "target_branch": "main",
+        "sha": "a" * 40,
+        "source_project_id": 101,
+        "target_project_id": 101,
+        "labels": [],
+        "created_at": "2026-08-17T07:00:00Z",
+        "updated_at": "2026-08-17T08:00:00Z",
+        "web_url": "https://gitlab.example.com/group/demo/-/merge_requests/7",
+    }
+    optional_paths: list[str] = []
+
+    async def fake_get_json(_: str, **__: object) -> object:
+        return detail
+
+    async def fake_get_optional_json(
+        path: str,
+        default: object,
+        **__: object,
+    ) -> object:
+        optional_paths.append(path)
+        if path.endswith("/approvals"):
+            return {"approved_by": []}
+        if path == "projects/202":
+            return {"path_with_namespace": "fork-group/demo"}
+        return default
+
+    setattr(provider, "get_json", fake_get_json)
+    setattr(provider, "get_optional_json", fake_get_optional_json)
+    try:
+        same_project = await provider._build_snapshot(
+            repository,
+            "group%2Fdemo",
+            {"iid": 7},
+        )
+        same_project_paths = list(optional_paths)
+        optional_paths.clear()
+        detail["source_project_id"] = 202
+        cross_project = await provider._build_snapshot(
+            repository,
+            "group%2Fdemo",
+            {"iid": 7},
+        )
+    finally:
+        await provider.close()
+
+    assert same_project.source_project == ""
+    assert same_project_paths == ["projects/group%2Fdemo/merge_requests/7/approvals"]
+    assert cross_project.source_project == "fork-group/demo"
+    assert optional_paths == [
+        "projects/group%2Fdemo/merge_requests/7/approvals",
+        "projects/202",
+    ]
+
+
 async def test_github_provider_auto_pages_and_honors_item_limit(snapshot_factory) -> None:
     """Provider 应自动翻页，但不能超过单仓库单轮数量上限。"""
 

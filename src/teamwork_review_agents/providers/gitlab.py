@@ -181,6 +181,24 @@ class GitLabProvider(BaseProvider):
         diff_refs = detail.get("diff_refs") or {}
         if not isinstance(diff_refs, dict):
             diff_refs = {}
+        source_project = ""
+        source_project_id = detail.get("source_project_id")
+        target_project_id = detail.get("target_project_id")
+        if (
+            source_project_id is not None
+            and target_project_id is not None
+            and str(source_project_id) != str(target_project_id)
+        ):
+            source_project_result = await self.get_optional_json(
+                f"projects/{quote(str(source_project_id), safe='')}",
+                {},
+            )
+            if isinstance(source_project_result, dict):
+                source_project = str(
+                    source_project_result.get("path_with_namespace") or ""
+                ).strip()
+            if not source_project:
+                source_project = str(source_project_id)
         return ChangeRequestSnapshot(
             provider=self.name,
             repository_id=repository.id,
@@ -191,6 +209,7 @@ class GitLabProvider(BaseProvider):
             source_branch=str(detail.get("source_branch") or ""),
             target_branch=str(detail.get("target_branch") or ""),
             head_sha=str(detail.get("sha") or diff_refs.get("head_sha") or ""),
+            source_project=source_project,
             labels=tuple(sorted(str(label) for label in detail.get("labels", []))),
             approvals=len(approved_by),
             pipeline_status=str(pipeline.get("status") or "unknown"),
