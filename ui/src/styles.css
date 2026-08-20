@@ -21,7 +21,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 72% -8%, #152338 0, transparent 38%), var(--bg); }
-button, input, select, textarea { font: inherit; }
+button, input, textarea { font: inherit; }
 button { color: inherit; }
 code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 
@@ -58,7 +58,6 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .config-editor-surface { min-width: 0; margin: 0; padding: 0; border: 0; }
 .config-editor-surface + .section-card { margin-top: 18px; }
 .config-editor-surface[disabled] input,
-.config-editor-surface[disabled] select,
 .config-editor-surface[disabled] textarea { color: #8997aa; background: #0b111a; cursor: default; opacity: .82; }
 .config-editor-surface[disabled] button,
 .config-editor-surface[disabled] .choice-card,
@@ -124,16 +123,16 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .overview-section-tools { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; }
 .overview-selection-actions { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .overview-list-controls { display: flex; flex: 0 1 auto; align-items: flex-end; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-.overview-list-controls label { min-width: 118px; display: flex; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
-.overview-list-controls label:first-child { min-width: 190px; }
-.overview-list-controls select, .overview-list-controls input { height: 34px; border: 1px solid #293647; border-radius: 7px; background: #0a111a; color: #aebccd; outline: none; padding: 0 9px; font-size: 10px; }
-.overview-list-controls select:focus, .overview-list-controls input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.overview-list-controls > label, .overview-list-controls > .select-field { min-width: 118px; display: flex; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
+.overview-list-controls > label:first-child, .overview-list-controls > .select-field:first-child { min-width: 190px; }
+.overview-list-controls .select-combobox-trigger, .overview-list-controls input { height: 34px; border-color: #293647; background: #0a111a; color: #aebccd; padding: 0 9px; font-size: 10px; }
+.overview-list-controls .select-combobox-trigger:focus-visible, .overview-list-controls input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .overview-list-controls .overview-number-filter { min-width: 92px; max-width: 112px; }
 .overview-list-controls .overview-custom-limit { min-width: 105px; }
 .overview-list-controls-numbered { width: min(100%, 880px); max-width: 880px; display: grid; flex: 1 1 700px; grid-template-columns: minmax(220px, 1fr) 92px 118px 118px; align-items: end; flex-wrap: nowrap; }
 .overview-list-controls-numbered.overview-list-controls-custom-limit { width: min(100%, 1000px); max-width: 1000px; grid-template-columns: minmax(190px, 1fr) 92px 112px 112px 118px; }
-.overview-list-controls-numbered label, .overview-list-controls-numbered label:first-child, .overview-list-controls-numbered .overview-number-filter, .overview-list-controls-numbered .overview-custom-limit { min-width: 0; max-width: none; }
-.overview-list-controls-numbered select, .overview-list-controls-numbered input { width: 100%; min-width: 0; }
+.overview-list-controls-numbered > label, .overview-list-controls-numbered > label:first-child, .overview-list-controls-numbered > .select-field, .overview-list-controls-numbered > .select-field:first-child, .overview-list-controls-numbered .overview-number-filter, .overview-list-controls-numbered .overview-custom-limit { min-width: 0; max-width: none; }
+.overview-list-controls-numbered .select-combobox, .overview-list-controls-numbered input { width: 100%; min-width: 0; }
 .latest-event-reference { min-width: 150px; display: flex; flex-direction: column; gap: 4px; }
 .latest-event-reference strong { color: #91d9b1; font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; font-weight: 600; white-space: nowrap; }
 .latest-event-reference small, .latest-event-empty { color: #66758a; font-size: 8px; white-space: nowrap; }
@@ -182,17 +181,17 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .form-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .field { min-width: 0; display: flex; flex-direction: column; gap: 7px; color: #8f9eb1; font-size: 11px; }
-.field input, .field select, .field textarea, .prompt-editor textarea, .env-row input, .env-row select { width: 100%; border: 1px solid #263243; border-radius: 7px; background: #090f18; color: var(--text); outline: none; padding: 9px 10px; transition: .15s ease; }
-.field input:focus, .field select:focus, .field textarea:focus, .prompt-editor textarea:focus, .env-row input:focus, .env-row select:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
-.field input:disabled { color: #718096; background: #0b111a; cursor: not-allowed; }
+.field input, .field textarea, .prompt-editor textarea, .env-row input { width: 100%; border: 1px solid #263243; border-radius: 7px; background: #090f18; color: var(--text); outline: none; padding: 9px 10px; transition: .15s ease; }
+.field input:focus, .field textarea:focus, .prompt-editor textarea:focus, .env-row input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.field input:disabled, .select-combobox-trigger:disabled { color: #718096; background: #0b111a; cursor: not-allowed; }
 .field small { color: #5f6d80; font-size: 9px; }
-.select-field.open { position: relative; z-index: 65; }
 .select-combobox { position: relative; min-width: 0; }
+.select-combobox.open { z-index: 65; }
 .select-combobox-trigger { width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid #263243; border-radius: 7px; outline: none; background: #090f18; color: var(--text); cursor: pointer; text-align: left; transition: .15s ease; }
 .select-combobox-trigger > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.select-combobox-trigger:hover, .select-combobox-trigger:focus-visible, .select-field.open .select-combobox-trigger { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.select-combobox-trigger:not(:disabled):hover, .select-combobox-trigger:focus-visible, .select-combobox.open .select-combobox-trigger { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .select-combobox-chevron { flex: 0 0 auto; color: #7f8da0; font-size: 15px; transition: transform .15s ease; }
-.select-field.open .select-combobox-chevron { color: var(--accent); transform: rotate(180deg); }
+.select-combobox.open .select-combobox-chevron { color: var(--accent); transform: rotate(180deg); }
 .select-combobox-options { position: absolute; z-index: 70; top: calc(100% + 6px); right: 0; left: 0; max-height: 250px; padding: 6px; overflow-y: auto; border: 1px solid #334256; border-radius: 9px; background: #0b121c; box-shadow: 0 18px 45px rgba(0, 0, 0, .5), inset 0 1px rgba(255, 255, 255, .025); }
 .select-combobox-options.open-upward { top: auto; bottom: calc(100% + 6px); }
 .select-combobox-option { width: 100%; min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 7px; padding: 9px 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #aab7c8; cursor: pointer; text-align: left; }
@@ -349,7 +348,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .agent-detail-actions { align-self: end; }
 .agent-detail-form, .rule-detail-form { padding: 22px; }
 .agent-detail-form > .card-list, .rule-detail-form > .card-list { gap: 0; }
-.agent-detail-surface[disabled] input, .agent-detail-surface[disabled] select, .agent-detail-surface[disabled] textarea { color: #8997aa; background: #0b111a; cursor: default; opacity: .82; }
+.agent-detail-surface[disabled] input, .agent-detail-surface[disabled] textarea { color: #8997aa; background: #0b111a; cursor: default; opacity: .82; }
 .agent-detail-surface[disabled] button, .agent-detail-surface[disabled] .choice-card, .agent-detail-surface[disabled] .file-button { pointer-events: none; cursor: default; opacity: .58; }
 .agent-detail-surface[disabled] .toggle.active span { background: #709080; }
 .codex-account-card { margin-top: 18px; }
@@ -387,7 +386,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 
 .env-list { display: flex; flex-direction: column; gap: 7px; }
 .env-row { display: grid; grid-template-columns: minmax(130px, 1.1fr) 102px minmax(170px, 1.6fr) auto auto auto 31px; align-items: center; gap: 7px; }
-.env-row input, .env-row select { padding: 8px 9px; font-size: 11px; }
+.env-row input, .env-row .select-combobox-trigger { padding: 8px 9px; font-size: 11px; }
+.env-row .select-combobox { width: 100%; }
 .env-name-cell { min-width: 0; }
 .credential-badge { display: inline-flex; margin-top: 4px; padding: 2px 6px; border: 1px solid #315f45; border-radius: 8px; background: #10271b; color: #77dca4; font-size: 8px; line-height: 1.2; }
 .provider-credential { align-items: start; padding: 6px; border: 1px solid #253d30; border-radius: 8px; background: rgba(16, 39, 27, .24); }
@@ -402,7 +402,9 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .provider-row { display: grid; grid-template-columns: 1fr .75fr 1.8fr 1.2fr; gap: 10px; align-items: start; }
 .prompt-editor { margin-top: 17px; padding: 15px; border: 1px solid var(--line-soft); border-radius: 9px; background: #090f18; }
 .prompt-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: #8998ab; font-size: 10px; }
-.prompt-toolbar select { margin-left: 6px; padding: 5px 7px; border: 1px solid #293546; border-radius: 5px; background: #101823; color: var(--text); }
+.prompt-source-picker { display: flex; align-items: center; gap: 6px; }
+.prompt-source-picker .select-combobox { min-width: 116px; }
+.prompt-source-picker .select-combobox-trigger { padding: 5px 7px; border-color: #293546; border-radius: 5px; background: #101823; }
 .prompt-toolbar code { color: #547460; font-size: 9px; }
 .prompt-editor textarea { resize: vertical; font: 400 11px/1.7 "SFMono-Regular", Consolas, monospace; }
 .permissions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
@@ -430,7 +432,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .choice-empty { padding: 18px 12px; border: 1px dashed #2a3646; border-radius: 8px; color: #68768a; text-align: center; font-size: 10px; line-height: 1.55; }
 .prompt-file-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: end; }
 .prompt-file-actions { display: flex; align-items: center; gap: 7px; }
-.prompt-file-actions select { min-width: 180px; padding: 9px 10px; border: 1px solid #263243; border-radius: 7px; background: #101823; color: var(--text); }
+.prompt-file-actions .prompt-file-select { min-width: 180px; }
+.prompt-file-actions .select-combobox-trigger { padding: 9px 10px; background: #101823; }
 .file-button { display: inline-flex; align-items: center; justify-content: center; }
 .file-button input { display: none; }
 .file-button.disabled { opacity: .45; pointer-events: none; }
@@ -569,12 +572,12 @@ tbody tr:last-child td { border-bottom: 0; }
 .runs-list { min-height: calc(100vh - 150px); }
 .runs-list .section-title-row { align-items: flex-end; }
 .runs-list-actions { display: flex; max-width: 76%; flex-wrap: wrap; align-items: flex-end; justify-content: flex-end; gap: 8px; }
-.runs-list-actions label { display: flex; min-width: 96px; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
+.runs-list-actions > label, .runs-list-actions > .select-field { display: flex; min-width: 96px; flex-direction: column; gap: 5px; color: #708096; font-size: 9px; }
 .runs-list-actions .runs-repository-filter { min-width: 210px; }
 .runs-list-actions .runs-number-filter { min-width: 82px; max-width: 98px; }
 .runs-list-actions .runs-custom-limit { min-width: 105px; }
-.runs-list-actions select, .runs-list-actions input { height: 34px; border: 1px solid #293647; border-radius: 7px; background: #0a111a; color: #aebccd; outline: none; padding: 0 9px; font-size: 10px; }
-.runs-list-actions select:focus, .runs-list-actions input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
+.runs-list-actions .select-combobox-trigger, .runs-list-actions input { height: 34px; border-color: #293647; background: #0a111a; color: #aebccd; padding: 0 9px; font-size: 10px; }
+.runs-list-actions .select-combobox-trigger:focus-visible, .runs-list-actions input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .run-table { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: #09101a; }
 .run-table-head, .run-row { display: grid; grid-template-columns: minmax(170px, 1.1fr) minmax(230px, 1.4fr) minmax(140px, .8fr) 165px 165px 90px 18px; gap: 14px; align-items: center; }
 .run-table-head { padding: 10px 14px; border-bottom: 1px solid var(--line); background: #0d1521; color: #627087; font-size: 9px; letter-spacing: .04em; }
@@ -863,8 +866,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .overview-section-tools { width: 100%; flex-direction: column; align-items: stretch; }
   .overview-selection-actions { width: 100%; }
   .overview-list-controls, .overview-list-controls-numbered, .overview-list-controls-numbered.overview-list-controls-custom-limit { width: 100%; max-width: none; display: grid; flex: none; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
-  .overview-list-controls label, .overview-list-controls label:first-child, .overview-list-controls .overview-number-filter, .overview-list-controls .overview-custom-limit { min-width: 0; max-width: none; }
-  .overview-list-controls-numbered > label:first-child { grid-column: 1 / -1; }
+  .overview-list-controls > label, .overview-list-controls > label:first-child, .overview-list-controls > .select-field, .overview-list-controls > .select-field:first-child, .overview-list-controls .overview-number-filter, .overview-list-controls .overview-custom-limit { min-width: 0; max-width: none; }
+  .overview-list-controls-numbered > label:first-child, .overview-list-controls-numbered > .select-field:first-child { grid-column: 1 / -1; }
   .overview-confirmation-layer { align-items: end; padding: 10px; }
   .overview-confirmation { width: 100%; max-height: calc(100vh - 20px); padding: 0 17px 17px; border-radius: 14px; }
   .overview-confirmation-head { grid-template-columns: 38px minmax(0, 1fr) 30px; gap: 11px; padding: 19px 0 16px; }
@@ -888,7 +891,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .skill-heading { grid-template-columns: 1fr; }
   .managed-skill { align-items: stretch; flex-direction: column; }
   .prompt-file-actions { align-items: stretch; flex-direction: column; }
-  .prompt-file-actions select, .prompt-file-actions .button { width: 100%; }
+  .prompt-file-actions .select-combobox, .prompt-file-actions .button { width: 100%; }
   .history-layout { grid-template-columns: 1fr; }
   .multi-choice-list { grid-template-columns: 1fr; }
   .env-row { grid-template-columns: 1fr 90px 1.3fr 31px; }
@@ -896,7 +899,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .prompt-toolbar { align-items: flex-start; flex-direction: column; gap: 8px; }
   .runs-list { min-height: auto; }
   .runs-list-actions { width: 100%; max-width: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; justify-content: stretch; }
-  .runs-list-actions label, .runs-list-actions .runs-repository-filter, .runs-list-actions .runs-number-filter, .runs-list-actions .runs-custom-limit { min-width: 0; max-width: none; }
+  .runs-list-actions > label, .runs-list-actions > .select-field, .runs-list-actions .runs-repository-filter, .runs-list-actions .runs-number-filter, .runs-list-actions .runs-custom-limit { min-width: 0; max-width: none; }
   .runs-list-actions .button { width: 100%; }
   .run-table { overflow: visible; border: 0; background: transparent; }
   .run-table-head { display: none; }
