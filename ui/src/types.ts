@@ -111,6 +111,7 @@ export type Agent = {
   max_concurrent_runs?: number;
   write_scopes?: Array<"change_request" | "workspace">;
   managed_comment?: boolean;
+  managed_comment_model_signature?: boolean;
   managed_comment_slot?: string;
   allowed_sub_agents?: string[];
   skills?: string[];

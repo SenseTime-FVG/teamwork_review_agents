@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from teamwork_review_agents.events import detect_events, detect_target_branch_event
 from teamwork_review_agents.managed_comments import ManagedCommentService
 from teamwork_review_agents.models import InvocationContext
@@ -199,3 +201,128 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     recreated = await service.publish_agent_comment(next_context, "新提交审核")
     assert recreated["action"] == "recreated"
     assert created == ["1", "2", "3"]
+
+
+async def test_agent_comment_model_signature_uses_persisted_run_snapshot(
+    snapshot_factory,
+    configured_app_factory,
+    monkeypatch,
+) -> None:
+    """模型签名必须来自当前运行快照，并在开关关闭时保持原正文。"""
+
+    config = configured_app_factory()
+    agent = config.agents["security-reviewer"]
+    agent.managed_comment = True
+    agent.managed_comment_model_signature = True
+    agent.managed_comment_slot = "stable-review-slot"
+    agent.write_scopes = ["change_request"]
+    store = StateStore(config.database.path)
+    store.initialize()
+    snapshots = {
+        "run-codex": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+        },
+        "run-deepseek": {
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": None,
+        },
+        "run-default": None,
+    }
+    monkeypatch.setattr(
+        store,
+        "get_run",
+        lambda run_id: {"model_snapshot": snapshots[run_id]},
+    )
+    published_bodies: list[str] = []
+
+    async def fake_publish(**kwargs):
+        published_bodies.append(kwargs["body"])
+        return {"action": "created", "comment_id": "1", "source_generation": 1}
+
+    service = ManagedCommentService(config, store)
+    monkeypatch.setattr(service, "publish", fake_publish)
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0].model_copy(
+        update={"source_generation": 1}
+    )
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="security-reviewer",
+        run_id="run-codex",
+        root_run_id="run-codex",
+        event=event,
+    )
+
+    await service.publish_agent_comment(context, "Codex 审核结果")
+    await service.publish_agent_comment(
+        context.model_copy(update={"run_id": "run-deepseek"}),
+        "DeepSeek 审核结果",
+    )
+    await service.publish_agent_comment(
+        context.model_copy(update={"run_id": "run-default"}),
+        "默认模型审核结果",
+    )
+    agent.managed_comment_model_signature = False
+    await service.publish_agent_comment(context, "不附加签名")
+
+    assert published_bodies == [
+        "Codex 审核结果\n\n---\n_模型：`gpt-5.6-sol (high)`_",
+        "DeepSeek 审核结果\n\n---\n_模型：`deepseek-v4-pro`_",
+        "默认模型审核结果\n\n---\n_模型：`Codex 账号默认（未记录具体模型）`_",
+        "不附加签名",
+    ]
+
+
+def test_model_signature_normalizes_untrusted_snapshot_text() -> None:
+    """模型快照中的空白和反引号不能破坏签名 Markdown。"""
+
+    signature = ManagedCommentService._format_model_signature(
+        {
+            "model": "custom`model\nnext",
+            "reasoning_effort": " very high ",
+        }
+    )
+    assert signature == "customˋmodel next (very high)"
+
+
+async def test_model_signature_counts_toward_comment_size_limit(
+    snapshot_factory,
+    configured_app_factory,
+    monkeypatch,
+) -> None:
+    """签名必须计入远端评论的最终 60 KiB 限制。"""
+
+    config = configured_app_factory()
+    agent = config.agents["security-reviewer"]
+    agent.managed_comment = True
+    agent.managed_comment_model_signature = True
+    agent.managed_comment_slot = "stable-review-slot"
+    agent.write_scopes = ["change_request"]
+    store = StateStore(config.database.path)
+    store.initialize()
+    monkeypatch.setattr(
+        store,
+        "get_run",
+        lambda _run_id: {
+            "model_snapshot": {
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+            }
+        },
+    )
+    service = ManagedCommentService(config, store)
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo")
+    event = detect_events(None, snapshot, emit_initial=True)[0].model_copy(
+        update={"source_generation": 1}
+    )
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="security-reviewer",
+        run_id="run-limit",
+        root_run_id="run-limit",
+        event=event,
+    )
+
+    with pytest.raises(ValueError, match="不能超过 60 KiB"):
+        await service.publish_agent_comment(context, "x" * (60 * 1024))

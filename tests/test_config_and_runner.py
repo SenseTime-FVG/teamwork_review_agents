@@ -394,10 +394,15 @@ def test_managed_comment_requires_stable_slot() -> None:
         {
             "prompt": "测试",
             "managed_comment": True,
+            "managed_comment_model_signature": True,
             "managed_comment_slot": "review-slot-1",
         }
     )
     assert agent.managed_comment_slot == "review-slot-1"
+    assert agent.managed_comment_model_signature is True
+
+    default_agent = AgentConfig.model_validate({"prompt": "测试"})
+    assert default_agent.managed_comment_model_signature is False
 
 
 @pytest.mark.parametrize(

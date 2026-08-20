@@ -320,6 +320,7 @@ function createEmptyAgent(): Agent {
     timeout_seconds: 1200,
     write_scopes: [],
     managed_comment: false,
+    managed_comment_model_signature: false,
     allowed_sub_agents: [],
     skills: [],
     environment: {},
@@ -4573,22 +4574,30 @@ function AgentsEditor(props: {
                     <strong>按源版本托管顶层评论</strong>
                     <p>目标分支变化时更新当前评论；源分支出现新提交或 force-push 时，为新的时间线代次追加评论。</p>
                   </div>
-                  <Toggle
-                    label="每个源版本代次只维护一条评论"
-                    checked={agent.managed_comment ?? false}
-                    onChange={(managed_comment) => update(name, {
-                      managed_comment,
-                      managed_comment_slot: managed_comment
-                        ? agent.managed_comment_slot ?? crypto.randomUUID()
-                        : agent.managed_comment_slot,
-                      write_scopes: managed_comment
-                        ? Array.from(new Set([...writeScopes, "change_request"])) as Agent["write_scopes"]
-                        : writeScopes,
-                    })}
-                  />
+                  <div className="managed-comment-toggles">
+                    <Toggle
+                      label="每个源版本代次只维护一条评论"
+                      checked={agent.managed_comment ?? false}
+                      onChange={(managed_comment) => update(name, {
+                        managed_comment,
+                        managed_comment_slot: managed_comment
+                          ? agent.managed_comment_slot ?? crypto.randomUUID()
+                          : agent.managed_comment_slot,
+                        write_scopes: managed_comment
+                          ? Array.from(new Set([...writeScopes, "change_request"])) as Agent["write_scopes"]
+                          : writeScopes,
+                      })}
+                    />
+                    <Toggle
+                      label="附加模型签名"
+                      checked={agent.managed_comment_model_signature ?? false}
+                      disabled={!(agent.managed_comment ?? false)}
+                      onChange={(managed_comment_model_signature) => update(name, { managed_comment_model_signature })}
+                    />
+                  </div>
                 </div>
                 <p className="network-permission-state">
-                  开启后，最终顶层评论必须调用 <code>publish_comment</code> 工具进行发布或更新；关闭不会删除历史评论。人工删除远端评论后，只有下次实际发布时才会重新创建。
+                  开启后，最终顶层评论必须调用 <code>publish_comment</code> 工具进行发布或更新；模型签名由服务端根据本轮运行快照自动追加。关闭不会删除历史评论。人工删除远端评论后，只有下次实际发布时才会重新创建。
                 </p>
               </section>
               <div className="permissions-grid">
