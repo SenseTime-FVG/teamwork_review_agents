@@ -59,6 +59,7 @@ type OverviewFilter = {
   repositoryId: string;
   number: string;
   status: string;
+  statuses: string[];
   limit: OverviewLimit;
   page: number;
 };
@@ -115,6 +116,7 @@ const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   repositoryId: "",
   number: "",
   status: "",
+  statuses: [],
   limit: 10,
   page: 1,
 };
@@ -362,7 +364,11 @@ function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   if (includeNumber && /^\d+$/.test(filter.number) && Number(filter.number) > 0) {
     parameters.set("number", filter.number);
   }
-  if (filter.status) parameters.set("status", filter.status);
+  if (filter.statuses.length > 0) {
+    filter.statuses.forEach((status) => parameters.append("status", status));
+  } else if (filter.status) {
+    parameters.set("status", filter.status);
+  }
   return parameters.toString();
 }
 
@@ -635,6 +641,193 @@ function SelectControl(props: {
   );
 }
 
+function MultiSelectControl(props: {
+  values: string[];
+  onChange: (values: string[]) => void;
+  options: SelectOption[];
+  allLabel: string;
+  ariaLabel?: string;
+  ariaLabelledBy?: string;
+  className?: string;
+  disabled?: boolean;
+}) {
+  const controlId = useId();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [openUpward, setOpenUpward] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const listboxId = `${controlId}-options`;
+  const menuOptions = useMemo(
+    () => [{ value: "", label: props.allLabel }, ...props.options],
+    [props.allLabel, props.options],
+  );
+  const selectedLabels = props.options
+    .filter((option) => props.values.includes(option.value))
+    .map((option) => option.label);
+  const triggerLabel = selectedLabels.length > 0
+    ? selectedLabels.join("、")
+    : props.allLabel;
+
+  useEffect(() => {
+    if (props.disabled) setOpen(false);
+  }, [props.disabled]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    const updatePlacement = () => {
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const bounds = trigger.getBoundingClientRect();
+      const spaceAbove = bounds.top;
+      const spaceBelow = window.innerHeight - bounds.bottom;
+      setOpenUpward(spaceBelow < menu.offsetHeight + 8 && spaceAbove > spaceBelow);
+    };
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    window.addEventListener("scroll", updatePlacement, true);
+    return () => {
+      window.removeEventListener("resize", updatePlacement);
+      window.removeEventListener("scroll", updatePlacement, true);
+    };
+  }, [menuOptions.length, open]);
+
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    document.getElementById(`${controlId}-option-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, controlId, open]);
+
+  function isSelected(value: string): boolean {
+    return value ? props.values.includes(value) : props.values.length === 0;
+  }
+
+  function openOptions(direction: "first" | "last" = "first") {
+    if (props.disabled || !menuOptions.length) return;
+    const selectedIndex = menuOptions.findIndex((option) => isSelected(option.value));
+    const fallbackIndex = direction === "last" ? menuOptions.length - 1 : 0;
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : fallbackIndex);
+    setOpen(true);
+  }
+
+  function toggleOption(index: number) {
+    const option = menuOptions[index];
+    if (!option) return;
+    if (!option.value) {
+      props.onChange([]);
+      return;
+    }
+    props.onChange(
+      props.values.includes(option.value)
+        ? props.values.filter((value) => value !== option.value)
+        : [...props.values, option.value],
+    );
+  }
+
+  return (
+    <div className={`select-combobox ${open ? "open" : ""} ${props.className ?? ""}`.trim()} ref={containerRef}>
+      <button
+        ref={triggerRef}
+        className="select-combobox-trigger"
+        type="button"
+        role="combobox"
+        aria-label={props.ariaLabel}
+        aria-labelledby={props.ariaLabelledBy}
+        aria-expanded={open}
+        aria-controls={listboxId}
+        aria-haspopup="listbox"
+        aria-activedescendant={open && activeIndex >= 0 ? `${controlId}-option-${activeIndex}` : undefined}
+        disabled={props.disabled}
+        onClick={() => {
+          if (open) setOpen(false);
+          else openOptions();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" || event.key === "Tab") {
+            setOpen(false);
+            return;
+          }
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            if (!open) {
+              openOptions(event.key === "ArrowUp" ? "last" : "first");
+              return;
+            }
+            const offset = event.key === "ArrowDown" ? 1 : -1;
+            setActiveIndex((current) => (
+              current < 0
+                ? 0
+                : (current + offset + menuOptions.length) % menuOptions.length
+            ));
+            return;
+          }
+          if (open && event.key === "Home") {
+            event.preventDefault();
+            setActiveIndex(0);
+            return;
+          }
+          if (open && event.key === "End") {
+            event.preventDefault();
+            setActiveIndex(menuOptions.length - 1);
+            return;
+          }
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (open) toggleOption(activeIndex);
+            else openOptions();
+          }
+        }}
+      >
+        <span>{triggerLabel}</span>
+        <span className="select-combobox-chevron" aria-hidden="true">⌄</span>
+      </button>
+      {open && (
+        <div
+          ref={menuRef}
+          id={listboxId}
+          className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
+          role="listbox"
+          aria-multiselectable="true"
+          aria-label={props.ariaLabel}
+          aria-labelledby={props.ariaLabelledBy}
+        >
+          {menuOptions.map((option, index) => {
+            const selected = isSelected(option.value);
+            return (
+              <button
+                id={`${controlId}-option-${index}`}
+                key={option.value || "__all__"}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${selected ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => toggleOption(index)}
+              >
+                <span className="select-combobox-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                <span>{option.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SelectField(props: {
   label: string;
   value: string;
@@ -657,6 +850,32 @@ function SelectField(props: {
         disabled={props.disabled}
       />
       {props.help && <small>{props.help}</small>}
+    </div>
+  );
+}
+
+function MultiSelectField(props: {
+  label: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+  options: SelectOption[];
+  allLabel: string;
+  className?: string;
+  disabled?: boolean;
+}) {
+  const fieldId = useId();
+
+  return (
+    <div className={`field select-field ${props.className ?? ""}`.trim()}>
+      <span id={`${fieldId}-label`}>{props.label}</span>
+      <MultiSelectControl
+        values={props.values}
+        onChange={props.onChange}
+        options={props.options}
+        allLabel={props.allLabel}
+        ariaLabelledBy={`${fieldId}-label`}
+        disabled={props.disabled}
+      />
     </div>
   );
 }
@@ -1248,6 +1467,7 @@ function OverviewListControls(props: {
   repositories: Repository[];
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
+  multiStatus?: boolean;
   showNumber?: boolean;
   onChange: (filter: OverviewFilter) => void;
 }) {
@@ -1316,15 +1536,25 @@ function OverviewListControls(props: {
           />
         </label>
       )}
-      <SelectField
-        label="状态"
-        value={props.filter.status}
-        onChange={(status) => props.onChange({ ...props.filter, status })}
-        options={[
-          { value: "", label: "全部状态" },
-          ...props.statuses,
-        ]}
-      />
+      {props.multiStatus ? (
+        <MultiSelectField
+          label="状态"
+          values={props.filter.statuses}
+          onChange={(statuses) => props.onChange({ ...props.filter, status: "", statuses })}
+          options={props.statuses}
+          allLabel="全部状态"
+        />
+      ) : (
+        <SelectField
+          label="状态"
+          value={props.filter.status}
+          onChange={(status) => props.onChange({ ...props.filter, status, statuses: [] })}
+          options={[
+            { value: "", label: "全部状态" },
+            ...props.statuses,
+          ]}
+        />
+      )}
       <SelectField
         label="展示"
         value={limitMode}
@@ -1684,6 +1914,7 @@ function Overview(props: {
               repositories={props.repositories}
               filter={props.changeRequestFilter}
               statuses={CHANGE_REQUEST_STATUS_OPTIONS}
+              multiStatus
               onChange={props.onChangeRequestFilterChange}
             />
           </div>
@@ -1784,7 +2015,9 @@ function Overview(props: {
           </table>
           {props.changeRequests.length === 0 && (
             <div className="empty">
-              {props.changeRequestFilter.repositoryId || props.changeRequestFilter.status
+              {props.changeRequestFilter.repositoryId
+                || props.changeRequestFilter.status
+                || props.changeRequestFilter.statuses.length > 0
                 ? "当前筛选条件下没有 MR / PR。"
                 : "尚未扫描到 MR / PR，请确认仓库已启用并执行扫描。"}
             </div>
