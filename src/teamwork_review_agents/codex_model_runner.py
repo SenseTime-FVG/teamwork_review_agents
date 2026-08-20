@@ -475,7 +475,8 @@ class CodexModelRunner:
             ),
         )
         tools = teamwork_function_tools(
-            allow_sub_agents=bool(agent.allowed_sub_agents)
+            allow_sub_agents=bool(agent.allowed_sub_agents),
+            allow_publish_comment=agent.managed_comment,
         )
         tool_executor = ModelToolExecutor(
             config=self.config,

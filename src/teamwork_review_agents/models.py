@@ -83,6 +83,7 @@ class ChangeEvent(BaseModel):
     source_activity_id: str | None = None
     source_activity_type: str | None = None
     source_occurred_at: datetime | None = None
+    source_generation: int = Field(default=1, ge=1)
 
     @property
     def resource_key(self) -> str:
@@ -119,6 +120,7 @@ class PreflightResult(BaseModel):
     repository_id: str
     number: int | None = None
     head_sha: str
+    source_generation: int = Field(default=1, ge=1)
     status: Literal[
         "running",
         "success",

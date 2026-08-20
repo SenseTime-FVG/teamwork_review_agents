@@ -15,8 +15,8 @@ from teamwork_review_agents.mcp_bridge import ManagedMcpBroker, call_bridge
 from teamwork_review_agents.models import InvocationContext
 
 
-async def test_mcp_proxy_only_exposes_invoke_agent() -> None:
-    """沙盒内代理应只暴露 invoke_agent，不直接装载业务配置。"""
+async def test_mcp_proxy_only_exposes_teamwork_gateway_tools() -> None:
+    """沙盒内代理应只暴露 Teamwork 网关工具，不直接装载业务配置。"""
 
     parameters = StdioServerParameters(
         command=sys.executable,
@@ -26,7 +26,10 @@ async def test_mcp_proxy_only_exposes_invoke_agent() -> None:
         async with ClientSession(*streams) as session:
             await session.initialize()
             tools = await session.list_tools()
-    assert [tool.name for tool in tools.tools] == ["invoke_agent"]
+    assert [tool.name for tool in tools.tools] == [
+        "invoke_agent",
+        "publish_comment",
+    ]
 
 
 async def test_mcp_bridge_delegates_validation_outside_sandbox(

@@ -906,13 +906,14 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
             if reject_comment:
                 raise RuntimeError("评论权限不足 provider-token")
             created.append(body)
-            return "101"
+            return str(100 + len(created))
 
         async def update_change_request_comment(
             self,
             _repository,
             _comment_id,
             body,
+            **_kwargs,
         ):
             updated.append(body)
             return True
@@ -921,12 +922,17 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
             self,
             _repository,
             comment_id,
+            **_kwargs,
         ):
             deleted.append(comment_id)
 
     monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
     monkeypatch.setattr(
         "teamwork_review_agents.preflight.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.managed_comments.create_provider",
         lambda *_args, **_kwargs: FakeProvider(),
     )
     executor = PreflightExecutor(config, store)
@@ -950,22 +956,84 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
     assert "provider-token" not in created[0]
     assert "********" in created[0]
     assert "仅显示末尾 12000 个字符" in created[0]
-    assert store.get_preflight_failure_comment("demo", 7) is not None
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    ) is not None
 
     await executor._sync_failure_comment_safely(repository, failure)
     assert len(created) == 1
-    assert updated == []
+    assert len(updated) == 1
 
     changed_failure = failure.model_copy(update={"output": "另一条失败信息"})
     await executor._sync_failure_comment_safely(repository, changed_failure)
-    assert len(updated) == 1
+    assert len(updated) == 2
+
+    next_generation_failure = failure.model_copy(
+        update={
+            "head_sha": "b" * 40,
+            "source_generation": 2,
+            "output": "新源版本仍然失败",
+        }
+    )
+    await executor._sync_failure_comment_safely(
+        repository,
+        next_generation_failure,
+    )
+    assert len(created) == 2
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    ) is not None
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=2,
+    ) is not None
+
+    next_generation_success = next_generation_failure.model_copy(
+        update={"status": "success", "output": "全部通过", "error": None}
+    )
+    await executor._sync_failure_comment_safely(
+        repository,
+        next_generation_success,
+    )
+    assert deleted == ["102"]
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    ) is not None
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=2,
+    ) is None
 
     success = failure.model_copy(
         update={"status": "success", "output": "全部通过", "error": None}
     )
     await executor._sync_failure_comment_safely(repository, success)
-    assert deleted == ["101"]
-    assert store.get_preflight_failure_comment("demo", 7) is None
+    assert deleted == ["102", "101"]
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    ) is None
 
     reject_comment = True
     comment_failure = await executor._publish_terminal_result(repository, failure)
@@ -979,4 +1047,4 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
 
     manual = failure.model_copy(update={"number": None})
     await executor._sync_failure_comment_safely(repository, manual)
-    assert len(created) == 1
+    assert len(created) == 2

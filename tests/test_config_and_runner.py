@@ -380,6 +380,26 @@ def test_agent_network_domains_are_normalized_and_validated() -> None:
             )
 
 
+def test_managed_comment_requires_stable_slot() -> None:
+    """启用托管顶层评论时必须配置稳定槽位。"""
+
+    with pytest.raises(ValueError, match="managed_comment_slot"):
+        AgentConfig.model_validate(
+            {
+                "prompt": "测试",
+                "managed_comment": True,
+            }
+        )
+    agent = AgentConfig.model_validate(
+        {
+            "prompt": "测试",
+            "managed_comment": True,
+            "managed_comment_slot": "review-slot-1",
+        }
+    )
+    assert agent.managed_comment_slot == "review-slot-1"
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -555,6 +575,75 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
         in command
     )
     assert command[-1] == "-"
+
+
+def test_runner_enables_managed_comment_tool(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """启用托管评论后，CLI 只额外开放 publish_comment。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    agent.managed_comment = True
+    agent.managed_comment_slot = "stable-review-slot"
+    agent.write_scopes = ["change_request"]
+    event_snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, event_snapshot, emit_initial=True)[0]
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="code-reviewer",
+        run_id="run-managed-comment",
+        root_run_id="run-managed-comment",
+        event=event,
+    )
+    command = CodexRunner(config).build_command(agent, repository, context)
+
+    assert (
+        'enabled_tools=["invoke_agent", "publish_comment"]'
+        in " ".join(command)
+    )
+
+
+def test_managed_comment_prompt_requires_publish_comment(
+    snapshot_factory,
+    configured_app_factory,
+) -> None:
+    """启用托管评论后，Prompt 必须禁止绕过受控工具发布总结。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    agent.managed_comment = True
+    agent.managed_comment_slot = "stable-review-slot"
+    agent.write_scopes = ["change_request"]
+    snapshot = snapshot_factory(
+        repository_id=repository.id,
+        provider=repository.provider,
+    )
+    from teamwork_review_agents.events import detect_events
+
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    prompt = AgentExecutor(config, StateStore(config.database.path)).build_prompt(
+        agent_name="code-reviewer",
+        event=event,
+        repository=repository,
+        task=None,
+        extra_context=None,
+        prompt_values={},
+        change_ref="refs/teamwork/change-requests/7/head",
+        actions=(event.type,),
+        target_head_sha="c" * 40,
+    )
+
+    assert "最终顶层评论必须调用 `publish_comment` 工具进行发布或更新" in prompt
+    assert "不得使用 `gh`、`glab` 或平台 API 另行发布顶层总结评论" in prompt
 
 
 def test_runner_forces_project_instruction_isolation_after_extra_args(

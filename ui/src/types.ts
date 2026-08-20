@@ -95,6 +95,8 @@ export type Agent = {
   idle_timeout_seconds?: number;
   max_concurrent_runs?: number;
   write_scopes?: Array<"change_request" | "workspace">;
+  managed_comment?: boolean;
+  managed_comment_slot?: string;
   allowed_sub_agents?: string[];
   skills?: string[];
   output_schema?: string;

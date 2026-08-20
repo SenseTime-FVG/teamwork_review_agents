@@ -22,6 +22,61 @@ class GitLabProvider(BaseProvider):
             "User-Agent": "teamwork-review-agents",
         }
 
+    async def create_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        number: int,
+        body: str,
+    ) -> str:
+        """通过 GitLab Notes API 创建 MR 顶层评论。"""
+
+        project = quote(repository.project, safe="")
+        payload = await self.post_json(
+            f"projects/{project}/merge_requests/{number}/notes",
+            {"body": body},
+        )
+        if not isinstance(payload, dict) or payload.get("id") is None:
+            raise ProviderError("GitLab MR 评论返回格式异常")
+        return str(payload["id"])
+
+    async def update_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+        body: str,
+        *,
+        number: int | None = None,
+    ) -> bool:
+        """更新已有 GitLab MR 评论；已被删除时交由调用方重建。"""
+
+        if number is None:
+            raise ProviderError("更新 GitLab MR 评论时必须提供变更请求编号")
+        project = quote(repository.project, safe="")
+        payload = await self.put_optional_json(
+            f"projects/{project}/merge_requests/{number}/notes/"
+            f"{quote(comment_id, safe='')}",
+            {"body": body},
+        )
+        return payload is not None
+
+    async def delete_change_request_comment(
+        self,
+        repository: RepositoryConfig,
+        comment_id: str,
+        *,
+        number: int | None = None,
+    ) -> None:
+        """删除 GitLab MR 评论；评论已不存在时按成功处理。"""
+
+        if number is None:
+            raise ProviderError("删除 GitLab MR 评论时必须提供变更请求编号")
+        project = quote(repository.project, safe="")
+        await self.delete_resource(
+            f"projects/{project}/merge_requests/{number}/notes/"
+            f"{quote(comment_id, safe='')}",
+            missing_ok=True,
+        )
+
     async def get_branch_head(
         self,
         repository: RepositoryConfig,

@@ -84,6 +84,8 @@ class GitHubProvider(BaseProvider):
         repository: RepositoryConfig,
         comment_id: str,
         body: str,
+        *,
+        number: int | None = None,
     ) -> bool:
         """更新已有 GitHub PR 评论；已被删除时交由调用方重建。"""
 
@@ -98,6 +100,8 @@ class GitHubProvider(BaseProvider):
         self,
         repository: RepositoryConfig,
         comment_id: str,
+        *,
+        number: int | None = None,
     ) -> None:
         """删除 GitHub PR 评论；评论已不存在时按成功处理。"""
 

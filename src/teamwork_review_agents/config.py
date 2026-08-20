@@ -366,6 +366,8 @@ class AgentConfig(BaseModel):
     idle_timeout_seconds: PositiveInt | None = None
     max_concurrent_runs: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
+    managed_comment: bool = False
+    managed_comment_slot: str | None = Field(default=None, min_length=1, max_length=128)
     allowed_sub_agents: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
     output_schema: Path | None = None
@@ -440,6 +442,21 @@ class AgentConfig(BaseModel):
 
         if bool(self.prompt_file) == bool(self.prompt):
             raise ValueError("Agent 必须且只能配置 prompt_file 或 prompt")
+        return self
+
+    @model_validator(mode="after")
+    def validate_managed_comment(self) -> "AgentConfig":
+        """启用托管评论时要求存在不会随 Agent 重命名变化的槽位。"""
+
+        if self.managed_comment and not self.managed_comment_slot:
+            raise ValueError("启用托管顶层评论时必须配置 managed_comment_slot")
+        if self.managed_comment_slot and re.fullmatch(
+            r"[A-Za-z0-9._:-]+",
+            self.managed_comment_slot,
+        ) is None:
+            raise ValueError(
+                "managed_comment_slot 只能包含字母、数字、点、下划线、冒号和短横线"
+            )
         return self
 
     @model_validator(mode="after")
@@ -589,6 +606,11 @@ class AppConfig(BaseModel):
             if agent.sandbox != "read-only" and "workspace" not in agent.write_scopes:
                 raise ValueError(
                     f"Agent {agent_name} 使用可写 sandbox，但没有声明 workspace 写作用域"
+                )
+            if agent.managed_comment and "change_request" not in agent.write_scopes:
+                raise ValueError(
+                    f"Agent {agent_name} 启用了托管顶层评论，"
+                    "但没有声明 change_request 写作用域"
                 )
 
         known_repositories = set(repository_ids)

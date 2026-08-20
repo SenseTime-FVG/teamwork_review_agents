@@ -24,7 +24,10 @@ async def test_mcp_server_lists_invoke_agent() -> None:
         async with ClientSession(*streams) as session:
             await session.initialize()
             tools = await session.list_tools()
-    assert [tool.name for tool in tools.tools] == ["invoke_agent"]
+    assert [tool.name for tool in tools.tools] == [
+        "invoke_agent",
+        "publish_comment",
+    ]
 
 
 async def test_mcp_rejects_agent_outside_allowlist(
