@@ -308,6 +308,11 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         newest.key,
     ]
     assert [
+        item["snapshot_key"] for item in store.list_snapshots(1, offset=1)
+    ] == [older.key]
+    assert store.count_snapshots() == 2
+    assert store.count_snapshots(repository_id="second", status="closed") == 1
+    assert [
         item["snapshot_key"]
         for item in store.list_snapshots(None, repository_id="second")
     ] == [older.key]
@@ -325,6 +330,9 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         older_event.id,
     ]
     assert store.list_events(1)[0]["event_id"] == newest_event.id
+    assert store.list_events(1, offset=1)[0]["event_id"] == older_event.id
+    assert store.count_events() == 2
+    assert store.count_events(repository_id="second", status="unmatched") == 1
     assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
     assert store.list_events(None, number=2)[0]["event_id"] == older_event.id
     assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id

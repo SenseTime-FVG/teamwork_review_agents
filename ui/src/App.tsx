@@ -54,6 +54,18 @@ type OverviewFilter = {
   number: string;
   status: string;
   limit: OverviewLimit;
+  page: number;
+};
+
+type OverviewPage = {
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+};
+
+type PaginatedOverviewResponse<T> = OverviewPage & {
+  items: T[];
 };
 
 type ExecutionTypeFilter = "all" | "agent" | "preflight";
@@ -98,6 +110,14 @@ const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   number: "",
   status: "",
   limit: 10,
+  page: 1,
+};
+
+const EMPTY_OVERVIEW_PAGE: OverviewPage = {
+  total: 0,
+  page: 1,
+  page_size: 10,
+  total_pages: 1,
 };
 
 const DEFAULT_EXECUTION_FILTER: ExecutionFilter = {
@@ -313,6 +333,7 @@ function dateTimeText(value?: string | null): string {
 
 function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   const parameters = new URLSearchParams();
+  parameters.set("page", String(filter.page));
   if (filter.limit === null) {
     parameters.set("all_records", "true");
   } else {
@@ -1303,6 +1324,37 @@ function OverviewListControls(props: {
   );
 }
 
+function OverviewPagination(props: {
+  page: OverviewPage;
+  onPageChange: (page: number) => void;
+}) {
+  const { page, onPageChange } = props;
+  return (
+    <nav className="overview-pagination" aria-label="列表分页">
+      <span>共 {page.total} 条</span>
+      <div className="overview-pagination-actions">
+        <button
+          type="button"
+          className="button secondary compact"
+          disabled={page.page <= 1}
+          onClick={() => onPageChange(page.page - 1)}
+        >
+          上一页
+        </button>
+        <span>第 {page.page} / {page.total_pages} 页</span>
+        <button
+          type="button"
+          className="button secondary compact"
+          disabled={page.page >= page.total_pages}
+          onClick={() => onPageChange(page.page + 1)}
+        >
+          下一页
+        </button>
+      </div>
+    </nav>
+  );
+}
+
 function OverviewConfirmationDialog(props: {
   model: OverviewConfirmation | null;
   busy: boolean;
@@ -1490,6 +1542,8 @@ function Overview(props: {
   repositories: Repository[];
   changeRequestFilter: OverviewFilter;
   eventFilter: OverviewFilter;
+  changeRequestPage: OverviewPage;
+  eventPage: OverviewPage;
   emittingKey: string;
   triggeringKeys: string[];
   selectionMode: boolean;
@@ -1503,6 +1557,8 @@ function Overview(props: {
   onTriggerSelected: (items: ChangeRequestRecord[]) => void;
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
+  onChangeRequestPageChange: (page: number) => void;
+  onEventPageChange: (page: number) => void;
 }) {
   const [selectedChangeRequest, setSelectedChangeRequest] = useState<ChangeRequestRecord | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
@@ -1685,6 +1741,10 @@ function Overview(props: {
             </div>
           )}
         </div>
+        <OverviewPagination
+          page={props.changeRequestPage}
+          onPageChange={props.onChangeRequestPageChange}
+        />
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -1739,6 +1799,10 @@ function Overview(props: {
             </div>
           )}
         </div>
+        <OverviewPagination
+          page={props.eventPage}
+          onPageChange={props.onEventPageChange}
+        />
       </section>
       <ChangeRequestDetailDrawer
         changeRequest={selectedChangeRequest}
@@ -6605,6 +6669,10 @@ export default function App() {
   const [preflightRuns, setPreflightRuns] = useState<PreflightRunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
+  const [changeRequestPage, setChangeRequestPage] = useState<OverviewPage>(
+    EMPTY_OVERVIEW_PAGE,
+  );
+  const [eventPage, setEventPage] = useState<OverviewPage>(EMPTY_OVERVIEW_PAGE);
   const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
     DEFAULT_OVERVIEW_FILTER,
   );
@@ -6616,6 +6684,7 @@ export default function App() {
   );
   const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
   const operationalRequestSequence = useRef(0);
+  const overviewRequestSequence = useRef(0);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
@@ -6664,12 +6733,23 @@ export default function App() {
   }, []);
 
   const refreshOverviewData = useCallback(async () => {
+    const requestSequence = overviewRequestSequence.current + 1;
+    overviewRequestSequence.current = requestSequence;
     const [nextEvents, nextChangeRequests] = await Promise.all([
-      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter, true)}`),
-      api<ChangeRequestRecord[]>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
+      api<PaginatedOverviewResponse<EventRecord>>(`/api/events?${overviewQuery(eventFilter, true)}`),
+      api<PaginatedOverviewResponse<ChangeRequestRecord>>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
     ]);
-    setEvents(nextEvents);
-    setChangeRequests(nextChangeRequests);
+    if (requestSequence !== overviewRequestSequence.current) return;
+    setEvents(nextEvents.items);
+    setChangeRequests(nextChangeRequests.items);
+    setEventPage(nextEvents);
+    setChangeRequestPage(nextChangeRequests);
+    if (nextEvents.page !== eventFilter.page) {
+      setEventFilter((current) => ({ ...current, page: nextEvents.page }));
+    }
+    if (nextChangeRequests.page !== changeRequestFilter.page) {
+      setChangeRequestFilter((current) => ({ ...current, page: nextChangeRequests.page }));
+    }
   }, [changeRequestFilter, eventFilter]);
 
   const load = useCallback(async () => {
@@ -6831,7 +6911,20 @@ export default function App() {
 
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
     cancelChangeRequestSelection();
-    setChangeRequestFilter(filter);
+    setChangeRequestFilter({ ...filter, page: 1 });
+  }
+
+  function changeOverviewEventFilter(filter: OverviewFilter) {
+    setEventFilter({ ...filter, page: 1 });
+  }
+
+  function changeOverviewChangeRequestPage(page: number) {
+    cancelChangeRequestSelection();
+    setChangeRequestFilter((current) => ({ ...current, page }));
+  }
+
+  function changeOverviewEventPage(page: number) {
+    setEventFilter((current) => ({ ...current, page }));
   }
 
   function toggleChangeRequestSelection(snapshotKey: string) {
@@ -7028,12 +7121,12 @@ export default function App() {
     const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
     setChangeRequestFilter((current) => (
       current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "" }
+        ? { ...current, repositoryId: "", page: 1 }
         : current
     ));
     setEventFilter((current) => (
       current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "" }
+        ? { ...current, repositoryId: "", page: 1 }
         : current
     ));
     setExecutionFilter((current) => (
@@ -7097,6 +7190,8 @@ export default function App() {
                   repositories={enabledRepositories}
                   changeRequestFilter={changeRequestFilter}
                   eventFilter={eventFilter}
+                  changeRequestPage={changeRequestPage}
+                  eventPage={eventPage}
                   emittingKey={emittingKey}
                   triggeringKeys={triggeringKeys}
                   selectionMode={changeRequestSelectionMode}
@@ -7109,7 +7204,9 @@ export default function App() {
                   onToggleSelection={toggleChangeRequestSelection}
                   onTriggerSelected={requestTriggerLatestEvents}
                   onChangeRequestFilterChange={changeOverviewChangeRequestFilter}
-                  onEventFilterChange={setEventFilter}
+                  onEventFilterChange={changeOverviewEventFilter}
+                  onChangeRequestPageChange={changeOverviewChangeRequestPage}
+                  onEventPageChange={changeOverviewEventPage}
                 />
               )}
               {configurableTab && (

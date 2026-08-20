@@ -822,6 +822,7 @@ class StateStore:
         self,
         limit: int | None = 100,
         *,
+        offset: int = 0,
         repository_id: str | None = None,
         number: int | None = None,
         status: str | None = None,
@@ -846,8 +847,8 @@ class StateStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
-            limit_clause = "LIMIT ?"
-            parameters.append(limit)
+            limit_clause = "LIMIT ? OFFSET ?"
+            parameters.extend((limit, max(0, offset)))
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -921,6 +922,36 @@ class StateStore:
             )
             results.append(summary)
         return results
+
+    def count_snapshots(
+        self,
+        *,
+        repository_id: str | None = None,
+        number: int | None = None,
+        status: str | None = None,
+    ) -> int:
+        """返回与快照列表筛选条件一致的记录总数。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if repository_id:
+            conditions.append("json_extract(payload, '$.repository_id') = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append(
+                "CAST(json_extract(payload, '$.number') AS INTEGER) = ?"
+            )
+            parameters.append(number)
+        if status:
+            conditions.append("json_extract(payload, '$.state') = ?")
+            parameters.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM snapshots {where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
 
     def get_change_request_detail(
         self,
@@ -2574,6 +2605,7 @@ class StateStore:
         self,
         limit: int | None = 50,
         *,
+        offset: int = 0,
         status: str | None = None,
         repository_id: str | None = None,
         number: int | None = None,
@@ -2598,8 +2630,8 @@ class StateStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
-            limit_clause = "LIMIT ?"
-            parameters.append(limit)
+            limit_clause = "LIMIT ? OFFSET ?"
+            parameters.extend((limit, max(0, offset)))
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -2704,6 +2736,38 @@ class StateStore:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_events(
+        self,
+        *,
+        status: str | None = None,
+        repository_id: str | None = None,
+        number: int | None = None,
+        event_id: str | None = None,
+    ) -> int:
+        """返回与事件列表筛选条件一致的记录总数。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            parameters.append(status)
+        if repository_id:
+            conditions.append("repository_id = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append("number = ?")
+            parameters.append(number)
+        if event_id:
+            conditions.append("event_id = ?")
+            parameters.append(event_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM event_inbox {where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
 
     def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
         """按需返回单个事件、Agent 调度和全部 CI 摘要。"""
