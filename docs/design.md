@@ -888,3 +888,19 @@ Windows 托管进程首次导入依赖、接受系统安全扫描并进入 FastA
 通用单选控件保留现有字段尺寸和布局密度，支持禁用状态、文本截断、当前选中标记、点击外部关闭，以及 Escape、Tab、方向键、Home、End、Enter 和空格键操作。控件继续使用 combobox / listbox / option 语义关联可访问名称；在配置只读状态或父级 `fieldset` 禁用时不得展开或修改值。
 
 运行时配置中已有的自定义枚举下拉与本次通用控件合并实现，避免两套定位和键盘逻辑继续分叉。多选列表、可搜索模型候选和普通文本输入保持现有实现。该调整只改变单选下拉的展示与交互，不改变概览筛选、分页、配置草稿、保存取消或后端配置结构。
+
+## 96. 模型 Provider、全局默认模型与配置页面重组
+
+模型执行后端不再由单一的 `runtime.codex.execution_mode` 全局决定。配置新增与代码托管平台 `providers` 明确分离的 `model_providers`，每个模型 Provider 使用稳定 ID、显示名称、驱动类型、启停状态、默认模型、模型目录和驱动专属参数。管理界面统一称为“Provider”，代码和配置中继续保留“平台 Provider”与“模型 Provider”的完整限定，避免 GitHub / GitLab 连接和模型上游发生名称冲突。
+
+`codex-cli` 是系统固定内置的模型 Provider：旧配置加载时自动补齐，首次使用时作为全局默认，不允许删除或改变驱动类型，但允许管理员停用。Codex Binary、Codex Home、期望版本、账户登录、账号模型目录、用户 MCP 继承和高级 Codex 配置都归入该 Provider 的详情。现有进程内 Codex OAuth 模型基座能力继续作为内置驱动保留。外部 API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 与 Gemini GenerateContent 协议，保存规范化 Base URL、API Key 凭据引用、请求超时、并发上限、默认参数以及自动发现或手工维护的模型目录。
+
+模型 API Key 与普通配置分离保存在运行数据目录的私有凭据存储中，配置文档和历史版本只保存凭据标识与脱敏状态。Provider 详情默认展示掩码；已通过管理 API 认证的管理员点击小眼睛时可按需读取明文，再次点击、关闭详情或刷新页面后立即从前端状态中清除。明文不得进入 Prompt、Agent 子进程环境、运行快照、应用日志、错误摘要或配置历史。替换和删除凭据使用原子写入；Windows 无法提供 POSIX 权限位时仍依赖本机管理 API 认证和数据目录访问控制。
+
+“运行时配置”页面删除。Codex 专属内容迁入 Provider；扫描、Web、并发、资源锁、Git 与工作区超时、保留期和 Teamwork 外层沙盒等模型无关设置迁入改名后的“全局配置与环境”。该页面增加全局默认模型，默认值为 `codex-cli` 与 Codex CLI 当前默认模型。全局模型身份由 `(provider_id, model_id)` 组成；模型 ID 留空表示使用所选 Provider 的默认模型，Codex CLI 再由能力诊断解析账号或用户配置中的动态默认。Agent 可以显式指定 Provider 与可选模型，也可以同时留空并继承全局默认，但不能产生只指定模型而 Provider 不明确的状态。
+
+有效模型解析顺序为 Agent 显式选择、全局默认选择、Codex CLI 有效配置或账号默认。Agent 列表、详情、编辑下拉、Provider 详情和运行详情必须同时展示继承来源与当前可解析的具体值，例如“继承全局默认（Codex CLI / gpt-5.6）”或“Codex CLI / CLI 默认模型（gpt-5.6）”；确实无法解析时显示明确原因，不伪造模型。运行创建或重试时继续固化真实 Provider、驱动、协议、模型和参数快照，配置随后变化不能改写历史记录。
+
+删除外部 API Provider 是一个原子引用迁移：如果全局默认引用它，则先把全局默认重置为 Codex CLI 的动态默认；所有显式引用它的 Agent 清空 Provider 与模型选择，转为继承迁移后的全局默认，然后才删除 Provider 与凭据。Codex CLI 当前已停用时仍完成引用回退，但新运行明确阻塞并提示重新启用或选择其他默认模型。停用不是删除，不改写全局默认或 Agent 引用；引用已停用 Provider 的新运行失败关闭，不能静默切换到其他模型。
+
+执行器按每次 Agent 的有效 Provider 选择 Runner，不能在服务加载时只创建一个全局 Runner。Codex CLI 继续走现有 CLI 生命周期；API 与 Codex OAuth 模型基座复用 Teamwork 的工具循环、工作区、Skill、sub-agent、取消、超时、脱敏和日志语义，只替换模型协议客户端。相同模型 ID 位于不同 Provider 时保持为不同身份，不照搬 TokenHub 的多上游自动路由；模型自动发现、Base URL 规范化、连接测试、掩码凭据和 Provider 级并发可以复用其经过验证的边界设计。

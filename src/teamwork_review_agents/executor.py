@@ -15,7 +15,6 @@ from .agent_workspace import (
 )
 from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
-from .codex_settings import resolve_agent_model_snapshot
 from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
     PromptRenderError,
@@ -26,6 +25,11 @@ from .environment import (
 from .locks import ResourceLease
 from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .model_tools import InvokeAgentStartedCallback
+from .model_provider_runtime import (
+    effective_agent_config,
+    resolve_model_selection,
+    resolve_model_snapshot,
+)
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
     CANCEL_SOURCE_SERVICE_SHUTDOWN,
@@ -124,6 +128,8 @@ class AgentExecutor:
     def __init__(self, config: AppConfig, store: StateStore) -> None:
         self.config = config
         self.store = store
+        self._provider_runners: dict[str, CodexRunner | CodexModelRunner] = {}
+        # 保留旧调用方读取 runner 的兼容视图；实际运行按每个 Agent 的 Provider 路由。
         self.runner = (
             CodexModelRunner(
                 config,
@@ -134,6 +140,27 @@ class AgentExecutor:
         )
         self.repositories = config.repository_map()
         self._shutdown_requested = threading.Event()
+
+    def _runner_for_provider(
+        self,
+        provider_id: str,
+    ) -> CodexRunner | CodexModelRunner:
+        """为模型 Provider 复用对应 Runner 实例。"""
+
+        runner = self._provider_runners.get(provider_id)
+        if runner is not None:
+            return runner
+        provider = self.config.model_providers[provider_id]
+        if provider.driver == "codex_cli":
+            runner = CodexRunner(self.config)
+        else:
+            runner = CodexModelRunner(
+                self.config,
+                provider_id=provider_id,
+                invoke_agent_callback=self._invoke_embedded_agent,
+            )
+        self._provider_runners[provider_id] = runner
+        return runner
 
     async def _invoke_embedded_agent(
         self,
@@ -408,13 +435,20 @@ class AgentExecutor:
 
         configured_repository = self.repositories[event.repository_id]
         provider = self.config.providers[configured_repository.provider]
-        agent = self.config.agents[agent_name]
+        configured_agent = self.config.agents[agent_name]
+        model_selection = resolve_model_selection(self.config, configured_agent)
+        agent = effective_agent_config(
+            self.config,
+            configured_agent,
+            model_selection,
+        )
         model_snapshot = await asyncio.to_thread(
-            resolve_agent_model_snapshot,
-            self.config.runtime.codex,
-            agent,
+            resolve_model_snapshot,
+            self.config,
+            configured_agent,
             self.config.runtime.codex_home,
         )
+        runner = self._runner_for_provider(model_selection.provider_id)
         proposed_run_id = str(uuid.uuid4())
         reservation = await asyncio.to_thread(
             self.store.begin_agent_run,
@@ -775,7 +809,14 @@ class AgentExecutor:
                         "run.started",
                         {
                             "agent_name": agent_name,
-                            "execution_mode": self.config.runtime.codex.execution_mode,
+                            "execution_mode": (
+                                "cli"
+                                if model_selection.provider.driver == "codex_cli"
+                                else "model"
+                            ),
+                            "provider_id": model_selection.provider_id,
+                            "provider_driver": model_selection.provider.driver,
+                            "model": model_selection.model,
                             "config_revision": self.config.revision,
                             "environment": audit_environment,
                             "workspace_mode": workspace_mode,
@@ -793,7 +834,7 @@ class AgentExecutor:
                         active_workspace=str(active_workspace),
                         event=event,
                     )
-                    result = await self.runner.run(
+                    result = await runner.run(
                         run_id=reservation.run_id,
                         root_run_id=reservation.root_run_id,
                         parent_run_id=reservation.parent_run_id,

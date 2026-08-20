@@ -22,11 +22,11 @@ database:
 #   # 启用仓库 Preflight 时，该仓库会自动产生首次事件，不受此开关影响。
 #   emit_initial_events: false
 
-# 可选：Codex Agent、sub-agent、重试和写资源锁参数。
+# 可选：Agent、sub-agent、重试、默认模型和写资源锁参数。
 # runtime:
-#   # 服务级根 Agent 全局并发上限；管理入口位于“全局环境”，默认 5。
+#   # 服务级根 Agent 全局并发上限；管理入口位于“全局配置与环境”，默认 5。
 #   max_concurrent_agents: 5
-#   # 当前 Agent 调度执行额度；管理入口位于“运行时配置”，与全局上限取较小值。
+#   # 当前 Agent 调度执行额度；与全局上限取较小值。
 #   agent_concurrency_limit: 5
 #   # 等待 MR/PR 或工作目录写锁的最长秒数。
 #   lock_timeout_seconds: 300
@@ -69,14 +69,14 @@ database:
 #     fail_closed: true
 #     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
 #     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。
-#   # Teamwork 使用 Codex CLI 或内嵌模型客户端时的默认参数；不会修改 config.toml。
+#   # 未显式配置 model_provider 的 Agent 继承这里的全局默认模型。
+#   # 初始默认使用不可删除的内置 Codex CLI Provider；model 留空时继续解析
+#   # Provider 默认模型以及 Codex CLI 账号或用户配置中的具体模型。
+#   default_model:
+#     provider: codex-cli
+#     # model: gpt-5.6-sol
+#   # Codex CLI 驱动专属参数；不会修改 config.toml。
 #   codex:
-#     # cli：保持当前 codex exec 完整运行时；model：Codex 只作为模型基座，
-#     # Teamwork 直接使用现有 OAuth 登录并负责命令、补丁和 sub-agent 工具。
-#     # model 不请求本机或外部 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
-#     execution_mode: cli
-#     # 可选：默认模型 ID。省略时继续使用 Codex 用户、仓库或账号默认值。
-#     model: gpt-5.6-sol
 #     # 可选：默认推理强度。具体可用值取决于模型，常见值如下。
 #     model_reasoning_effort: high
 #     # inherit：继承 Codex 配置；standard：显式关闭；fast：显式开启快速模式。
@@ -97,6 +97,33 @@ database:
 #   mcp_tool_timeout_seconds: 1800
 #   # 单次运行最多保留的 Codex JSONL 事件数。
 #   max_jsonl_events: 2000
+
+# 可选：模型执行 Provider。即使整段省略，系统也会自动补齐不可删除的 codex-cli。
+# API Key 不写入 YAML，而是在管理 UI 的“Provider”页单独保存；列表默认脱敏，
+# 只有管理员主动点击小眼睛时才临时返回明文。
+# model_providers:
+#   codex-cli:
+#     display_name: Codex CLI
+#     driver: codex_cli
+#     # 内置 Provider 可以停用，但不能删除；被停用时引用它的新运行会明确失败。
+#     enabled: true
+#     # 留空时使用 Codex CLI、账号或用户配置解析出的默认模型。
+#     # default_model: gpt-5.6-sol
+#
+#   openai-compatible:
+#     display_name: OpenAI Compatible
+#     # 可选 openai_responses、openai_chat_completions、anthropic_messages、
+#     # gemini_generate_content；协议必须与上游服务一致。
+#     driver: openai_responses
+#     enabled: true
+#     base_url: https://api.example.com
+#     default_model: example-model
+#     # 可手工填写，也可以在 Provider 页使用 API Key 检测并刷新。
+#     models:
+#       - example-model
+#     request_timeout_seconds: 120
+#     # 可选：限制这个 Provider 的并发模型请求。
+#     max_concurrency: 4
 
 # 管理 API 与 UI 的默认启动配置。
 web:
@@ -217,15 +244,19 @@ web:
 #     # 也可以引用运行服务的机器上已经存在的绝对目录。
 #     path: /opt/teamwork-skills/security-review
 
-# 内置 Codex CLI Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
+# 内置 Agent。键名是 Agent 唯一名称，由规则和 sub-agent 白名单引用。
 # 这里的定义会显示在首次启动的 UI 中，但只有启用规则后才会被自动触发。
 agents:
   general-reviewer:
     # prompt_file 和 prompt 必须且只能配置一个；相对路径以 config.yaml 为基准。
     # 这三个明确列出的文件是项目内置 Prompt，其他 prompts/ 文件仍被 Git 忽略。
     prompt_file: ./prompts/general-review.md
-    # 可选：model、model_reasoning_effort、fast_mode、model_verbosity、personality
-    # 和 web_search 可以覆盖 runtime.codex；省略时继承运行时或 Codex 默认设置。
+    # 可选：model_provider 与 model 共同覆盖全局默认模型；两者都省略时继承
+    # runtime.default_model。只指定 Provider 时使用该 Provider 的默认模型。
+    # model_provider: openai-compatible
+    # model: example-model
+    # model_reasoning_effort、fast_mode、model_verbosity、personality 和 web_search
+    # 可以继续覆盖 Provider 或 Codex CLI 驱动默认设置。
     # read-only：本地只读；workspace-write：允许写本次独立运行 clone（含其 .git）
     # 以及 Codex 权限档案定义的系统临时目录；基础仓库与真实 HOME 不会因此可写；
     # danger-full-access：完全访问，会绕过受限的 Teamwork 外层沙盒。

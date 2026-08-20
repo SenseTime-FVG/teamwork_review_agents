@@ -126,6 +126,7 @@ export type RepositoryGitDetail = {
 export type Agent = {
   prompt_file?: string;
   prompt?: string;
+  model_provider?: string;
   model?: string;
   model_reasoning_effort?: string;
   fast_mode?: "inherit" | "standard" | "fast";
@@ -171,7 +172,7 @@ export type ManagedSandboxConfig = {
 
 export type CodexInheritedSetting = {
   value?: string | null;
-  source: "codex" | "user" | "model" | "builtin" | "runtime" | "unknown";
+  source: "codex" | "user" | "model" | "builtin" | "runtime" | "provider" | "unknown";
   known: boolean;
 };
 
@@ -187,7 +188,48 @@ export type RuntimeConfig = Record<string, unknown> & {
   git_timeout_seconds?: number;
   agent_idle_timeout_seconds?: number;
   managed_sandbox?: ManagedSandboxConfig;
+  default_model?: {
+    provider: string;
+    model?: string | null;
+  };
   codex?: CodexRuntimeConfig;
+};
+
+export type ModelProviderDriver =
+  | "codex_cli"
+  | "codex_oauth"
+  | "openai_responses"
+  | "openai_chat_completions"
+  | "anthropic_messages"
+  | "gemini_generate_content";
+
+export type ModelProviderConfig = {
+  display_name: string;
+  driver: ModelProviderDriver;
+  enabled?: boolean;
+  base_url?: string;
+  default_model?: string;
+  models?: string[];
+  request_timeout_seconds?: number;
+  max_concurrency?: number | null;
+  model_reasoning_effort?: string;
+  model_verbosity?: "low" | "medium" | "high";
+  personality?: "none" | "friendly" | "pragmatic";
+};
+
+export type ModelProviderItem = ModelProviderConfig & {
+  id: string;
+  builtin: boolean;
+  deletable: boolean;
+  api_key_configured: boolean;
+  masked_key?: string | null;
+  referenced_agents: string[];
+  is_global_default: boolean;
+};
+
+export type ModelProviderSnapshot = {
+  providers: ModelProviderItem[];
+  default_model: { provider: string; model?: string | null };
 };
 
 export type CodexRuntimeOptions = {
@@ -330,6 +372,7 @@ export type ConfigDocument = {
   web: Record<string, unknown>;
   environment: { global: EnvironmentMap };
   providers: Record<string, Record<string, unknown>>;
+  model_providers: Record<string, ModelProviderConfig>;
   repositories: Repository[];
   skills: Record<string, Skill>;
   agents: Record<string, Agent>;
@@ -435,6 +478,10 @@ export type RunSummary = {
 
 export type AgentModelSnapshot = {
   execution_mode: "cli" | "model";
+  provider_id?: string;
+  provider_name?: string;
+  provider_driver?: ModelProviderDriver;
+  provider_enabled?: boolean;
   model?: string | null;
   model_source: "agent" | "runtime" | "codex_user" | "codex_default" | string;
   reasoning_effort?: string | null;
@@ -443,6 +490,8 @@ export type AgentModelSnapshot = {
   fast_mode_source: string;
   verbosity?: string | null;
   verbosity_source: string;
+  resolved_label?: string;
+  unresolved_reason?: string | null;
 };
 
 export type RunDetail = RunSummary & {

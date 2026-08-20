@@ -30,6 +30,9 @@ import type {
   EventDispatchDetail,
   EventRecord,
   ManualLatestEventBatchResponse,
+  ModelProviderConfig,
+  ModelProviderDriver,
+  ModelProviderSnapshot,
   PreflightRunDetail,
   PreflightRunSummary,
   Repository,
@@ -48,7 +51,7 @@ import type {
   Skill,
 } from "./types";
 
-type Tab = "overview" | "repositories" | "environment" | "skills" | "agents" | "rules" | "runtime" | "runs";
+type Tab = "overview" | "repositories" | "environment" | "model-providers" | "skills" | "agents" | "rules" | "runs";
 
 type OverviewLimit = number | null;
 
@@ -259,6 +262,13 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
   delete scannerInput.page_size;
   const runtimeInput = { ...(value.runtime ?? {}) };
   const codexInput = { ...(runtimeInput.codex ?? {}) };
+  const modelProviders = value.model_providers ?? {
+    "codex-cli": {
+      display_name: "Codex CLI",
+      driver: "codex_cli" as const,
+      enabled: true,
+    },
+  };
   return {
     database: value.database ?? { path: "../data/teamwork-review-agents.db" },
     scanner: {
@@ -288,6 +298,9 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
         fail_closed: true,
         ...(runtimeInput.managed_sandbox ?? {}),
       },
+      default_model: runtimeInput.default_model ?? {
+        provider: "codex-cli",
+      },
       codex: {
         execution_mode: "cli",
         fast_mode: "inherit",
@@ -304,6 +317,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
     },
     environment: { global: value.environment?.global ?? {} },
     providers: value.providers ?? {},
+    model_providers: modelProviders,
     repositories: value.repositories ?? [],
     skills: value.skills ?? {},
     agents: value.agents ?? {},
@@ -1875,9 +1889,29 @@ function Overview(props: {
 
 function GlobalEnvironment(props: {
   document: ConfigDocument;
+  codexOptions: CodexRuntimeOptions;
   onChange: (document: ConfigDocument) => void;
 }) {
   const protectedNames = providerCredentialNames(props.document);
+  const defaultSelection = props.document.runtime.default_model ?? { provider: "codex-cli" };
+  const defaultProvider = props.document.model_providers[defaultSelection.provider]
+    ?? props.document.model_providers["codex-cli"];
+  const providerModels = defaultProvider?.driver === "codex_cli" || defaultProvider?.driver === "codex_oauth"
+    ? props.codexOptions.models
+    : (defaultProvider?.models ?? []).map((model) => ({
+        slug: model,
+        display_name: model,
+        supported_reasoning_levels: [],
+        supports_fast_mode: false,
+      }));
+  const resolvedDefaultModel = defaultSelection.model
+    || defaultProvider?.default_model
+    || (defaultProvider?.driver === "codex_cli" || defaultProvider?.driver === "codex_oauth"
+      ? props.codexOptions.inherited_model.value
+      : undefined);
+  const defaultModelPlaceholder = defaultProvider?.driver === "codex_cli"
+    ? `CLI 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`
+    : `Provider 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`;
   function patchSection(section: "scanner" | "runtime" | "web", key: string, value: unknown) {
     props.onChange({
       ...props.document,
@@ -1886,6 +1920,38 @@ function GlobalEnvironment(props: {
   }
   return (
     <div className="page-stack">
+      <section className="section-card">
+        <div className="section-title-row">
+          <div>
+            <h2>全局默认模型</h2>
+            <p>所有没有显式选择模型的 Agent 都继承这里的 Provider 与具体模型。</p>
+          </div>
+        </div>
+        <div className="form-grid three">
+          <SelectField
+            label="默认 Provider"
+            value={defaultSelection.provider}
+            onChange={(provider) => patchSection("runtime", "default_model", { provider })}
+            options={Object.entries(props.document.model_providers).map(([id, provider]) => ({
+              value: id,
+              label: `${provider.display_name}${provider.enabled === false ? "（已停用）" : ""}`,
+            }))}
+            help="系统初始使用不可删除的 Codex CLI Provider"
+          />
+          <ModelField
+            id="global-default-model"
+            label="默认模型"
+            value={defaultSelection.model ?? ""}
+            placeholder={defaultModelPlaceholder}
+            models={providerModels}
+            onChange={(model) => patchSection("runtime", "default_model", {
+              provider: defaultSelection.provider,
+              model: model || undefined,
+            })}
+            help={`当前有效值：${defaultProvider?.display_name ?? defaultSelection.provider} / ${resolvedDefaultModel ?? "暂未解析"}`}
+          />
+        </div>
+      </section>
       <EnvironmentEditor
         title="全局环境变量"
         value={props.document.environment.global}
@@ -1900,6 +1966,10 @@ function GlobalEnvironment(props: {
           <Field label="配置检测（秒）" type="number" value={Number(props.document.web.config_poll_seconds)} onChange={(value) => patchSection("web", "config_poll_seconds", Number(value))} />
           <Field label="日志保留（天）" type="number" value={Number(props.document.web.log_retention_days)} onChange={(value) => patchSection("web", "log_retention_days", Number(value))} />
           <Field label="全局并发上限" type="number" value={Number(props.document.runtime.max_concurrent_agents ?? 5)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} help="默认 5；与运行时 Agent 并发数取较小值" />
+          <Field label="Agent 运行并发数" type="number" value={Number(props.document.runtime.agent_concurrency_limit ?? 5)} onChange={(value) => patchSection("runtime", "agent_concurrency_limit", Number(value))} help="与全局并发上限取较小值" />
+          <Field label="基础仓库初始化超时（秒）" type="number" value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)} onChange={(value) => patchSection("runtime", "repository_initialization_timeout_seconds", Number(value))} />
+          <Field label="Git 操作超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} />
+          <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
           <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
@@ -1910,6 +1980,346 @@ function GlobalEnvironment(props: {
           <small>只控制 discovered；扫描周期内真实发生的 opened、closed、reopened 等事件始终会记录。</small>
         </div>
       </section>
+      <section className="section-card">
+        <div className="section-title-row"><div><h2>Teamwork 外层沙盒</h2><p>供模型基座和受限 Agent 统一使用的跨平台执行边界。</p></div></div>
+        <div className="toggle-grid">
+          <Toggle
+            label="启用 Teamwork 托管外层沙盒"
+            checked={props.document.runtime.managed_sandbox?.enabled ?? true}
+            onChange={(enabled) => patchSection("runtime", "managed_sandbox", {
+              ...(props.document.runtime.managed_sandbox ?? {}),
+              enabled,
+            })}
+          />
+          <Toggle
+            label="能力不可用时失败关闭"
+            checked={props.document.runtime.managed_sandbox?.fail_closed ?? true}
+            disabled={!(props.document.runtime.managed_sandbox?.enabled ?? true)}
+            onChange={(fail_closed) => patchSection("runtime", "managed_sandbox", {
+              ...(props.document.runtime.managed_sandbox ?? {}),
+              fail_closed,
+            })}
+          />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+const MODEL_PROVIDER_DRIVER_OPTIONS: Array<{ value: ModelProviderDriver; label: string }> = [
+  { value: "openai_responses", label: "OpenAI Responses" },
+  { value: "openai_chat_completions", label: "OpenAI Chat Completions" },
+  { value: "anthropic_messages", label: "Anthropic Messages" },
+  { value: "gemini_generate_content", label: "Gemini GenerateContent" },
+  { value: "codex_oauth", label: "Codex OAuth 模型基座" },
+];
+
+function modelProviderDriverLabel(driver: ModelProviderDriver): string {
+  if (driver === "codex_cli") return "Codex CLI";
+  return MODEL_PROVIDER_DRIVER_OPTIONS.find((item) => item.value === driver)?.label ?? driver;
+}
+
+function ModelProvidersEditor(props: {
+  document: ConfigDocument;
+  savedDocument: ConfigDocument | null;
+  revision: string;
+  codexOptions: CodexRuntimeOptions;
+  editable: boolean;
+  onChange: (document: ConfigDocument) => void;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const providerIds = Object.keys(props.document.model_providers);
+  const [selectedId, setSelectedId] = useState("codex-cli");
+  const [snapshot, setSnapshot] = useState<ModelProviderSnapshot | null>(null);
+  const [visibleKey, setVisibleKey] = useState("");
+  const [keyInput, setKeyInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [connectionResult, setConnectionResult] = useState("");
+  const selected = props.document.model_providers[selectedId]
+    ?? props.document.model_providers[providerIds[0]];
+  const selectedSnapshot = snapshot?.providers.find((item) => item.id === selectedId);
+  const external = selected && !["codex_cli", "codex_oauth"].includes(selected.driver);
+
+  const reloadSnapshot = useCallback(async () => {
+    try {
+      setSnapshot(await api<ModelProviderSnapshot>("/api/model-providers"));
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "Provider 状态加载失败");
+    }
+  }, [props.onError]);
+
+  useEffect(() => {
+    void reloadSnapshot();
+  }, [props.revision, reloadSnapshot]);
+
+  useEffect(() => {
+    setVisibleKey("");
+  }, [props.revision]);
+
+  useEffect(() => {
+    if (!props.document.model_providers[selectedId]) {
+      setSelectedId(providerIds[0] ?? "codex-cli");
+    }
+  }, [providerIds, props.document.model_providers, selectedId]);
+
+  function updateProvider(patch: Partial<ModelProviderConfig>) {
+    if (!selected) return;
+    props.onChange({
+      ...props.document,
+      model_providers: {
+        ...props.document.model_providers,
+        [selectedId]: { ...selected, ...patch },
+      },
+    });
+  }
+
+  function addProvider() {
+    let index = 1;
+    while (props.document.model_providers[`provider-${index}`]) index += 1;
+    const id = `provider-${index}`;
+    props.onChange({
+      ...props.document,
+      model_providers: {
+        ...props.document.model_providers,
+        [id]: {
+          display_name: `API Provider ${index}`,
+          driver: "openai_responses",
+          enabled: true,
+          base_url: "https://api.openai.com",
+          request_timeout_seconds: 120,
+          models: [],
+        },
+      },
+    });
+    setSelectedId(id);
+  }
+
+  async function revealKey() {
+    if (visibleKey) {
+      setVisibleKey("");
+      return;
+    }
+    try {
+      const result = await api<{ api_key: string }>(`/api/model-providers/${encodeURIComponent(selectedId)}/key`);
+      setVisibleKey(result.api_key);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "API Key 查看失败");
+    }
+  }
+
+  async function replaceKey() {
+    if (!keyInput.trim()) return;
+    setBusy(true);
+    try {
+      const result = await api<ModelProviderSnapshot>(`/api/model-providers/${encodeURIComponent(selectedId)}/key`, {
+        method: "PUT",
+        body: JSON.stringify({ api_key: keyInput }),
+      });
+      setSnapshot(result);
+      setKeyInput("");
+      setVisibleKey("");
+      props.onNotice("API Key 已安全保存");
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "API Key 保存失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshModels() {
+    setBusy(true);
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument; model_providers: ModelProviderSnapshot }>(
+        `/api/model-providers/${encodeURIComponent(selectedId)}/refresh-models`,
+        { method: "POST", body: JSON.stringify({ revision: props.revision }) },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      setSnapshot(result.model_providers);
+      props.onNotice("模型目录已刷新");
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "模型目录刷新失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testConnection() {
+    setBusy(true);
+    setConnectionResult("");
+    try {
+      const result = await api<CodexConnectionTestResult & { provider_id: string }>(
+        `/api/model-providers/${encodeURIComponent(selectedId)}/connection-test`,
+        { method: "POST" },
+      );
+      setConnectionResult(`${result.model ?? "默认模型"} · ${result.elapsed_seconds.toFixed(2)} 秒 · ${result.reply}`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "Provider 连接测试失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteProvider() {
+    if (!selectedSnapshot?.deletable) return;
+    const impacts = [
+      selectedSnapshot.is_global_default ? "全局默认模型将回退到 Codex CLI" : "",
+      selectedSnapshot.referenced_agents.length
+        ? `${selectedSnapshot.referenced_agents.length} 个显式引用它的 Agent 将改为继承全局默认模型`
+        : "",
+    ].filter(Boolean).join("；");
+    const affected = impacts ? `；${impacts}` : "";
+    if (!window.confirm(`删除 ${selected.display_name}${affected}？`)) return;
+    setBusy(true);
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument; model_providers: ModelProviderSnapshot }>(
+        `/api/model-providers/${encodeURIComponent(selectedId)}`,
+        { method: "DELETE", body: JSON.stringify({ revision: props.revision }) },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      setSnapshot(result.model_providers);
+      setSelectedId("codex-cli");
+      setVisibleKey("");
+      props.onNotice("Provider 已删除，相关引用已回退");
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "Provider 删除失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!selected) return null;
+  const modelOptions = (selected.models ?? []).map((model) => ({
+    slug: model,
+    display_name: model,
+    supported_reasoning_levels: [],
+    supports_fast_mode: false,
+  }));
+  const selectedResolved = resolvedProviderModel(
+    props.document,
+    props.codexOptions,
+    selectedId,
+  );
+
+  return (
+    <div className="provider-layout">
+      <section className="section-card provider-list-card">
+        <div className="section-title-row">
+          <div><h2>Provider</h2><p>为不同 Agent 提供独立模型与执行协议。</p></div>
+          {props.editable && <button className="button secondary" type="button" onClick={addProvider}>新增 API Provider</button>}
+        </div>
+        <div className="provider-list">
+          {Object.entries(props.document.model_providers).map(([id, provider]) => (
+            <button key={id} type="button" className={id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(id); setVisibleKey(""); setConnectionResult(""); }}>
+              <span><strong>{provider.display_name}</strong><small>{modelProviderDriverLabel(provider.driver)} · {provider.enabled === false ? "已停用" : "已启用"}</small></span>
+              {id === "codex-cli" && <em>内置</em>}
+            </button>
+          ))}
+        </div>
+      </section>
+      <div className="page-stack provider-detail-stack">
+        <section className="section-card">
+          <div className="section-title-row">
+            <div><span className="eyebrow">{selectedId}</span><h2>{selected.display_name}</h2><p>{modelProviderDriverLabel(selected.driver)}</p></div>
+            <div className="button-group">
+              <button className="button secondary" type="button" disabled={busy || props.editable || !selectedSnapshot} onClick={() => void testConnection()}>{busy ? "处理中…" : "连接测试"}</button>
+              {selectedSnapshot?.deletable && <button className="button danger" type="button" disabled={busy || props.editable} onClick={() => void deleteProvider()}>删除</button>}
+            </div>
+          </div>
+          {connectionResult && <div className="alert success">{connectionResult}</div>}
+          <fieldset className="config-editor-surface" disabled={!props.editable}>
+            <div className="form-grid three">
+              <Field label="显示名称" value={selected.display_name} onChange={(display_name) => updateProvider({ display_name })} />
+              <SelectField
+                label="驱动协议"
+                value={selected.driver}
+                disabled={selectedId === "codex-cli"}
+                onChange={(driver) => updateProvider({ driver: driver as ModelProviderDriver })}
+                options={selectedId === "codex-cli"
+                  ? [{ value: "codex_cli", label: "Codex CLI（内置）" }]
+                  : MODEL_PROVIDER_DRIVER_OPTIONS}
+              />
+              <Toggle label="启用 Provider" checked={selected.enabled !== false} onChange={(enabled) => updateProvider({ enabled })} />
+              {external && <Field label="Base URL" value={selected.base_url ?? ""} onChange={(base_url) => updateProvider({ base_url })} placeholder="https://api.example.com" />}
+              <ModelField
+                id={`provider-model-${selectedId}`}
+                label="Provider 默认模型"
+                value={selected.default_model ?? ""}
+                placeholder={selectedResolved.defaultLabel}
+                models={selected.driver === "codex_cli" || selected.driver === "codex_oauth" ? props.codexOptions.models : modelOptions}
+                onChange={(default_model) => updateProvider({ default_model: default_model || undefined })}
+                help={`当前显示：${selected.display_name} / ${selected.default_model || selectedResolved.defaultLabel}`}
+              />
+              {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
+              {external && <Field label="并发上限（可选）" type="number" value={selected.max_concurrency ?? ""} onChange={(value) => updateProvider({ max_concurrency: value ? Number(value) : null })} />}
+              {external && (
+                <SelectField
+                  label="默认推理强度（可选）"
+                  value={selected.model_reasoning_effort ?? ""}
+                  onChange={(model_reasoning_effort) => updateProvider({ model_reasoning_effort: model_reasoning_effort || undefined })}
+                  options={[
+                    { value: "", label: "不向上游显式传递" },
+                    ...REASONING_LEVELS.map((value) => ({ value, label: value })),
+                  ]}
+                />
+              )}
+              {external && (
+                <SelectField
+                  label="默认输出详细度（可选）"
+                  value={selected.model_verbosity ?? ""}
+                  onChange={(model_verbosity) => updateProvider({ model_verbosity: model_verbosity ? model_verbosity as ModelProviderConfig["model_verbosity"] : undefined })}
+                  options={[
+                    { value: "", label: "使用 Provider / 模型默认" },
+                    { value: "low", label: "低" },
+                    { value: "medium", label: "中" },
+                    { value: "high", label: "高" },
+                  ]}
+                />
+              )}
+              {external && (
+                <SelectField
+                  label="默认交互风格（可选）"
+                  value={selected.personality ?? ""}
+                  onChange={(personality) => updateProvider({ personality: personality ? personality as ModelProviderConfig["personality"] : undefined })}
+                  options={[
+                    { value: "", label: "无 Provider 预设" },
+                    { value: "none", label: "无预设" },
+                    { value: "friendly", label: "友好" },
+                    { value: "pragmatic", label: "务实" },
+                  ]}
+                />
+              )}
+            </div>
+            {external && (
+              <label className="field provider-model-list-field">
+                <span>手工模型目录</span>
+                <textarea rows={5} value={(selected.models ?? []).join("\n")} onChange={(event) => updateProvider({ models: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean) })} placeholder="每行一个模型 ID" />
+                <small>保存 Provider 后可使用“检测并刷新模型”覆盖为上游目录。</small>
+              </label>
+            )}
+          </fieldset>
+        </section>
+        {external && (
+          <section className="section-card">
+            <div className="section-title-row"><div><h2>API Key</h2><p>默认脱敏；小眼睛仅在当前详情临时显示明文。</p></div><button className="button secondary" type="button" disabled={!selectedSnapshot?.api_key_configured} onClick={() => void revealKey()}>{visibleKey ? "隐藏明文" : "查看明文"}</button></div>
+            <div className="credential-value mono">{visibleKey || selectedSnapshot?.masked_key || "尚未配置"}</div>
+            <div className="form-grid two">
+              <Field label={selectedSnapshot?.api_key_configured ? "替换 API Key" : "API Key"} type="password" value={keyInput} onChange={setKeyInput} />
+              <div className="field-action"><button className="button secondary" type="button" disabled={busy || !selectedSnapshot || !keyInput.trim()} onClick={() => void replaceKey()}>安全保存</button><button className="button secondary" type="button" disabled={busy || props.editable || !selectedSnapshot?.api_key_configured} onClick={() => void refreshModels()}>检测并刷新模型</button></div>
+            </div>
+          </section>
+        )}
+        {selected.driver === "codex_cli" && (
+          <>
+            <CodexRuntimeEditor document={props.document} options={props.codexOptions} editable={props.editable} onChange={props.onChange} />
+            <CodexAccountCard
+              configuredHome={props.savedDocument?.runtime.codex_home ? String(props.savedDocument.runtime.codex_home) : undefined}
+              homeHasUnsavedChange={String(props.document.runtime.codex_home ?? "") !== String(props.savedDocument?.runtime.codex_home ?? "")}
+            />
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -1918,11 +2328,11 @@ function effectiveInheritedModel(
   document: ConfigDocument,
   options: CodexRuntimeOptions,
 ): { value?: string | null; label: string } {
-  const runtimeModel = document.runtime.codex?.model?.trim();
-  if (runtimeModel) {
+  const providerModel = document.model_providers["codex-cli"]?.default_model?.trim();
+  if (providerModel) {
     return {
-      value: runtimeModel,
-      label: `继承 Teamwork 运行时默认（${runtimeModel}）`,
+      value: providerModel,
+      label: `Codex CLI 默认模型（${providerModel}）`,
     };
   }
   if (options.codex_model) {
@@ -1935,8 +2345,63 @@ function effectiveInheritedModel(
   }
   return {
     value: null,
-    label: "继承 Codex CLI / 账号默认（UNK）",
+    label: "Codex CLI 默认模型（暂未解析）",
   };
+}
+
+function resolvedProviderModel(
+  document: ConfigDocument,
+  options: CodexRuntimeOptions,
+  providerId: string,
+  configuredModel?: string | null,
+): {
+  providerName: string;
+  model?: string;
+  concrete: string;
+  defaultLabel: string;
+  models: CodexRuntimeOptions["models"];
+} {
+  const provider = document.model_providers[providerId];
+  const codexProvider = provider?.driver === "codex_cli" || provider?.driver === "codex_oauth";
+  const model = configuredModel
+    || provider?.default_model
+    || (codexProvider ? options.inherited_model.value ?? undefined : undefined);
+  const concrete = model ?? (codexProvider
+    ? "暂未解析：Codex 配置与账号未返回具体模型"
+    : "暂未解析：Provider 未配置默认模型");
+  const models = codexProvider
+    ? options.models
+    : (provider?.models ?? []).map((item) => ({
+        slug: item,
+        display_name: item,
+        supported_reasoning_levels: [],
+        supports_fast_mode: false,
+      }));
+  return {
+    providerName: provider?.display_name ?? providerId,
+    model,
+    concrete,
+    defaultLabel: provider?.driver === "codex_cli"
+      ? `CLI 默认模型（${concrete}）`
+      : `Provider 默认模型（${concrete}）`,
+    models,
+  };
+}
+
+function agentModelDisplay(
+  document: ConfigDocument,
+  options: CodexRuntimeOptions,
+  agent: Agent,
+): string {
+  if (agent.model_provider) {
+    const resolved = resolvedProviderModel(document, options, agent.model_provider, agent.model);
+    return agent.model
+      ? `${resolved.providerName} / ${agent.model}`
+      : `${resolved.providerName} / ${resolved.defaultLabel}`;
+  }
+  const globalDefault = document.runtime.default_model ?? { provider: "codex-cli" };
+  const resolved = resolvedProviderModel(document, options, globalDefault.provider, globalDefault.model);
+  return `继承全局默认（${resolved.providerName} / ${resolved.concrete}）`;
 }
 
 type InheritedSettingKey = keyof CodexRuntimeOptions["inherited_settings"];
@@ -1973,6 +2438,7 @@ const SETTING_SOURCE_LABELS: Record<CodexInheritedSetting["source"], string> = {
   model: "模型默认",
   builtin: "Codex 默认",
   runtime: "运行时默认",
+  provider: "Provider 默认",
   unknown: "Codex / 模型默认",
 };
 
@@ -2018,7 +2484,19 @@ function runtimeInheritedSetting(
   key: InheritedSettingKey,
   model?: string | null,
   sandbox?: Agent["sandbox"],
+  provider?: ModelProviderConfig,
 ): CodexInheritedSetting {
+  if (provider && provider.driver !== "codex_cli" && provider.driver !== "codex_oauth") {
+    const providerValues: Partial<Record<InheritedSettingKey, string | undefined>> = {
+      model_reasoning_effort: provider.model_reasoning_effort,
+      fast_mode: "standard",
+      model_verbosity: provider.model_verbosity,
+      personality: provider.personality,
+      web_search: "disabled",
+    };
+    const value = providerValues[key];
+    return { value: value ?? null, source: "provider", known: Boolean(value) };
+  }
   const codex = document.runtime.codex ?? {};
   const explicitValue = codex[key];
   const hasExplicitValue = key === "fast_mode"
@@ -2046,7 +2524,7 @@ function agentInheritanceLabel(
   setting: CodexInheritedSetting,
 ): string {
   const value = settingValueLabel(key, setting);
-  if (value === "UNK") return "继承运行时默认（UNK）";
+  if (value === "UNK") return `继承 ${SETTING_SOURCE_LABELS[setting.source]}（UNK）`;
   return `继承运行时默认（${value} · ${SETTING_SOURCE_LABELS[setting.source]}）`;
 }
 
@@ -2068,12 +2546,10 @@ function CodexRuntimeEditor(props: {
   editable: boolean;
   onChange: (document: ConfigDocument) => void;
 }) {
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [connectionResult, setConnectionResult] = useState<CodexConnectionTestResult | null>(null);
-  const [connectionError, setConnectionError] = useState("");
   const codex = props.document.runtime.codex ?? {};
   const inherited = effectiveInheritedModel(props.document, props.options);
-  const selectedModel = codex.model || props.options.codex_model;
+  const selectedModel = props.document.model_providers["codex-cli"]?.default_model
+    || props.options.codex_model;
   const inheritedReasoning = baseInheritedSetting(
     props.options,
     "model_reasoning_effort",
@@ -2095,77 +2571,26 @@ function CodexRuntimeEditor(props: {
     patchRuntime({ codex: { ...codex, ...patch } });
   }
 
-  async function testConnection() {
-    if (testingConnection) return;
-    setTestingConnection(true);
-    setConnectionResult(null);
-    setConnectionError("");
-    try {
-      setConnectionResult(await api<CodexConnectionTestResult>("/api/codex/connection-test", { method: "POST" }));
-    } catch (reason) {
-      setConnectionError(reason instanceof Error ? reason.message : "Codex 连接测试失败");
-    } finally {
-      setTestingConnection(false);
-    }
-  }
-
   return (
     <div className="page-stack">
       <section className="section-card">
         <div className="section-title-row">
           <div>
-            <h2>Codex 运行方式与默认参数</h2>
-            <p>选择由 Codex CLI 托管完整 Agent，或只使用 Codex 模型并由 Teamwork 提供工具和运行环境。</p>
-          </div>
-          <div className="runtime-connection-test" aria-live="polite">
-            <button
-              type="button"
-              className="button secondary"
-              disabled={testingConnection}
-              onClick={() => { void testConnection(); }}
-            >
-              {testingConnection ? "连接测试中…" : "连接测试"}
-            </button>
-            <small>测试当前已保存配置</small>
-            {connectionResult && (
-              <span className="runtime-connection-result success">
-                {connectionResult.mode === "model" ? "模型基座" : "Codex CLI"}
-                {` · ${connectionResult.model ?? "默认模型"} · ${connectionResult.elapsed_seconds.toFixed(2)} 秒 · 回复：${connectionResult.reply}`}
-              </span>
-            )}
-            {connectionError && <span className="runtime-connection-result error">{connectionError}</span>}
+            <h2>Codex CLI 配置</h2>
+            <p>配置内置 Codex CLI 的命令、账号环境和驱动专属默认参数。</p>
           </div>
         </div>
         <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="runtime-mode-stack">
-          <div className="rule-option runtime-mode-option">
-            <Toggle
-              label="Codex 仅作为模型基座"
-              checked={(codex.execution_mode ?? "cli") === "model"}
-              onChange={(enabled) => patchCodex({ execution_mode: enabled ? "model" : "cli" })}
-            />
-            <p>
-              开启后不启动 <code>codex exec</code>，Teamwork 直接复用当前 Codex OAuth 登录并提供命令、补丁和 sub-agent 工具；
-              关闭后保持现有 Codex CLI 工具、MCP 与运行环境。
-            </p>
-          </div>
-          {(codex.execution_mode ?? "cli") === "model" && (
-            <div className="alert warning">
-              模型基座模式不会请求外部或本机 codex-api-service，也不继承 Codex CLI 内置工具和用户 MCP。
-              受限 Agent 必须成功启用下方 Teamwork 外层沙盒；默认模型需在本页、Agent 或 Codex config.toml 中明确配置。
-            </div>
-          )}
           <div className="agent-workspace-note">
             <strong>当前模型来源</strong>
             <span>
-              {inherited.label}。下面展示的是后台全局继承值；Agent 可以单独覆盖。
-              {(codex.execution_mode ?? "cli") === "cli"
-                ? "仓库中的 .codex/config.toml 仍可能参与 Codex 原生合并。"
-                : "模型基座模式只读取配置的顶层模型默认值，不执行仓库 Codex 配置。"}
+              {inherited.label}。Agent 未显式选择模型时由“全局配置与环境”的默认模型决定；
+              仓库中的 .codex/config.toml 仍可能参与 Codex CLI 原生合并。
             </span>
           </div>
           <div className="agent-workspace-note">
-            <strong>{(codex.execution_mode ?? "cli") === "model" ? "认证与沙盒 CLI" : "实际后台 CLI"}</strong>
+            <strong>实际后台 CLI</strong>
             <span>
               {props.options.binary.resolved_path ?? String(props.document.runtime.codex_binary ?? "codex")}
               {props.options.binary.version ? ` · ${props.options.binary.version}` : " · 版本无法识别"}
@@ -2199,49 +2624,6 @@ function CodexRuntimeEditor(props: {
             placeholder={props.options.binary.version ?? "例如 0.146.0"}
             onChange={(expected_codex_version) => patchRuntime({ expected_codex_version: expected_codex_version || undefined })}
             help="填写后版本不一致会阻止 Agent 启动"
-          />
-          <Field
-            label="基础仓库初始化超时（秒）"
-            type="number"
-            value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)}
-            onChange={(value) => patchRuntime({ repository_initialization_timeout_seconds: Number(value) })}
-            help="首次克隆基础仓库默认最多等待 30 分钟"
-          />
-          <Field
-            label="Git 操作超时（秒）"
-            type="number"
-            value={Number(props.document.runtime.git_timeout_seconds ?? 600)}
-            onChange={(value) => patchRuntime({ git_timeout_seconds: Number(value) })}
-            help="基础仓库就绪后，fetch、运行 clone 和 worktree 等命令默认最多等待 10 分钟"
-          />
-          <Field
-            label="默认无进展超时（秒）"
-            type="number"
-            value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)}
-            onChange={(value) => patchRuntime({ agent_idle_timeout_seconds: Number(value) })}
-            help="只由 stdout / JSONL 续期，重复 stderr 不会延长"
-          />
-          <Field
-            label="Agent 运行并发数"
-            type="number"
-            value={Number(props.document.runtime.agent_concurrency_limit ?? 5)}
-            onChange={(value) => patchRuntime({ agent_concurrency_limit: Number(value) })}
-            help={`默认 5；与全局并发上限 ${String(props.document.runtime.max_concurrent_agents ?? 5)} 取较小值`}
-          />
-          <ModelField
-            id="runtime-codex-models"
-            label="默认模型"
-            value={codex.model ?? ""}
-            placeholder={inherited.label}
-            models={props.options.models}
-            onChange={(model) => patchCodex({ model: model || undefined })}
-            help={
-              props.options.catalog_error
-                ? "无法读取模型目录，仍可手工填写模型 ID"
-                : props.options.catalog_source === "account_cache"
-                  ? "候选项来自当前 Codex 账号模型缓存"
-                  : "候选项来自当前服务使用的 Codex CLI 内置目录"
-            }
           />
           <SelectField
             label="默认推理强度"
@@ -2311,56 +2693,7 @@ function CodexRuntimeEditor(props: {
               { value: "cached", label: "缓存搜索" },
               { value: "live", label: "实时搜索" },
             ]}
-            help={(codex.execution_mode ?? "cli") === "model" ? "模型基座模式不提供 Codex 托管搜索工具，此项仅用于 CLI 模式" : undefined}
           />
-        </div>
-        </fieldset>
-      </section>
-      <section className="section-card">
-        <div className="section-title-row">
-          <div>
-            <h2>Teamwork 外层沙盒</h2>
-            <p>由 Teamwork 统一生成权限档案，再交给 Codex CLI 的 macOS、Linux / WSL 或 Windows 原生沙盒执行器。</p>
-          </div>
-        </div>
-        <fieldset className="config-editor-surface" disabled={!props.editable}>
-        <div className="agent-workspace-note">
-          <strong>当前能力</strong>
-          <span>
-            {props.options.managed_sandbox.platform}
-            {props.options.managed_sandbox.backend ? ` · ${props.options.managed_sandbox.backend}` : ""}
-            {props.options.managed_sandbox.available ? " · 可用" : " · 不可用"}
-            {props.options.managed_sandbox.error ? ` · ${props.options.managed_sandbox.error}` : ""}
-          </span>
-        </div>
-        <div className="toggle-grid">
-          <Toggle
-            label="启用 Teamwork 托管外层沙盒"
-            checked={props.document.runtime.managed_sandbox?.enabled ?? true}
-            onChange={(enabled) => patchRuntime({
-              managed_sandbox: {
-                ...(props.document.runtime.managed_sandbox ?? {}),
-                enabled,
-              },
-            })}
-          />
-          <small>受限 Agent 使用外层原生沙盒；完全访问模式仍是管理员主动选择的高风险直通模式。</small>
-          <Toggle
-            label="能力不可用时失败关闭"
-            checked={props.document.runtime.managed_sandbox?.fail_closed ?? true}
-            disabled={!(props.document.runtime.managed_sandbox?.enabled ?? true)}
-            onChange={(fail_closed) => patchRuntime({
-              managed_sandbox: {
-                ...(props.document.runtime.managed_sandbox ?? {}),
-                fail_closed,
-              },
-            })}
-          />
-          <small>
-            {(codex.execution_mode ?? "cli") === "model"
-              ? "模型基座模式没有 Codex 内层沙盒，因此受限 Agent 始终失败关闭，此开关只影响 CLI 模式。"
-              : "关闭后仅安全回退到 Codex 自身的同级沙盒，不会以宿主机完整权限启动。"}
-          </small>
         </div>
         </fieldset>
       </section>
@@ -2368,11 +2701,7 @@ function CodexRuntimeEditor(props: {
         <div className="section-title-row">
           <div>
             <h2>后台 MCP 能力隔离</h2>
-            <p>
-              {(codex.execution_mode ?? "cli") === "model"
-                ? "模型基座模式不加载任何用户 MCP，sub-agent 由 Teamwork 内部执行器直接调度；以下设置留给 CLI 模式。"
-                : "默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。"}
-            </p>
+            <p>默认关闭用户 Codex 配置中的 MCP，只保留 Teamwork sub-agent 网关；平台操作优先使用 MR / PR 输入、API、gh / glab 和本地工作区。</p>
           </div>
         </div>
         <fieldset className="config-editor-surface" disabled={!props.editable}>
@@ -2400,7 +2729,6 @@ function CodexRuntimeEditor(props: {
             <h2>高级 Codex 配置</h2>
             <p>
               使用 Codex 原生点号键。值按 JSON 编写；结构化字段、安全策略、MCP 和 Skill 不能在这里覆盖。
-              {(codex.execution_mode ?? "cli") === "model" ? " 模型基座模式不解释这些 CLI 高级项。" : ""}
             </p>
           </div>
         </div>
@@ -4483,7 +4811,7 @@ function AgentsEditor(props: {
   return (
     <section className={`section-card ${props.showOverview === false ? "agent-detail-form" : ""}`}>
       {props.showOverview !== false && <div className="section-title-row">
-        <div><h2>Agent</h2><p>每个 Agent 使用当前 Codex 运行模式执行，并可通过白名单调用其他 Agent。</p></div>
+        <div><h2>Agent</h2><p>每个 Agent 可独立选择模型 Provider，也可以继承全局默认模型。</p></div>
         <button className="button primary" onClick={() => {
           let index = allNames.length + 1;
           let name = `agent-${index}`;
@@ -4498,13 +4826,23 @@ function AgentsEditor(props: {
       <div className="card-list">
         {names.map((name) => {
           const agent = props.document.agents[name];
-          const agentModel = agent.model || inheritedModel.value;
+          const globalDefault = props.document.runtime.default_model ?? { provider: "codex-cli" };
+          const selectedProviderId = agent.model_provider ?? globalDefault.provider;
+          const selectedProvider = props.document.model_providers[selectedProviderId];
+          const selectedProviderModel = resolvedProviderModel(
+            props.document,
+            props.codexOptions,
+            selectedProviderId,
+            agent.model ?? (agent.model_provider ? undefined : globalDefault.model),
+          );
+          const agentModel = selectedProviderModel.model || inheritedModel.value;
           const inheritedReasoning = runtimeInheritedSetting(
             props.document,
             props.codexOptions,
             "model_reasoning_effort",
             agentModel,
             agent.sandbox,
+            selectedProvider,
           );
           const inheritedFastMode = runtimeInheritedSetting(
             props.document,
@@ -4512,6 +4850,7 @@ function AgentsEditor(props: {
             "fast_mode",
             agentModel,
             agent.sandbox,
+            selectedProvider,
           );
           const inheritedVerbosity = runtimeInheritedSetting(
             props.document,
@@ -4519,6 +4858,7 @@ function AgentsEditor(props: {
             "model_verbosity",
             agentModel,
             agent.sandbox,
+            selectedProvider,
           );
           const inheritedPersonality = runtimeInheritedSetting(
             props.document,
@@ -4526,6 +4866,7 @@ function AgentsEditor(props: {
             "personality",
             agentModel,
             agent.sandbox,
+            selectedProvider,
           );
           const inheritedWebSearch = runtimeInheritedSetting(
             props.document,
@@ -4533,6 +4874,7 @@ function AgentsEditor(props: {
             "web_search",
             agentModel,
             agent.sandbox,
+            selectedProvider,
           );
           const promptSource = agent.prompt_file ? "file" : "inline";
           const writeScopes = agent.write_scopes ?? [];
@@ -4570,15 +4912,44 @@ function AgentsEditor(props: {
                 }}>×</button>}
               </div>
               <div className="form-grid three">
-                <ModelField
-                  id={`agent-models-${name.replace(/[^A-Za-z0-9_-]/g, "-")}`}
-                  label="模型（可选）"
-                  value={agent.model ?? ""}
-                  placeholder={inheritedModel.label}
-                  models={props.codexOptions.models}
-                  onChange={(model) => update(name, { model: model || undefined })}
-                  help={agent.model ? "当前 Agent 显式覆盖运行时默认" : inheritedModel.label}
+                <SelectField
+                  label="模型 Provider"
+                  value={agent.model_provider ?? ""}
+                  onChange={(model_provider) => update(name, {
+                    model_provider: model_provider || undefined,
+                    model: undefined,
+                  })}
+                  options={[
+                    {
+                      value: "",
+                      label: agentModelDisplay(props.document, props.codexOptions, {}),
+                    },
+                    ...Object.entries(props.document.model_providers).map(([id, provider]) => ({
+                      value: id,
+                      label: `${provider.display_name}${provider.enabled === false ? "（已停用）" : ""}`,
+                    })),
+                  ]}
+                  help={agentModelDisplay(props.document, props.codexOptions, agent)}
                 />
+                {agent.model_provider ? (
+                  <ModelField
+                    id={`agent-models-${name.replace(/[^A-Za-z0-9_-]/g, "-")}`}
+                    label="模型（可选）"
+                    value={agent.model ?? ""}
+                    placeholder={selectedProviderModel.defaultLabel}
+                    models={selectedProviderModel.models}
+                    onChange={(model) => update(name, { model: model || undefined })}
+                    help={agentModelDisplay(props.document, props.codexOptions, agent)}
+                  />
+                ) : (
+                  <Field
+                    label="当前有效模型"
+                    value={agentModelDisplay(props.document, props.codexOptions, agent)}
+                    onChange={() => undefined}
+                    disabled
+                    help="未指定模型时始终继承全局默认 Provider 与模型"
+                  />
+                )}
                 <SelectField
                   label="本地文件权限（Sandbox）"
                   value={agent.sandbox ?? "read-only"}
@@ -4895,7 +5266,6 @@ function AgentsView(props: {
     { kind: "discard"; nextName: string | null } | { kind: "delete" } | null
   >(null);
 
-  const inheritedModel = effectiveInheritedModel(props.document, props.codexOptions);
   const names = useMemo(
     () => Object.keys(props.document.agents).sort((left, right) => left.localeCompare(right)),
     [props.document.agents],
@@ -5110,7 +5480,7 @@ function AgentsView(props: {
               return (
                 <button type="button" className="agent-config-row" key={name} onClick={() => requestDetail(name)}>
                   <span className="agent-config-identity"><span className="agent-config-avatar" aria-hidden="true">A</span><span><strong>{name}</strong><small>Codex Agent</small></span></span>
-                  <span className="agent-config-summary"><strong>{agent.prompt_file ? "文件 Prompt" : "内联 Prompt"}</strong><small>{agent.model || inheritedModel.value || "Codex 默认模型"}</small></span>
+                  <span className="agent-config-summary"><strong>{agent.prompt_file ? "文件 Prompt" : "内联 Prompt"}</strong><small>{agentModelDisplay(props.document, props.codexOptions, agent)}</small></span>
                   <span><strong>{agentSandboxLabel(agent.sandbox)}</strong><small>{agentHomeLabel(agent)}</small></span>
                   <span><strong className={agent.network_access || agent.sandbox === "danger-full-access" ? "success-text" : ""}>{agentNetworkLabel(agent)}</strong></span>
                   <span><strong>{agent.skills?.length ?? 0}</strong><small>项</small></span>
@@ -6706,10 +7076,13 @@ function AgentRunDetailDrawer(props: {
                       <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
                       <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                       <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
-                      <div><dt>Codex 会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
+                      <div><dt>模型会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
                       <div><dt>执行模式</dt><dd>{modelExecutionModeLabel(detail.model_snapshot?.execution_mode)}</dd></div>
+                      <div><dt>Provider</dt><dd>{detail.model_snapshot
+                        ? `${detail.model_snapshot.provider_name ?? detail.model_snapshot.provider_id ?? "Codex"}${detail.model_snapshot.provider_enabled === false ? "（已停用）" : ""}`
+                        : "历史运行未记录"}</dd></div>
                       <div><dt>模型</dt><dd>{detail.model_snapshot
-                        ? detail.model_snapshot.model ?? "Codex CLI / 账号默认（未固定模型）"
+                        ? detail.model_snapshot.resolved_label ?? detail.model_snapshot.model ?? "Provider 默认模型（暂未解析）"
                         : "历史运行未记录"}</dd></div>
                       <div><dt>模型来源</dt><dd>{detail.model_snapshot
                         ? modelSettingSourceLabel(detail.model_snapshot.model_source)
@@ -7493,17 +7866,17 @@ export default function App() {
   const tabs = useMemo<Array<{ id: Tab; label: string; mark: string }>>(() => [
     { id: "overview", label: "运行概览", mark: "01" },
     { id: "repositories", label: "仓库", mark: "02" },
-    { id: "environment", label: "全局环境", mark: "03" },
-    { id: "skills", label: "SKILL", mark: "04" },
-    { id: "agents", label: "Agent", mark: "05" },
-    { id: "rules", label: "触发规则", mark: "06" },
-    { id: "runtime", label: "运行时配置", mark: "07" },
+    { id: "environment", label: "全局配置与环境", mark: "03" },
+    { id: "model-providers", label: "Provider", mark: "04" },
+    { id: "skills", label: "SKILL", mark: "05" },
+    { id: "agents", label: "Agent", mark: "06" },
+    { id: "rules", label: "触发规则", mark: "07" },
     { id: "runs", label: "运行与日志", mark: "08" },
   ], []);
   const configurableTab = (
     tab === "environment"
+    || tab === "model-providers"
     || tab === "skills"
-    || tab === "runtime"
   );
 
   useLayoutEffect(() => {
@@ -7578,24 +7951,26 @@ export default function App() {
                     <span>{editing ? "编辑模式" : "只读模式"}</span>
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>
                   </div>
-                  {tab === "runtime" ? (
-                    <CodexRuntimeEditor
+                  {tab === "model-providers" ? (
+                    <ModelProvidersEditor
                       document={document}
-                      options={codexOptions}
+                      savedDocument={savedDocument}
+                      revision={revision}
+                      codexOptions={codexOptions}
                       editable={editing}
                       onChange={changeDocument}
+                      onSaved={acceptItemConfig}
+                      onError={setError}
+                      onNotice={(message) => {
+                        setNotice(message);
+                        window.setTimeout(() => setNotice(""), 3500);
+                      }}
                     />
                   ) : (
                     <fieldset className="config-editor-surface" disabled={!editing}>
-                      {tab === "environment" && <GlobalEnvironment document={document} onChange={changeDocument} />}
+                      {tab === "environment" && <GlobalEnvironment document={document} codexOptions={codexOptions} onChange={changeDocument} />}
                       {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
                     </fieldset>
-                  )}
-                  {tab === "runtime" && (
-                    <CodexAccountCard
-                      configuredHome={savedDocument?.runtime.codex_home ? String(savedDocument.runtime.codex_home) : undefined}
-                      homeHasUnsavedChange={String(document.runtime.codex_home ?? "") !== String(savedDocument?.runtime.codex_home ?? "")}
-                    />
                   )}
                   {tab === "environment" && <ConfigHistory />}
                 </>

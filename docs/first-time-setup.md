@@ -8,7 +8,7 @@
 
 启动 Teamwork 服务的系统用户必须具备以下登录态：
 
-- 已登录的 Codex CLI。
+- 已安装 Codex CLI；使用默认内置 Provider 时还需要完成 Codex 登录。
 - GitHub 仓库使用已登录的 `gh`；GitLab 仓库使用已登录的 `glab`。
 - 扫描器使用的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN` 已存在于启动服务的宿主机环境中。
 
@@ -60,11 +60,13 @@ teamwork-review-agents start
 
 平台连接负责扫描 API；仓库配置负责远端项目定位和本地 Git 基础目录，两者不能互相替代。Agent 不会直接在基础仓库中运行；可写 Agent 创建独立临时 clone，只读 Agent 创建轻量 linked worktree。
 
-## 3. 引用宿主机 Provider Token
+## 3. 配置全局设置并引用宿主机 Provider Token
 
-进入“全局环境”，为平台连接使用的 Token 变量添加同名配置。推荐选择“宿主机环境”，避免把 Token 明文写入 `config.yaml`。
+进入“全局配置与环境”，先确认全局默认模型。初始值使用不可删除的内置 Codex CLI；所有没有显式指定模型的 Agent 都会继承这里的 Provider 与模型。
 
-![全局环境中的 Provider Token 引用](assets/first-time-setup/02-global-environment.png)
+然后为平台连接使用的 Token 变量添加同名配置。推荐选择“宿主机环境”，避免把 Token 明文写入 `config.yaml`。
+
+![全局配置与环境中的 Provider Token 引用](assets/first-time-setup/02-global-environment.png)
 
 以 GitHub 为例：
 
@@ -79,7 +81,21 @@ Provider 凭据会被系统强制视为 Secret，并禁止进入 Prompt 和 Code
 
 在 Windows 中，`$env:GITHUB_TOKEN` 或 `$env:GITLAB_TOKEN` 只属于当前 PowerShell 会话及其后代进程。使用这种方式时，必须从同一个 PowerShell 会话启动 Teamwork；如果改为用户级环境变量或由 Windows 服务管理器、任务计划程序注入，也只有之后创建的服务进程能够读取。不要在文档、截图或 Git 仓库中填写真实 Token。
 
-## 4. 检查 Agent
+## 4. 检查或新增模型 Provider
+
+进入“Provider”。系统内置的 Codex CLI Provider 可以停用，但不能删除；页面同时显示实际 CLI 路径、版本、`CODEX_HOME`、默认模型、MCP 和高级 Codex 配置。
+
+如果需要使用其他模型服务，可以新增 API Provider：
+
+1. 选择与上游一致的 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 或 Gemini GenerateContent 协议。
+2. 配置 Base URL、默认模型、超时和可选并发上限。
+3. 保存 Provider 后单独填写 API Key；列表默认只显示掩码，小眼睛仅在当前详情临时查看明文。
+4. 可手工维护模型 ID，也可使用已保存的 Key 检测并刷新模型目录。
+5. 执行连接测试，确认模型能够返回最小文本响应。
+
+API Key 与 YAML 配置历史分开保存，不会进入 Prompt、Agent 工具环境、运行快照或日志。停用 Provider 会保留引用并阻止新运行；删除 API Provider 会让引用它的 Agent 改为继承全局默认，如果全局默认也引用它，则全局默认先回退到 Codex CLI。
+
+## 5. 检查 Agent
 
 进入“Agent”。项目内置审核和文档更新 Agent，可以点击任意一行查看完整配置，并在详情页独立编辑和保存。
 
@@ -88,6 +104,7 @@ Provider 凭据会被系统强制视为 Secret，并禁止进入 Prompt 和 Code
 首次配置至少检查：
 
 - Prompt 文件路径或内联 Prompt 是否存在。
+- 模型 Provider 与模型是否正确；选择“继承全局默认”或“CLI / Provider 默认模型”时，括号内应显示当前解析到的具体值或无法解析的原因。
 - 本地文件权限是否符合任务需要。
 - 需要调用 `gh`、`glab` 或其他联网命令时，是否开启“允许命令联网”。
 - 如配置域名白名单，是否包含任务需要访问的域名。
@@ -96,13 +113,13 @@ Provider 凭据会被系统强制视为 Secret，并禁止进入 Prompt 和 Code
 
 命令联网权限与 Codex 的联网搜索是两项独立配置。Provider Token 不会进入 Agent；`gh` / `glab` 使用本机钥匙串或各自配置目录中的登录态。
 
-## 5. 检查运行时配置
+Codex CLI 的命令、账号环境与驱动专属参数在“Provider”页配置；后台并发、Git 超时、无进展超时和外层沙盒在“全局配置与环境”页配置。
 
-进入“运行时配置”，确认：
+首次配置还应确认：
 
 - 实际 Codex CLI 路径和版本符合预期。
 - 如配置独立 `CODEX_HOME`，该目录已经单独完成 Codex 登录。
-- 默认无进展超时不会误杀正常的长任务。
+- “全局配置与环境”中的默认无进展超时不会误杀正常的长任务。
 - 后台默认隔离用户 MCP；确实需要的 MCP 已显式加入白名单。
 
 如果页面提示 CLI 版本与模型缓存客户端不一致，应先统一 Codex 版本或改用独立 `CODEX_HOME`，再执行真实 Agent 任务。

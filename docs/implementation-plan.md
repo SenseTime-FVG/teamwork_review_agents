@@ -1058,3 +1058,17 @@
 - 重新生成前端静态资源，执行 TypeScript / Vite 生产构建、Python 全量测试、编译检查、补丁检查和本地管理界面逐页核验；不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
 
 验收：所有单选下拉展开后都与未展开控件左右边缘严格对齐；页面下方空间不足时可向上展开；概览与运行筛选、配置编辑、键盘操作、禁用状态和响应式布局不回归；源码与构建产物中不再保留用于业务字段的原生 `select`。
+
+## 阶段九十四：模型 Provider 与全局默认模型
+
+- 新增 `model_providers` 和全局默认模型配置，把既有 CLI 配置迁移为固定内置 `codex-cli` Provider，并把旧模型基座模式迁移为 `codex-oauth` Provider；内置 CLI 不可删除或改变驱动但允许停用，旧 Agent 继续保持升级前行为。
+- 把执行器从全局单 Runner 改为按 Agent 有效模型选择 Provider Runner；Codex CLI 保持原链路，Codex OAuth 和外部 API Provider 复用 Teamwork 工具循环、工作区、Skill、sub-agent、取消、超时、脱敏与日志。
+- 增加 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议适配器，并提供 Base URL 规范化、连接测试、模型发现、手工模型和 Provider 级请求并发限制。
+- 建立模型 Provider 私有凭据存储和管理 API；配置与历史只返回掩码，管理 Token 鉴权后允许小眼睛按需查看模型 API Key，保证明文不进入日志、Prompt、运行快照和 Agent 子进程。
+- 实现 `(provider_id, model_id)` 全局默认模型，初始指向 Codex CLI；Agent 显式模型必须同时指定 Provider，留空则继承全局默认。所有管理页面展示解析后的具体 Provider、模型和继承来源，无法解析时显示原因。
+- 外部 Provider 删除前原子迁移引用：全局默认回退 Codex CLI，相关 Agent 清空显式模型并继承全局默认，然后删除凭据；停用 Provider 保留引用并让新运行明确失败，不进行静默模型切换。
+- 删除“运行时配置”页面，新增 Provider 列表与详情页；把 Codex 专属内容迁入内置 Provider，把模型无关的扫描、Web、并发、超时、保留期和外层沙盒设置迁入“全局配置与环境”。
+- 补充配置迁移与引用校验、凭据掩码/查看/替换/删除、Provider 删除回退、停用失败关闭、协议工具调用、Runner 路由、模型快照、管理 API 和前端交互测试。
+- 执行 Python 定向与全量测试、TypeScript 检查、前端生产构建、编译检查和补丁检查；不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
+
+验收：全新和旧配置都固定包含不可删除但可停用的 Codex CLI Provider，未指定模型的 Agent 默认显示并使用全局 Codex CLI 具体模型；不同 Agent 可同时选择不同 Provider 与模型；模型 API Key 可由管理员通过小眼睛临时查看且不会出现在其他输出；删除 API Provider 后引用按约定回退，停用时不静默切换；Codex CLI、Codex OAuth、四类 API 协议和历史运行快照均保持可追溯，既有平台 Provider 与扫描行为不回归。

@@ -769,6 +769,21 @@ tbody tr:last-child td { border-bottom: 0; }
 .loading-screen { min-height: 55vh; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 12px; }
 .spinner { width: 15px; height: 15px; border: 2px solid #263243; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 
+.provider-layout { display: grid; grid-template-columns: minmax(250px, .45fr) minmax(0, 1.55fr); gap: 16px; align-items: start; }
+.provider-list-card { position: sticky; top: 0; }
+.provider-list { display: flex; flex-direction: column; gap: 7px; }
+.provider-list > button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: #09111b; color: var(--text); text-align: left; cursor: pointer; }
+.provider-list > button:hover, .provider-list > button.selected { border-color: #38664c; background: #102019; }
+.provider-list > button span, .provider-list > button strong, .provider-list > button small { display: block; min-width: 0; }
+.provider-list > button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.provider-list > button small { margin-top: 5px; color: var(--muted); font-size: 9px; }
+.provider-list > button em { padding: 3px 6px; border: 1px solid #315943; border-radius: 999px; color: var(--accent); font: normal 8px "SFMono-Regular", Consolas, monospace; }
+.provider-detail-stack { min-width: 0; }
+.provider-model-list-field { margin-top: 14px; }
+.provider-model-list-field textarea { width: 100%; resize: vertical; }
+.credential-value { min-height: 42px; display: flex; align-items: center; margin-bottom: 14px; padding: 11px 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #080e16; color: #b9c7d7; overflow-wrap: anywhere; }
+.field-action { display: flex; align-items: end; gap: 8px; padding-bottom: 1px; }
+
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 50% { opacity: .45; } }
 @keyframes drawer-fade-in { from { opacity: 0; } }
@@ -776,6 +791,8 @@ tbody tr:last-child td { border-bottom: 0; }
 @keyframes confirmation-pop-in { from { opacity: 0; transform: translateY(10px) scale(.975); } }
 
 @media (max-width: 1120px) {
+  .provider-layout { grid-template-columns: 1fr; }
+  .provider-list-card { position: static; }
   .app-shell { grid-template-columns: 80px minmax(0, 1fr); }
   .sidebar { padding: 22px 11px; }
   .brand { justify-content: center; padding-inline: 0; }
