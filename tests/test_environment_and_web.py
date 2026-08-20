@@ -533,6 +533,19 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
                     "workspace": "./workspaces/third",
                     "enabled": False,
                     "environment": {},
+                    "agent_workspace": {
+                        "cache_enabled": True,
+                        "timeout_seconds": 1200,
+                        "max_output_bytes": 500000,
+                        "prepare_steps": [
+                            {
+                                "name": "安装前端依赖",
+                                "cwd": "ui",
+                                "command": ["npm", "ci"],
+                                "timeout_seconds": 600,
+                            }
+                        ],
+                    },
                 },
             },
         )
@@ -543,6 +556,19 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
             "second",
             "third",
         ]
+        assert created_body["document"]["repositories"][2]["agent_workspace"] == {
+            "cache_enabled": True,
+            "timeout_seconds": 1200,
+            "max_output_bytes": 500000,
+            "prepare_steps": [
+                {
+                    "name": "安装前端依赖",
+                    "cwd": "ui",
+                    "command": ["npm", "ci"],
+                    "timeout_seconds": 600,
+                }
+            ],
+        }
 
         repository = created_body["document"]["repositories"][2]
         repository["project"] = "owner/third-updated"

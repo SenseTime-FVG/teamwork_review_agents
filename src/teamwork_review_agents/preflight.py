@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
-from .config import AppConfig, PreflightConfig
+from .config import AgentWorkspaceConfig, AppConfig, PreflightConfig
 from .environment import SecretRedactor, resolve_provider_token
 from .filesystem import temporary_directory
 from .managed_comments import ManagedCommentService
@@ -56,6 +56,8 @@ SAFE_HOST_ENVIRONMENT = {
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
     "UV_LINK_MODE",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
 } | WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PREFLIGHT_COMMENT_OUTPUT_CHARS = 12_000
@@ -93,6 +95,7 @@ class PreflightStepUpdate:
 StepUpdateCallback = Callable[[PreflightStepUpdate], Awaitable[None]]
 OutputCallback = Callable[[str], Awaitable[None]]
 CancelCheck = Callable[[], bool]
+CommandWrapper = Callable[[list[str], Path], list[str]]
 
 
 async def _emit_step_update(
@@ -184,7 +187,7 @@ async def _read_bounded_stream(
 
 
 async def execute_preflight_steps(
-    config: PreflightConfig,
+    config: PreflightConfig | AgentWorkspaceConfig,
     *,
     cwd: Path,
     environment: dict[str, str],
@@ -192,23 +195,32 @@ async def execute_preflight_steps(
     on_output: OutputCallback | None = None,
     cancel_check: CancelCheck | None = None,
     unlimited: bool = False,
+    command_wrapper: CommandWrapper | None = None,
+    operation_name: str = "Preflight",
+    cancellation_message: str = "用户取消了手动 CI",
 ) -> StepExecutionOutcome:
-    """按配置顺序执行 CI 步骤，并支持实时输出、取消和手动不限时。"""
+    """按配置顺序执行参数数组步骤，并支持目录、输出、取消和超时。"""
 
     loop = asyncio.get_running_loop()
     deadline = None if unlimited else loop.time() + config.timeout_seconds
     output = ""
-    for step_index, step in enumerate(config.steps):
+    steps = (
+        config.prepare_steps
+        if isinstance(config, AgentWorkspaceConfig)
+        else config.steps
+    )
+    resolved_cwd = cwd.resolve()
+    for step_index, step in enumerate(steps):
         if cancel_check is not None and cancel_check():
             return StepExecutionOutcome(
                 status="cancelled",
                 failed_step=step.name,
                 output=output,
-                error="用户取消了手动 CI",
+                error=cancellation_message,
             )
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
-            error = "Preflight 总运行时间超时"
+            error = f"{operation_name} 总运行时间超时"
             await _emit_step_update(
                 on_step_update,
                 PreflightStepUpdate(
@@ -244,13 +256,27 @@ async def execute_preflight_steps(
             ),
         )
         try:
+            configured_cwd = getattr(step, "cwd", ".")
+            step_cwd = (resolved_cwd / configured_cwd).resolve()
+            try:
+                step_cwd.relative_to(resolved_cwd)
+            except ValueError as exc:
+                raise ValueError(
+                    f"步骤 {step.name} 的工作目录逃逸了 Agent 工作区"
+                ) from exc
+            if not step_cwd.is_dir():
+                raise ValueError(
+                    f"步骤 {step.name} 的工作目录不存在：{configured_cwd}"
+                )
             command = [
                 resolve_executable(step.command[0], environment),
                 *step.command[1:],
             ]
+            if command_wrapper is not None:
+                command = command_wrapper(command, step_cwd)
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=cwd,
+                cwd=step_cwd,
                 env=environment,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
@@ -341,7 +367,7 @@ async def execute_preflight_steps(
                 config.max_output_bytes,
             )
             if cancelled:
-                error = "用户取消了手动 CI"
+                error = cancellation_message
                 terminal_status = "cancelled"
             else:
                 error = f"步骤 {step.name} 超过 {step_timeout:.0f} 秒"

@@ -6,7 +6,7 @@ import copy
 import os
 import hashlib
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -280,7 +280,7 @@ class PreflightStepConfig(BaseModel):
         """拒绝缺少执行程序的空命令，避免把配置错误推迟到运行期。"""
 
         if not value[0].strip():
-            raise ValueError("Preflight 步骤的执行程序不能为空")
+            raise ValueError("命令步骤的执行程序不能为空")
         return value
 
 
@@ -304,6 +304,37 @@ class PreflightConfig(BaseModel):
         return self
 
 
+class AgentWorkspacePrepareStepConfig(PreflightStepConfig):
+    """一个在 Agent 模型启动前执行的工作区准备步骤。"""
+
+    cwd: str = "."
+
+    @field_validator("cwd")
+    @classmethod
+    def validate_relative_cwd(cls, value: str) -> str:
+        """只接受跨平台可解释的仓库内相对目录。"""
+
+        normalized = value.strip().replace("\\", "/") or "."
+        posix_path = PurePosixPath(normalized)
+        windows_path = PureWindowsPath(normalized)
+        if posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+            raise ValueError("Agent 工作区准备目录必须是仓库内相对路径")
+        if ".." in posix_path.parts:
+            raise ValueError("Agent 工作区准备目录不能包含 ..")
+        return posix_path.as_posix()
+
+
+class AgentWorkspaceConfig(BaseModel):
+    """仓库级 Agent 工作区准备与依赖下载缓存配置。"""
+
+    cache_enabled: bool = False
+    timeout_seconds: PositiveInt = 1800
+    max_output_bytes: PositiveInt = 1_000_000
+    prepare_steps: list[AgentWorkspacePrepareStepConfig] = Field(
+        default_factory=list,
+    )
+
+
 class RepositoryConfig(BaseModel):
     """被扫描仓库及 Agent 本地工作目录配置。"""
 
@@ -314,6 +345,9 @@ class RepositoryConfig(BaseModel):
     clone_url: str | None = None
     enabled: bool = True
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
+    agent_workspace: AgentWorkspaceConfig = Field(
+        default_factory=AgentWorkspaceConfig,
+    )
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
 
     @model_validator(mode="before")

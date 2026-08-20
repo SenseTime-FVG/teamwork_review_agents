@@ -221,6 +221,7 @@ def test_repository_cache_is_shared_by_repository_not_branch(tmp_path) -> None:
 
     assert root.parent == config.database.path.parent / "preflight-cache"
     assert environment["TEAMWORK_PREFLIGHT_CACHE_DIR"] == str(root.resolve())
+    assert environment["TEAMWORK_REPOSITORY_CACHE_DIR"] == str(root.resolve())
     for name in (
         "UV_CACHE_DIR",
         "PIP_CACHE_DIR",

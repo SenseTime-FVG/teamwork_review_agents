@@ -127,6 +127,36 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
     assert command[separator + 1 :] == inner
 
 
+def test_managed_sandbox_wrapper_allows_only_repository_cache_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启用仓库缓存时只应增加当前仓库缓存根目录的写权限。"""
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    cache_directory = tmp_path / "repository-cache"
+    unrelated_directory = tmp_path / "other-cache"
+    cache_directory.mkdir()
+    unrelated_directory.mkdir()
+    agent = AgentConfig(prompt="测试", sandbox="workspace-write")
+
+    command = wrap_managed_sandbox_command(
+        codex_binary="codex",
+        workspace=tmp_path,
+        agent=agent,
+        inner_command=["npm", "ci"],
+        environment={
+            "TEAMWORK_REPOSITORY_CACHE_DIR": str(cache_directory),
+        },
+    )
+
+    separator = command.index("--")
+    outer_command = " ".join(command[:separator])
+    assert f'{json.dumps(str(cache_directory.resolve()))}="write"' in outer_command
+    assert str(unrelated_directory.resolve()) not in outer_command
+    assert command[separator + 1 :] == ["npm", "ci"]
+
+
 def test_runner_uses_sandbox_proxy_without_exposing_service_paths(
     tmp_path: Path,
     snapshot_factory,

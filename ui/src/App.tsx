@@ -33,6 +33,8 @@ import type {
   PreflightRunDetail,
   PreflightRunSummary,
   Repository,
+  RepositoryAgentWorkspace,
+  RepositoryAgentWorkspacePrepareStep,
   RepositoryGitDetail,
   RepositoryPreflight,
   RepositoryPreflightStep,
@@ -3166,6 +3168,14 @@ function RepositoryDetailEditor(props: {
     max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
     steps: repository.preflight?.steps ?? [],
   };
+  const agentWorkspace: Required<Omit<RepositoryAgentWorkspace, "prepare_steps">> & {
+    prepare_steps: RepositoryAgentWorkspacePrepareStep[];
+  } = {
+    cache_enabled: repository.agent_workspace?.cache_enabled ?? false,
+    timeout_seconds: repository.agent_workspace?.timeout_seconds ?? 1800,
+    max_output_bytes: repository.agent_workspace?.max_output_bytes ?? 1_000_000,
+    prepare_steps: repository.agent_workspace?.prepare_steps ?? [],
+  };
 
   function update(patch: Partial<Repository>) {
     const repositories = [...props.document.repositories];
@@ -3186,6 +3196,27 @@ function RepositoryDetailEditor(props: {
 
   function updatePreflight(patch: Partial<RepositoryPreflight>) {
     update({ preflight: { ...preflight, ...patch } });
+  }
+
+  function updateAgentWorkspace(patch: Partial<RepositoryAgentWorkspace>) {
+    update({ agent_workspace: { ...agentWorkspace, ...patch } });
+  }
+
+  function updateAgentWorkspaceStep(
+    index: number,
+    patch: Partial<RepositoryAgentWorkspacePrepareStep>,
+  ) {
+    const prepare_steps = [...agentWorkspace.prepare_steps];
+    prepare_steps[index] = { ...prepare_steps[index], ...patch };
+    updateAgentWorkspace({ prepare_steps });
+  }
+
+  function moveAgentWorkspaceStep(index: number, offset: number) {
+    const target = index + offset;
+    if (target < 0 || target >= agentWorkspace.prepare_steps.length) return;
+    const prepare_steps = [...agentWorkspace.prepare_steps];
+    [prepare_steps[index], prepare_steps[target]] = [prepare_steps[target], prepare_steps[index]];
+    updateAgentWorkspace({ prepare_steps });
   }
 
   function updatePreflightStep(index: number, patch: Partial<RepositoryPreflightStep>) {
@@ -3251,6 +3282,109 @@ function RepositoryDetailEditor(props: {
             />
           </div>
         </fieldset>
+        <section className="repository-preflight-section">
+          <div className="repository-preflight-head">
+            <div>
+              <strong>Agent 工作区准备</strong>
+              <p>在模型启动前，于本次隔离工作区中执行用户定义的安装命令；不会修改 Prompt，也不会自动猜测包管理器。</p>
+            </div>
+          </div>
+          <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+            <div className="repository-preflight-content">
+              <div className="form-grid two">
+                <Field
+                  label="准备总超时（秒）"
+                  type="number"
+                  value={agentWorkspace.timeout_seconds}
+                  onChange={(value) => updateAgentWorkspace({ timeout_seconds: Number(value) })}
+                />
+                <Field
+                  label="最大日志字节数"
+                  type="number"
+                  value={agentWorkspace.max_output_bytes}
+                  onChange={(value) => updateAgentWorkspace({ max_output_bytes: Number(value) })}
+                />
+              </div>
+              <div className="repository-preflight-cache-option">
+                <Toggle
+                  label={agentWorkspace.cache_enabled ? "Agent 仓库级下载缓存已启用" : "Agent 仓库级下载缓存已停用"}
+                  checked={agentWorkspace.cache_enabled}
+                  onChange={(cache_enabled) => updateAgentWorkspace({ cache_enabled })}
+                />
+                <p>同一仓库跨分支共享包管理器下载缓存；node_modules、虚拟环境和构建产物仍只存在于每次运行的隔离工作区。</p>
+              </div>
+              <div className="repository-preflight-steps-head">
+                <div>
+                  <strong>模型启动前准备步骤</strong>
+                  <p>命令完全由用户定义，按参数数组顺序直接执行且不经过 Shell；复杂流程建议调用仓库脚本。</p>
+                </div>
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  onClick={() => updateAgentWorkspace({
+                    prepare_steps: [
+                      ...agentWorkspace.prepare_steps,
+                      { name: `prepare-${agentWorkspace.prepare_steps.length + 1}`, cwd: ".", command: ["npm", "ci"] },
+                    ],
+                  })}
+                >+ 添加步骤</button>
+              </div>
+              <div className="repository-preflight-steps">
+                {agentWorkspace.prepare_steps.map((step, index) => (
+                  <article className="repository-preflight-step" key={index}>
+                    <div className="repository-preflight-step-title">
+                      <strong>步骤 {index + 1}</strong>
+                      <div className="button-group">
+                        <button type="button" className="icon-button" disabled={index === 0} title="上移" onClick={() => moveAgentWorkspaceStep(index, -1)}>↑</button>
+                        <button type="button" className="icon-button" disabled={index === agentWorkspace.prepare_steps.length - 1} title="下移" onClick={() => moveAgentWorkspaceStep(index, 1)}>↓</button>
+                        <button type="button" className="icon-button danger" title="删除步骤" onClick={() => updateAgentWorkspace({ prepare_steps: agentWorkspace.prepare_steps.filter((_, itemIndex) => itemIndex !== index) })}>×</button>
+                      </div>
+                    </div>
+                    <div className="form-grid two">
+                      <Field label="步骤名称" value={step.name} onChange={(name) => updateAgentWorkspaceStep(index, { name })} />
+                      <Field
+                        label="工作目录（仓库内相对路径）"
+                        value={step.cwd ?? "."}
+                        placeholder="ui"
+                        onChange={(cwd) => updateAgentWorkspaceStep(index, { cwd })}
+                        help="例如 ui；只允许当前 Agent 工作区内的相对目录"
+                      />
+                      <Field
+                        label="执行程序"
+                        value={step.command[0] ?? ""}
+                        placeholder="npm"
+                        onChange={(program) => updateAgentWorkspaceStep(index, { command: [program, ...step.command.slice(1)] })}
+                        help="例如 npm、uv、python、bash"
+                      />
+                      <Field
+                        label="单步超时（秒，可选）"
+                        type="number"
+                        value={step.timeout_seconds ?? ""}
+                        onChange={(value) => updateAgentWorkspaceStep(index, { timeout_seconds: value ? Number(value) : undefined })}
+                      />
+                    </div>
+                    <label className="field repository-preflight-args">
+                      <span>参数（每行一个）</span>
+                      <textarea
+                        className="mono"
+                        rows={Math.min(8, Math.max(3, step.command.length))}
+                        value={step.command.slice(1).join("\n")}
+                        placeholder="ci"
+                        onChange={(event) => updateAgentWorkspaceStep(index, {
+                          command: [step.command[0] ?? "", ...event.target.value.split("\n").filter((value) => value !== "")],
+                        })}
+                      />
+                      <small>例如工作目录 ui、执行程序 npm、参数 ci，效果等价于在 ui 目录执行 npm ci，但不会启动 Shell。</small>
+                    </label>
+                  </article>
+                ))}
+                {agentWorkspace.prepare_steps.length === 0 && (
+                  <div className="choice-empty">当前未配置准备命令；Agent 将在工作区创建后直接启动模型。</div>
+                )}
+              </div>
+            </div>
+          </fieldset>
+        </section>
         <section className="repository-preflight-section">
           <div className="repository-preflight-head">
             <div>
