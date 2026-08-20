@@ -166,6 +166,7 @@ class StateStore:
                     repository_id TEXT NOT NULL,
                     number INTEGER,
                     head_sha TEXT NOT NULL,
+                    source_generation INTEGER NOT NULL DEFAULT 1,
                     config_revision TEXT NOT NULL,
                     trigger_source TEXT NOT NULL DEFAULT 'event',
                     branch TEXT,
@@ -233,6 +234,34 @@ class StateStore:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(repository_id, number)
                 );
+
+                CREATE TABLE IF NOT EXISTS change_request_source_generations (
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(repository_id, number)
+                );
+
+                CREATE TABLE IF NOT EXISTS managed_comments (
+                    repository_id TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    namespace TEXT NOT NULL,
+                    slot TEXT NOT NULL,
+                    source_generation INTEGER NOT NULL,
+                    remote_comment_id TEXT NOT NULL,
+                    source_head_sha TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(
+                        repository_id, number, namespace, slot,
+                        source_generation
+                    )
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_managed_comments_remote
+                ON managed_comments(repository_id, number, remote_comment_id);
 
                 CREATE TABLE IF NOT EXISTS event_preflight_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -363,6 +392,12 @@ class StateStore:
             self._ensure_column(
                 connection,
                 "preflight_runs",
+                "source_generation",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            self._ensure_column(
+                connection,
+                "preflight_runs",
                 "cancel_requested",
                 "INTEGER NOT NULL DEFAULT 0",
             )
@@ -380,6 +415,43 @@ class StateStore:
             )
             if cancel_source_added:
                 self._recover_legacy_shutdown_cancellations(connection)
+            self._migrate_managed_comment_state(connection)
+
+    @staticmethod
+    def _migrate_managed_comment_state(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """初始化源代次并保留旧版 Preflight 失败评论映射。"""
+
+        now = time.time()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO change_request_source_generations (
+                repository_id, number, head_sha, generation, updated_at
+            )
+            SELECT json_extract(payload, '$.repository_id'),
+                   CAST(json_extract(payload, '$.number') AS INTEGER),
+                   COALESCE(json_extract(payload, '$.head_sha'), ''),
+                   1, ?
+            FROM snapshots
+            WHERE json_extract(payload, '$.repository_id') IS NOT NULL
+              AND json_extract(payload, '$.number') IS NOT NULL
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO managed_comments (
+                repository_id, number, namespace, slot, source_generation,
+                remote_comment_id, source_head_sha, content_hash, updated_at
+            )
+            SELECT repository_id, number, 'preflight', status_context, 1,
+                   remote_comment_id, head_sha, content_hash, updated_at
+            FROM preflight_failure_comments
+            """
+        )
+        # 旧表只用于一次性迁移；清空后可避免服务重启时把已删除的映射重新导入。
+        connection.execute("DELETE FROM preflight_failure_comments")
 
     @staticmethod
     def _migrate_preflight_runs_for_manual(
@@ -411,6 +483,7 @@ class StateStore:
                     repository_id TEXT NOT NULL,
                     number INTEGER,
                     head_sha TEXT NOT NULL,
+                    source_generation INTEGER NOT NULL DEFAULT 1,
                     config_revision TEXT NOT NULL,
                     trigger_source TEXT NOT NULL DEFAULT 'event',
                     branch TEXT,
@@ -429,12 +502,12 @@ class StateStore:
                 );
                 INSERT INTO preflight_runs_migrated (
                     run_id, idempotency_key, event_id, repository_id, number,
-                    head_sha, config_revision, trigger_source, phase, status,
+                    head_sha, source_generation, config_revision, trigger_source, phase, status,
                     attempts, failed_step, exit_code, output, error,
                     status_published, started_at, finished_at
                 )
                 SELECT run_id, idempotency_key, event_id, repository_id, number,
-                       head_sha, config_revision, 'event',
+                       head_sha, 1, config_revision, 'event',
                        CASE WHEN status = 'running' THEN 'running_steps'
                             ELSE 'finished' END,
                        status, attempts, failed_step, exit_code, output, error,
@@ -789,13 +862,71 @@ class StateStore:
             inserted += cursor.rowcount
         return inserted
 
+    @staticmethod
+    def _resolve_source_generation(
+        connection: sqlite3.Connection,
+        *,
+        repository_id: str,
+        number: int,
+        head_sha: str,
+        now: float,
+        increment_on_change: bool,
+    ) -> int:
+        """在事务内读取或推进 MR / PR 的单调源版本代次。"""
+
+        row = connection.execute(
+            """
+            SELECT head_sha, generation
+            FROM change_request_source_generations
+            WHERE repository_id = ? AND number = ?
+            """,
+            (repository_id, number),
+        ).fetchone()
+        if row is None:
+            generation = 1
+            connection.execute(
+                """
+                INSERT INTO change_request_source_generations (
+                    repository_id, number, head_sha, generation, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (repository_id, number, head_sha, generation, now),
+            )
+            return generation
+        generation = int(row["generation"])
+        if increment_on_change and str(row["head_sha"]) != head_sha:
+            generation += 1
+            connection.execute(
+                """
+                UPDATE change_request_source_generations
+                SET head_sha = ?, generation = ?, updated_at = ?
+                WHERE repository_id = ? AND number = ?
+                """,
+                (head_sha, generation, now, repository_id, number),
+            )
+        return generation
+
     def enqueue_events(self, events: Iterable[ChangeEvent]) -> int:
         """不改写快照，幂等追加管理员补发或其他外部产生的事件。"""
 
         now = time.time()
+        pending = list(events)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            inserted = self._insert_events(connection, events, now)
+            annotated: list[ChangeEvent] = []
+            for event in pending:
+                generation = self._resolve_source_generation(
+                    connection,
+                    repository_id=event.repository_id,
+                    number=event.number,
+                    head_sha=event.current_snapshot.head_sha,
+                    now=now,
+                    increment_on_change=False,
+                )
+                annotated.append(
+                    event.model_copy(update={"source_generation": generation})
+                )
+            inserted = self._insert_events(connection, annotated, now)
             connection.commit()
         return inserted
 
@@ -822,6 +953,7 @@ class StateStore:
         self,
         limit: int | None = 100,
         *,
+        offset: int = 0,
         repository_id: str | None = None,
         number: int | None = None,
         status: str | None = None,
@@ -846,8 +978,8 @@ class StateStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
-            limit_clause = "LIMIT ?"
-            parameters.append(limit)
+            limit_clause = "LIMIT ? OFFSET ?"
+            parameters.extend((limit, max(0, offset)))
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -922,6 +1054,36 @@ class StateStore:
             results.append(summary)
         return results
 
+    def count_snapshots(
+        self,
+        *,
+        repository_id: str | None = None,
+        number: int | None = None,
+        status: str | None = None,
+    ) -> int:
+        """返回与快照列表筛选条件一致的记录总数。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if repository_id:
+            conditions.append("json_extract(payload, '$.repository_id') = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append(
+                "CAST(json_extract(payload, '$.number') AS INTEGER) = ?"
+            )
+            parameters.append(number)
+        if status:
+            conditions.append("json_extract(payload, '$.state') = ?")
+            parameters.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM snapshots {where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
+
     def get_change_request_detail(
         self,
         repository_id: str,
@@ -955,9 +1117,22 @@ class StateStore:
         """在一个事务中更新快照、事件和可选 Provider 活动游标。"""
 
         now = time.time()
+        pending = list(events)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            inserted = self._insert_events(connection, events, now)
+            generation = self._resolve_source_generation(
+                connection,
+                repository_id=snapshot.repository_id,
+                number=snapshot.number,
+                head_sha=snapshot.head_sha,
+                now=now,
+                increment_on_change=True,
+            )
+            annotated = [
+                event.model_copy(update={"source_generation": generation})
+                for event in pending
+            ]
+            inserted = self._insert_events(connection, annotated, now)
             connection.execute(
                 """
                 INSERT INTO snapshots (snapshot_key, payload, updated_at)
@@ -988,6 +1163,19 @@ class StateStore:
                 )
             connection.commit()
         return inserted
+
+    def source_generation(self, repository_id: str, number: int) -> int | None:
+        """读取 MR / PR 当前已观察到的源版本代次。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT generation FROM change_request_source_generations
+                WHERE repository_id = ? AND number = ?
+                """,
+                (repository_id, number),
+            ).fetchone()
+        return int(row["generation"]) if row is not None else None
 
     def pending_events(self, limit: int = 100) -> list[ChangeEvent]:
         """按创建顺序读取待处理或待重试事件。"""
@@ -1198,8 +1386,8 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def cleanup_terminal_transient_event(self, event_id: str) -> bool:
-        """固化运行上下文并删除已经成功结束的临时事件。"""
+    def finalize_terminal_target_event_context(self, event_id: str) -> bool:
+        """为终态目标分支事件固化运行上下文，并保留事件供历史查询。"""
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1207,7 +1395,7 @@ class StateStore:
                 """
                 SELECT payload FROM event_inbox
                 WHERE event_id = ? AND event_type = ?
-                  AND status IN ('completed', 'unmatched')
+                  AND status IN ('completed', 'unmatched', 'failed', 'cancelled')
                 """,
                 (event_id, TARGET_COMMITS_CHANGED_EVENT),
             ).fetchone()
@@ -1233,10 +1421,6 @@ class StateStore:
                     event_id,
                 ),
             )
-            connection.execute(
-                "DELETE FROM event_inbox WHERE event_id = ?",
-                (event_id,),
-            )
             connection.commit()
         return True
 
@@ -1249,6 +1433,7 @@ class StateStore:
         repository_id: str,
         number: int,
         head_sha: str,
+        source_generation: int = 1,
         config_revision: str,
         max_attempts: int,
     ) -> PreflightReservation | None:
@@ -1269,9 +1454,9 @@ class StateStore:
                     """
                     INSERT INTO preflight_runs (
                         run_id, idempotency_key, event_id, repository_id, number,
-                        head_sha, config_revision, trigger_source, phase,
+                        head_sha, source_generation, config_revision, trigger_source, phase,
                         status, attempts, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'event', 'preparing',
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'event', 'preparing',
                               'running', 1, ?)
                     """,
                     (
@@ -1281,6 +1466,7 @@ class StateStore:
                         repository_id,
                         number,
                         head_sha,
+                        source_generation,
                         config_revision,
                         now,
                     ),
@@ -1308,13 +1494,14 @@ class StateStore:
                 """
                 UPDATE preflight_runs
                 SET status = 'running', attempts = ?, event_id = ?,
+                    source_generation = ?,
                     trigger_source = 'event', phase = 'preparing',
                     branch = NULL, cache_path = NULL, cancel_requested = 0,
                     failed_step = NULL, exit_code = NULL, output = '', error = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
-                (attempts, event_id, now, row["run_id"]),
+                (attempts, event_id, source_generation, now, row["run_id"]),
             )
             connection.execute(
                 """
@@ -1539,7 +1726,8 @@ class StateStore:
             row = connection.execute(
                 """
                 SELECT run_id, repository_id, number, head_sha, status,
-                       failed_step, exit_code, output, error, status_published
+                       source_generation, failed_step, exit_code, output, error,
+                       status_published
                 FROM preflight_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -1551,6 +1739,7 @@ class StateStore:
             repository_id=str(row["repository_id"]),
             number=None if row["number"] is None else int(row["number"]),
             head_sha=str(row["head_sha"]),
+            source_generation=int(row["source_generation"] or 1),
             status=str(row["status"]),
             failed_step=row["failed_step"],
             exit_code=row["exit_code"],
@@ -1706,6 +1895,110 @@ class StateStore:
                 WHERE repository_id = ? AND number = ?
                 """,
                 (repository_id, number),
+            )
+
+    def get_managed_comment(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+        source_generation: int,
+    ) -> dict[str, object] | None:
+        """读取一个命名槽位在指定源代次维护的远端评论。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT repository_id, number, namespace, slot,
+                       source_generation, remote_comment_id, source_head_sha,
+                       content_hash, updated_at
+                FROM managed_comments
+                WHERE repository_id = ? AND number = ?
+                  AND namespace = ? AND slot = ?
+                  AND source_generation = ?
+                """,
+                (
+                    repository_id,
+                    number,
+                    namespace,
+                    slot,
+                    source_generation,
+                ),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_managed_comment(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+        source_generation: int,
+        remote_comment_id: str,
+        source_head_sha: str,
+        content_hash: str,
+    ) -> None:
+        """原子保存一个托管评论槽位的最新远端映射。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO managed_comments (
+                    repository_id, number, namespace, slot,
+                    source_generation, remote_comment_id, source_head_sha,
+                    content_hash, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    repository_id, number, namespace, slot,
+                    source_generation
+                ) DO UPDATE SET
+                    remote_comment_id = excluded.remote_comment_id,
+                    source_head_sha = excluded.source_head_sha,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    repository_id,
+                    number,
+                    namespace,
+                    slot,
+                    source_generation,
+                    remote_comment_id,
+                    source_head_sha,
+                    content_hash,
+                    time.time(),
+                ),
+            )
+
+    def delete_managed_comment(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+        source_generation: int,
+    ) -> None:
+        """删除指定源代次的本地托管评论映射。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM managed_comments
+                WHERE repository_id = ? AND number = ?
+                  AND namespace = ? AND slot = ?
+                  AND source_generation = ?
+                """,
+                (
+                    repository_id,
+                    number,
+                    namespace,
+                    slot,
+                    source_generation,
+                ),
             )
 
     def begin_agent_run(
@@ -2574,6 +2867,7 @@ class StateStore:
         self,
         limit: int | None = 50,
         *,
+        offset: int = 0,
         status: str | None = None,
         repository_id: str | None = None,
         number: int | None = None,
@@ -2598,8 +2892,8 @@ class StateStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = ""
         if limit is not None:
-            limit_clause = "LIMIT ?"
-            parameters.append(limit)
+            limit_clause = "LIMIT ? OFFSET ?"
+            parameters.extend((limit, max(0, offset)))
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
@@ -2704,6 +2998,38 @@ class StateStore:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_events(
+        self,
+        *,
+        status: str | None = None,
+        repository_id: str | None = None,
+        number: int | None = None,
+        event_id: str | None = None,
+    ) -> int:
+        """返回与事件列表筛选条件一致的记录总数。"""
+
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            parameters.append(status)
+        if repository_id:
+            conditions.append("repository_id = ?")
+            parameters.append(repository_id)
+        if number is not None:
+            conditions.append("number = ?")
+            parameters.append(number)
+        if event_id:
+            conditions.append("event_id = ?")
+            parameters.append(event_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM event_inbox {where}",
+                parameters,
+            ).fetchone()
+        return int(row["count"])
 
     def get_event_detail(self, event_id: str) -> dict[str, Any] | None:
         """按需返回单个事件、Agent 调度和全部 CI 摘要。"""
@@ -3012,3 +3338,26 @@ class StateStore:
                 (older_than,),
             )
         return run_cursor.rowcount + preflight_cursor.rowcount
+
+    def prune_terminal_target_events(
+        self,
+        older_than: float,
+        *,
+        max_attempts: int,
+    ) -> int:
+        """删除超过保留期的终态目标分支事件，活动事件必须继续保留。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM event_inbox
+                WHERE event_type = ?
+                  AND (
+                      status IN ('completed', 'unmatched', 'cancelled')
+                      OR (status = 'failed' AND attempts >= ?)
+                  )
+                  AND updated_at < ?
+                """,
+                (TARGET_COMMITS_CHANGED_EVENT, max_attempts, older_than),
+            )
+        return cursor.rowcount

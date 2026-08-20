@@ -54,6 +54,18 @@ type OverviewFilter = {
   number: string;
   status: string;
   limit: OverviewLimit;
+  page: number;
+};
+
+type OverviewPage = {
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+};
+
+type PaginatedOverviewResponse<T> = OverviewPage & {
+  items: T[];
 };
 
 type ExecutionTypeFilter = "all" | "agent" | "preflight";
@@ -98,6 +110,14 @@ const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   number: "",
   status: "",
   limit: 10,
+  page: 1,
+};
+
+const EMPTY_OVERVIEW_PAGE: OverviewPage = {
+  total: 0,
+  page: 1,
+  page_size: 10,
+  total_pages: 1,
 };
 
 const DEFAULT_EXECUTION_FILTER: ExecutionFilter = {
@@ -297,6 +317,7 @@ function createEmptyAgent(): Agent {
     network_domains: [],
     timeout_seconds: 1200,
     write_scopes: [],
+    managed_comment: false,
     allowed_sub_agents: [],
     skills: [],
     environment: {},
@@ -313,6 +334,7 @@ function dateTimeText(value?: string | null): string {
 
 function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
   const parameters = new URLSearchParams();
+  parameters.set("page", String(filter.page));
   if (filter.limit === null) {
     parameters.set("all_records", "true");
   } else {
@@ -1303,6 +1325,37 @@ function OverviewListControls(props: {
   );
 }
 
+function OverviewPagination(props: {
+  page: OverviewPage;
+  onPageChange: (page: number) => void;
+}) {
+  const { page, onPageChange } = props;
+  return (
+    <nav className="overview-pagination" aria-label="列表分页">
+      <span>共 {page.total} 条</span>
+      <div className="overview-pagination-actions">
+        <button
+          type="button"
+          className="button secondary compact"
+          disabled={page.page <= 1}
+          onClick={() => onPageChange(page.page - 1)}
+        >
+          上一页
+        </button>
+        <span>第 {page.page} / {page.total_pages} 页</span>
+        <button
+          type="button"
+          className="button secondary compact"
+          disabled={page.page >= page.total_pages}
+          onClick={() => onPageChange(page.page + 1)}
+        >
+          下一页
+        </button>
+      </div>
+    </nav>
+  );
+}
+
 function OverviewConfirmationDialog(props: {
   model: OverviewConfirmation | null;
   busy: boolean;
@@ -1490,6 +1543,8 @@ function Overview(props: {
   repositories: Repository[];
   changeRequestFilter: OverviewFilter;
   eventFilter: OverviewFilter;
+  changeRequestPage: OverviewPage;
+  eventPage: OverviewPage;
   emittingKey: string;
   triggeringKeys: string[];
   selectionMode: boolean;
@@ -1503,6 +1558,8 @@ function Overview(props: {
   onTriggerSelected: (items: ChangeRequestRecord[]) => void;
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
+  onChangeRequestPageChange: (page: number) => void;
+  onEventPageChange: (page: number) => void;
 }) {
   const [selectedChangeRequest, setSelectedChangeRequest] = useState<ChangeRequestRecord | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
@@ -1685,6 +1742,10 @@ function Overview(props: {
             </div>
           )}
         </div>
+        <OverviewPagination
+          page={props.changeRequestPage}
+          onPageChange={props.onChangeRequestPageChange}
+        />
       </section>
       <section className="section-card">
         <div className="section-title-row">
@@ -1739,6 +1800,10 @@ function Overview(props: {
             </div>
           )}
         </div>
+        <OverviewPagination
+          page={props.eventPage}
+          onPageChange={props.onEventPageChange}
+        />
       </section>
       <ChangeRequestDetailDrawer
         changeRequest={selectedChangeRequest}
@@ -4368,6 +4433,30 @@ function AgentsEditor(props: {
                   Provider Token 始终不会进入 Codex；gh / glab 只使用当前系统钥匙串或各自 CLI 登录态。
                 </p>
               </section>
+              <section className="network-permission-section">
+                <div className="network-permission-head">
+                  <div>
+                    <strong>按源版本托管顶层评论</strong>
+                    <p>目标分支变化时更新当前评论；源分支出现新提交或 force-push 时，为新的时间线代次追加评论。</p>
+                  </div>
+                  <Toggle
+                    label="每个源版本代次只维护一条评论"
+                    checked={agent.managed_comment ?? false}
+                    onChange={(managed_comment) => update(name, {
+                      managed_comment,
+                      managed_comment_slot: managed_comment
+                        ? agent.managed_comment_slot ?? crypto.randomUUID()
+                        : agent.managed_comment_slot,
+                      write_scopes: managed_comment
+                        ? Array.from(new Set([...writeScopes, "change_request"])) as Agent["write_scopes"]
+                        : writeScopes,
+                    })}
+                  />
+                </div>
+                <p className="network-permission-state">
+                  开启后，最终顶层评论必须调用 <code>publish_comment</code> 工具进行发布或更新；关闭不会删除历史评论。人工删除远端评论后，只有下次实际发布时才会重新创建。
+                </p>
+              </section>
               <div className="permissions-grid">
                 <ChoiceCards
                   title="写操作声明"
@@ -4379,8 +4468,12 @@ function AgentsEditor(props: {
                   ]}
                   onChange={(values) => {
                     const hasWorkspace = values.includes("workspace");
+                    const hasChangeRequest = values.includes("change_request");
                     update(name, {
                       write_scopes: values as Agent["write_scopes"],
+                      managed_comment: hasChangeRequest
+                        ? agent.managed_comment ?? false
+                        : false,
                       sandbox: hasWorkspace
                         ? agent.sandbox === "danger-full-access" ? "danger-full-access" : "workspace-write"
                         : "read-only",
@@ -6605,6 +6698,10 @@ export default function App() {
   const [preflightRuns, setPreflightRuns] = useState<PreflightRunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [changeRequests, setChangeRequests] = useState<ChangeRequestRecord[]>([]);
+  const [changeRequestPage, setChangeRequestPage] = useState<OverviewPage>(
+    EMPTY_OVERVIEW_PAGE,
+  );
+  const [eventPage, setEventPage] = useState<OverviewPage>(EMPTY_OVERVIEW_PAGE);
   const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
     DEFAULT_OVERVIEW_FILTER,
   );
@@ -6616,6 +6713,8 @@ export default function App() {
   );
   const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
   const operationalRequestSequence = useRef(0);
+  const overviewRequestSequence = useRef(0);
+  const mainRef = useRef<HTMLElement>(null);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
@@ -6664,12 +6763,23 @@ export default function App() {
   }, []);
 
   const refreshOverviewData = useCallback(async () => {
+    const requestSequence = overviewRequestSequence.current + 1;
+    overviewRequestSequence.current = requestSequence;
     const [nextEvents, nextChangeRequests] = await Promise.all([
-      api<EventRecord[]>(`/api/events?${overviewQuery(eventFilter, true)}`),
-      api<ChangeRequestRecord[]>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
+      api<PaginatedOverviewResponse<EventRecord>>(`/api/events?${overviewQuery(eventFilter, true)}`),
+      api<PaginatedOverviewResponse<ChangeRequestRecord>>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
     ]);
-    setEvents(nextEvents);
-    setChangeRequests(nextChangeRequests);
+    if (requestSequence !== overviewRequestSequence.current) return;
+    setEvents(nextEvents.items);
+    setChangeRequests(nextChangeRequests.items);
+    setEventPage(nextEvents);
+    setChangeRequestPage(nextChangeRequests);
+    if (nextEvents.page !== eventFilter.page) {
+      setEventFilter((current) => ({ ...current, page: nextEvents.page }));
+    }
+    if (nextChangeRequests.page !== changeRequestFilter.page) {
+      setChangeRequestFilter((current) => ({ ...current, page: nextChangeRequests.page }));
+    }
   }, [changeRequestFilter, eventFilter]);
 
   const load = useCallback(async () => {
@@ -6831,7 +6941,20 @@ export default function App() {
 
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
     cancelChangeRequestSelection();
-    setChangeRequestFilter(filter);
+    setChangeRequestFilter({ ...filter, page: 1 });
+  }
+
+  function changeOverviewEventFilter(filter: OverviewFilter) {
+    setEventFilter({ ...filter, page: 1 });
+  }
+
+  function changeOverviewChangeRequestPage(page: number) {
+    cancelChangeRequestSelection();
+    setChangeRequestFilter((current) => ({ ...current, page }));
+  }
+
+  function changeOverviewEventPage(page: number) {
+    setEventFilter((current) => ({ ...current, page }));
   }
 
   function toggleChangeRequestSelection(snapshotKey: string) {
@@ -7028,12 +7151,12 @@ export default function App() {
     const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
     setChangeRequestFilter((current) => (
       current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "" }
+        ? { ...current, repositoryId: "", page: 1 }
         : current
     ));
     setEventFilter((current) => (
       current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "" }
+        ? { ...current, repositoryId: "", page: 1 }
         : current
     ));
     setExecutionFilter((current) => (
@@ -7059,6 +7182,15 @@ export default function App() {
     || tab === "runtime"
   );
 
+  useLayoutEffect(() => {
+    globalThis.document.scrollingElement?.scrollTo({
+      top: 0,
+      left: 0,
+      behavior: "auto",
+    });
+    mainRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [tab]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -7066,7 +7198,7 @@ export default function App() {
         <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
         <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle || status.dispatching_events ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
       </aside>
-      <main className="main">
+      <main className="main" ref={mainRef}>
         <header className="topbar">
           <div><span className="eyebrow">MR / PR AUTOMATION</span><h1>{tabs.find((item) => item.id === tab)?.label}</h1></div>
           <div className="top-actions">
@@ -7097,6 +7229,8 @@ export default function App() {
                   repositories={enabledRepositories}
                   changeRequestFilter={changeRequestFilter}
                   eventFilter={eventFilter}
+                  changeRequestPage={changeRequestPage}
+                  eventPage={eventPage}
                   emittingKey={emittingKey}
                   triggeringKeys={triggeringKeys}
                   selectionMode={changeRequestSelectionMode}
@@ -7109,7 +7243,9 @@ export default function App() {
                   onToggleSelection={toggleChangeRequestSelection}
                   onTriggerSelected={requestTriggerLatestEvents}
                   onChangeRequestFilterChange={changeOverviewChangeRequestFilter}
-                  onEventFilterChange={setEventFilter}
+                  onEventFilterChange={changeOverviewEventFilter}
+                  onChangeRequestPageChange={changeOverviewChangeRequestPage}
+                  onEventPageChange={changeOverviewEventPage}
                 />
               )}
               {configurableTab && (

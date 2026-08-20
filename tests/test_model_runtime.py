@@ -448,7 +448,7 @@ def test_shell_command_uses_final_child_path(tmp_path) -> None:
         os_name="nt",
     )
 
-    assert command[0] == str(shell.resolve())
+    assert Path(command[0]).samefile(shell)
 
 
 def test_unified_diff_rejects_escape_and_git_metadata() -> None:

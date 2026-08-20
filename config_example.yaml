@@ -248,6 +248,10 @@ agents:
     write_scopes:
       - workspace
       - change_request
+    # 可选：按源分支版本代次维护顶层总结评论。目标分支变化更新当前评论，
+    # 源分支变化追加新评论；slot 是不随 Agent 重命名变化的稳定标识。
+    managed_comment: true
+    managed_comment_slot: 90d75f2e-9c29-4b77-8ce9-6b30d76b9b1a
     # 只授予 invoke_agent 调用权限；空数组表示不能委托其他 Agent。
     allowed_sub_agents: []
     # 可选：当前 Agent 独立装载的 Skill ID，不继承给 sub-agent。

@@ -1099,6 +1099,7 @@ def create_app(
     async def events(
         limit: int = Query(default=50, ge=1),
         all_records: bool = False,
+        page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
         status: Literal[
@@ -1112,13 +1113,38 @@ def create_app(
         ]
         | None = None,
     ):
-        return await asyncio.to_thread(
-            manager.store.list_events,
-            None if all_records else limit,
+        query_limit = None if all_records else limit
+        if page is None:
+            return await asyncio.to_thread(
+                manager.store.list_events,
+                query_limit,
+                status=status,
+                repository_id=repository_id,
+                number=number,
+            )
+        total = await asyncio.to_thread(
+            manager.store.count_events,
             status=status,
             repository_id=repository_id,
             number=number,
         )
+        total_pages = 1 if all_records else max(1, (total + limit - 1) // limit)
+        effective_page = 1 if all_records else min(page, total_pages)
+        items = await asyncio.to_thread(
+            manager.store.list_events,
+            query_limit,
+            offset=0 if all_records else (effective_page - 1) * limit,
+            status=status,
+            repository_id=repository_id,
+            number=number,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": effective_page,
+            "page_size": total if all_records else limit,
+            "total_pages": total_pages,
+        }
 
     @app.get("/api/events/{event_id}")
     async def event_detail(event_id: str):
@@ -1133,14 +1159,32 @@ def create_app(
     async def change_requests(
         limit: int = Query(default=100, ge=1),
         all_records: bool = False,
+        page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
         status: Literal["opened", "closed", "merged"] | None = None,
     ):
         """返回扫描器已经建立基线的 MR/PR 最新快照。"""
 
+        query_limit = None if all_records else limit
+        total: int | None = None
+        effective_page = page
+        total_pages: int | None = None
+        if page is not None:
+            total = await asyncio.to_thread(
+                manager.store.count_snapshots,
+                repository_id=repository_id,
+                status=status,
+            )
+            total_pages = 1 if all_records else max(1, (total + limit - 1) // limit)
+            effective_page = 1 if all_records else min(page, total_pages)
         records = await asyncio.to_thread(
             manager.store.list_snapshots,
-            None if all_records else limit,
+            query_limit,
+            offset=(
+                0
+                if all_records or effective_page is None
+                else (effective_page - 1) * limit
+            ),
             repository_id=repository_id,
             status=status,
         )
@@ -1150,7 +1194,15 @@ def create_app(
             record["latest_event_supported"] = bool(
                 provider is not None and provider.kind == "github"
             )
-        return records
+        if page is None:
+            return records
+        return {
+            "items": records,
+            "total": total,
+            "page": effective_page,
+            "page_size": total if all_records else limit,
+            "total_pages": total_pages,
+        }
 
     @app.get("/api/change-request-detail")
     async def change_request_detail(

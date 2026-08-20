@@ -171,7 +171,7 @@ GitHub 历史 PR 的列表行会展示 Timeline 中最新一条可转换为规�
 
 GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产生的 `closed`；系统将其归并为一次 `change_request.merged`，不会把自动关闭另算为普通关闭，也不会重复触发合并规则。
 
-`change_request.commits_changed` 表示 PR / MR 源分支 Head 变化；`change_request.target_commits_changed` 表示打开状态 PR / MR 的目标分支真实 Head 变化。目标分支按仓库和分支每轮只查询一次，首次读取只建立基线。目标分支变化事件仅作为可靠触发信号短期入队，成功处理或未匹配规则后立即删除，不进入长期事件历史，但由它创建的 Agent 运行与日志仍会保留。
+`change_request.commits_changed` 表示 PR / MR 源分支 Head 变化；`change_request.target_commits_changed` 表示打开状态 PR / MR 的目标分支真实 Head 变化。目标分支按仓库和分支每轮只查询一次，首次读取只建立基线。目标分支变化事件作为轻量可靠触发信号入队，进入完成、未匹配、失败或取消终态后仍会在事件历史中保留，并与实时日志共用 `web.log_retention_days`（默认 30 天）保留期；由它创建的 Agent 运行与固化上下文不随事件过期清理。
 
 ## Agent 运行状态与 Git 超时
 
@@ -196,7 +196,7 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 运行时配置中的“Codex 仅作为模型基座”默认关闭。关闭时继续使用完整的 `codex exec` 运行时，包括 Codex CLI 自己的 Agent 循环、内置工具和允许的 MCP；开启后，Teamwork 不再启动 `codex exec`，而是直接读取 `runtime.codex_home`（或 `CODEX_HOME` / `~/.codex`）中的现有 ChatGPT OAuth 登录，并在进程内访问 Codex Responses 模型。该模式不启动或请求本机、外部的 `codex-api-service`，只把 Codex 用作模型基座。
 
-模型基座模式由 Teamwork 提供 `execute_command`、`apply_patch` 和白名单 `invoke_agent`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它不会继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`；模型必须在 Agent、`runtime.codex.model` 或用户 `config.toml` 顶层明确配置。OAuth token 只用于宿主模型请求，不进入 Prompt、工具环境和运行日志。
+模型基座模式由 Teamwork 提供 `execute_command`、`apply_patch`、白名单 `invoke_agent`，以及按 Agent 配置开放的 `publish_comment`，负责函数调用回传、Skill 指令、日志、取消、超时和 Token 用量。它不会继承 Codex CLI 的内置工具、用户 MCP 或仓库 `.codex/config.toml`；模型必须在 Agent、`runtime.codex.model` 或用户 `config.toml` 顶层明确配置。OAuth token 只用于宿主模型请求，不进入 Prompt、工具环境和运行日志。
 
 受限 Agent 在模型基座模式下没有 Codex 内层沙盒可回退，因此 `read-only` 和 `workspace-write` 的每个命令、补丁进程都必须成功进入 Teamwork 外层沙盒；即使 `fail_closed` 配成 `false`，该模式仍失败关闭。`danger-full-access` 继续表示管理员明确允许工具直接访问宿主环境。配置文件等价写法如下：
 
@@ -227,13 +227,17 @@ agents:
 
 `read-only` 使用只读外层档案；`workspace-write` 允许写当前独立运行 clone（含它自己的 `.git`）和 Codex 权限档案定义的系统临时目录，后者承载每轮临时 HOME 与工具缓存；基础仓库和真实 HOME 不会因此变成可写。`danger-full-access` 会绕过受限外层沙盒，属于明确的高风险配置。网络关闭和普通联网由外层档案执行；域名白名单非空时，Teamwork 还会显式启用 Codex 网络代理，确保规则不只是配置声明。Provider Token 仍会从 Codex 环境中移除。
 
-sub-agent 不需要为此获得配置文件或数据库权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行原有白名单、深度、幂等和并发校验。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、基础仓库或其他 Agent 工作区；通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
+sub-agent 和托管评论都不需要为此获得配置文件、数据库或 Provider Token 权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 与 `publish_comment` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行白名单、写作用域、源版本代次、幂等和并发校验。`publish_comment` 只接收完整正文，仓库、PR/MR、Agent 槽位和源版本代次全部来自服务签发的可信上下文。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、Provider Token、基础仓库或其他 Agent 工作区；通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
+
+Agent 详情页可以开启“按源版本托管顶层评论”。开启后必须同时声明 `change_request` 写作用域，并保存一个不会随 Agent 重命名变化的 `managed_comment_slot`。同一 Agent、同一 PR/MR、同一源版本代次只维护一条顶层评论：目标分支变化但源分支未变时更新原评论；源分支新增提交或 force-push 时创建下一代评论，保留时间线中的旧审核记录。人工删除评论不会被后台立即补回，只有该 Agent 下一次实际调用 `publish_comment` 时才会重新创建。关闭开关也不会删除历史评论。
 
 `fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时才回退到原来的 Codex 内层同级沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“运行时配置”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
 
 ## GitHub 本地 CI 门禁
 
 通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
+
+开启 `publish_failure_comment` 后，Preflight 失败评论复用与 Agent 托管评论相同的源版本代次规则，并以 `status_context` 作为独立槽位：同一源版本内的重复失败、超时或执行异常会更新原评论；源分支变化后再次失败会追加新评论；同一源版本随后成功只删除该代次的失败评论，不删除时间线中更早源版本留下的失败记录。人工删除的失败评论也只会在下一次该代次真实失败时重建。
 
 ![GitHub 本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
 

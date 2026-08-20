@@ -216,6 +216,9 @@ class CodexRunner:
                 else "teamwork_review_agents.mcp_server"
             ),
         ]
+        enabled_tools = ["invoke_agent"]
+        if agent.managed_comment:
+            enabled_tools.append("publish_comment")
         overrides = [
             *runtime_overrides(self.config.runtime.codex),
             *agent_overrides(agent),
@@ -232,7 +235,10 @@ class CodexRunner:
                 f"mcp_servers.{server_name}.tool_timeout_sec="
                 f"{self.config.runtime.mcp_tool_timeout_seconds}"
             ),
-            f"mcp_servers.{server_name}.enabled_tools=[\"invoke_agent\"]",
+            (
+                f"mcp_servers.{server_name}.enabled_tools="
+                f"{json.dumps(enabled_tools)}"
+            ),
             f"mcp_servers.{server_name}.default_tools_approval_mode=\"approve\"",
         ]
         if use_mcp_bridge and mcp_bridge is not None:

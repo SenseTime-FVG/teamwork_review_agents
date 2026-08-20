@@ -160,6 +160,39 @@ async def call_bridge(
 ) -> dict[str, Any]:
     """从沙盒内提交一次 invoke_agent 请求并等待受控响应。"""
 
+    return await _call_bridge_method(
+        channel,
+        method="invoke_agent",
+        params={
+            "agent_name": agent_name,
+            "task": task,
+            "extra_context": extra_context,
+        },
+    )
+
+
+async def publish_comment_bridge(
+    channel: McpBridgeChannel,
+    *,
+    body: str,
+) -> dict[str, Any]:
+    """从沙盒内提交一次 publish_comment 请求并等待受控响应。"""
+
+    return await _call_bridge_method(
+        channel,
+        method="publish_comment",
+        params={"body": body},
+    )
+
+
+async def _call_bridge_method(
+    channel: McpBridgeChannel,
+    *,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """通过临时通道提交一个白名单方法并验证响应。"""
+
     request_id = str(uuid.uuid4())
     request_path = channel.requests_directory / f"{request_id}.request.json"
     response_path = channel.responses_directory / f"{request_id}.response.json"
@@ -172,12 +205,8 @@ async def call_bridge(
             "version": CHANNEL_VERSION,
             "request_id": request_id,
             "token": channel.token,
-            "method": "invoke_agent",
-            "params": {
-                "agent_name": agent_name,
-                "task": task,
-                "extra_context": extra_context,
-            },
+            "method": method,
+            "params": params,
         },
     )
     deadline = time.monotonic() + channel.response_timeout_seconds
@@ -371,25 +400,34 @@ async def _handle_request(
             raise ValueError("MCP Bridge 请求 ID 不匹配")
         if request.get("token") != channel.token:
             raise PermissionError("MCP Bridge 通道令牌无效")
-        if request.get("method") != "invoke_agent":
-            raise PermissionError("MCP Bridge 只允许 invoke_agent")
+        method = request.get("method")
+        if method not in {"invoke_agent", "publish_comment"}:
+            raise PermissionError("MCP Bridge 请求的方法不在白名单中")
         params = request.get("params")
         if not isinstance(params, dict):
-            raise ValueError("invoke_agent 参数格式无效")
-        agent_name = params.get("agent_name")
-        task = params.get("task")
-        extra_context = params.get("extra_context")
-        if not isinstance(agent_name, str) or not agent_name.strip():
-            raise ValueError("invoke_agent 缺少 agent_name")
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError("invoke_agent 缺少 task")
-        if extra_context is not None and not isinstance(extra_context, dict):
-            raise ValueError("invoke_agent 的 extra_context 必须是对象")
+            raise ValueError("MCP Bridge 参数格式无效")
 
         # 延迟导入可避免 CodexRunner 与桥接模块在主服务进程中形成循环依赖。
-        from .mcp_server import invoke_agent
+        if method == "invoke_agent":
+            agent_name = params.get("agent_name")
+            task = params.get("task")
+            extra_context = params.get("extra_context")
+            if not isinstance(agent_name, str) or not agent_name.strip():
+                raise ValueError("invoke_agent 缺少 agent_name")
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("invoke_agent 缺少 task")
+            if extra_context is not None and not isinstance(extra_context, dict):
+                raise ValueError("invoke_agent 的 extra_context 必须是对象")
+            from .mcp_server import invoke_agent
 
-        result = await invoke_agent(agent_name, task, extra_context)
+            result = await invoke_agent(agent_name, task, extra_context)
+        else:
+            body = params.get("body")
+            if not isinstance(body, str) or not body.strip():
+                raise ValueError("publish_comment 缺少 body")
+            from .mcp_server import publish_comment
+
+            result = await publish_comment(body)
         response.update({"ok": True, "result": result})
     except asyncio.CancelledError:
         raise

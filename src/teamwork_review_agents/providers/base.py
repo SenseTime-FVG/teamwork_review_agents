@@ -138,6 +138,26 @@ class BaseProvider(ABC):
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
 
+    async def put_optional_json(
+        self,
+        path: str,
+        payload: dict[str, object],
+    ) -> object | None:
+        """执行 PUT；远端资源不存在时返回空，其余错误保持显式失败。"""
+
+        try:
+            response = await self.client.put(path, json=payload)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(
+                f"Provider {self.name} 请求失败：{exc.response.status_code} {path}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
     async def delete_resource(self, path: str, *, missing_ok: bool = False) -> None:
         """执行 DELETE；可选择把远端资源已不存在视为成功。"""
 
@@ -181,6 +201,8 @@ class BaseProvider(ABC):
         repository: RepositoryConfig,
         comment_id: str,
         body: str,
+        *,
+        number: int | None = None,
     ) -> bool:
         """更新 MR/PR 评论；评论已不存在时返回假。"""
 
@@ -190,6 +212,8 @@ class BaseProvider(ABC):
         self,
         repository: RepositoryConfig,
         comment_id: str,
+        *,
+        number: int | None = None,
     ) -> None:
         """删除 MR/PR 评论；具体平台必须显式实现。"""
 

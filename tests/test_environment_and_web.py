@@ -1007,6 +1007,28 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/change-requests?repository_id=second&status=closed&limit=10"
         ).json()
         assert [item["snapshot_key"] for item in filtered_snapshots] == [second.key]
+        first_snapshot_page = client.get(
+            "/api/change-requests?page=1&limit=1"
+        ).json()
+        assert first_snapshot_page["total"] == 2
+        assert first_snapshot_page["page"] == 1
+        assert first_snapshot_page["total_pages"] == 2
+        assert [item["snapshot_key"] for item in first_snapshot_page["items"]] == [
+            first.key
+        ]
+        last_snapshot_page = client.get(
+            "/api/change-requests?page=99&limit=1"
+        ).json()
+        assert last_snapshot_page["page"] == 2
+        assert [item["snapshot_key"] for item in last_snapshot_page["items"]] == [
+            second.key
+        ]
+        all_snapshot_page = client.get(
+            "/api/change-requests?page=2&all_records=true"
+        ).json()
+        assert all_snapshot_page["page"] == 1
+        assert all_snapshot_page["total_pages"] == 1
+        assert len(all_snapshot_page["items"]) == 2
         change_request_detail = client.get(
             "/api/change-request-detail?repository_id=second&number=2"
         )
@@ -1032,6 +1054,18 @@ def test_overview_api_filters_status_repository_and_limit(
         assert [item["event_id"] for item in filtered_events] == [second_event.id]
         number_events = client.get("/api/events?number=2&limit=10").json()
         assert [item["event_id"] for item in number_events] == [second_event.id]
+        first_event_page = client.get("/api/events?page=1&limit=1").json()
+        assert first_event_page["total"] == 2
+        assert first_event_page["page"] == 1
+        assert first_event_page["total_pages"] == 2
+        assert [item["event_id"] for item in first_event_page["items"]] == [
+            first_event.id
+        ]
+        last_event_page = client.get("/api/events?page=99&limit=1").json()
+        assert last_event_page["page"] == 2
+        assert [item["event_id"] for item in last_event_page["items"]] == [
+            second_event.id
+        ]
 
         reservation = store.begin_preflight_run(
             proposed_run_id="web-preflight",

@@ -580,3 +580,81 @@ async def test_github_provider_manages_pull_request_comments() -> None:
     assert requests[0].url.path == "/repos/owner/demo/issues/7/comments"
     assert requests[1].url.path == "/repos/owner/demo/issues/comments/101"
     assert json.loads(requests[0].content)["body"] == "第一次失败"
+
+
+async def test_gitlab_provider_manages_merge_request_comments() -> None:
+    """GitLab Notes API 应支持创建、更新、远端缺失和幂等删除。"""
+
+    requests: list[httpx.Request] = []
+    update_missing = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(201, json={"id": 202})
+        if request.method == "PUT":
+            if update_missing:
+                return httpx.Response(404, json={"message": "404 Note Not Found"})
+            return httpx.Response(200, json={"id": 202})
+        if request.method == "DELETE":
+            return httpx.Response(404, json={"message": "404 Note Not Found"})
+        raise AssertionError(f"未预期的请求：{request.method}")
+
+    provider = GitLabProvider(
+        "gitlab-main",
+        ProviderConfig(
+            kind="gitlab",
+            base_url="https://gitlab.example.com/api/v4",
+            token_env="GITLAB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="https://gitlab.example.com/api/v4/",
+        transport=httpx.MockTransport(handler),
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="gitlab-main",
+        project="group/nested/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    try:
+        comment_id = await provider.create_change_request_comment(
+            repository,
+            7,
+            "第一次失败",
+        )
+        assert comment_id == "202"
+        assert await provider.update_change_request_comment(
+            repository,
+            comment_id,
+            "第二次失败",
+            number=7,
+        ) is True
+        update_missing = True
+        assert await provider.update_change_request_comment(
+            repository,
+            comment_id,
+            "远端已删除",
+            number=7,
+        ) is False
+        await provider.delete_change_request_comment(
+            repository,
+            comment_id,
+            number=7,
+        )
+    finally:
+        await provider.close()
+
+    assert [request.method for request in requests] == [
+        "POST",
+        "PUT",
+        "PUT",
+        "DELETE",
+    ]
+    expected_path = "/api/v4/projects/group%2Fnested%2Fdemo/merge_requests/7/notes"
+    assert requests[0].url.raw_path.decode() == expected_path
+    assert requests[1].url.raw_path.decode() == f"{expected_path}/202"

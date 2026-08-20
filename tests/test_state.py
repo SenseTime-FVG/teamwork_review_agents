@@ -22,11 +22,11 @@ from teamwork_review_agents.state import (
 )
 
 
-def test_terminal_target_event_is_lightweight_and_removed_without_losing_run(
+def test_terminal_target_event_is_lightweight_retained_and_pruned_without_losing_run(
     tmp_path,
     snapshot_factory,
 ) -> None:
-    """临时目标事件结束后应删除，关联运行仍保留完整 MR/PR 摘要。"""
+    """目标事件终态先保留再按期限清理，关联运行始终保留完整摘要。"""
 
     store = StateStore(tmp_path / "state.db")
     store.initialize()
@@ -76,14 +76,100 @@ def test_terminal_target_event_is_lightweight_and_removed_without_losing_run(
     )
     store.finish_event(event.id)
 
-    assert store.cleanup_terminal_transient_event(event.id) is True
-    assert store.list_events(None) == []
+    assert store.finalize_terminal_target_event_context(event.id) is True
+    retained = store.list_events(None)
+    assert len(retained) == 1
+    assert retained[0]["event_id"] == event.id
+    assert retained[0]["status"] == "completed"
     detail = store.get_run("target-run")
     assert detail is not None
     assert detail["repository_id"] == current.repository_id
     assert detail["change_request_number"] == current.number
     assert detail["change_request_title"] == current.title
     assert detail["change_request_url"] == current.web_url
+
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE event_inbox SET updated_at = ? WHERE event_id = ?",
+            (1.0, event.id),
+        )
+    assert store.prune_terminal_target_events(2.0, max_attempts=2) == 1
+    assert store.list_events(None) == []
+
+    detail_after_prune = store.get_run("target-run")
+    assert detail_after_prune is not None
+    assert detail_after_prune["repository_id"] == current.repository_id
+    assert detail_after_prune["change_request_number"] == current.number
+
+
+def test_target_event_retention_prune_only_removes_terminal_statuses(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """过期清理覆盖全部终态，同时保护仍在处理链路中的目标事件。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    old = snapshot_factory(target_head_sha="a" * 40)
+    current = snapshot_factory(target_head_sha="b" * 40)
+    active_events = []
+    terminal_events = []
+    statuses = (
+        "pending",
+        "processing",
+        "triggered",
+        "completed",
+        "unmatched",
+        "failed",
+        "cancelled",
+    )
+    for index, status in enumerate(statuses, start=1):
+        event = detect_target_branch_event(
+            old,
+            current,
+            batch_id=f"active-{index}",
+            occurred_at=current.updated_at,
+        )[0]
+        store.save_snapshot_and_events(current, [event])
+        with store.connect() as connection:
+            connection.execute(
+                """
+                UPDATE event_inbox
+                SET status = ?, attempts = ?, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (status, 2 if status == "failed" else 0, 1.0, event.id),
+            )
+        if status in {"pending", "processing", "triggered"}:
+            active_events.append(event)
+        else:
+            terminal_events.append(event)
+
+    retryable_failed_event = detect_target_branch_event(
+        old,
+        current,
+        batch_id="retryable-failed",
+        occurred_at=current.updated_at,
+    )[0]
+    store.save_snapshot_and_events(current, [retryable_failed_event])
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE event_inbox
+            SET status = 'failed', attempts = 1, updated_at = ?
+            WHERE event_id = ?
+            """,
+            (1.0, retryable_failed_event.id),
+        )
+    active_events.append(retryable_failed_event)
+
+    assert (
+        store.prune_terminal_target_events(2.0, max_attempts=2)
+        == len(terminal_events)
+    )
+    assert {record["event_id"] for record in store.list_events(None)} == {
+        event.id for event in active_events
+    }
 
 
 def test_connection_context_closes_on_success_and_failure(tmp_path) -> None:
@@ -308,6 +394,11 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         newest.key,
     ]
     assert [
+        item["snapshot_key"] for item in store.list_snapshots(1, offset=1)
+    ] == [older.key]
+    assert store.count_snapshots() == 2
+    assert store.count_snapshots(repository_id="second", status="closed") == 1
+    assert [
         item["snapshot_key"]
         for item in store.list_snapshots(None, repository_id="second")
     ] == [older.key]
@@ -325,6 +416,9 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
         older_event.id,
     ]
     assert store.list_events(1)[0]["event_id"] == newest_event.id
+    assert store.list_events(1, offset=1)[0]["event_id"] == older_event.id
+    assert store.count_events() == 2
+    assert store.count_events(repository_id="second", status="unmatched") == 1
     assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
     assert store.list_events(None, number=2)[0]["event_id"] == older_event.id
     assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id

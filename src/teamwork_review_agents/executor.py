@@ -314,10 +314,19 @@ class AgentExecutor:
             }
             if extra_context:
                 context["delegated_context"] = extra_context
+        managed_comment_instruction = ""
+        if agent.managed_comment:
+            managed_comment_instruction = (
+                "最终顶层评论必须调用 `publish_comment` 工具进行发布或更新；"
+                "不得使用 `gh`、`glab` 或平台 API 另行发布顶层总结评论。"
+                "该工具只接收完整评论正文，评论目标和源版本代次由 Teamwork "
+                "根据本次可信运行上下文确定。\n\n"
+            )
         return (
             f"{role_prompt}\n\n"
             "# 本次运行上下文\n\n"
             f"```json\n{json.dumps(context, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"{managed_comment_instruction}"
             "如果工具列表中存在 `invoke_agent`，只能在确有必要时调用配置允许的 "
             "sub-agent，并向它传递边界清晰的任务。最终必须明确说明实际执行的操作、"
             "验证结果和仍存在的阻断项。"

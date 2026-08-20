@@ -13,9 +13,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import AgentConfig, AppConfig, RepositoryConfig
+from .managed_comments import ManagedCommentService
 from .managed_sandbox import wrap_managed_sandbox_command
 from .models import InvocationContext
 from .process_control import process_group_options, terminate_process
+from .state import StateStore
 from .subprocess_utils import resolve_executable
 
 
@@ -40,7 +42,11 @@ _PROCESS_TERMINATE_GRACE_SECONDS = 3.0
 _PROCESS_KILL_GRACE_SECONDS = 1.0
 
 
-def teamwork_function_tools(*, allow_sub_agents: bool) -> list[dict[str, Any]]:
+def teamwork_function_tools(
+    *,
+    allow_sub_agents: bool,
+    allow_publish_comment: bool = False,
+) -> list[dict[str, Any]]:
     """生成 Codex Responses 接受的 Teamwork 函数工具定义。"""
 
     tools: list[dict[str, Any]] = [
@@ -124,6 +130,28 @@ def teamwork_function_tools(*, allow_sub_agents: bool) -> list[dict[str, Any]]:
                 },
             }
         )
+    if allow_publish_comment:
+        tools.append(
+            {
+                "type": "function",
+                "name": "publish_comment",
+                "description": (
+                    "发布或更新当前 Agent 在本次 PR/MR 源版本代次的托管顶层评论。"
+                    "目标分支变化会更新当前评论，源分支变化会创建下一代评论。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": "需要发布的完整 Markdown 顶层评论正文。",
+                        }
+                    },
+                    "required": ["body"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     return tools
 
 
@@ -173,7 +201,22 @@ class ModelToolExecutor:
                 arguments,
                 started_callback=invoke_agent_started_callback,
             )
+        if name == "publish_comment":
+            return await self._publish_comment(arguments)
         raise ValueError(f"未知 Teamwork 工具：{name}")
+
+    async def _publish_comment(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """把顶层评论交给 Teamwork 托管服务发布或更新。"""
+
+        body = arguments.get("body")
+        if not isinstance(body, str):
+            raise ValueError("publish_comment.body 必须是字符串")
+        store = StateStore(self.config.database.path)
+        await asyncio.to_thread(store.initialize)
+        return await ManagedCommentService(
+            self.config,
+            store,
+        ).publish_agent_comment(self.context, body)
 
     async def _execute_command(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """在受约束工作目录内执行跨平台 shell。"""

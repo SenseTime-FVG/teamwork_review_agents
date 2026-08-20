@@ -14,6 +14,7 @@ from typing import Awaitable, Callable, Literal
 from .config import AppConfig, PreflightConfig
 from .environment import SecretRedactor, resolve_provider_token
 from .filesystem import temporary_directory
+from .managed_comments import ManagedCommentService
 from .models import ChangeEvent, PreflightResult, stable_hash
 from .preflight_cache import (
     build_repository_cache_environment,
@@ -553,43 +554,29 @@ class PreflightExecutor:
         repository,
         result: PreflightResult,
     ) -> None:
-        """按 CI 终态创建、更新或删除一条仓库级失败评论。"""
+        """按源版本代次创建、更新或删除 CI 失败评论。"""
 
         if (
             not repository.preflight.publish_failure_comment
             or result.number is None
         ):
             return
-        record = await asyncio.to_thread(
-            self.store.get_preflight_failure_comment,
-            repository.id,
-            result.number,
-        )
+        service = ManagedCommentService(self.config, self.store)
+        slot = repository.preflight.status_context
         if result.status == "success":
-            if record is None:
-                return
-            provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
-            async with create_provider(
-                repository.provider,
-                provider_config,
-                self.config.scanner,
-                token=token,
-            ) as remote:
-                await remote.delete_change_request_comment(
-                    repository,
-                    str(record["remote_comment_id"]),
+            deleted = await service.delete(
+                repository_id=repository.id,
+                number=result.number,
+                namespace="preflight",
+                slot=slot,
+                source_generation=result.source_generation,
+            )
+            if deleted:
+                await self._append_log(
+                    result.run_id,
+                    "本地 CI 已通过，已删除当前源版本代次的失败评论",
+                    event_type="comment_deleted",
                 )
-            await asyncio.to_thread(
-                self.store.delete_preflight_failure_comment,
-                repository.id,
-                result.number,
-            )
-            await self._append_log(
-                result.run_id,
-                "本地 CI 已通过，已删除此前发布的失败评论",
-                event_type="comment_deleted",
-            )
             return
         if result.status not in {"failure", "timed_out", "error"}:
             return
@@ -601,51 +588,24 @@ class PreflightExecutor:
             result,
             redactor=SecretRedactor((token,)),
         )
-        content_hash = stable_hash(body)
-        if record is not None and record["content_hash"] == content_hash:
-            return
-
-        action = "创建"
-        async with create_provider(
-            repository.provider,
-            provider_config,
-            self.config.scanner,
-            token=token,
-        ) as remote:
-            remote_comment_id: str
-            if record is not None:
-                updated = await remote.update_change_request_comment(
-                    repository,
-                    str(record["remote_comment_id"]),
-                    body,
-                )
-                if updated:
-                    remote_comment_id = str(record["remote_comment_id"])
-                    action = "更新"
-                else:
-                    remote_comment_id = await remote.create_change_request_comment(
-                        repository,
-                        result.number,
-                        body,
-                    )
-            else:
-                remote_comment_id = await remote.create_change_request_comment(
-                    repository,
-                    result.number,
-                    body,
-                )
-        await asyncio.to_thread(
-            self.store.save_preflight_failure_comment,
+        synced = await service.publish(
             repository_id=repository.id,
             number=result.number,
-            status_context=repository.preflight.status_context,
-            remote_comment_id=remote_comment_id,
-            head_sha=result.head_sha,
-            content_hash=content_hash,
+            namespace="preflight",
+            slot=slot,
+            source_generation=result.source_generation,
+            source_head_sha=result.head_sha,
+            body=body,
         )
+        action = {
+            "created": "创建",
+            "updated": "更新",
+            "unchanged": "确认",
+            "recreated": "重新创建",
+        }[str(synced["action"])]
         await self._append_log(
             result.run_id,
-            f"已{action}本地 CI 失败评论",
+            f"已{action}当前源版本代次的本地 CI 失败评论",
             event_type="comment_synced",
         )
 
@@ -707,6 +667,7 @@ class PreflightExecutor:
                 repository_id=result.repository_id,
                 number=result.number,
                 head_sha=result.head_sha,
+                source_generation=result.source_generation,
                 status="error",
                 error=f"本地 CI 已完成，但 GitHub 状态回写失败：{status_error}",
             )
@@ -721,6 +682,9 @@ class PreflightExecutor:
         key = preflight_idempotency_key(self.config, event)
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
+            cached = cached.model_copy(
+                update={"source_generation": event.source_generation}
+            )
             if cached.status == "superseded":
                 return cached.model_copy(update={"reused": True})
             if cached.status_published:
@@ -738,18 +702,25 @@ class PreflightExecutor:
             repository_id=repository.id,
             number=event.number,
             head_sha=snapshot.head_sha,
+            source_generation=event.source_generation,
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
         )
         if reservation is None:
             current = await asyncio.to_thread(self.store.load_preflight_result, key)
             if current is not None:
-                return current.model_copy(update={"reused": True})
+                return current.model_copy(
+                    update={
+                        "reused": True,
+                        "source_generation": event.source_generation,
+                    }
+                )
             return PreflightResult(
                 run_id=proposed_run_id,
                 repository_id=repository.id,
                 number=event.number,
                 head_sha=snapshot.head_sha,
+                source_generation=event.source_generation,
                 status="error",
                 error="无法创建或读取 Preflight 运行记录",
             )
@@ -874,6 +845,7 @@ class PreflightExecutor:
                 repository_id=repository.id,
                 number=event.number,
                 head_sha=snapshot.head_sha,
+                source_generation=event.source_generation,
                 status=outcome.status,
                 failed_step=outcome.failed_step,
                 exit_code=outcome.exit_code,
@@ -892,6 +864,7 @@ class PreflightExecutor:
                 repository_id=repository.id,
                 number=event.number,
                 head_sha=snapshot.head_sha,
+                source_generation=event.source_generation,
                 status="superseded",
                 error=str(exc),
             )
@@ -907,6 +880,7 @@ class PreflightExecutor:
                 repository_id=repository.id,
                 number=event.number,
                 head_sha=snapshot.head_sha,
+                source_generation=event.source_generation,
                 status="error",
                 error=str(exc),
             )
