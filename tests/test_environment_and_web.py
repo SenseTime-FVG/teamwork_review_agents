@@ -801,6 +801,7 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         event_detail = client.get(
             f"/api/events/{event_record['event_id']}"
         ).json()
+        assert event_detail["change_request_url"] == snapshot.web_url
         assert event_detail["dispatches"] == []
         assert event_detail["agent_runs"] == []
         assert event_detail["preflight"] is None

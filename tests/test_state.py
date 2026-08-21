@@ -1460,10 +1460,29 @@ def test_event_list_exposes_linked_preflight_summary(
 
     detail = store.get_event_detail(event.id)
     assert detail is not None
+    assert detail["change_request_url"] == event.new.web_url
     assert detail["dispatches"] == []
     assert "output" not in detail["preflight"]
     assert detail["preflight"]["reused"] == 0
     assert detail["preflights"][0]["run_id"] == reservation.run_id
+
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE event_inbox
+            SET payload = json_remove(
+                payload,
+                '$.current.web_url',
+                '$.new.web_url',
+                '$.old.web_url'
+            )
+            WHERE event_id = ?
+            """,
+            (event.id,),
+        )
+    fallback_detail = store.get_event_detail(event.id)
+    assert fallback_detail is not None
+    assert fallback_detail["change_request_url"] == snapshot.web_url
 
     summaries = store.list_preflight_runs()
     assert summaries[0]["run_id"] == reservation.run_id
