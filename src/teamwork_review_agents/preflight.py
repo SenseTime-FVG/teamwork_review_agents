@@ -515,7 +515,7 @@ def _failure_comment_body(
         ])
     sections.extend([
         "",
-        "> 后续同一 PR 再次失败会更新本评论；本地 CI 通过后会自动删除。",
+        "> 后续真实 CI 再次失败时会删除本评论并在时间线底部发布最新结果；本地 CI 通过后会自动删除活动失败评论。",
     ])
     return "\n".join(sections)
 
@@ -578,8 +578,10 @@ class PreflightExecutor:
         self,
         repository,
         result: PreflightResult,
+        *,
+        replace_existing: bool = True,
     ) -> None:
-        """按源版本代次创建、更新或删除 CI 失败评论。"""
+        """维护当前 PR 的单条活动 CI 失败评论。"""
 
         if (
             not repository.preflight.publish_failure_comment
@@ -589,17 +591,26 @@ class PreflightExecutor:
         service = ManagedCommentService(self.config, self.store)
         slot = repository.preflight.status_context
         if result.status == "success":
-            deleted = await service.delete(
+            current_generation = await asyncio.to_thread(
+                self.store.source_generation,
+                repository.id,
+                result.number,
+            )
+            if (
+                current_generation is not None
+                and result.source_generation < current_generation
+            ):
+                return
+            deleted = await service.delete_all(
                 repository_id=repository.id,
                 number=result.number,
                 namespace="preflight",
                 slot=slot,
-                source_generation=result.source_generation,
             )
             if deleted:
                 await self._append_log(
                     result.run_id,
-                    "本地 CI 已通过，已删除当前源版本代次的失败评论",
+                    f"本地 CI 已通过，已删除 {deleted} 条活动失败评论",
                     event_type="comment_deleted",
                 )
             return
@@ -613,7 +624,7 @@ class PreflightExecutor:
             result,
             redactor=SecretRedactor((token,)),
         )
-        synced = await service.publish(
+        synced = await service.publish_latest(
             repository_id=repository.id,
             number=result.number,
             namespace="preflight",
@@ -621,16 +632,17 @@ class PreflightExecutor:
             source_generation=result.source_generation,
             source_head_sha=result.head_sha,
             body=body,
+            replace_existing=replace_existing,
         )
+        if synced["action"] == "preserved":
+            return
         action = {
             "created": "创建",
-            "updated": "更新",
-            "unchanged": "确认",
-            "recreated": "重新创建",
+            "replaced": "刷新",
         }[str(synced["action"])]
         await self._append_log(
             result.run_id,
-            f"已{action}当前源版本代次的本地 CI 失败评论",
+            f"已{action}本地 CI 活动失败评论",
             event_type="comment_synced",
         )
 
@@ -638,11 +650,17 @@ class PreflightExecutor:
         self,
         repository,
         result: PreflightResult,
+        *,
+        replace_existing: bool = True,
     ) -> None:
         """隔离评论写回错误，确保平台权限问题不篡改 CI 真实终态。"""
 
         try:
-            await self._sync_failure_comment(repository, result)
+            await self._sync_failure_comment(
+                repository,
+                result,
+                replace_existing=replace_existing,
+            )
         except Exception as exc:
             provider_config = self.config.providers[repository.provider]
             token = resolve_provider_token(self.config, provider_config)
@@ -658,6 +676,8 @@ class PreflightExecutor:
         self,
         repository,
         result: PreflightResult,
+        *,
+        replace_existing_comment: bool = True,
     ) -> PreflightResult:
         """只发布代码门禁终态；写回失败时保留本地真实结论。"""
 
@@ -684,7 +704,11 @@ class PreflightExecutor:
                 self.store.mark_preflight_status_published,
                 result.run_id,
             )
-        await self._sync_failure_comment_safely(repository, result)
+        await self._sync_failure_comment_safely(
+            repository,
+            result,
+            replace_existing=replace_existing_comment,
+        )
         if status_error is not None:
             return PreflightResult(
                 run_id=result.run_id,
@@ -712,9 +736,17 @@ class PreflightExecutor:
             if cached.status == "superseded":
                 return cached.model_copy(update={"reused": True})
             if cached.status_published:
-                await self._sync_failure_comment_safely(repository, cached)
+                await self._sync_failure_comment_safely(
+                    repository,
+                    cached,
+                    replace_existing=False,
+                )
                 return cached.model_copy(update={"reused": True})
-            published = await self._publish_terminal_result(repository, cached)
+            published = await self._publish_terminal_result(
+                repository,
+                cached,
+                replace_existing_comment=False,
+            )
             return published.model_copy(update={"reused": True})
 
         proposed_run_id = str(uuid.uuid4())

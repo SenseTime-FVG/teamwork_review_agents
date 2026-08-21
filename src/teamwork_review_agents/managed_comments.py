@@ -255,6 +255,157 @@ class ManagedCommentService:
             )
         return True
 
+    async def publish_latest(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+        source_generation: int,
+        source_head_sha: str,
+        body: str,
+        replace_existing: bool,
+    ) -> dict[str, Any]:
+        """在槽位内发布最新评论，可选择先删除全部历史评论。"""
+
+        normalized_body = body.strip()
+        if not normalized_body:
+            raise ValueError("publish_comment.body 必须是非空字符串")
+        if len(normalized_body.encode("utf-8")) > _COMMENT_LIMIT_BYTES:
+            raise ValueError("publish_comment.body 不能超过 60 KiB")
+        if source_generation < 1:
+            raise ValueError("托管评论的源版本代次必须大于零")
+        repository = self._repository(repository_id)
+        resource_key = self._slot_resource_key(
+            repository_id=repository_id,
+            number=number,
+            namespace=namespace,
+            slot=slot,
+        )
+        async with ResourceLease(
+            self.store,
+            [resource_key],
+            f"managed-comment:{uuid.uuid4()}",
+            ttl_seconds=self.config.runtime.lock_ttl_seconds,
+            timeout_seconds=self.config.runtime.lock_timeout_seconds,
+        ):
+            records = await asyncio.to_thread(
+                self.store.list_managed_comments,
+                repository_id=repository_id,
+                number=number,
+                namespace=namespace,
+                slot=slot,
+            )
+            if records and not replace_existing:
+                current = records[-1]
+                return {
+                    "action": "preserved",
+                    "comment_id": str(current["remote_comment_id"]),
+                    "source_generation": int(current["source_generation"]),
+                }
+
+            provider_config = self.config.providers[repository.provider]
+            token = resolve_provider_token(self.config, provider_config)
+            async with create_provider(
+                repository.provider,
+                provider_config,
+                self.config.scanner,
+                token=token,
+            ) as remote:
+                for record in records:
+                    await remote.delete_change_request_comment(
+                        repository,
+                        str(record["remote_comment_id"]),
+                        number=number,
+                    )
+                    await asyncio.to_thread(
+                        self.store.delete_managed_comment,
+                        repository_id=repository_id,
+                        number=number,
+                        namespace=namespace,
+                        slot=slot,
+                        source_generation=int(record["source_generation"]),
+                    )
+                remote_comment_id = await remote.create_change_request_comment(
+                    repository,
+                    number,
+                    normalized_body,
+                )
+            await asyncio.to_thread(
+                self.store.save_managed_comment,
+                repository_id=repository_id,
+                number=number,
+                namespace=namespace,
+                slot=slot,
+                source_generation=source_generation,
+                remote_comment_id=remote_comment_id,
+                source_head_sha=source_head_sha,
+                content_hash=stable_hash(normalized_body),
+            )
+        return {
+            "action": "replaced" if records else "created",
+            "comment_id": remote_comment_id,
+            "source_generation": source_generation,
+        }
+
+    async def delete_all(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+    ) -> int:
+        """删除一个命名槽位下全部源代次的远端评论和本地映射。"""
+
+        repository = self._repository(repository_id)
+        resource_key = self._slot_resource_key(
+            repository_id=repository_id,
+            number=number,
+            namespace=namespace,
+            slot=slot,
+        )
+        async with ResourceLease(
+            self.store,
+            [resource_key],
+            f"managed-comment:{uuid.uuid4()}",
+            ttl_seconds=self.config.runtime.lock_ttl_seconds,
+            timeout_seconds=self.config.runtime.lock_timeout_seconds,
+        ):
+            records = await asyncio.to_thread(
+                self.store.list_managed_comments,
+                repository_id=repository_id,
+                number=number,
+                namespace=namespace,
+                slot=slot,
+            )
+            if not records:
+                return 0
+            provider_config = self.config.providers[repository.provider]
+            token = resolve_provider_token(self.config, provider_config)
+            async with create_provider(
+                repository.provider,
+                provider_config,
+                self.config.scanner,
+                token=token,
+            ) as remote:
+                for record in records:
+                    await remote.delete_change_request_comment(
+                        repository,
+                        str(record["remote_comment_id"]),
+                        number=number,
+                    )
+                    await asyncio.to_thread(
+                        self.store.delete_managed_comment,
+                        repository_id=repository_id,
+                        number=number,
+                        namespace=namespace,
+                        slot=slot,
+                        source_generation=int(record["source_generation"]),
+                    )
+        return len(records)
+
     def _repository(self, repository_id: str):
         """按 ID 解析仓库并返回清晰错误。"""
 
@@ -280,4 +431,21 @@ class ManagedCommentService:
             namespace,
             slot,
             source_generation,
+        )
+
+    @staticmethod
+    def _slot_resource_key(
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+    ) -> str:
+        """生成不会泄露槽位文本的跨代次评论写锁键。"""
+
+        return "managed-comment-slot:" + stable_hash(
+            repository_id,
+            number,
+            namespace,
+            slot,
         )

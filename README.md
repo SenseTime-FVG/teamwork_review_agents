@@ -241,7 +241,7 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
 
-开启 `publish_failure_comment` 后，Preflight 失败评论复用与 Agent 托管评论相同的源版本代次规则，并以 `status_context` 作为独立槽位：同一源版本内的重复失败、超时或执行异常会更新原评论；源分支变化后再次失败会追加新评论；同一源版本随后成功只删除该代次的失败评论，不删除时间线中更早源版本留下的失败记录。人工删除的失败评论也只会在下一次该代次真实失败时重建。
+开启 `publish_failure_comment` 后，Preflight 以 `status_context` 作为独立槽位，并且同一 PR 只保留一条活动失败评论：每次真实 CI 再次失败或超时时先删除旧评论，再在时间线底部创建本轮评论；相同 CI 结果被多个事件复用时不反复刷新，映射缺失时才补建；当前最新源版本成功后会删除该槽位全部历史失败评论。Agent 托管评论仍按源版本代次保留审核历史，不受该策略影响。
 
 ![GitHub 本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
 
@@ -344,7 +344,7 @@ Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改
 
 默认启用的 `cache_enabled` 会为每个仓库建立稳定缓存根目录，并把 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer、Playwright、Puppeteer 和 Deno 等常见缓存定向到该目录。同一仓库跨分支、跨 PR 共享下载缓存，但临时 worktree、HOME 和安装产物仍按运行隔离。仓库详情中的“执行 CI / 预热缓存”会针对远端默认分支最新提交启动不限时、可取消的手动 CI；它不创建 MR / PR 事件、不触发 Agent，也不回写 Commit Status。运行概览、事件详情和运行与日志页使用同一个 CI 详情抽屉持续显示 Git 阶段、当前步骤与命令输出。
 
-可选的 `publish_failure_comment` 默认关闭。开启后，自动 MR / PR CI 首次失败会创建一条包含 Head SHA、失败步骤、退出码和有界末尾输出的评论，连续失败只更新同一条评论；后续 CI 通过时删除旧失败评论，不发布成功评论。手动仓库 CI 没有关联 PR，因此始终不评论。评论回写异常只记录在 CI 日志中，不会改变真实 CI 结论。
+可选的 `publish_failure_comment` 默认关闭。开启后，自动 MR / PR CI 首次失败会创建一条包含 Head SHA、失败步骤、退出码和有界末尾输出的评论；新的真实失败先删除旧评论，再在时间线底部创建最新评论，同时始终只保留一条活动失败评论。缓存复用失败不会反复刷新评论，当前最新源版本通过时删除全部历史代次失败评论且不发布成功评论。手动仓库 CI 没有关联 PR，因此始终不评论。评论回写异常只记录在 CI 日志中，不会改变真实 CI 结论。
 
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 

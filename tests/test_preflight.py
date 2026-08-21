@@ -1044,11 +1044,11 @@ async def test_preflight_retries_only_final_status_delivery(
     assert statuses == ["pending", "success", "success"]
 
 
-async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_success(
+async def test_preflight_failure_comment_is_rotated_preserved_and_deleted_on_success(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """自动 CI 只维护一条脱敏失败评论，通过后应删除且写回失败不改 CI 终态。"""
+    """真实失败刷新单条评论，复用不刷新，通过后清理全部历史映射。"""
 
     config = parse_config_data(
         {
@@ -1091,6 +1091,7 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
     deleted: list[str] = []
     statuses: list[str] = []
     reject_comment = False
+    reject_delete = False
 
     class FakeProvider:
         async def __aenter__(self):
@@ -1129,6 +1130,8 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
             comment_id,
             **_kwargs,
         ):
+            if reject_delete:
+                raise RuntimeError("删除评论失败 provider-token")
             deleted.append(comment_id)
 
     monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
@@ -1161,6 +1164,7 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
     assert "provider-token" not in created[0]
     assert "********" in created[0]
     assert "仅显示末尾 12000 个字符" in created[0]
+    assert "在时间线底部发布最新结果" in created[0]
     assert store.get_managed_comment(
         repository_id="demo",
         number=7,
@@ -1169,21 +1173,37 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
         source_generation=1,
     ) is not None
 
-    await executor._sync_failure_comment_safely(repository, failure)
+    await executor._sync_failure_comment_safely(
+        repository,
+        failure,
+        replace_existing=False,
+    )
     assert len(created) == 1
-    assert len(updated) == 1
+    assert updated == []
+    assert deleted == []
 
     changed_failure = failure.model_copy(update={"output": "另一条失败信息"})
     await executor._sync_failure_comment_safely(repository, changed_failure)
-    assert len(updated) == 2
+    assert len(created) == 2
+    assert updated == []
+    assert deleted == ["101"]
+    current = store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    )
+    assert current is not None
+    assert current["remote_comment_id"] == "102"
 
     infrastructure_error = failure.model_copy(
         update={"status": "error", "error": "Git 操作失败"}
     )
     await executor._sync_failure_comment_safely(repository, infrastructure_error)
-    assert len(created) == 1
-    assert len(updated) == 2
-    assert deleted == []
+    assert len(created) == 2
+    assert updated == []
+    assert deleted == ["101"]
 
     next_generation_failure = failure.model_copy(
         update={
@@ -1196,14 +1216,15 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
         repository,
         next_generation_failure,
     )
-    assert len(created) == 2
+    assert len(created) == 3
+    assert deleted == ["101", "102"]
     assert store.get_managed_comment(
         repository_id="demo",
         number=7,
         namespace="preflight",
         slot=repository.preflight.status_context,
         source_generation=1,
-    ) is not None
+    ) is None
     assert store.get_managed_comment(
         repository_id="demo",
         number=7,
@@ -1211,41 +1232,62 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
         slot=repository.preflight.status_context,
         source_generation=2,
     ) is not None
+
+    await executor._sync_failure_comment_safely(
+        repository,
+        next_generation_failure,
+        replace_existing=False,
+    )
+    assert len(created) == 3
+    assert deleted == ["101", "102"]
 
     next_generation_success = next_generation_failure.model_copy(
         update={"status": "success", "output": "全部通过", "error": None}
     )
+    monkeypatch.setattr(store, "source_generation", lambda *_args: 3)
     await executor._sync_failure_comment_safely(
         repository,
         next_generation_success,
     )
-    assert deleted == ["102"]
-    assert store.get_managed_comment(
-        repository_id="demo",
-        number=7,
-        namespace="preflight",
-        slot=repository.preflight.status_context,
-        source_generation=1,
-    ) is not None
+    assert deleted == ["101", "102"]
     assert store.get_managed_comment(
         repository_id="demo",
         number=7,
         namespace="preflight",
         slot=repository.preflight.status_context,
         source_generation=2,
-    ) is None
+    ) is not None
+    monkeypatch.setattr(store, "source_generation", lambda *_args: 2)
 
-    success = failure.model_copy(
-        update={"status": "success", "output": "全部通过", "error": None}
+    store.save_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+        remote_comment_id="legacy-100",
+        source_head_sha="a" * 40,
+        content_hash="legacy",
     )
-    await executor._sync_failure_comment_safely(repository, success)
-    assert deleted == ["102", "101"]
+
+    await executor._sync_failure_comment_safely(
+        repository,
+        next_generation_success,
+    )
+    assert deleted == ["101", "102", "legacy-100", "103"]
     assert store.get_managed_comment(
         repository_id="demo",
         number=7,
         namespace="preflight",
         slot=repository.preflight.status_context,
         source_generation=1,
+    ) is None
+    assert store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=2,
     ) is None
 
     reject_comment = True
@@ -1258,6 +1300,29 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
     assert "provider-token" not in comment_errors[-1]["payload"]
     assert "********" in comment_errors[-1]["payload"]
 
+    reject_comment = False
+    await executor._sync_failure_comment_safely(repository, failure)
+    assert len(created) == 4
+    reject_delete = True
+    await executor._sync_failure_comment_safely(repository, changed_failure)
+    assert len(created) == 4
+    current = store.get_managed_comment(
+        repository_id="demo",
+        number=7,
+        namespace="preflight",
+        slot=repository.preflight.status_context,
+        source_generation=1,
+    )
+    assert current is not None
+    assert current["remote_comment_id"] == "104"
+    comment_errors = [
+        log
+        for log in store.list_preflight_logs("comment-run")
+        if log["event_type"] == "comment_error"
+    ]
+    assert "provider-token" not in comment_errors[-1]["payload"]
+    assert "********" in comment_errors[-1]["payload"]
+
     manual = failure.model_copy(update={"number": None})
     await executor._sync_failure_comment_safely(repository, manual)
-    assert len(created) == 2
+    assert len(created) == 4
