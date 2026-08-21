@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   api,
   getToken,
@@ -6986,6 +6987,7 @@ function ChangeRequestDetailDrawer(props: {
     left: number;
     top: number;
   } | null>(null);
+  const eventContextMenuRef = useRef<HTMLDivElement | null>(null);
   const changeRequestKey = changeRequest
     ? `${changeRequest.repository_id}:${changeRequest.number}`
     : "";
@@ -7047,6 +7049,23 @@ function ChangeRequestDetailDrawer(props: {
       window.removeEventListener("resize", closeMenu);
       window.removeEventListener("scroll", closeMenu, true);
     };
+  }, [eventContextMenu]);
+
+  useLayoutEffect(() => {
+    if (!eventContextMenu || !eventContextMenuRef.current) return;
+    const bounds = eventContextMenuRef.current.getBoundingClientRect();
+    const left = Math.max(
+      8,
+      Math.min(eventContextMenu.left, window.innerWidth - bounds.width - 8),
+    );
+    const top = Math.max(
+      8,
+      Math.min(eventContextMenu.top, window.innerHeight - bounds.height - 8),
+    );
+    if (left === eventContextMenu.left && top === eventContextMenu.top) return;
+    setEventContextMenu((current) => (
+      current ? { ...current, left, top } : current
+    ));
   }, [eventContextMenu]);
 
   const statusOptions = useMemo<SelectOption[]>(() => {
@@ -7181,12 +7200,18 @@ function ChangeRequestDetailDrawer(props: {
                           contextEvent.preventDefault();
                           contextEvent.stopPropagation();
                           const bounds = contextEvent.currentTarget.getBoundingClientRect();
-                          const requestedLeft = contextEvent.clientX || bounds.right - 8;
-                          const requestedTop = contextEvent.clientY || bounds.top + 8;
+                          const openedFromKeyboard = contextEvent.clientX === 0
+                            && contextEvent.clientY === 0;
+                          const requestedLeft = openedFromKeyboard
+                            ? bounds.left + 8
+                            : contextEvent.clientX;
+                          const requestedTop = openedFromKeyboard
+                            ? bounds.top + 8
+                            : contextEvent.clientY;
                           setEventContextMenu({
                             event,
-                            left: Math.max(8, Math.min(requestedLeft, window.innerWidth - 176)),
-                            top: Math.max(8, Math.min(requestedTop, window.innerHeight - 64)),
+                            left: requestedLeft,
+                            top: requestedTop,
                           });
                         }}
                       >
@@ -7201,8 +7226,9 @@ function ChangeRequestDetailDrawer(props: {
             </>
           )}
         </div>
-        {eventContextMenu && active && (
+        {eventContextMenu && active && createPortal(
           <div
+            ref={eventContextMenuRef}
             className="event-context-menu"
             role="menu"
             aria-label="关联事件操作"
@@ -7221,7 +7247,8 @@ function ChangeRequestDetailDrawer(props: {
             >
               手动触发
             </button>
-          </div>
+          </div>,
+          document.body,
         )}
       </aside>
     </div>
