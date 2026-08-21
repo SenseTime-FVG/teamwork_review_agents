@@ -2384,6 +2384,7 @@ function ModelProvidersEditor(props: {
   const [keyInput, setKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [connectionResult, setConnectionResult] = useState("");
+  const [detailError, setDetailError] = useState("");
   const [pendingAction, setPendingAction] = useState<ModelProviderPendingAction | null>(null);
 
   useBodyScrollLock(selectedId !== null);
@@ -2392,9 +2393,15 @@ function ModelProvidersEditor(props: {
     try {
       setSnapshot(await api<ModelProviderSnapshot>("/api/model-providers"));
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "Provider 状态加载失败");
+      const message = reason instanceof Error ? reason.message : "Provider 状态加载失败";
+      if (selectedId !== null) {
+        setDetailError(message);
+        props.onError("");
+      } else {
+        props.onError(message);
+      }
     }
-  }, [props.onError]);
+  }, [props.onError, selectedId]);
 
   useEffect(() => {
     void reloadSnapshot();
@@ -2410,6 +2417,16 @@ function ModelProvidersEditor(props: {
   const original = selectedId ? props.document.model_providers[selectedId] : undefined;
   const selectedSnapshot = snapshot?.providers.find((item) => item.id === selectedId);
   const external = selected?.driver !== "codex_cli";
+
+  function beginDetailAction() {
+    setDetailError("");
+    props.onError("");
+  }
+
+  function showDetailError(reason: unknown, fallback: string) {
+    setDetailError(reason instanceof Error ? reason.message : fallback);
+    props.onError("");
+  }
 
   function codexRuntimePayload(document: ConfigDocument) {
     return {
@@ -2451,6 +2468,8 @@ function ModelProvidersEditor(props: {
   function applyTransition(transition: ModelProviderTransition) {
     setPendingAction(null);
     clearDraft();
+    setDetailError("");
+    props.onError("");
     setVisibleKey("");
     setConnectionResult("");
     if (transition.kind === "cancel-edit") return;
@@ -2512,6 +2531,7 @@ function ModelProvidersEditor(props: {
 
   function beginEdit() {
     if (!selectedId || !props.document.model_providers[selectedId]) return;
+    beginDetailAction();
     setDraftId(selectedId);
     setDraftDocument(structuredClone(props.document));
     setCreating(false);
@@ -2548,7 +2568,7 @@ function ModelProvidersEditor(props: {
   async function saveProvider() {
     if (!editing || !draftDocument || !selected || !draftId.trim()) return;
     setBusy(true);
-    props.onError("");
+    beginDetailAction();
     try {
       const endpoint = creating
         ? "/api/model-providers"
@@ -2578,7 +2598,7 @@ function ModelProvidersEditor(props: {
         ? `Provider ${draftId.trim()} 已创建并热加载`
         : `Provider ${draftId.trim()} 已保存并热加载`);
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "Provider 保存失败");
+      showDetailError(reason, "Provider 保存失败");
     } finally {
       setBusy(false);
     }
@@ -2590,19 +2610,21 @@ function ModelProvidersEditor(props: {
       setVisibleKey("");
       return;
     }
+    beginDetailAction();
     try {
       const result = await api<{ api_key: string }>(
         `/api/model-providers/${encodeURIComponent(selectedId)}/key`,
       );
       setVisibleKey(result.api_key);
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "API Key 查看失败");
+      showDetailError(reason, "API Key 查看失败");
     }
   }
 
   async function replaceKey() {
     if (!selectedId || !keyInput.trim()) return;
     setBusy(true);
+    beginDetailAction();
     try {
       const result = await api<ModelProviderSnapshot>(
         `/api/model-providers/${encodeURIComponent(selectedId)}/key`,
@@ -2616,7 +2638,7 @@ function ModelProvidersEditor(props: {
       setVisibleKey("");
       props.onNotice("API Key 已安全保存");
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "API Key 保存失败");
+      showDetailError(reason, "API Key 保存失败");
     } finally {
       setBusy(false);
     }
@@ -2625,6 +2647,7 @@ function ModelProvidersEditor(props: {
   async function refreshModels() {
     if (!selectedId) return;
     setBusy(true);
+    beginDetailAction();
     try {
       const result = await api<{
         revision: string;
@@ -2638,7 +2661,7 @@ function ModelProvidersEditor(props: {
       setSnapshot(result.model_providers);
       props.onNotice("模型目录已刷新");
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "模型目录刷新失败");
+      showDetailError(reason, "模型目录刷新失败");
     } finally {
       setBusy(false);
     }
@@ -2647,6 +2670,7 @@ function ModelProvidersEditor(props: {
   async function testConnection() {
     if (!selectedId) return;
     setBusy(true);
+    beginDetailAction();
     setConnectionResult("");
     try {
       const result = await api<CodexConnectionTestResult & { provider_id: string }>(
@@ -2657,7 +2681,7 @@ function ModelProvidersEditor(props: {
         `${result.model ?? "默认模型"} · ${result.elapsed_seconds.toFixed(2)} 秒 · ${result.reply}`,
       );
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "Provider 连接测试失败");
+      showDetailError(reason, "Provider 连接测试失败");
     } finally {
       setBusy(false);
     }
@@ -2666,6 +2690,7 @@ function ModelProvidersEditor(props: {
   async function deleteProvider() {
     if (!selectedId || !selectedSnapshot?.deletable || !selected) return;
     setBusy(true);
+    beginDetailAction();
     try {
       const result = await api<{
         revision: string;
@@ -2683,7 +2708,7 @@ function ModelProvidersEditor(props: {
       setPendingAction(null);
       props.onNotice("Provider 已删除，相关引用已回退");
     } catch (reason) {
-      props.onError(reason instanceof Error ? reason.message : "Provider 删除失败");
+      showDetailError(reason, "Provider 删除失败");
       setPendingAction(null);
     } finally {
       setBusy(false);
@@ -2854,6 +2879,12 @@ function ModelProvidersEditor(props: {
                 <button className="run-drawer-close" type="button" aria-label="关闭" disabled={busy} onClick={closeDetail}>×</button>
               </div>
             </header>
+            {detailError && (
+              <div className="alert error provider-detail-alert" role="alert">
+                <span>{detailError}</span>
+                <button type="button" aria-label="关闭 Provider 错误提示" onClick={() => setDetailError("")}>×</button>
+              </div>
+            )}
             <div className="run-drawer-body provider-detail-body">
               {connectionResult && <div className="alert success">{connectionResult}</div>}
               <section className="section-card">
