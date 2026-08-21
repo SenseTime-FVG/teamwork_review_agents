@@ -502,6 +502,39 @@ def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
     assert not store.claim_event(event.id, 2)
 
 
+def test_settle_pending_events_as_unmatched_does_not_override_claimed_event(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """提前收敛只能完成仍待处理的事件，不能覆盖已经领取的事件。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    opened = snapshot_factory()
+    closed = snapshot_factory(
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    events = detect_events(opened, closed)
+    by_type = {event.type: event for event in events}
+    store.save_snapshot_and_events(closed, events)
+    store.set_event_queue_reason(
+        (event.id for event in events),
+        "change_request_order",
+    )
+    assert store.claim_event(by_type["change_request.closed"].id, 1)
+
+    settled = store.settle_pending_events_as_unmatched(
+        event.id for event in events
+    )
+
+    assert settled == (by_type["change_request.updated"].id,)
+    records = {item["event_type"]: item for item in store.list_events(None)}
+    assert records["change_request.closed"]["status"] == "processing"
+    assert records["change_request.updated"]["status"] == "unmatched"
+    assert records["change_request.updated"]["queue_reason"] is None
+
+
 def test_service_shutdown_release_does_not_consume_event_attempt(
     tmp_path,
     snapshot_factory,

@@ -1304,6 +1304,41 @@ class StateStore:
                 (reason, time.time(), *ids),
             )
 
+    def settle_pending_events_as_unmatched(
+        self,
+        event_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """原子收敛仍待处理的未匹配事件，并返回实际完成的事件 ID。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return ()
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                f"""
+                SELECT event_id FROM event_inbox
+                WHERE event_id IN ({placeholders}) AND status = 'pending'
+                """,
+                ids,
+            ).fetchall()
+            pending_ids = {str(row["event_id"]) for row in rows}
+            if pending_ids:
+                pending_placeholders = ", ".join("?" for _ in pending_ids)
+                connection.execute(
+                    f"""
+                    UPDATE event_inbox
+                    SET status = 'unmatched', error = NULL,
+                        queue_reason = NULL, updated_at = ?
+                    WHERE event_id IN ({pending_placeholders})
+                      AND status = 'pending'
+                    """,
+                    (time.time(), *pending_ids),
+                )
+            connection.commit()
+        return tuple(event_id for event_id in ids if event_id in pending_ids)
+
     def claim_event(self, event_id: str, max_attempts: int) -> bool:
         """原子领取一个事件，并限制总尝试次数。"""
 

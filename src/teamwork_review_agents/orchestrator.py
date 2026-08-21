@@ -466,6 +466,40 @@ class Orchestrator:
             idempotency_key=invocation.idempotency_key,
         )
 
+    async def _settle_unmatched_waiting_events(
+        self,
+        summary: CycleSummary,
+        events: list[ChangeEvent],
+    ) -> list[ChangeEvent]:
+        """提前收敛资源队列中确定无匹配规则的待处理事件。"""
+
+        if not events or self._shutdown_requested:
+            return events
+        repository = self.config.repository_map().get(events[0].repository_id)
+        if repository is None or not repository.enabled:
+            return events
+        try:
+            unmatched_event_ids = [
+                event.id
+                for event in events
+                if not any(rule_matches(rule, event) for rule in self.config.rules)
+            ]
+        except Exception:
+            # 规则条件异常仍交给既有批次处理路径记录失败，不能中断调度循环。
+            return events
+        settled_event_ids = await asyncio.to_thread(
+            self.store.settle_pending_events_as_unmatched,
+            unmatched_event_ids,
+        )
+        for event_id in settled_event_ids:
+            await asyncio.to_thread(
+                self.store.finalize_terminal_target_event_context,
+                event_id,
+            )
+        summary.processed_events += len(settled_event_ids)
+        settled = set(settled_event_ids)
+        return [event for event in events if event.id not in settled]
+
     async def _process_resource_events(
         self,
         summary: CycleSummary,
@@ -809,6 +843,10 @@ class Orchestrator:
                         resource[1],
                         max_attempts=max_attempts,
                     )
+                    waiting_events = await self._settle_unmatched_waiting_events(
+                        summary,
+                        waiting_events,
+                    )
                     await asyncio.to_thread(
                         self.store.set_event_queue_reason,
                         (event.id for event in waiting_events),
@@ -822,6 +860,10 @@ class Orchestrator:
                         resource[0],
                         resource[1],
                         max_attempts=max_attempts,
+                    )
+                    waiting_events = await self._settle_unmatched_waiting_events(
+                        summary,
+                        waiting_events,
                     )
                     await asyncio.to_thread(
                         self.store.set_event_queue_reason,
