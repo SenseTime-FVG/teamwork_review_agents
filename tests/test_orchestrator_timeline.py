@@ -953,6 +953,104 @@ async def test_batches_for_same_change_request_keep_event_order(
     assert actions == ["change_request.closed", "change_request.reopened"]
 
 
+async def test_unmatched_later_batch_settles_while_previous_agent_is_running(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """前序 Agent 运行时，后续批次无匹配事件应立即收敛。"""
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="state-review",
+            events=["change_request.closed", "change_request.reopened"],
+            agents=["code-reviewer"],
+        )
+    ]
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    opened = snapshot_factory(number=46)
+    closed = snapshot_factory(
+        number=46,
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    reopened = snapshot_factory(
+        number=46,
+        state="opened",
+        updated_at="2026-08-17T08:06:00Z",
+    )
+    closed_event = next(
+        event
+        for event in detect_events(opened, closed, batch_id="close-batch")
+        if event.type == "change_request.closed"
+    )
+    orchestrator.store.save_snapshot_and_events(closed, [closed_event])
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_execute(**kwargs):
+        """保持前序 Agent 运行，并记录后续匹配事件的启动时机。"""
+
+        action = kwargs["actions"][0]
+        if action == "change_request.closed":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return AgentResult(
+            run_id=f"run-{action}",
+            root_run_id=f"run-{action}",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    summary = CycleSummary()
+    dispatch = asyncio.create_task(orchestrator.process_events(summary))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    later_events = detect_events(closed, reopened, batch_id="reopen-batch")
+    orchestrator.store.save_snapshot_and_events(reopened, later_events)
+
+    for _ in range(50):
+        records = {
+            item["event_type"]: item for item in orchestrator.store.list_events()
+        }
+        if (
+            records["change_request.updated"]["status"] == "unmatched"
+            and records["change_request.reopened"]["queue_reason"]
+            == "change_request_order"
+        ):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("后续事件没有完成即时收敛与匹配事件排队")
+
+    assert records["change_request.updated"]["queue_reason"] is None
+    assert records["change_request.reopened"]["status"] == "pending"
+    assert records["change_request.reopened"]["queue_reason"] == (
+        "change_request_order"
+    )
+    assert not second_started.is_set()
+    assert summary.processed_events == 1
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    await asyncio.wait_for(dispatch, timeout=1)
+
+    final_records = {
+        item["event_type"]: item for item in orchestrator.store.list_events()
+    }
+    assert final_records["change_request.closed"]["status"] == "completed"
+    assert final_records["change_request.reopened"]["status"] == "completed"
+    assert final_records["change_request.updated"]["status"] == "unmatched"
+    assert summary.agent_runs == 2
+    assert summary.processed_events == 3
+
+
 async def test_retrying_resource_progresses_while_unrelated_agent_is_running(
     monkeypatch,
     configured_app_factory,
