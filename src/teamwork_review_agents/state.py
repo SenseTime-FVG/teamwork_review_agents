@@ -2037,6 +2037,36 @@ class StateStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def list_managed_comments(
+        self,
+        *,
+        repository_id: str,
+        number: int,
+        namespace: str,
+        slot: str,
+    ) -> list[dict[str, object]]:
+        """读取一个命名槽位下全部源代次的托管评论映射。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT repository_id, number, namespace, slot,
+                       source_generation, remote_comment_id, source_head_sha,
+                       content_hash, updated_at
+                FROM managed_comments
+                WHERE repository_id = ? AND number = ?
+                  AND namespace = ? AND slot = ?
+                ORDER BY source_generation ASC, updated_at ASC
+                """,
+                (
+                    repository_id,
+                    number,
+                    namespace,
+                    slot,
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def save_managed_comment(
         self,
         *,
