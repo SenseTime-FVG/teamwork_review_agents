@@ -912,6 +912,65 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
             json={"targets": []},
         ).status_code == 422
 
+        source_event_id = event_record["event_id"]
+        source_status = client.get(f"/api/events/{source_event_id}").json()["status"]
+        replayed = client.post(f"/api/events/{source_event_id}/replay")
+        assert replayed.status_code == 200
+        replayed_body = replayed.json()
+        assert replayed_body["source_event_id"] == source_event_id
+        assert replayed_body["event_id"] != source_event_id
+        replayed_detail = client.get(
+            f"/api/events/{replayed_body['event_id']}"
+        ).json()
+        assert replayed_detail["origin"] == "manual"
+        assert replayed_detail["source_event_id"] == source_event_id
+        assert replayed_detail["source_event_occurred_at"] == event_record[
+            "occurred_at"
+        ]
+        assert client.get(f"/api/events/{source_event_id}").json()[
+            "status"
+        ] == source_status
+        assert dispatch_calls == [True, True]
+        assert client.post("/api/events/unknown-event/replay").status_code == 404
+        configured_repository = app.state.config_manager.config.repository_map()[
+            "first"
+        ]
+        configured_repository.enabled = False
+        try:
+            disabled_replay = client.post(f"/api/events/{source_event_id}/replay")
+            assert disabled_replay.status_code == 409
+            assert disabled_replay.json()["detail"] == (
+                "仓库未启用，不能手动触发事件"
+            )
+        finally:
+            configured_repository.enabled = True
+
+        replay_batch = client.post(
+            "/api/events/replay",
+            json={
+                "event_ids": [
+                    source_event_id,
+                    manual_records[0]["event_id"],
+                    source_event_id,
+                    "unknown-event",
+                ]
+            },
+        )
+        assert replay_batch.status_code == 200
+        replay_batch_body = replay_batch.json()
+        assert replay_batch_body["requested"] == 4
+        assert replay_batch_body["created"] == 2
+        assert replay_batch_body["failed"] == 2
+        assert replay_batch_body["results"][2]["reason"] == (
+            "批量请求中存在重复事件"
+        )
+        assert replay_batch_body["results"][3]["status_code"] == 404
+        assert dispatch_calls == [True, True, True]
+        assert client.post(
+            "/api/events/replay",
+            json={"event_ids": []},
+        ).status_code == 422
+
         reservation = store.begin_agent_run(
             proposed_run_id="run-web",
             root_run_id=None,

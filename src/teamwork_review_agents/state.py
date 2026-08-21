@@ -915,20 +915,34 @@ class StateStore:
             connection.execute("BEGIN IMMEDIATE")
             annotated: list[ChangeEvent] = []
             for event in pending:
-                generation = self._resolve_source_generation(
-                    connection,
-                    repository_id=event.repository_id,
-                    number=event.number,
-                    head_sha=event.current_snapshot.head_sha,
-                    now=now,
-                    increment_on_change=False,
-                )
+                generation = event.source_generation
+                if event.source_event_id is None:
+                    generation = self._resolve_source_generation(
+                        connection,
+                        repository_id=event.repository_id,
+                        number=event.number,
+                        head_sha=event.current_snapshot.head_sha,
+                        now=now,
+                        increment_on_change=False,
+                    )
                 annotated.append(
                     event.model_copy(update={"source_generation": generation})
                 )
             inserted = self._insert_events(connection, annotated, now)
             connection.commit()
         return inserted
+
+    def load_event(self, event_id: str) -> ChangeEvent | None:
+        """按事件 ID 读取完整事件载荷。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM event_inbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ChangeEvent.model_validate_json(row["payload"])
 
     def has_event_type(
         self,
@@ -2925,6 +2939,10 @@ class StateStore:
                            AS source_activity_type,
                        json_extract(event_inbox.payload, '$.source_occurred_at')
                            AS source_occurred_at,
+                       json_extract(event_inbox.payload, '$.source_event_id')
+                           AS source_event_id,
+                       json_extract(event_inbox.payload, '$.source_event_occurred_at')
+                           AS source_event_occurred_at,
                        preflight.status AS preflight_status,
                        preflight.run_id AS preflight_run_id,
                        preflight.exit_code AS preflight_exit_code,

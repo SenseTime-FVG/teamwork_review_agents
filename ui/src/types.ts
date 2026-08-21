@@ -452,6 +452,23 @@ export type ManualLatestEventBatchResponse = {
   reason: string;
 };
 
+export type ManualEventReplayBatchResult = {
+  source_event_id: string;
+  created: boolean;
+  status_code: number;
+  event_id?: string;
+  event_type?: string;
+  reason: string;
+};
+
+export type ManualEventReplayBatchResponse = {
+  requested: number;
+  created: number;
+  failed: number;
+  results: ManualEventReplayBatchResult[];
+  reason: string;
+};
+
 export type RunSummary = {
   run_id: string;
   root_run_id: string;
@@ -536,6 +553,8 @@ export type EventRecord = {
   source_activity_id?: string | null;
   source_activity_type?: string | null;
   source_occurred_at?: string | null;
+  source_event_id?: string | null;
+  source_event_occurred_at?: string | null;
   preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | "superseded" | null;
   preflight_run_id?: string | null;
   preflight_exit_code?: number | null;

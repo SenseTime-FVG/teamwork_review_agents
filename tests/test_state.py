@@ -6,6 +6,7 @@ import pytest
 
 from teamwork_review_agents.events import (
     create_manual_activity_event,
+    create_manual_replay_event,
     detect_events,
     detect_target_branch_event,
 )
@@ -355,6 +356,53 @@ def test_latest_activity_reference_and_manual_events_are_independent(
     assert {item["origin"] for item in records} == {"manual"}
     assert {item["source_activity_id"] for item in records} == {activity.id}
     assert {item["source_activity_type"] for item in records} == {"merged"}
+
+
+def test_manual_event_replay_preserves_source_context(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """历史事件重放应复制原始上下文，并使用独立事件 ID 记录来源。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(repository_id="demo", number=10)
+    source = detect_events(None, snapshot, emit_initial=True)[0]
+    assert store.enqueue_events([source]) == 1
+
+    stored_source = store.load_event(source.id)
+    assert stored_source is not None
+    newer_snapshot = snapshot_factory(
+        repository_id="demo",
+        number=10,
+        head_sha="newer-head",
+        updated_at="2026-08-18T11:00:00Z",
+    )
+    store.save_snapshot_and_events(newer_snapshot, [])
+    assert store.source_generation("demo", 10) == stored_source.source_generation + 1
+    replay = create_manual_replay_event(stored_source)
+    assert replay.id != stored_source.id
+    assert replay.batch_id != stored_source.batch_id
+    assert replay.type == stored_source.type
+    assert replay.old == stored_source.old
+    assert replay.new == stored_source.new
+    assert replay.current_snapshot == stored_source.current_snapshot
+    assert replay.source_generation == stored_source.source_generation
+    assert replay.source_event_id == stored_source.id
+    assert replay.source_event_occurred_at == stored_source.occurred_at
+    assert replay.origin == "manual"
+
+    assert store.enqueue_events([replay]) == 1
+    stored_replay = store.load_event(replay.id)
+    assert stored_replay is not None
+    assert stored_replay.source_event_id == stored_source.id
+    assert stored_replay.source_generation == stored_source.source_generation
+    records = store.list_events(None, repository_id="demo", number=10)
+    replay_record = next(item for item in records if item["event_id"] == replay.id)
+    assert replay_record["source_event_id"] == stored_source.id
+    assert replay_record["source_event_occurred_at"] == stored_replay.model_dump(
+        mode="json"
+    )["source_event_occurred_at"]
 
 
 def test_overview_lists_filter_sort_and_apply_optional_limits(

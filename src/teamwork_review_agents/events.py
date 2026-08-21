@@ -94,6 +94,40 @@ def create_manual_activity_event(
     )
 
 
+def create_manual_replay_event(source: ChangeEvent) -> ChangeEvent:
+    """复制历史事件上下文，创建可独立调度的手动重放事件。"""
+
+    request_id = uuid.uuid4().hex
+    return ChangeEvent(
+        id=stable_hash(
+            source.provider,
+            source.repository_id,
+            source.number,
+            "manual-replay",
+            request_id,
+            source.id,
+            source.type,
+        ),
+        type=source.type,
+        provider=source.provider,
+        repository_id=source.repository_id,
+        number=source.number,
+        old=source.old,
+        new=source.new,
+        current=source.current_snapshot,
+        batch_id=f"manual-replay:{request_id}",
+        changed_fields=source.changed_fields,
+        occurred_at=datetime.now(UTC),
+        origin="manual",
+        source_activity_id=source.source_activity_id,
+        source_activity_type=source.source_activity_type,
+        source_occurred_at=source.source_occurred_at,
+        source_event_id=source.id,
+        source_event_occurred_at=source.occurred_at,
+        source_generation=source.source_generation,
+    )
+
+
 def _event_id(
     snapshot: ChangeRequestSnapshot,
     event_type: str,
