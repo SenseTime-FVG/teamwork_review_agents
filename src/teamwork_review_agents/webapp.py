@@ -79,6 +79,23 @@ PREFLIGHT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _expand_execution_status_groups(
+    status_groups: list[ExecutionStatusGroup] | None,
+    mappings: dict[str, tuple[str, ...]],
+) -> tuple[str, ...] | None:
+    """将多个统一状态组按选择顺序展开并去重。"""
+
+    if status_groups is None:
+        return None
+    return tuple(
+        dict.fromkeys(
+            status
+            for status_group in status_groups
+            for status in mappings[status_group]
+        )
+    )
+
+
 class ConfigDocumentRequest(BaseModel):
     """UI 提交的完整配置文档。"""
 
@@ -1203,7 +1220,7 @@ def create_app(
         limit: int = Query(default=50, ge=1),
         all_records: bool = False,
         status: str | None = None,
-        status_group: ExecutionStatusGroup | None = None,
+        status_group: list[ExecutionStatusGroup] | None = Query(default=None),
         agent_name: str | None = None,
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
@@ -1219,10 +1236,9 @@ def create_app(
             manager.store.list_runs,
             None if all_records else limit,
             status=status,
-            statuses=(
-                AGENT_EXECUTION_STATUS_GROUPS[status_group]
-                if status_group
-                else None
+            statuses=_expand_execution_status_groups(
+                status_group,
+                AGENT_EXECUTION_STATUS_GROUPS,
             ),
             agent_name=agent_name,
             repository_id=repository_id,
@@ -1250,7 +1266,7 @@ def create_app(
             "superseded",
         ]
         | None = None,
-        status_group: ExecutionStatusGroup | None = None,
+        status_group: list[ExecutionStatusGroup] | None = Query(default=None),
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
     ):
@@ -1265,10 +1281,9 @@ def create_app(
             manager.store.list_preflight_runs,
             None if all_records else limit,
             status=status,
-            statuses=(
-                PREFLIGHT_EXECUTION_STATUS_GROUPS[status_group]
-                if status_group
-                else None
+            statuses=_expand_execution_status_groups(
+                status_group,
+                PREFLIGHT_EXECUTION_STATUS_GROUPS,
             ),
             repository_id=repository_id,
             number=number,
@@ -1481,16 +1496,18 @@ def create_app(
         page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
-        status: Literal[
-            "pending",
-            "processing",
-            "unmatched",
-            "triggered",
-            "completed",
-            "failed",
-            "cancelled",
+        status: list[
+            Literal[
+                "pending",
+                "processing",
+                "unmatched",
+                "triggered",
+                "completed",
+                "failed",
+                "cancelled",
+            ]
         ]
-        | None = None,
+        | None = Query(default=None),
     ):
         query_limit = None if all_records else limit
         if page is None:

@@ -77,13 +77,13 @@ type PaginatedOverviewResponse<T> = OverviewPage & {
 
 type ExecutionTypeFilter = "all" | "agent" | "preflight";
 
-type ExecutionStatusFilter = "" | "waiting" | "running" | "success" | "failure" | "timed_out" | "cancelled";
+type ExecutionStatusFilter = "waiting" | "running" | "success" | "failure" | "timed_out" | "cancelled";
 
 type ExecutionFilter = {
   repositoryId: string;
   number: string;
   type: ExecutionTypeFilter;
-  status: ExecutionStatusFilter;
+  statuses: ExecutionStatusFilter[];
   limit: number | null;
 };
 
@@ -132,12 +132,12 @@ const DEFAULT_EXECUTION_FILTER: ExecutionFilter = {
   repositoryId: "",
   number: "",
   type: "all",
-  status: "",
+  statuses: [],
   limit: 20,
 };
 
 const EXECUTION_STATUS_OPTIONS: Array<{
-  value: Exclude<ExecutionStatusFilter, "">;
+  value: ExecutionStatusFilter;
   label: string;
 }> = [
   { value: "waiting", label: "等待中" },
@@ -383,17 +383,17 @@ function executionQuery(filter: ExecutionFilter): string {
   if (/^\d+$/.test(filter.number) && Number(filter.number) > 0) {
     parameters.set("number", filter.number);
   }
-  if (filter.status) parameters.set("status_group", filter.status);
+  filter.statuses.forEach((status) => parameters.append("status_group", status));
   return parameters.toString();
 }
 
 function executionStatusMatches(
   kind: "agent" | "preflight",
   status: string,
-  filter: ExecutionStatusFilter,
+  filters: ExecutionStatusFilter[],
 ): boolean {
-  if (!filter) return true;
-  const groups: Record<Exclude<ExecutionStatusFilter, "">, string[]> = kind === "agent"
+  if (filters.length === 0) return true;
+  const groups: Record<ExecutionStatusFilter, string[]> = kind === "agent"
     ? {
         waiting: ["queued", "preparing"],
         running: ["running"],
@@ -410,7 +410,7 @@ function executionStatusMatches(
         timed_out: ["timed_out"],
         cancelled: ["cancelled"],
       };
-  return groups[filter].includes(status);
+  return filters.some((filter) => groups[filter].includes(status));
 }
 
 function shortRevision(revision?: string): string {
@@ -2035,6 +2035,7 @@ function Overview(props: {
             repositories={props.repositories}
             filter={props.eventFilter}
             statuses={EVENT_STATUS_OPTIONS}
+            multiStatus
             showNumber
             onChange={props.onEventFilterChange}
           />
@@ -2075,7 +2076,10 @@ function Overview(props: {
           </table>
           {props.events.length === 0 && (
             <div className="empty">
-              {props.eventFilter.repositoryId || props.eventFilter.number || props.eventFilter.status
+              {props.eventFilter.repositoryId
+                || props.eventFilter.number
+                || props.eventFilter.status
+                || props.eventFilter.statuses.length > 0
                 ? "当前筛选条件下没有变化事件。"
                 : "尚未产生事件"}
             </div>
@@ -7739,7 +7743,7 @@ function RunsView(props: {
       .filter((record) => executionStatusMatches(
         record.kind,
         record.kind === "agent" ? record.agent.status : record.preflight.status,
-        props.filter.status,
+        props.filter.statuses,
       ))
       .sort((left, right) => right.startedAt - left.startedAt)
       .slice(0, props.filter.limit ?? Number.MAX_SAFE_INTEGER);
@@ -7801,17 +7805,15 @@ function RunsView(props: {
                 { value: "preflight", label: "本地 CI" },
               ]}
             />
-            <SelectField
+            <MultiSelectField
               label="状态"
-              value={props.filter.status}
-              onChange={(value) => props.onFilterChange({
+              values={props.filter.statuses}
+              onChange={(statuses) => props.onFilterChange({
                 ...props.filter,
-                status: value as ExecutionStatusFilter,
+                statuses: statuses as ExecutionStatusFilter[],
               })}
-              options={[
-                { value: "", label: "全部状态" },
-                ...EXECUTION_STATUS_OPTIONS,
-              ]}
+              options={EXECUTION_STATUS_OPTIONS}
+              allLabel="全部状态"
             />
             <SelectField
               label="展示"
