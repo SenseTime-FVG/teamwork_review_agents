@@ -111,6 +111,7 @@ type AgentActionConfirmation = {
   details: Array<{ label: string; value: string; mono?: boolean }>;
   impactTitle: string;
   impact: string;
+  cancelLabel?: string;
   confirmLabel: string;
   dangerous?: boolean;
 };
@@ -1804,7 +1805,7 @@ function AgentActionConfirmationDialog(props: {
           <p>{model.impact}</p>
         </div>
         <footer className="overview-confirmation-actions">
-          <button type="button" className="button secondary" disabled={busy} onClick={onCancel}>取消</button>
+          <button type="button" className="button secondary" disabled={busy} onClick={onCancel}>{model.cancelLabel ?? "取消"}</button>
           <button
             type="button"
             className={`button ${model.dangerous ? "danger" : "primary"}`}
@@ -2347,6 +2348,16 @@ function modelProviderDriverLabel(driver: ModelProviderDriver): string {
   return MODEL_PROVIDER_DRIVER_OPTIONS.find((item) => item.value === driver)?.label ?? driver;
 }
 
+type ModelProviderTransition =
+  | { kind: "close" }
+  | { kind: "open"; providerId: string }
+  | { kind: "create" }
+  | { kind: "cancel-edit" };
+
+type ModelProviderPendingAction =
+  | { kind: "discard"; transition: ModelProviderTransition }
+  | { kind: "delete" };
+
 function ModelProvidersEditor(props: {
   document: ConfigDocument;
   revision: string;
@@ -2373,6 +2384,7 @@ function ModelProvidersEditor(props: {
   const [keyInput, setKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [connectionResult, setConnectionResult] = useState("");
+  const [pendingAction, setPendingAction] = useState<ModelProviderPendingAction | null>(null);
 
   useBodyScrollLock(selectedId !== null);
 
@@ -2436,37 +2448,20 @@ function ModelProvidersEditor(props: {
     setKeyInput("");
   }
 
-  function confirmDiscard(): boolean {
-    return !dirty || window.confirm("当前 Provider 有未保存修改，确认放弃这些修改？");
-  }
-
-  function openDetail(providerId: string) {
-    if (!confirmDiscard()) return;
+  function applyTransition(transition: ModelProviderTransition) {
+    setPendingAction(null);
     clearDraft();
-    setSelectedId(providerId);
     setVisibleKey("");
     setConnectionResult("");
-  }
-
-  function closeDetail() {
-    if (!confirmDiscard()) return;
-    clearDraft();
-    setSelectedId(null);
-    setVisibleKey("");
-    setConnectionResult("");
-  }
-
-  useEffect(() => {
-    if (selectedId === null) return undefined;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) closeDetail();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedId, busy, dirty]);
-
-  function beginCreate() {
-    if (!confirmDiscard()) return;
+    if (transition.kind === "cancel-edit") return;
+    if (transition.kind === "close") {
+      setSelectedId(null);
+      return;
+    }
+    if (transition.kind === "open") {
+      setSelectedId(transition.providerId);
+      return;
+    }
     let index = 1;
     while (props.document.model_providers[`provider-${index}`]) index += 1;
     const providerId = `provider-${index}`;
@@ -2484,9 +2479,35 @@ function ModelProvidersEditor(props: {
     setDraftDocument(nextDocument);
     setCreating(true);
     setEditing(true);
-    setVisibleKey("");
-    setKeyInput("");
-    setConnectionResult("");
+  }
+
+  function requestTransition(transition: ModelProviderTransition) {
+    if (dirty) {
+      setPendingAction({ kind: "discard", transition });
+      return;
+    }
+    applyTransition(transition);
+  }
+
+  function openDetail(providerId: string) {
+    requestTransition({ kind: "open", providerId });
+  }
+
+  function closeDetail() {
+    requestTransition({ kind: "close" });
+  }
+
+  useEffect(() => {
+    if (selectedId === null) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy && !pendingAction) closeDetail();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedId, busy, dirty, pendingAction]);
+
+  function beginCreate() {
+    requestTransition({ kind: "create" });
   }
 
   function beginEdit() {
@@ -2500,12 +2521,7 @@ function ModelProvidersEditor(props: {
   }
 
   function cancelEdit() {
-    if (creating) {
-      clearDraft();
-      setSelectedId(null);
-      return;
-    }
-    clearDraft();
+    requestTransition({ kind: creating ? "close" : "cancel-edit" });
   }
 
   function updateProvider(patch: Partial<ModelProviderConfig>) {
@@ -2649,13 +2665,6 @@ function ModelProvidersEditor(props: {
 
   async function deleteProvider() {
     if (!selectedId || !selectedSnapshot?.deletable || !selected) return;
-    const impacts = [
-      selectedSnapshot.is_global_default ? "全局默认模型将回退到 Codex CLI" : "",
-      selectedSnapshot.referenced_agents.length
-        ? `${selectedSnapshot.referenced_agents.length} 个 Agent 将改为继承全局默认模型`
-        : "",
-    ].filter(Boolean).join("；");
-    if (!window.confirm(`删除 ${selected.display_name}${impacts ? `；${impacts}` : ""}？`)) return;
     setBusy(true);
     try {
       const result = await api<{
@@ -2671,11 +2680,66 @@ function ModelProvidersEditor(props: {
       clearDraft();
       setSelectedId(null);
       setVisibleKey("");
+      setPendingAction(null);
       props.onNotice("Provider 已删除，相关引用已回退");
     } catch (reason) {
       props.onError(reason instanceof Error ? reason.message : "Provider 删除失败");
+      setPendingAction(null);
     } finally {
       setBusy(false);
+    }
+  }
+
+  const confirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!pendingAction || !selected) return null;
+    if (pendingAction.kind === "discard") {
+      return {
+        eyebrow: "MODEL PROVIDER",
+        title: "放弃未保存的 Provider 修改？",
+        description: "当前详情中的修改尚未保存，继续后无法从页面恢复。",
+        details: [
+          { label: "Provider", value: selected.display_name },
+          { label: "Provider ID", value: activeId || "新 Provider", mono: true },
+          { label: "配置版本", value: shortRevision(props.revision), mono: true },
+        ],
+        impactTitle: "只放弃当前草稿",
+        impact: "已保存配置、受管密钥、模型目录和历史运行快照不会受到影响。",
+        cancelLabel: "继续编辑",
+        confirmLabel: "放弃修改",
+        dangerous: true,
+      };
+    }
+    if (!selectedSnapshot?.deletable) return null;
+    const impacts = [
+      selectedSnapshot.is_global_default ? "全局默认模型将回退到 Codex CLI" : "",
+      selectedSnapshot.referenced_agents.length
+        ? `${selectedSnapshot.referenced_agents.length} 个 Agent 将改为继承全局默认模型`
+        : "",
+    ].filter(Boolean);
+    return {
+      eyebrow: "MODEL PROVIDER",
+      title: `删除 Provider ${selected.display_name}？`,
+      description: "删除后会立即保存配置并通知后台热加载。",
+      details: [
+        { label: "Provider", value: selected.display_name },
+        { label: "Provider ID", value: activeId, mono: true },
+        { label: "全局默认", value: selectedSnapshot.is_global_default ? "是" : "否" },
+        { label: "Agent 引用", value: `${selectedSnapshot.referenced_agents.length} 个` },
+      ],
+      impactTitle: impacts.length > 0 ? "相关引用将自动回退" : "删除 Provider 配置与凭据",
+      impact: `${impacts.length > 0 ? `${impacts.join("；")}。` : ""}历史运行快照不会删除。`,
+      confirmLabel: "确认删除",
+      dangerous: true,
+    };
+  }, [activeId, pendingAction, props.revision, selected, selectedSnapshot]);
+
+  function confirmPendingAction() {
+    if (pendingAction?.kind === "delete") {
+      void deleteProvider();
+      return;
+    }
+    if (pendingAction?.kind === "discard") {
+      applyTransition(pendingAction.transition);
     }
   }
 
@@ -2783,7 +2847,7 @@ function ModelProvidersEditor(props: {
                     <button className="button secondary" type="button" disabled={busy || !selectedSnapshot} onClick={() => void testConnection()}>
                       {busy ? "测试中…" : "连接测试"}
                     </button>
-                    {selectedSnapshot?.deletable && <button className="button danger" type="button" disabled={busy} onClick={() => void deleteProvider()}>删除</button>}
+                    {selectedSnapshot?.deletable && <button className="button danger" type="button" disabled={busy} onClick={() => setPendingAction({ kind: "delete" })}>删除</button>}
                     <button className="button primary" type="button" onClick={beginEdit}>编辑 Provider</button>
                   </>
                 )}
@@ -2926,6 +2990,12 @@ function ModelProvidersEditor(props: {
           </aside>
         </div>
       )}
+      <AgentActionConfirmationDialog
+        model={confirmation}
+        busy={busy}
+        onCancel={() => { if (!busy) setPendingAction(null); }}
+        onConfirm={confirmPendingAction}
+      />
     </>
   );
 }
