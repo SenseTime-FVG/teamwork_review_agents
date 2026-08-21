@@ -33,6 +33,7 @@ from .events import (
     FIELD_EVENTS,
     TARGET_COMMITS_CHANGED_EVENT,
     create_manual_activity_event,
+    create_manual_replay_event,
     detect_events,
 )
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
@@ -197,6 +198,12 @@ class ManualLatestEventBatchRequest(BaseModel):
     """批量手动触发最新事件请求。"""
 
     targets: list[ManualLatestEventTarget] = Field(min_length=1, max_length=100)
+
+
+class ManualEventReplayBatchRequest(BaseModel):
+    """批量手动重放历史事件请求。"""
+
+    event_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 class PromptPreviewRequest(BaseModel):
@@ -1550,6 +1557,95 @@ def create_app(
         if detail is None:
             raise HTTPException(status_code=404, detail="事件不存在")
         return detail
+
+    async def create_manual_event_replay(event_id: str):
+        """校验来源事件并创建尚未入库的手动重放事件。"""
+
+        source = await asyncio.to_thread(manager.store.load_event, event_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="来源事件不存在")
+        repository = manager.config.repository_map().get(source.repository_id)
+        if repository is None or not repository.enabled:
+            raise HTTPException(status_code=409, detail="仓库未启用，不能手动触发事件")
+        return create_manual_replay_event(source), source
+
+    @app.post("/api/events/{event_id}/replay")
+    async def replay_event(event_id: str):
+        """复制一条历史事件并作为新的手动事件送入规则引擎。"""
+
+        event, source = await create_manual_event_replay(event_id)
+        inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
+        if not inserted:
+            raise HTTPException(status_code=409, detail="手动事件未能写入，请重新操作")
+        runtime.dispatch_events_now()
+        return {
+            "created": True,
+            "source_event_id": source.id,
+            "event_id": event.id,
+            "event_type": event.type,
+            "reason": f"已手动重放 {event.type}",
+        }
+
+    @app.post("/api/events/replay")
+    async def replay_events(request: ManualEventReplayBatchRequest):
+        """逐项重放历史事件，并让单项失败不阻塞其他目标。"""
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        created_count = 0
+        for event_id in request.event_ids:
+            if event_id in seen:
+                results.append(
+                    {
+                        "source_event_id": event_id,
+                        "created": False,
+                        "status_code": 409,
+                        "reason": "批量请求中存在重复事件",
+                    }
+                )
+                continue
+            seen.add(event_id)
+            try:
+                event, source = await create_manual_event_replay(event_id)
+                inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
+                if not inserted:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="手动事件未能写入，请重新操作",
+                    )
+            except HTTPException as exc:
+                results.append(
+                    {
+                        "source_event_id": event_id,
+                        "created": False,
+                        "status_code": exc.status_code,
+                        "reason": str(exc.detail),
+                    }
+                )
+                continue
+
+            created_count += 1
+            results.append(
+                {
+                    "source_event_id": source.id,
+                    "created": True,
+                    "status_code": 200,
+                    "event_id": event.id,
+                    "event_type": event.type,
+                    "reason": f"已手动重放 {event.type}",
+                }
+            )
+
+        if created_count:
+            runtime.dispatch_events_now()
+        failed_count = len(results) - created_count
+        return {
+            "requested": len(request.event_ids),
+            "created": created_count,
+            "failed": failed_count,
+            "results": results,
+            "reason": f"批量手动触发完成：成功 {created_count} 项，失败 {failed_count} 项",
+        }
 
     @app.get("/api/change-requests")
     async def change_requests(

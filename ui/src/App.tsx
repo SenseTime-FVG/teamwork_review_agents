@@ -29,6 +29,7 @@ import type {
   EventDetailRecord,
   EventDispatchDetail,
   EventRecord,
+  ManualEventReplayBatchResponse,
   ManualLatestEventBatchResponse,
   ModelProviderConfig,
   ModelProviderDriver,
@@ -88,8 +89,9 @@ type ExecutionFilter = {
 };
 
 type OverviewConfirmation = {
-  kind: "discovered" | "latest" | "latest-batch";
-  items: ChangeRequestRecord[];
+  kind: "discovered" | "latest" | "latest-batch" | "event-replay" | "event-replay-batch";
+  changeRequests?: ChangeRequestRecord[];
+  events?: EventRecord[];
   eyebrow: string;
   title: string;
   description: string;
@@ -1828,8 +1830,13 @@ function Overview(props: {
   eventPage: OverviewPage;
   emittingKey: string;
   triggeringKeys: string[];
+  replayingEventIds: string[];
   selectionMode: boolean;
   selectedSnapshotKeys: string[];
+  eventSelectionMode: boolean;
+  selectedEventIds: string[];
+  detailRefreshToken: number;
+  confirmationOpen: boolean;
   onAction: (action: "scan" | "pause" | "resume") => void;
   onEmitDiscovered: (item: ChangeRequestRecord) => void;
   onTriggerLatestEvent: (item: ChangeRequestRecord) => void;
@@ -1837,6 +1844,11 @@ function Overview(props: {
   onCancelSelection: () => void;
   onToggleSelection: (snapshotKey: string) => void;
   onTriggerSelected: (items: ChangeRequestRecord[]) => void;
+  onReplayEvent: (event: EventRecord) => void;
+  onBeginEventSelection: () => void;
+  onCancelEventSelection: () => void;
+  onToggleEventSelection: (eventId: string) => void;
+  onReplaySelectedEvents: (events: EventRecord[]) => void;
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
   onChangeRequestPageChange: (page: number) => void;
@@ -1854,6 +1866,9 @@ function Overview(props: {
   const pendingEvents = (props.status.stats.events.pending ?? 0) + (props.status.stats.events.processing ?? 0);
   const selectedItems = props.changeRequests.filter((item) => (
     item.latest_event && props.selectedSnapshotKeys.includes(item.snapshot_key)
+  ));
+  const selectedEventItems = props.events.filter((event) => (
+    props.selectedEventIds.includes(event.event_id)
   ));
   return (
     <div className="page-stack">
@@ -2037,23 +2052,59 @@ function Overview(props: {
       <section className="section-card">
         <div className="section-title-row">
           <div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div>
-          <OverviewListControls
-            repositories={props.repositories}
-            filter={props.eventFilter}
-            statuses={EVENT_STATUS_OPTIONS}
-            multiStatus
-            showNumber
-            onChange={props.onEventFilterChange}
-          />
+          <div className="overview-section-tools">
+            <div className="overview-selection-actions">
+              {props.eventSelectionMode ? (
+                <>
+                  <button
+                    type="button"
+                    className="button secondary compact"
+                    disabled={props.replayingEventIds.length > 0}
+                    onClick={props.onCancelEventSelection}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="button primary compact"
+                    disabled={selectedEventItems.length === 0 || props.replayingEventIds.length > 0}
+                    onClick={() => props.onReplaySelectedEvents(selectedEventItems)}
+                  >
+                    {props.replayingEventIds.length > 0
+                      ? "触发中…"
+                      : `手动触发（${selectedEventItems.length}）`}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  disabled={props.events.length === 0}
+                  title={props.events.length > 0 ? "选择多个事件批量手动触发" : "当前列表没有可手动触发的事件"}
+                  onClick={props.onBeginEventSelection}
+                >
+                  选择
+                </button>
+              )}
+            </div>
+            <OverviewListControls
+              repositories={props.repositories}
+              filter={props.eventFilter}
+              statuses={EVENT_STATUS_OPTIONS}
+              multiStatus
+              showNumber
+              onChange={props.onEventFilterChange}
+            />
+          </div>
         </div>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th></tr></thead>
+            <thead><tr>{props.eventSelectionMode && <th className="overview-selection-column">选择</th>}<th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th><th>操作</th></tr></thead>
             <tbody>
               {props.events.map((event) => (
                 <tr
                   key={event.event_id}
-                  className="overview-detail-row"
+                  className={`overview-detail-row ${props.selectedEventIds.includes(event.event_id) ? "overview-row-selected" : ""}`}
                   tabIndex={0}
                   onClick={() => setSelectedEvent(event)}
                   onKeyDown={(keyboardEvent) => {
@@ -2063,6 +2114,19 @@ function Overview(props: {
                     }
                   }}
                 >
+                  {props.eventSelectionMode && (
+                    <td className="overview-selection-column">
+                      <input
+                        type="checkbox"
+                        aria-label={`选择事件 ${event.event_type}`}
+                        checked={props.selectedEventIds.includes(event.event_id)}
+                        disabled={props.replayingEventIds.length > 0}
+                        title="加入批量手动触发"
+                        onClick={(clickEvent) => clickEvent.stopPropagation()}
+                        onChange={() => props.onToggleEventSelection(event.event_id)}
+                      />
+                    </td>
+                  )}
                   <td className="mono">
                     <span className="event-type-with-origin">
                       {event.event_type}
@@ -2076,6 +2140,20 @@ function Overview(props: {
                   </td>
                   <td><EventAgentProgress event={event} /></td>
                   <td>{dateTimeText(event.occurred_at)}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className="button secondary compact"
+                      disabled={props.replayingEventIds.includes(event.event_id)}
+                      title={`将 ${event.event_type} 复制为新的手动事件`}
+                      onClick={(clickEvent) => {
+                        clickEvent.stopPropagation();
+                        props.onReplayEvent(event);
+                      }}
+                    >
+                      {props.replayingEventIds.includes(event.event_id) ? "触发中…" : "手动触发"}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -2098,9 +2176,16 @@ function Overview(props: {
       </section>
       <ChangeRequestDetailDrawer
         changeRequest={selectedChangeRequest}
-        active={selectedEvent === null && selectedExecution === null}
+        active={selectedEvent === null && selectedExecution === null && !props.confirmationOpen}
         depth={0}
+        refreshToken={props.detailRefreshToken}
+        triggering={Boolean(
+          selectedChangeRequest
+          && props.triggeringKeys.includes(selectedChangeRequest.snapshot_key)
+        )}
         onOpenEvent={setSelectedEvent}
+        onReplayEvent={props.onReplayEvent}
+        onTriggerLatestEvent={props.onTriggerLatestEvent}
         onClose={() => setSelectedChangeRequest(null)}
       />
       <EventDetailDrawer
@@ -6874,14 +6959,33 @@ function ChangeRequestDetailDrawer(props: {
   changeRequest: ChangeRequestRecord | null;
   active: boolean;
   depth: number;
+  refreshToken: number;
+  triggering: boolean;
   onOpenEvent: (event: EventRecord) => void;
+  onReplayEvent: (event: EventRecord) => void;
+  onTriggerLatestEvent: (changeRequest: ChangeRequestRecord) => void;
   onClose: () => void;
 }) {
-  const { changeRequest, active, depth, onClose, onOpenEvent } = props;
+  const {
+    changeRequest,
+    active,
+    depth,
+    refreshToken,
+    triggering,
+    onClose,
+    onOpenEvent,
+    onReplayEvent,
+    onTriggerLatestEvent,
+  } = props;
   const [detail, setDetail] = useState<ChangeRequestDetailRecord | null>(null);
   const [error, setError] = useState("");
   const [statusFilters, setStatusFilters] = useState<string[]>([]);
   const [eventTypeFilters, setEventTypeFilters] = useState<string[]>([]);
+  const [eventContextMenu, setEventContextMenu] = useState<{
+    event: EventRecord;
+    left: number;
+    top: number;
+  } | null>(null);
   const changeRequestKey = changeRequest
     ? `${changeRequest.repository_id}:${changeRequest.number}`
     : "";
@@ -6891,6 +6995,7 @@ function ChangeRequestDetailDrawer(props: {
   useEffect(() => {
     setStatusFilters([]);
     setEventTypeFilters([]);
+    setEventContextMenu(null);
   }, [changeRequestKey]);
 
   useEffect(() => {
@@ -6915,16 +7020,34 @@ function ChangeRequestDetailDrawer(props: {
         if (!disposed) setError(reason instanceof Error ? reason.message : "MR/PR 详情加载失败");
       });
     return () => { disposed = true; };
-  }, [changeRequest]);
+  }, [changeRequest, refreshToken]);
 
   useEffect(() => {
     if (!changeRequest || !active) return undefined;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key !== "Escape") return;
+      if (eventContextMenu) {
+        setEventContextMenu(null);
+        return;
+      }
+      onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [active, changeRequest, onClose]);
+  }, [active, changeRequest, eventContextMenu, onClose]);
+
+  useEffect(() => {
+    if (!eventContextMenu) return undefined;
+    const closeMenu = () => setEventContextMenu(null);
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+    };
+  }, [eventContextMenu]);
 
   const statusOptions = useMemo<SelectOption[]>(() => {
     const labels = new Set(
@@ -6952,6 +7075,11 @@ function ChangeRequestDetailDrawer(props: {
 
   if (!changeRequest) return null;
   const current = detail ?? changeRequest;
+  const latestEventUnavailableReason = current.latest_event_supported === false
+    ? "当前 Provider 不支持最新平台事件"
+    : current.latest_event_checked
+      ? "当前没有可识别的最新平台事件"
+      : "等待扫描获取最新平台事件";
   return (
     <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
       <button type="button" className="run-drawer-backdrop" aria-label="关闭 MR/PR 详情" disabled={!active} onClick={onClose} />
@@ -6964,6 +7092,17 @@ function ChangeRequestDetailDrawer(props: {
           </div>
           <div className="run-drawer-actions">
             <StatusPill value={current.state} />
+            <button
+              type="button"
+              className="button secondary compact"
+              disabled={!current.latest_event || triggering}
+              title={current.latest_event
+                ? `手动触发最新平台事件 ${current.latest_event.event_type}`
+                : latestEventUnavailableReason}
+              onClick={() => onTriggerLatestEvent(current)}
+            >
+              {triggering ? "触发中…" : "手动触发"}
+            </button>
             <button className="run-drawer-close" aria-label="关闭" disabled={!active} onClick={onClose}>×</button>
           </div>
         </header>
@@ -6981,6 +7120,8 @@ function ChangeRequestDetailDrawer(props: {
                   <div><dt>远端更新</dt><dd>{dateTimeText(detail.updated_at)}</dd></div>
                   <div><dt>最近扫描</dt><dd>{timeText(detail.scanned_at)}</dd></div>
                   <div><dt>平台地址</dt><dd><a href={detail.web_url} target="_blank" rel="noreferrer">打开 MR / PR</a></dd></div>
+                  <div><dt>最新平台事件</dt><dd className="mono">{detail.latest_event?.event_type ?? latestEventUnavailableReason}</dd></div>
+                  <div><dt>平台提供时间</dt><dd>{detail.latest_event ? dateTimeText(detail.latest_event.occurred_at) : "—"}</dd></div>
                 </dl>
               </section>
               <section className="event-detail-section">
@@ -7027,7 +7168,28 @@ function ChangeRequestDetailDrawer(props: {
                 ) : (
                   <div className="event-dispatch-list">
                     {filteredEvents.map((event) => (
-                      <button type="button" className="event-record-card" key={event.event_id} onClick={() => onOpenEvent(event)}>
+                      <button
+                        type="button"
+                        className="event-record-card"
+                        key={event.event_id}
+                        title="左键查看详情，右键手动触发"
+                        onClick={() => {
+                          setEventContextMenu(null);
+                          onOpenEvent(event);
+                        }}
+                        onContextMenu={(contextEvent) => {
+                          contextEvent.preventDefault();
+                          contextEvent.stopPropagation();
+                          const bounds = contextEvent.currentTarget.getBoundingClientRect();
+                          const requestedLeft = contextEvent.clientX || bounds.right - 8;
+                          const requestedTop = contextEvent.clientY || bounds.top + 8;
+                          setEventContextMenu({
+                            event,
+                            left: Math.max(8, Math.min(requestedLeft, window.innerWidth - 176)),
+                            top: Math.max(8, Math.min(requestedTop, window.innerHeight - 64)),
+                          });
+                        }}
+                      >
                         <span><strong>{event.event_type}</strong><small>{dateTimeText(event.occurred_at)}</small></span>
                         <EventStatusPill event={event} />
                         <span className="run-row-arrow" aria-hidden="true">›</span>
@@ -7039,6 +7201,28 @@ function ChangeRequestDetailDrawer(props: {
             </>
           )}
         </div>
+        {eventContextMenu && active && (
+          <div
+            className="event-context-menu"
+            role="menu"
+            aria-label="关联事件操作"
+            style={{ left: eventContextMenu.left, top: eventContextMenu.top }}
+            onPointerDown={(pointerEvent) => pointerEvent.stopPropagation()}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              autoFocus
+              onClick={() => {
+                const sourceEvent = eventContextMenu.event;
+                setEventContextMenu(null);
+                onReplayEvent(sourceEvent);
+              }}
+            >
+              手动触发
+            </button>
+          </div>
+        )}
       </aside>
     </div>
   );
@@ -7140,6 +7324,8 @@ function EventDetailDrawer(props: {
                   <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
                   <div><dt>平台活动</dt><dd>{detail.source_activity_type ?? "—"}</dd></div>
                   <div><dt>平台活动时间</dt><dd>{dateTimeText(detail.source_occurred_at)}</dd></div>
+                  <div><dt>来源事件 ID</dt><dd className="mono">{detail.source_event_id ?? "—"}</dd></div>
+                  <div><dt>来源事件时间</dt><dd>{dateTimeText(detail.source_event_occurred_at)}</dd></div>
                 </dl>
                 {detail.error && <pre className="detail-pre detail-error">{detail.error}</pre>}
               </section>
@@ -8010,8 +8196,12 @@ export default function App() {
   const mainRef = useRef<HTMLElement>(null);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
+  const [replayingEventIds, setReplayingEventIds] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
   const [selectedSnapshotKeys, setSelectedSnapshotKeys] = useState<string[]>([]);
+  const [eventSelectionMode, setEventSelectionMode] = useState(false);
+  const [selectedEventIds, setSelectedEventIds] = useState<string[]>([]);
+  const [detailRefreshToken, setDetailRefreshToken] = useState(0);
   const [overviewConfirmation, setOverviewConfirmation] = useState<OverviewConfirmation | null>(null);
   const [confirmingOverviewAction, setConfirmingOverviewAction] = useState(false);
   const [eventOptions, setEventOptions] = useState<string[]>([]);
@@ -8133,6 +8323,13 @@ export default function App() {
       return next.length === current.length ? current : next;
     });
   }, [changeRequests]);
+  useEffect(() => {
+    const availableIds = new Set(events.map((event) => event.event_id));
+    setSelectedEventIds((current) => {
+      const next = current.filter((eventId) => availableIds.has(eventId));
+      return next.length === current.length ? current : next;
+    });
+  }, [events]);
 
   function changeDocument(next: ConfigDocument) {
     if (!editing) return;
@@ -8155,7 +8352,10 @@ export default function App() {
       setPendingRepositoryExitTab(nextTab);
       return;
     }
-    if (tab === "overview") cancelChangeRequestSelection();
+    if (tab === "overview") {
+      cancelChangeRequestSelection();
+      cancelEventSelection();
+    }
     setTab(nextTab);
   }
 
@@ -8232,12 +8432,18 @@ export default function App() {
     setSelectedSnapshotKeys([]);
   }
 
+  function cancelEventSelection() {
+    setEventSelectionMode(false);
+    setSelectedEventIds([]);
+  }
+
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
     cancelChangeRequestSelection();
     setChangeRequestFilter({ ...filter, page: 1 });
   }
 
   function changeOverviewEventFilter(filter: OverviewFilter) {
+    cancelEventSelection();
     setEventFilter({ ...filter, page: 1 });
   }
 
@@ -8247,6 +8453,7 @@ export default function App() {
   }
 
   function changeOverviewEventPage(page: number) {
+    cancelEventSelection();
     setEventFilter((current) => ({ ...current, page }));
   }
 
@@ -8258,6 +8465,14 @@ export default function App() {
     ));
   }
 
+  function toggleEventSelection(eventId: string) {
+    setSelectedEventIds((current) => (
+      current.includes(eventId)
+        ? current.filter((selectedId) => selectedId !== eventId)
+        : [...current, eventId]
+    ));
+  }
+
   function requestEmitDiscovered(item: ChangeRequestRecord) {
     const hasMatchingRule = Boolean(document?.rules.some((rule) => (
       rule.enabled !== false
@@ -8266,7 +8481,7 @@ export default function App() {
     )));
     setOverviewConfirmation({
       kind: "discovered",
-      items: [item],
+      changeRequests: [item],
       eyebrow: "首次事件",
       title: "确认补发首次事件",
       description: "请核对目标与规则影响。确认后会创建一条首次发现事件。",
@@ -8295,7 +8510,7 @@ export default function App() {
     )));
     setOverviewConfirmation({
       kind: "latest",
-      items: [item],
+      changeRequests: [item],
       eyebrow: "平台事件",
       title: "确认手动触发",
       description: "将缓存的最新平台事件重新发送到当前规则引擎。",
@@ -8339,7 +8554,7 @@ export default function App() {
     );
     setOverviewConfirmation({
       kind: "latest-batch",
-      items: targets,
+      changeRequests: targets,
       eyebrow: "批量平台事件",
       title: `确认触发 ${targets.length} 个 MR / PR`,
       description: "每个目标将使用自己的缓存最新平台事件，分别发送到当前规则引擎。",
@@ -8360,6 +8575,76 @@ export default function App() {
     });
   }
 
+  function requestReplayEvent(event: EventRecord) {
+    const hasCandidateRule = Boolean(document?.rules.some((rule) => (
+      rule.enabled !== false
+      && rule.events.includes(event.event_type)
+      && (!rule.repositories || rule.repositories.includes(event.repository_id))
+    )));
+    setOverviewConfirmation({
+      kind: "event-replay",
+      events: [event],
+      eyebrow: "历史事件",
+      title: "确认手动触发",
+      description: "复制来源事件保存的上下文，创建一条新的独立手动事件。",
+      details: [
+        { label: "目标", value: `${event.repository_id} · #${event.number}` },
+        { label: "事件", value: event.event_type, mono: true },
+        { label: "来源事件 ID", value: event.event_id, mono: true },
+        { label: "原发生时间", value: dateTimeText(event.occurred_at) },
+      ],
+      impactTitle: hasCandidateRule ? "可能触发 Agent" : "当前没有候选规则",
+      impact: hasCandidateRule
+        ? "新事件会重新进入当前规则匹配流程；最终仍需满足规则条件，Agent 可能执行其获准操作。"
+        : "新事件预计会被记录为未触发，不会启动 Agent。",
+      impactTone: hasCandidateRule ? "attention" : "quiet",
+      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本可能复用已有 CI 结果。",
+      confirmLabel: "确认触发",
+    });
+  }
+
+  function requestReplayEvents(items: EventRecord[]) {
+    if (items.length === 0) return;
+    const repositoryCounts = new Map<string, number>();
+    const eventCounts = new Map<string, number>();
+    let candidateCount = 0;
+    for (const event of items) {
+      repositoryCounts.set(event.repository_id, (repositoryCounts.get(event.repository_id) ?? 0) + 1);
+      eventCounts.set(event.event_type, (eventCounts.get(event.event_type) ?? 0) + 1);
+      if (document?.rules.some((rule) => (
+        rule.enabled !== false
+        && rule.events.includes(event.event_type)
+        && (!rule.repositories || rule.repositories.includes(event.repository_id))
+      ))) {
+        candidateCount += 1;
+      }
+    }
+    const summarize = (counts: Map<string, number>) => (
+      [...counts.entries()].map(([name, count]) => `${name} × ${count}`).join("；")
+    );
+    setOverviewConfirmation({
+      kind: "event-replay-batch",
+      events: items,
+      eyebrow: "批量历史事件",
+      title: `确认触发 ${items.length} 条事件`,
+      description: "每条来源事件都会复制原始上下文，并分别创建新的独立手动事件。",
+      details: [
+        { label: "事件数量", value: `${items.length} 条` },
+        { label: "仓库分布", value: summarize(repositoryCounts) },
+        { label: "事件分布", value: summarize(eventCounts), mono: true },
+      ],
+      impactTitle: candidateCount > 0
+        ? `${candidateCount} 条事件可能触发 Agent`
+        : "当前没有候选规则",
+      impact: candidateCount > 0
+        ? "新事件会分别进入当前规则匹配流程；每条事件仍需满足规则条件，Agent 可能执行其获准操作。"
+        : "这些新事件预计会被记录为未触发，不会启动 Agent。",
+      impactTone: candidateCount > 0 ? "attention" : "quiet",
+      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本可能复用已有 CI 结果。",
+      confirmLabel: `触发 ${items.length} 项`,
+    });
+  }
+
   function closeOverviewConfirmation() {
     if (!confirmingOverviewAction) setOverviewConfirmation(null);
   }
@@ -8371,37 +8656,64 @@ export default function App() {
     setConfirmingOverviewAction(true);
     setError("");
     try {
-      const item = action.items[0];
-      if (!item) return;
+      const changeRequestItems = action.changeRequests ?? [];
+      const eventItems = action.events ?? [];
+      const item = changeRequestItems[0];
+      const sourceEvent = eventItems[0];
       if (action.kind === "discovered") {
+        if (!item) return;
         setEmittingKey(item.snapshot_key);
+      } else if (action.kind === "event-replay" || action.kind === "event-replay-batch") {
+        if (!sourceEvent) return;
+        setReplayingEventIds(eventItems.map((event) => event.event_id));
       } else {
-        setTriggeringKeys(action.items.map((target) => target.snapshot_key));
+        if (!item) return;
+        setTriggeringKeys(changeRequestItems.map((target) => target.snapshot_key));
       }
-      let result: { created: boolean; reason: string } | ManualLatestEventBatchResponse;
+      let result:
+        | { created: boolean; reason: string }
+        | ManualLatestEventBatchResponse
+        | ManualEventReplayBatchResponse;
       if (action.kind === "latest-batch") {
         result = await api<ManualLatestEventBatchResponse>(
           "/api/change-requests/trigger-latest-events",
           {
             method: "POST",
             body: JSON.stringify({
-              targets: action.items.map((target) => ({
+              targets: changeRequestItems.map((target) => ({
                 repository_id: target.repository_id,
                 number: target.number,
               })),
             }),
           },
         );
+      } else if (action.kind === "event-replay-batch") {
+        result = await api<ManualEventReplayBatchResponse>(
+          "/api/events/replay",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              event_ids: eventItems.map((event) => event.event_id),
+            }),
+          },
+        );
+      } else if (action.kind === "event-replay") {
+        result = await api<{ created: boolean; reason: string }>(
+          `/api/events/${encodeURIComponent(sourceEvent!.event_id)}/replay`,
+          { method: "POST" },
+        );
       } else {
         const endpoint = action.kind === "discovered"
-          ? `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/emit-discovered`
-          : `/api/change-requests/${encodeURIComponent(item.repository_id)}/${item.number}/trigger-latest-event`;
+          ? `/api/change-requests/${encodeURIComponent(item!.repository_id)}/${item!.number}/emit-discovered`
+          : `/api/change-requests/${encodeURIComponent(item!.repository_id)}/${item!.number}/trigger-latest-event`;
         result = await api<{ created: boolean; reason: string }>(endpoint, { method: "POST" });
       }
       await Promise.all([refreshOperationalData(), refreshOverviewData()]);
+      setDetailRefreshToken((current) => current + 1);
       setNotice(result.reason);
-      if (action.kind === "latest-batch" && "results" in result) {
-        const failed = result.results.filter((entry) => !entry.created);
+      if (action.kind === "latest-batch") {
+        const batchResult = result as ManualLatestEventBatchResponse;
+        const failed = batchResult.results.filter((entry) => !entry.created);
         if (failed.length === 0) {
           cancelChangeRequestSelection();
         } else {
@@ -8409,7 +8721,7 @@ export default function App() {
             failed.map((entry) => `${entry.repository_id}:${entry.number}`),
           );
           setSelectedSnapshotKeys(
-            action.items
+            changeRequestItems
               .filter((target) => failedKeys.has(`${target.repository_id}:${target.number}`))
               .map((target) => target.snapshot_key),
           );
@@ -8419,18 +8731,34 @@ export default function App() {
               .join("；")}`,
           );
         }
+      } else if (action.kind === "event-replay-batch") {
+        const batchResult = result as ManualEventReplayBatchResponse;
+        const failed = batchResult.results.filter((entry) => !entry.created);
+        if (failed.length === 0) {
+          cancelEventSelection();
+        } else {
+          setSelectedEventIds(failed.map((entry) => entry.source_event_id));
+          setError(
+            `有 ${failed.length} 项触发失败：${failed
+              .map((entry) => `${entry.source_event_id.slice(0, 12)}（${entry.reason}）`)
+              .join("；")}`,
+          );
+        }
       }
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
       const fallback = action.kind === "discovered"
         ? "补发首次发现事件失败"
-        : "手动触发最新平台事件失败";
+        : action.kind === "event-replay" || action.kind === "event-replay-batch"
+          ? "手动触发历史事件失败"
+          : "手动触发最新平台事件失败";
       setError(reason instanceof Error ? reason.message : fallback);
     } finally {
       setOverviewConfirmation(null);
       setConfirmingOverviewAction(false);
       setEmittingKey("");
       setTriggeringKeys([]);
+      setReplayingEventIds([]);
     }
   }
 
@@ -8525,8 +8853,13 @@ export default function App() {
                   eventPage={eventPage}
                   emittingKey={emittingKey}
                   triggeringKeys={triggeringKeys}
+                  replayingEventIds={replayingEventIds}
                   selectionMode={changeRequestSelectionMode}
                   selectedSnapshotKeys={selectedSnapshotKeys}
+                  eventSelectionMode={eventSelectionMode}
+                  selectedEventIds={selectedEventIds}
+                  detailRefreshToken={detailRefreshToken}
+                  confirmationOpen={overviewConfirmation !== null}
                   onAction={control}
                   onEmitDiscovered={requestEmitDiscovered}
                   onTriggerLatestEvent={requestTriggerLatestEvent}
@@ -8534,6 +8867,11 @@ export default function App() {
                   onCancelSelection={cancelChangeRequestSelection}
                   onToggleSelection={toggleChangeRequestSelection}
                   onTriggerSelected={requestTriggerLatestEvents}
+                  onReplayEvent={requestReplayEvent}
+                  onBeginEventSelection={() => setEventSelectionMode(true)}
+                  onCancelEventSelection={cancelEventSelection}
+                  onToggleEventSelection={toggleEventSelection}
+                  onReplaySelectedEvents={requestReplayEvents}
                   onChangeRequestFilterChange={changeOverviewChangeRequestFilter}
                   onEventFilterChange={changeOverviewEventFilter}
                   onChangeRequestPageChange={changeOverviewChangeRequestPage}
