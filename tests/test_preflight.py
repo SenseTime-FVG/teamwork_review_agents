@@ -631,6 +631,100 @@ async def test_preflight_superseded_head_is_terminal_and_not_published(
     )
 
 
+async def test_preflight_infrastructure_error_retries_without_remote_result(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """基础设施异常应保留重试，但不得发布平台状态或失败评论。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "publish_failure_comment": True,
+                        "steps": [
+                            {
+                                "name": "never-run",
+                                "command": [
+                                    sys.executable,
+                                    "-c",
+                                    "raise SystemExit(9)",
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    event = detect_events(
+        None,
+        snapshot_factory(
+            provider="github-main",
+            repository_id="demo",
+            head_sha="c" * 40,
+        ),
+        emit_initial=True,
+    )[0]
+    worktree_attempts = 0
+
+    @contextmanager
+    def failing_worktree(*_args, **_kwargs):
+        nonlocal worktree_attempts
+        worktree_attempts += 1
+        raise RuntimeError("Git 操作失败，请检查仓库地址、网络和权限")
+        yield tmp_path
+
+    published_statuses: list[str] = []
+    synced_comments: list[str] = []
+
+    async def record_status(*_args, state, **_kwargs):
+        published_statuses.append(state)
+
+    async def record_comment(_repository, result):
+        synced_comments.append(result.status)
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        failing_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = PreflightExecutor(config, store)
+    monkeypatch.setattr(executor, "_set_remote_status", record_status)
+    monkeypatch.setattr(executor, "_sync_failure_comment_safely", record_comment)
+
+    first = await executor.ensure_passed(event)
+    second = await executor.ensure_passed(event)
+
+    assert first.status == "error"
+    assert second.status == "error"
+    assert worktree_attempts == 2
+    assert published_statuses == []
+    assert synced_comments == []
+    detail = store.get_preflight_run(first.run_id)
+    assert detail is not None
+    assert detail["attempts"] == 2
+    assert detail["status"] == "error"
+    assert detail["status_published"] == 0
+
+
 async def test_preflight_uses_final_snapshot_for_deduplicated_commit_batch(
     tmp_path,
     monkeypatch,
@@ -972,6 +1066,14 @@ async def test_preflight_failure_comment_is_reused_redacted_and_deleted_on_succe
     changed_failure = failure.model_copy(update={"output": "另一条失败信息"})
     await executor._sync_failure_comment_safely(repository, changed_failure)
     assert len(updated) == 2
+
+    infrastructure_error = failure.model_copy(
+        update={"status": "error", "error": "Git 操作失败"}
+    )
+    await executor._sync_failure_comment_safely(repository, infrastructure_error)
+    assert len(created) == 1
+    assert len(updated) == 2
+    assert deleted == []
 
     next_generation_failure = failure.model_copy(
         update={

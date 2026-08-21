@@ -447,7 +447,7 @@ def _status_description(result: PreflightResult) -> str:
         return f"步骤 {result.failed_step or 'unknown'} 超时"
     if result.status == "superseded":
         return "事件 Head 已更新，本地 CI 已跳过"
-    return "本地 CI 基础设施错误"
+    raise ValueError("基础设施异常没有可发布的 Commit Status")
 
 
 def _bounded_comment_text(value: str, *, limit: int) -> str:
@@ -470,7 +470,6 @@ def _failure_comment_body(
     status_label = {
         "failure": "未通过",
         "timed_out": "超时",
-        "error": "执行异常",
     }.get(result.status, result.status)
     marker = stable_hash(
         "preflight-failure-comment",
@@ -604,7 +603,7 @@ class PreflightExecutor:
                     event_type="comment_deleted",
                 )
             return
-        if result.status not in {"failure", "timed_out", "error"}:
+        if result.status not in {"failure", "timed_out"}:
             return
 
         provider_config = self.config.providers[repository.provider]
@@ -660,16 +659,15 @@ class PreflightExecutor:
         repository,
         result: PreflightResult,
     ) -> PreflightResult:
-        """发布已持久化的终态；失败时返回可重试错误但保留本地终态。"""
+        """只发布代码门禁终态；写回失败时保留本地真实结论。"""
 
-        if result.status == "superseded":
+        if result.status in {"error", "superseded"}:
             return result
 
         remote_state = {
             "success": "success",
             "failure": "failure",
             "timed_out": "failure",
-            "error": "error",
         }[result.status]
         status_error: Exception | None = None
         try:
