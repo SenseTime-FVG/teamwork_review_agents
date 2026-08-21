@@ -424,10 +424,15 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
     assert store.list_events(1, offset=1)[0]["event_id"] == older_event.id
     assert store.count_events() == 2
     assert store.count_events(repository_id="second", status="unmatched") == 1
+    assert store.count_events(status=["pending", "unmatched"]) == 2
     assert store.list_events(None, repository_id="second")[0]["event_id"] == older_event.id
     assert store.list_events(None, number=2)[0]["event_id"] == older_event.id
     assert store.list_events(None, status="unmatched")[0]["event_id"] == older_event.id
     assert store.list_events(None, status="pending")[0]["event_id"] == newest_event.id
+    assert [
+        item["event_id"]
+        for item in store.list_events(None, status=["pending", "unmatched"])
+    ] == [newest_event.id, older_event.id]
     assert store.list_events(None)[0]["occurred_at"].startswith("2026-08-18T10:00:00")
 
     detail = store.get_change_request_detail("second", 2)

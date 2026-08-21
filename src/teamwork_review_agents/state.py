@@ -2876,7 +2876,7 @@ class StateStore:
         limit: int | None = 50,
         *,
         offset: int = 0,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         repository_id: str | None = None,
         number: int | None = None,
         event_id: str | None = None,
@@ -2885,9 +2885,11 @@ class StateStore:
 
         conditions: list[str] = []
         parameters: list[Any] = []
-        if status:
-            conditions.append("event_inbox.status = ?")
-            parameters.append(status)
+        statuses = [status] if isinstance(status, str) else list(status or ())
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"event_inbox.status IN ({placeholders})")
+            parameters.extend(statuses)
         if repository_id:
             conditions.append("event_inbox.repository_id = ?")
             parameters.append(repository_id)
@@ -3010,7 +3012,7 @@ class StateStore:
     def count_events(
         self,
         *,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         repository_id: str | None = None,
         number: int | None = None,
         event_id: str | None = None,
@@ -3019,9 +3021,11 @@ class StateStore:
 
         conditions: list[str] = []
         parameters: list[Any] = []
-        if status:
-            conditions.append("status = ?")
-            parameters.append(status)
+        statuses = [status] if isinstance(status, str) else list(status or ())
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"status IN ({placeholders})")
+            parameters.extend(statuses)
         if repository_id:
             conditions.append("repository_id = ?")
             parameters.append(repository_id)

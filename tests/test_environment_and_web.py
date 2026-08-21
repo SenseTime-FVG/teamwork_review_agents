@@ -1090,6 +1090,18 @@ def test_overview_api_filters_status_repository_and_limit(
             "/api/events?repository_id=second&status=cancelled&limit=10"
         ).json()
         assert [item["event_id"] for item in filtered_events] == [second_event.id]
+        multi_status_events = client.get(
+            "/api/events?status=pending&status=cancelled&limit=10"
+        ).json()
+        assert [item["event_id"] for item in multi_status_events] == [
+            first_event.id,
+            second_event.id,
+        ]
+        multi_status_event_page = client.get(
+            "/api/events?status=pending&status=cancelled&page=1&limit=1"
+        ).json()
+        assert multi_status_event_page["total"] == 2
+        assert multi_status_event_page["total_pages"] == 2
         number_events = client.get("/api/events?number=2&limit=10").json()
         assert [item["event_id"] for item in number_events] == [second_event.id]
         first_event_page = client.get("/api/events?page=1&limit=1").json()
@@ -1174,6 +1186,12 @@ def test_overview_api_filters_status_repository_and_limit(
             agent_reservation.run_id
         ]
         assert client.get("/api/runs?status_group=failure").json() == []
+        multi_status_runs = client.get(
+            "/api/runs?status_group=success&status_group=failure&limit=10"
+        ).json()
+        assert [item["run_id"] for item in multi_status_runs] == [
+            agent_reservation.run_id
+        ]
         assert len(client.get("/api/runs?all_records=true").json()) == 1
         assert client.get("/api/runs?status_group=unknown").status_code == 422
         assert client.get(
@@ -1196,6 +1214,13 @@ def test_overview_api_filters_status_repository_and_limit(
         assert client.get(
             "/api/preflight-runs?status_group=waiting"
         ).json() == []
+        multi_status_preflights = client.get(
+            "/api/preflight-runs?status_group=running"
+            "&status_group=failure&limit=10"
+        ).json()
+        assert [item["run_id"] for item in multi_status_preflights] == [
+            reservation.run_id
+        ]
         assert len(
             client.get("/api/preflight-runs?all_records=true").json()
         ) == 1
