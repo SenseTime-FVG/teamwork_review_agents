@@ -615,7 +615,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-drawer-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; min-height: 105px; padding: 22px 24px 17px; border-bottom: 1px solid var(--line); background: #0b131e; }
 .run-drawer-head h2 { margin: 6px 0 4px; font-size: 20px; }
 .run-drawer-head p { margin: 0; color: #728096; font: 400 9px "SFMono-Regular", Consolas, monospace; }
-.event-change-request-link { color: #8eb6ef; text-decoration: underline; text-decoration-color: rgba(142, 182, 239, .45); text-underline-offset: 3px; }
+.event-change-request-link { color: #8eb6ef; cursor: pointer; text-decoration: underline; text-decoration-color: rgba(142, 182, 239, .45); text-underline-offset: 3px; }
 .event-change-request-link:hover, .event-change-request-link:focus-visible { color: var(--accent); text-decoration-color: currentColor; outline: none; }
 .run-drawer-actions { display: flex; align-items: center; gap: 9px; }
 .run-drawer-close { display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid var(--line); border-radius: 7px; background: #111a27; color: #a8b4c4; cursor: pointer; font-size: 20px; line-height: 1; }

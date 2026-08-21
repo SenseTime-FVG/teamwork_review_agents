@@ -7105,7 +7105,19 @@ function ChangeRequestDetailDrawer(props: {
       <aside className="run-drawer event-detail-drawer" role="dialog" aria-modal={active} aria-label="MR/PR 详情">
         <header className="run-drawer-head">
           <div>
-            <span className="eyebrow">{current.repository_id} · #{current.number}</span>
+            <span className="eyebrow">
+              {current.repository_id} · {current.web_url ? (
+                <a
+                  className="event-change-request-link"
+                  href={current.web_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`打开 ${current.repository_id} #${current.number}`}
+                >
+                  #{current.number}
+                </a>
+              ) : `#${current.number}`}
+            </span>
             <h2>{current.title}</h2>
             <p>{current.source_branch} → {current.target_branch}</p>
           </div>
