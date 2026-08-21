@@ -646,6 +646,7 @@ function MultiSelectControl(props: {
   onChange: (values: string[]) => void;
   options: SelectOption[];
   allLabel: string;
+  selectionSummary?: (labels: string[]) => string;
   ariaLabel?: string;
   ariaLabelledBy?: string;
   className?: string;
@@ -667,7 +668,7 @@ function MultiSelectControl(props: {
     .filter((option) => props.values.includes(option.value))
     .map((option) => option.label);
   const triggerLabel = selectedLabels.length > 0
-    ? selectedLabels.join("、")
+    ? props.selectionSummary?.(selectedLabels) ?? selectedLabels.join("、")
     : props.allLabel;
 
   useEffect(() => {
@@ -860,6 +861,7 @@ function MultiSelectField(props: {
   onChange: (values: string[]) => void;
   options: SelectOption[];
   allLabel: string;
+  selectionSummary?: (labels: string[]) => string;
   className?: string;
   disabled?: boolean;
 }) {
@@ -873,6 +875,7 @@ function MultiSelectField(props: {
         onChange={props.onChange}
         options={props.options}
         allLabel={props.allLabel}
+        selectionSummary={props.selectionSummary}
         ariaLabelledBy={`${fieldId}-label`}
         disabled={props.disabled}
       />
@@ -6874,8 +6877,18 @@ function ChangeRequestDetailDrawer(props: {
   const { changeRequest, active, depth, onClose, onOpenEvent } = props;
   const [detail, setDetail] = useState<ChangeRequestDetailRecord | null>(null);
   const [error, setError] = useState("");
+  const [statusFilters, setStatusFilters] = useState<string[]>([]);
+  const [eventTypeFilters, setEventTypeFilters] = useState<string[]>([]);
+  const changeRequestKey = changeRequest
+    ? `${changeRequest.repository_id}:${changeRequest.number}`
+    : "";
 
   useBodyScrollLock(changeRequest !== null);
+
+  useEffect(() => {
+    setStatusFilters([]);
+    setEventTypeFilters([]);
+  }, [changeRequestKey]);
 
   useEffect(() => {
     if (!changeRequest) {
@@ -6909,6 +6922,30 @@ function ChangeRequestDetailDrawer(props: {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [active, changeRequest, onClose]);
+
+  const statusOptions = useMemo<SelectOption[]>(() => {
+    const labels = new Set(
+      (detail?.events ?? []).map((event) => eventStatusPresentation(event).label),
+    );
+    return [...labels]
+      .sort((left, right) => left.localeCompare(right, "zh-CN"))
+      .map((label) => ({ value: label, label }));
+  }, [detail]);
+  const eventTypeOptions = useMemo<SelectOption[]>(() => {
+    const eventTypes = new Set((detail?.events ?? []).map((event) => event.event_type));
+    return [...eventTypes]
+      .sort((left, right) => left.localeCompare(right))
+      .map((eventType) => ({ value: eventType, label: eventType }));
+  }, [detail]);
+  const filteredEvents = useMemo(() => (detail?.events ?? []).filter((event) => (
+    (statusFilters.length === 0
+      || statusFilters.includes(eventStatusPresentation(event).label))
+    && (eventTypeFilters.length === 0 || eventTypeFilters.includes(event.event_type))
+  )), [detail, eventTypeFilters, statusFilters]);
+  const filtersActive = statusFilters.length > 0 || eventTypeFilters.length > 0;
+  const compactSelectionSummary = (labels: string[]) => (
+    labels.length === 1 ? labels[0] : `${labels[0]}等 ${labels.length} 项`
+  );
 
   if (!changeRequest) return null;
   const current = detail ?? changeRequest;
@@ -6944,15 +6981,49 @@ function ChangeRequestDetailDrawer(props: {
                 </dl>
               </section>
               <section className="event-detail-section">
-                <div className="event-detail-section-title">
-                  <div><span className="eyebrow">EVENTS</span><h3>关联事件</h3></div>
-                  <span className="event-detail-count">{detail.events.length}</span>
+                <div className="event-detail-section-title event-detail-events-title">
+                  <div>
+                    <span className="eyebrow">EVENTS</span>
+                    <div className="event-detail-heading-line">
+                      <h3>关联事件</h3>
+                      <span className="event-detail-sort-note">按时间倒序</span>
+                    </div>
+                  </div>
+                  <div className="event-detail-events-controls">
+                    <div className="event-detail-events-filters">
+                      <MultiSelectField
+                        label="状态"
+                        values={statusFilters}
+                        onChange={setStatusFilters}
+                        options={statusOptions}
+                        allLabel="全部状态"
+                        selectionSummary={compactSelectionSummary}
+                        className="event-detail-events-filter"
+                        disabled={detail.events.length === 0}
+                      />
+                      <MultiSelectField
+                        label="事件"
+                        values={eventTypeFilters}
+                        onChange={setEventTypeFilters}
+                        options={eventTypeOptions}
+                        allLabel="全部事件"
+                        selectionSummary={compactSelectionSummary}
+                        className="event-detail-events-filter event-detail-events-filter-type"
+                        disabled={detail.events.length === 0}
+                      />
+                    </div>
+                    <span className="event-detail-count">
+                      {filtersActive ? `${filteredEvents.length} / ${detail.events.length}` : detail.events.length}
+                    </span>
+                  </div>
                 </div>
                 {detail.events.length === 0 ? (
                   <div className="event-detail-empty">当前 MR/PR 尚无关联事件。</div>
+                ) : filteredEvents.length === 0 ? (
+                  <div className="event-detail-empty">当前筛选条件下没有关联事件。</div>
                 ) : (
                   <div className="event-dispatch-list">
-                    {detail.events.map((event) => (
+                    {filteredEvents.map((event) => (
                       <button type="button" className="event-record-card" key={event.event_id} onClick={() => onOpenEvent(event)}>
                         <span><strong>{event.event_type}</strong><small>{dateTimeText(event.occurred_at)}</small></span>
                         <EventStatusPill event={event} />
