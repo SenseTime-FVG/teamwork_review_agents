@@ -612,6 +612,7 @@ export type EventPreflightSummary = {
 };
 
 export type EventDetailRecord = EventRecord & {
+  change_request_url?: string | null;
   dispatches: EventDispatchDetail[];
   agent_runs: EventAgentRunSummary[];
   preflights: EventPreflightSummary[];

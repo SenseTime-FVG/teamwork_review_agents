@@ -7299,7 +7299,19 @@ function EventDetailDrawer(props: {
           <div>
             <span className="eyebrow">{current.event_id}</span>
             <h2>{current.event_type}</h2>
-            <p>{current.repository_id} · #{current.number} · {dateTimeText(current.occurred_at)}</p>
+            <p>
+              {current.repository_id} · {detail?.change_request_url ? (
+                <a
+                  className="event-change-request-link"
+                  href={detail.change_request_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`打开 ${current.repository_id} #${current.number}`}
+                >
+                  #{current.number}
+                </a>
+              ) : `#${current.number}`} · {dateTimeText(current.occurred_at)}
+            </p>
           </div>
           <div className="run-drawer-actions">
             <EventStatusPill event={current} />

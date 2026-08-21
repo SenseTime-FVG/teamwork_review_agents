@@ -3103,6 +3103,23 @@ class StateStore:
         if not records:
             return None
         with self.connect() as connection:
+            change_request_row = connection.execute(
+                """
+                SELECT COALESCE(
+                           NULLIF(json_extract(event.payload, '$.current.web_url'), ''),
+                           NULLIF(json_extract(event.payload, '$.new.web_url'), ''),
+                           NULLIF(json_extract(event.payload, '$.old.web_url'), ''),
+                           NULLIF(json_extract(snapshot.payload, '$.web_url'), '')
+                       ) AS change_request_url
+                FROM event_inbox AS event
+                LEFT JOIN snapshots AS snapshot
+                    ON snapshot.snapshot_key = (
+                        event.repository_id || ':' || event.number
+                    )
+                WHERE event.event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
             dispatch_rows = connection.execute(
                 """
                 SELECT dispatch.idempotency_key, dispatch.rule_name,
@@ -3159,6 +3176,11 @@ class StateStore:
         preflights = [dict(row) for row in preflight_rows]
         return {
             **records[0],
+            "change_request_url": (
+                change_request_row["change_request_url"]
+                if change_request_row is not None
+                else None
+            ),
             "dispatches": [dict(row) for row in dispatch_rows],
             "agent_runs": [dict(row) for row in agent_run_rows],
             "preflights": preflights,
