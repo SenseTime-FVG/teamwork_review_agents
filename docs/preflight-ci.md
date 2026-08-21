@@ -10,7 +10,7 @@
 
 同一批次中未要求 CI 的 Agent 会立即启动，不等待 Preflight。要求 CI 的规则共享以仓库 ID、PR 编号、Head SHA 和完整配置 revision 生成的幂等结果。`success`、`failure` 与 `timed_out` 是可复用的本地终态；Git、进程启动或清理故障产生的 `error` 只影响要求 CI 的事件路径，并按事件重试额度再次执行。
 
-执行器先写入 `pending` Commit Status，再更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule，然后按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。
+执行器先更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule；精确工作区准备成功后才写入 `pending` Commit Status，并按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。
 
 `cache_enabled: true` 时，依赖下载缓存按仓库稳定身份隔离并跨分支共享，避免同一仓库的不同 PR 重复下载；临时 worktree、HOME 与安装目录不共享。系统会为常见 Python、Node.js、Rust、Go、Java、.NET、PHP 和浏览器工具注入其标准缓存变量。仓库详情还可以手动执行远端默认分支最新提交，用于提前填充缓存；手动运行不设 CI 步骤总限时，但可以取消，且不会触发 Agent 或发布 PR Commit Status。
 
@@ -23,7 +23,7 @@
 - `success`：写入 GitHub `success`，继续启动要求 CI 的 Review Agent。
 - `failure`：写入 GitHub `failure`，正常结束要求 CI 的规则路径；不影响同批次未要求 CI 的 Agent。
 - `timed_out`：按代码失败处理并写入 GitHub `failure`，只阻断要求 CI 的规则。
-- `error`：写入 GitHub `error`，要求 CI 的事件路径失败并按 `event_retry_count` 重试。
+- `error`：不写入 GitHub Commit Status，也不发布或改写失败评论；只让要求 CI 的事件路径失败并按 `event_retry_count` 重试。
 
 启用门禁的仓库会自动产生首次 `change_request.discovered` 事件，不受全局 `scanner.emit_initial_events` 开关影响。部署方应在 GitHub Ruleset 中把 `status_context`（默认 `teamwork/local-ci`）设为 required status check。
 
