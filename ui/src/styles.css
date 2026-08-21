@@ -810,6 +810,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .provider-detail-drawer { width: min(1120px, 88vw); }
 .provider-detail-head { min-height: 112px; }
 .provider-detail-actions { flex-wrap: wrap; justify-content: flex-end; }
+.provider-detail-alert { flex: none; align-items: flex-start; max-height: 120px; margin: 12px 24px 0; overflow: auto; overflow-wrap: anywhere; line-height: 1.55; }
+.provider-detail-alert span { min-width: 0; }
+.provider-detail-alert button { flex: none; line-height: 1; }
 .provider-detail-body > .section-card, .provider-detail-body > .page-stack, .provider-detail-body > .codex-account-card { margin-bottom: 16px; }
 .provider-detail-body .page-stack { gap: 16px; }
 .provider-detail-body .section-card { box-shadow: none; }
