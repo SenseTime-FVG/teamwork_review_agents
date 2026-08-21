@@ -1884,7 +1884,7 @@ function Overview(props: {
       </div>
       <section className="section-card">
         <div className="section-title-row">
-          <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；这里的数量与变化事件分开统计。</p></div>
+          <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；最新平台事件来自 Provider Timeline，仅作为手动触发参考，不等同于已经入队的关联事件。</p></div>
           <div className="overview-section-tools">
             <div className="overview-selection-actions">
               {props.selectionMode ? (
@@ -1906,7 +1906,7 @@ function Overview(props: {
                   disabled={!props.changeRequests.some((item) => item.latest_event)}
                   title={props.changeRequests.some((item) => item.latest_event)
                     ? "选择多个 MR / PR 批量手动触发"
-                    : "当前列表没有可手动触发的最新事件"}
+                    : "当前列表没有可手动触发的最新平台事件"}
                   onClick={props.onBeginSelection}
                 >
                   选择
@@ -1927,7 +1927,7 @@ function Overview(props: {
             <thead>
               <tr>
                 {props.selectionMode && <th className="overview-selection-column">选择</th>}
-                <th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th><th>最新事件</th><th>操作</th>
+                <th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th><th>最新平台事件</th><th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -1951,7 +1951,7 @@ function Overview(props: {
                         aria-label={`选择 ${item.repository_id} #${item.number}`}
                         checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
                         disabled={!item.latest_event || props.triggeringKeys.length > 0}
-                        title={item.latest_event ? "加入批量手动触发" : "尚无可触发的最新事件"}
+                        title={item.latest_event ? "加入批量手动触发" : "尚无可触发的最新平台事件"}
                         onClick={(event) => event.stopPropagation()}
                         onChange={() => props.onToggleSelection(item.snapshot_key)}
                       />
@@ -1985,7 +1985,10 @@ function Overview(props: {
                   </td>
                   <td>
                     {item.latest_event ? (
-                      <span className="latest-event-reference">
+                      <span
+                        className="latest-event-reference"
+                        title="按 Provider Timeline 原始顺序选取；显示时间仅为平台提供时间"
+                      >
                         <strong>{item.latest_event.event_type}</strong>
                         <small>{dateTimeText(item.latest_event.occurred_at)}</small>
                       </span>
@@ -1994,7 +1997,7 @@ function Overview(props: {
                         {item.latest_event_supported === false
                           ? "当前 Provider 不支持"
                           : item.latest_event_checked
-                            ? "暂无可识别事件"
+                            ? "暂无可识别平台事件"
                             : "等待扫描获取"}
                       </span>
                     )}
@@ -2003,7 +2006,7 @@ function Overview(props: {
                     <button
                       className="button secondary compact"
                       disabled={!item.latest_event || props.triggeringKeys.includes(item.snapshot_key)}
-                      title={item.latest_event ? `手动发送 ${item.latest_event.event_type}` : "尚无可触发的最新事件"}
+                      title={item.latest_event ? `手动发送最新平台事件 ${item.latest_event.event_type}` : "尚无可触发的最新平台事件"}
                       onClick={(event) => {
                         event.stopPropagation();
                         props.onTriggerLatestEvent(item);
@@ -8293,13 +8296,13 @@ export default function App() {
     setOverviewConfirmation({
       kind: "latest",
       items: [item],
-      eyebrow: "手动事件",
+      eyebrow: "平台事件",
       title: "确认手动触发",
       description: "将缓存的最新平台事件重新发送到当前规则引擎。",
       details: [
         { label: "目标", value: `${item.repository_id} · #${item.number} ${item.title}` },
-        { label: "事件", value: latestEvent.event_type, mono: true },
-        { label: "平台原事件时间", value: dateTimeText(latestEvent.occurred_at) },
+        { label: "平台事件", value: latestEvent.event_type, mono: true },
+        { label: "平台提供时间", value: dateTimeText(latestEvent.occurred_at) },
       ],
       impactTitle: hasCandidateRule ? "可能触发 Agent" : "当前没有候选规则",
       impact: hasCandidateRule
@@ -8337,9 +8340,9 @@ export default function App() {
     setOverviewConfirmation({
       kind: "latest-batch",
       items: targets,
-      eyebrow: "批量手动事件",
+      eyebrow: "批量平台事件",
       title: `确认触发 ${targets.length} 个 MR / PR`,
-      description: "每个目标将使用自己的缓存最新事件，分别发送到当前规则引擎。",
+      description: "每个目标将使用自己的缓存最新平台事件，分别发送到当前规则引擎。",
       details: [
         { label: "目标数量", value: `${targets.length} 个` },
         { label: "仓库分布", value: summarize(repositoryCounts) },
@@ -8421,7 +8424,7 @@ export default function App() {
     } catch (reason) {
       const fallback = action.kind === "discovered"
         ? "补发首次发现事件失败"
-        : "手动触发最新事件失败";
+        : "手动触发最新平台事件失败";
       setError(reason instanceof Error ? reason.message : fallback);
     } finally {
       setOverviewConfirmation(null);
