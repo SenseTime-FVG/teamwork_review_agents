@@ -8,7 +8,7 @@
 
 仓库启用 `preflight` 只代表具备本地 CI 能力。编排器仅在匹配规则配置 `run_preflight: true`、仓库启用 CI 且变更请求仍处于打开状态时执行门禁。规则要求 CI 但仓库未启用或未配置时直接启动 Agent，不报错；PR 已关闭或合并时也跳过门禁。规则选择全部仓库时，不要求所有启用仓库都配置 CI。
 
-同一批次中未要求 CI 的 Agent 会立即启动，不等待 Preflight。要求 CI 的规则共享以仓库 ID、PR 编号、Head SHA 和完整配置 revision 生成的幂等结果。`success`、`failure` 与 `timed_out` 是可复用的本地终态；Git、进程启动或清理故障产生的 `error` 只影响要求 CI 的事件路径，并按事件重试额度再次执行。
+同一批次中未要求 CI 的 Agent 会立即启动，不等待 Preflight。要求 CI 的规则共享以仓库 ID、PR 编号、Head SHA 和完整配置 revision 生成的幂等结果。`success`、`failure` 与 `timed_out` 是可复用的本地终态；Git、进程启动或清理故障产生的 `error` 只影响要求 CI 的事件路径，并按事件重试额度再次执行。基础设施异常耗尽自动重试后，扫描事件继续复用该终态以避免无限运行；管理员新建的手动事件会把旧运行保留为历史记录，并为同一幂等键原子换入一条全新运行和完整重试额度。新运行随后成为同一 Head 与配置的当前可复用结果。
 
 执行器先更新 PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule；精确工作区准备成功后才写入 `pending` Commit Status，并按参数数组顺序执行步骤。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。
 
