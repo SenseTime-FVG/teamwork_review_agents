@@ -8637,7 +8637,7 @@ export default function App() {
         ? "新事件会重新进入当前规则匹配流程；最终仍需满足规则条件，Agent 可能执行其获准操作。"
         : "新事件预计会被记录为未触发，不会启动 Agent。",
       impactTone: hasCandidateRule ? "attention" : "quiet",
-      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本可能复用已有 CI 结果。",
+      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本通常复用已有 CI 结果，已耗尽重试的基础设施异常会重新执行 CI。",
       confirmLabel: "确认触发",
     });
   }
@@ -8679,7 +8679,7 @@ export default function App() {
         ? "新事件会分别进入当前规则匹配流程；每条事件仍需满足规则条件，Agent 可能执行其获准操作。"
         : "这些新事件预计会被记录为未触发，不会启动 Agent。",
       impactTone: candidateCount > 0 ? "attention" : "quiet",
-      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本可能复用已有 CI 结果。",
+      safetyNote: "来源事件及其状态不会改变；相同 Head 和配置版本通常复用已有 CI 结果，已耗尽重试的基础设施异常会重新执行 CI。",
       confirmLabel: `触发 ${items.length} 项`,
     });
   }

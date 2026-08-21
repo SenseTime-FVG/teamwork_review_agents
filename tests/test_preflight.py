@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
-from teamwork_review_agents.events import detect_activity_events, detect_events
+from teamwork_review_agents.events import (
+    create_manual_replay_event,
+    detect_activity_events,
+    detect_events,
+)
 from teamwork_review_agents.models import ChangeRequestActivity, PreflightResult
 from teamwork_review_agents.preflight import (
     PreflightExecutor,
@@ -712,17 +716,123 @@ async def test_preflight_infrastructure_error_retries_without_remote_result(
 
     first = await executor.ensure_passed(event)
     second = await executor.ensure_passed(event)
+    third = await executor.ensure_passed(event)
+    exhausted = await executor.ensure_passed(event)
 
     assert first.status == "error"
     assert second.status == "error"
-    assert worktree_attempts == 2
+    assert third.status == "error"
+    assert exhausted.status == "error"
+    assert exhausted.reused is True
+    assert worktree_attempts == 3
     assert published_statuses == []
     assert synced_comments == []
     detail = store.get_preflight_run(first.run_id)
     assert detail is not None
-    assert detail["attempts"] == 2
+    assert detail["attempts"] == 3
     assert detail["status"] == "error"
     assert detail["status_published"] == 0
+
+
+async def test_manual_event_restarts_exhausted_infrastructure_error(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+) -> None:
+    """手动事件应新建 CI 运行，重新验证已耗尽的基础设施异常。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "runtime": {"event_retry_count": 0},
+            "providers": {
+                "github-main": {
+                    "kind": "github",
+                    "base_url": "https://api.github.com",
+                    "token_env": "GITHUB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "github-main",
+                    "project": "owner/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [
+                            {
+                                "name": "tests",
+                                "command": [sys.executable, "-c", "print('ok')"],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    source = detect_events(
+        None,
+        snapshot_factory(
+            provider="github-main",
+            repository_id="demo",
+            head_sha="d" * 40,
+        ),
+        emit_initial=True,
+    )[0]
+    replay = create_manual_replay_event(source)
+    worktree_attempts = 0
+
+    @contextmanager
+    def recovering_worktree(*_args, **_kwargs):
+        nonlocal worktree_attempts
+        worktree_attempts += 1
+        if worktree_attempts == 1:
+            raise RuntimeError("Git 操作失败")
+        yield tmp_path
+
+    statuses: list[str] = []
+
+    class FakeProvider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def set_commit_status(self, _repository, _sha, *, state, **_kwargs):
+            statuses.append(state)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        recovering_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = PreflightExecutor(config, store)
+
+    failed = await executor.ensure_passed(source)
+    recovered = await executor.ensure_passed(replay)
+
+    assert failed.status == "error"
+    assert recovered.status == "success"
+    assert recovered.reused is False
+    assert recovered.run_id != failed.run_id
+    assert worktree_attempts == 2
+    assert statuses == ["pending", "success"]
+    old_detail = store.get_preflight_run(failed.run_id)
+    assert old_detail is not None
+    assert old_detail["status"] == "error"
+    current = store.load_preflight_result(preflight_idempotency_key(config, replay))
+    assert current is not None
+    assert current.run_id == recovered.run_id
+    assert current.status == "success"
 
 
 async def test_preflight_uses_final_snapshot_for_deduplicated_commit_batch(

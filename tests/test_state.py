@@ -1268,6 +1268,123 @@ def test_preflight_runs_are_idempotent_per_head_and_config_revision(tmp_path) ->
     assert changed.run_id == "preflight-2"
 
 
+def test_manual_event_restarts_exhausted_preflight_with_new_run(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """手动事件应换代已耗尽的异常运行，并保留旧记录与关联。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    snapshot = snapshot_factory(repository_id="demo", number=7)
+    source = detect_events(None, snapshot, emit_initial=True)[0]
+    replay = create_manual_replay_event(source)
+    assert store.enqueue_events([source, replay]) == 2
+    idempotency_key = "demo:7:sha-a:revision-a"
+
+    first = store.begin_preflight_run(
+        proposed_run_id="preflight-exhausted",
+        idempotency_key=idempotency_key,
+        event_id=source.id,
+        repository_id="demo",
+        number=7,
+        head_sha=snapshot.head_sha,
+        config_revision="revision-a",
+        max_attempts=1,
+    )
+    assert first is not None
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id=first.run_id,
+            repository_id="demo",
+            number=7,
+            head_sha=snapshot.head_sha,
+            status="error",
+            error="Git 操作失败",
+        )
+    )
+
+    restarted = store.begin_preflight_run(
+        proposed_run_id="preflight-manual-retry",
+        idempotency_key=idempotency_key,
+        event_id=replay.id,
+        repository_id="demo",
+        number=7,
+        head_sha=snapshot.head_sha,
+        config_revision="revision-a",
+        max_attempts=1,
+        restart_exhausted_error=True,
+    )
+
+    assert restarted is not None
+    assert restarted.run_id == "preflight-manual-retry"
+    assert restarted.attempts == 1
+    old_detail = store.get_preflight_run(first.run_id)
+    assert old_detail is not None
+    assert old_detail["status"] == "error"
+    new_detail = store.get_preflight_run(restarted.run_id)
+    assert new_detail is not None
+    assert new_detail["status"] == "running"
+    with store.connect() as connection:
+        keys = {
+            str(row["run_id"]): str(row["idempotency_key"])
+            for row in connection.execute(
+                """
+                SELECT run_id, idempotency_key
+                FROM preflight_runs
+                WHERE run_id IN (?, ?)
+                """,
+                (first.run_id, restarted.run_id),
+            ).fetchall()
+        }
+    assert keys[first.run_id].startswith(f"{idempotency_key}:exhausted:")
+    assert keys[restarted.run_id] == idempotency_key
+    source_detail = store.get_event_detail(source.id)
+    assert source_detail is not None
+    assert source_detail["preflight"]["run_id"] == first.run_id
+    replay_detail = store.get_event_detail(replay.id)
+    assert replay_detail is not None
+    assert replay_detail["preflight"]["run_id"] == restarted.run_id
+    assert replay_detail["preflight"]["reused"] == 0
+    assert store.begin_preflight_run(
+        proposed_run_id="preflight-concurrent-duplicate",
+        idempotency_key=idempotency_key,
+        event_id=replay.id,
+        repository_id="demo",
+        number=7,
+        head_sha=snapshot.head_sha,
+        config_revision="revision-a",
+        max_attempts=1,
+        restart_exhausted_error=True,
+    ) is None
+
+    store.finish_preflight_run(
+        PreflightResult(
+            run_id=restarted.run_id,
+            repository_id="demo",
+            number=7,
+            head_sha=snapshot.head_sha,
+            status="success",
+        )
+    )
+    current = store.load_preflight_result(idempotency_key)
+    assert current is not None
+    assert current.run_id == restarted.run_id
+    assert current.status == "success"
+    assert len(store.list_preflight_runs(number=7)) == 2
+    assert store.begin_preflight_run(
+        proposed_run_id="preflight-after-success",
+        idempotency_key=idempotency_key,
+        event_id=replay.id,
+        repository_id="demo",
+        number=7,
+        head_sha=snapshot.head_sha,
+        config_revision="revision-a",
+        max_attempts=1,
+        restart_exhausted_error=True,
+    ) is None
+
+
 def test_preflight_failure_comment_mapping_has_one_record_per_change_request(
     tmp_path,
 ) -> None:

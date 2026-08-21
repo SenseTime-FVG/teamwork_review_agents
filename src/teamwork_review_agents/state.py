@@ -1493,8 +1493,9 @@ class StateStore:
         source_generation: int = 1,
         config_revision: str,
         max_attempts: int,
+        restart_exhausted_error: bool = False,
     ) -> PreflightReservation | None:
-        """幂等创建 CI 运行；只有基础设施 error 可以复用记录重试。"""
+        """幂等创建 CI 运行，并允许手动事件换代已耗尽的异常记录。"""
 
         now = time.time()
         with self.connect() as connection:
@@ -1543,9 +1544,59 @@ class StateStore:
                 connection.commit()
                 return PreflightReservation(proposed_run_id, 1)
 
-            if row["status"] != "error" or row["attempts"] >= max_attempts:
+            if row["status"] != "error":
                 connection.rollback()
                 return None
+            if row["attempts"] >= max_attempts:
+                if not restart_exhausted_error:
+                    connection.rollback()
+                    return None
+                archived_key = (
+                    f"{idempotency_key}:exhausted:{row['run_id']}"
+                )
+                connection.execute(
+                    """
+                    UPDATE preflight_runs
+                    SET idempotency_key = ?
+                    WHERE run_id = ? AND idempotency_key = ?
+                    """,
+                    (archived_key, row["run_id"], idempotency_key),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO preflight_runs (
+                        run_id, idempotency_key, event_id, repository_id, number,
+                        head_sha, source_generation, config_revision, trigger_source, phase,
+                        status, attempts, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'event', 'preparing',
+                              'running', 1, ?)
+                    """,
+                    (
+                        proposed_run_id,
+                        idempotency_key,
+                        event_id,
+                        repository_id,
+                        number,
+                        head_sha,
+                        source_generation,
+                        config_revision,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO event_preflight_links (
+                        event_id, run_id, reused, linked_at
+                    )
+                    SELECT ?, ?, 0, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM event_inbox WHERE event_id = ?
+                    )
+                    """,
+                    (event_id, proposed_run_id, now, event_id),
+                )
+                connection.commit()
+                return PreflightReservation(proposed_run_id, 1)
             attempts = int(row["attempts"]) + 1
             connection.execute(
                 """

@@ -729,6 +729,7 @@ class PreflightExecutor:
             source_generation=event.source_generation,
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
+            restart_exhausted_error=event.origin == "manual",
         )
         if reservation is None:
             current = await asyncio.to_thread(self.store.load_preflight_result, key)
