@@ -27,7 +27,7 @@ from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
 from .model_tools import InvokeAgentStartedCallback
 from .model_provider_runtime import (
     effective_agent_config,
-    resolve_model_selection,
+    resolve_model_plan,
     resolve_model_snapshot,
 )
 from .state import (
@@ -447,7 +447,32 @@ class AgentExecutor:
         configured_repository = self.repositories[event.repository_id]
         provider = self.config.providers[configured_repository.provider]
         configured_agent = self.config.agents[agent_name]
-        model_selection = resolve_model_selection(self.config, configured_agent)
+        model_plan = resolve_model_plan(self.config, configured_agent)
+
+        def executable_selection(selection: Any) -> bool:
+            """判断候选是否能启动当前执行器。完整 CLI 允许模型由 CLI 自行决定。"""
+
+            if not selection.provider.enabled:
+                return False
+            if selection.model:
+                return True
+            return (
+                selection.provider.driver == "codex_cli"
+                and self.config.runtime.codex.execution_mode == "cli"
+            )
+
+        model_selection = next(
+            (
+                selection
+                for selection in model_plan.selections
+                if executable_selection(selection)
+            ),
+            None,
+        )
+        if model_selection is None:
+            raise AgentExecutionError(
+                "模型主链与回退链没有可用的 Provider/模型"
+            )
         agent = effective_agent_config(
             self.config,
             configured_agent,
@@ -850,7 +875,11 @@ class AgentExecutor:
                         root_run_id=reservation.root_run_id,
                         parent_run_id=reservation.parent_run_id,
                         agent_name=agent_name,
-                        agent=agent,
+                        agent=(
+                            configured_agent
+                            if isinstance(runner, CodexModelRunner)
+                            else agent
+                        ),
                         repository=repository,
                         context=context,
                         prompt=prompt,
@@ -860,6 +889,20 @@ class AgentExecutor:
                         cancel_check=lambda: asyncio.to_thread(
                             self._cancel_requested,
                             reservation.run_id,
+                        ),
+                        **(
+                            {
+                                "model_plan": model_plan.selections,
+                                "model_snapshot_callback": (
+                                    lambda snapshot: asyncio.to_thread(
+                                        self.store.update_agent_run_model_snapshot,
+                                        reservation.run_id,
+                                        snapshot,
+                                    )
+                                ),
+                            }
+                            if isinstance(runner, CodexModelRunner)
+                            else {}
                         ),
                     )
                 if lease.lost:

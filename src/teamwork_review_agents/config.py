@@ -267,6 +267,7 @@ class RuntimeConfig(BaseModel):
     default_model: ModelSelectionConfig = Field(
         default_factory=ModelSelectionConfig,
     )
+    default_model_fallbacks: list[ModelSelectionConfig] = Field(default_factory=list)
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
     mcp_tool_timeout_seconds: PositiveInt = 1800
@@ -461,6 +462,7 @@ class AgentConfig(BaseModel):
     prompt: str | None = None
     model_provider: str | None = None
     model: str | None = None
+    model_fallbacks: list[ModelSelectionConfig] | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
     model_verbosity: Literal["low", "medium", "high"] | None = None
@@ -646,6 +648,12 @@ class AppConfig(BaseModel):
                 "全局默认模型引用了不存在的 Provider："
                 f"{self.runtime.default_model.provider}"
             )
+        for selection in self.runtime.default_model_fallbacks:
+            if selection.provider not in self.model_providers:
+                raise ValueError(
+                    "全局模型回退链引用了不存在的 Provider："
+                    f"{selection.provider}"
+                )
 
         reserved_token_names = {"CODEX_API_KEY", "OPENAI_API_KEY"}
         provider_token_names = {
@@ -730,6 +738,13 @@ class AppConfig(BaseModel):
                 raise ValueError(
                     f"Agent {agent_name} 指定模型时必须同时指定模型 Provider"
                 )
+            if agent.model_fallbacks is not None:
+                for selection in agent.model_fallbacks:
+                    if selection.provider not in self.model_providers:
+                        raise ValueError(
+                            f"Agent {agent_name} 的模型回退链引用了不存在的 Provider："
+                            f"{selection.provider}"
+                        )
             unknown = set(agent.allowed_sub_agents) - agent_names
             if unknown:
                 raise ValueError(

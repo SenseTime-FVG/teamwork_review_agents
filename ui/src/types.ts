@@ -128,6 +128,7 @@ export type Agent = {
   prompt?: string;
   model_provider?: string;
   model?: string;
+  model_fallbacks?: ModelSelection[] | null;
   model_reasoning_effort?: string;
   fast_mode?: "inherit" | "standard" | "fast";
   model_verbosity?: "low" | "medium" | "high";
@@ -150,6 +151,11 @@ export type Agent = {
   skip_git_repo_check?: boolean;
   extra_codex_args?: string[];
   environment?: EnvironmentMap;
+};
+
+export type ModelSelection = {
+  provider: string;
+  model?: string | null;
 };
 
 export type CodexConfigValue = string | number | boolean | Array<string | number | boolean>;
@@ -192,6 +198,7 @@ export type RuntimeConfig = Record<string, unknown> & {
     provider: string;
     model?: string | null;
   };
+  default_model_fallbacks?: ModelSelection[];
   codex?: CodexRuntimeConfig;
 };
 
@@ -224,6 +231,7 @@ export type ModelProviderItem = ModelProviderConfig & {
   masked_key?: string | null;
   referenced_agents: string[];
   is_global_default: boolean;
+  is_global_fallback: boolean;
 };
 
 export type ModelProviderSnapshot = {
@@ -508,6 +516,18 @@ export type AgentModelSnapshot = {
   verbosity_source: string;
   resolved_label?: string;
   unresolved_reason?: string | null;
+  fallback_plan?: Array<{
+    provider_id: string;
+    provider_name?: string;
+    provider_driver?: ModelProviderDriver;
+    provider_enabled?: boolean;
+    model?: string | null;
+    model_source?: string;
+    resolved_label?: string;
+    unresolved_reason?: string | null;
+  }>;
+  fallback_attempts?: Array<Record<string, unknown>>;
+  fallback_used?: boolean;
 };
 
 export type RunDetail = RunSummary & {

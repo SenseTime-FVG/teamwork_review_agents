@@ -15,12 +15,14 @@ from teamwork_review_agents.codex_model_runner import CodexModelRunner
 from teamwork_review_agents.codex_runner import CodexRunner
 from teamwork_review_agents.config import (
     ModelProviderConfig,
+    ModelSelectionConfig,
     parse_config_data,
 )
 from teamwork_review_agents.config_manager import ConfigManager
 from teamwork_review_agents.executor import AgentExecutor
 from teamwork_review_agents.model_provider_client import (
     ExternalModelClient,
+    ModelProviderRequestError,
     _chat_messages,
 )
 from teamwork_review_agents.model_provider_credentials import (
@@ -28,9 +30,11 @@ from teamwork_review_agents.model_provider_credentials import (
 )
 from teamwork_review_agents.model_provider_runtime import (
     ModelProviderUnavailableError,
+    resolve_model_plan,
     resolve_model_selection,
     resolve_model_snapshot,
 )
+from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.webapp import create_app
 
@@ -184,7 +188,20 @@ def test_legacy_oauth_provider_collapses_into_codex_cli(tmp_path) -> None:
 def test_deleted_provider_references_fall_back_atomically(tmp_path) -> None:
     """删除 Provider 时应同时回退全局默认和所有 Agent 引用。"""
 
-    manager = ConfigManager(_write_provider_config(tmp_path))
+    config_path = _write_provider_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["runtime"]["default_model_fallbacks"] = [
+        {"provider": "external-openai", "model": "backup-model"},
+    ]
+    raw["agents"]["explicit"]["model_fallbacks"] = [
+        {"provider": "external-openai", "model": "backup-model"},
+        {"provider": "codex-cli", "model": "codex-backup"},
+    ]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(config_path)
     updated = manager.delete_model_provider(
         expected_revision=manager.config.revision,
         provider_id="external-openai",
@@ -198,6 +215,10 @@ def test_deleted_provider_references_fall_back_atomically(tmp_path) -> None:
     assert updated.agents["explicit"].model is None
     assert "model_provider" not in document["agents"]["explicit"]
     assert "model" not in document["agents"]["explicit"]
+    assert updated.runtime.default_model_fallbacks == []
+    assert updated.agents["explicit"].model_fallbacks == [
+        ModelSelectionConfig(provider="codex-cli", model="codex-backup"),
+    ]
 
     with pytest.raises(ValueError, match="不允许删除"):
         manager.delete_model_provider(
@@ -268,6 +289,160 @@ def test_model_snapshot_records_provider_and_resolved_inheritance(tmp_path) -> N
     assert snapshot["resolved_label"] == (
         "继承全局默认（External OpenAI / global-model）"
     )
+
+
+def test_model_plan_orders_agent_chain_before_global_chain_and_deduplicates(tmp_path) -> None:
+    """Agent 主模型后应先走 Agent 回退，再接全局链并去重。"""
+
+    config_path = _write_provider_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    providers = raw["model_providers"]
+    for provider_id in ("agent-fallback", "global-fallback", "global-fallback-2"):
+        providers[provider_id] = {
+            "display_name": provider_id,
+            "driver": "openai_responses",
+            "base_url": "https://models.example.test",
+            "default_model": f"{provider_id}-model",
+        }
+    raw["runtime"]["default_model_fallbacks"] = [
+        {"provider": "global-fallback", "model": "global-b"},
+        {"provider": "global-fallback-2", "model": "global-c"},
+    ]
+    raw["agents"]["explicit"]["model_fallbacks"] = [
+        {"provider": "agent-fallback", "model": "agent-e"},
+        {"provider": "external-openai", "model": "global-model"},
+    ]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = parse_config_data(raw, config_path)
+
+    plan = resolve_model_plan(config, config.agents["explicit"])
+
+    assert [
+        (selection.provider_id, selection.model)
+        for selection in plan.selections
+    ] == [
+        ("external-openai", "agent-model"),
+        ("agent-fallback", "agent-e"),
+        ("external-openai", "global-model"),
+        ("global-fallback", "global-b"),
+        ("global-fallback-2", "global-c"),
+    ]
+
+
+def test_model_snapshot_contains_fallback_plan(tmp_path) -> None:
+    """模型运行快照应固化完整的去重候选链。"""
+
+    config_path = _write_provider_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["runtime"]["default_model_fallbacks"] = [
+        {"provider": "external-openai", "model": "provider-model"},
+    ]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = parse_config_data(raw, config_path)
+    snapshot = resolve_model_snapshot(config, config.agents["inherited"])
+
+    assert [item["model"] for item in snapshot["fallback_plan"]] == [
+        "global-model",
+        "provider-model",
+    ]
+    assert snapshot["fallback_attempts"] == []
+    assert snapshot["fallback_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_model_runner_falls_back_without_replaying_tools(
+    configured_app_factory,
+    snapshot_factory,
+    monkeypatch,
+) -> None:
+    """Provider 限流时应在同一模型循环切换，不能重新执行已完成工具。"""
+
+    config = configured_app_factory()
+    config.model_providers["provider-a"] = ModelProviderConfig.model_validate(
+        {
+            "display_name": "Provider A",
+            "driver": "openai_responses",
+            "base_url": "https://a.example.test",
+            "default_model": "model-a",
+        }
+    )
+    config.model_providers["provider-b"] = ModelProviderConfig.model_validate(
+        {
+            "display_name": "Provider B",
+            "driver": "openai_responses",
+            "base_url": "https://b.example.test",
+            "default_model": "model-b",
+        }
+    )
+    config.runtime.default_model = ModelSelectionConfig(
+        provider="provider-a",
+        model="model-a",
+    )
+    config.runtime.default_model_fallbacks = [
+        ModelSelectionConfig(provider="provider-b", model="model-b")
+    ]
+    agent = config.agents["code-reviewer"].model_copy(
+        update={"sandbox": "danger-full-access"}
+    )
+    credentials = ModelProviderCredentialStore(
+        config.database.path.parent / "model-provider-credentials"
+    )
+    credentials.replace("provider-a", "key-a")
+    credentials.replace("provider-b", "key-b")
+    calls: list[str] = []
+
+    async def fake_create_response(self, payload, *, event_callback=None):
+        calls.append(self.provider.display_name)
+        if self.provider.display_name == "Provider A":
+            raise ModelProviderRequestError(
+                "模型 Provider 请求失败（HTTP 429）",
+                status_code=429,
+                fallbackable=True,
+            )
+        return {
+            "id": "fallback-response",
+            "output": [
+                {
+                    "id": "fallback-message",
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "备用完成"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    monkeypatch.setattr(ExternalModelClient, "create_response", fake_create_response)
+    snapshots: list[dict[str, Any]] = []
+    async def save_snapshot(snapshot: dict[str, Any]) -> None:
+        snapshots.append(snapshot)
+
+    plan = resolve_model_plan(config, agent)
+    result = await CodexModelRunner(config, provider_id="provider-a").run(
+        run_id="fallback-run",
+        root_run_id="fallback-run",
+        parent_run_id=None,
+        agent_name="code-reviewer",
+        agent=agent,
+        repository=config.repositories[0],
+        context=None,
+        prompt="测试回退",
+        process_environment={},
+        redactor=SecretRedactor(()),
+        model_plan=plan.selections,
+        model_snapshot_callback=save_snapshot,
+    )
+
+    assert result.status == "completed"
+    assert result.final_message == "备用完成"
+    assert calls == ["Provider A", "Provider B"]
+    assert snapshots[-1]["provider_id"] == "provider-b"
+    assert snapshots[-1]["fallback_used"] is True
 
 
 def test_credential_store_masks_reveals_replaces_and_deletes(tmp_path) -> None:
@@ -362,6 +537,32 @@ async def test_openai_responses_protocol_keeps_native_output() -> None:
     result = await client.create_response(_payload())
     assert result["id"] == "response-1"
     assert result["output"][0]["content"][0]["text"] == "完成"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_fallbackable"),
+    [(400, False), (429, True), (503, True)],
+)
+async def test_external_http_error_marks_fallbackability(
+    status_code: int,
+    expected_fallbackable: bool,
+) -> None:
+    """只有认证、限流和服务不可用等 HTTP 错误才进入模型回退链。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"message": "failed"}})
+
+    client = ExternalModelClient(
+        _provider("openai_responses"),
+        "secret",
+        timeout_seconds=10,
+        idle_timeout_seconds=10,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ModelProviderRequestError) as raised:
+        await client.create_response(_payload())
+    assert raised.value.status_code == status_code
+    assert raised.value.fallbackable is expected_fallbackable
 
 
 async def test_openai_chat_protocol_normalizes_tool_call() -> None:
@@ -557,6 +758,7 @@ def test_model_provider_web_api_masks_reveals_and_deletes(tmp_path) -> None:
         assert external["api_key_configured"] is False
         assert external["referenced_agents"] == ["explicit"]
         assert external["is_global_default"] is True
+        assert external["is_global_fallback"] is False
 
         replaced = client.put(
             "/api/model-providers/external-openai/key",

@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -15,8 +15,10 @@ from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from .agent_home import TemporaryAgentHome, cleanup_stale_agent_homes_once
 from .codex_model_client import (
+    CodexOAuthError,
     CodexOAuthStore,
     CodexResponsesClient,
+    CodexUpstreamError,
 )
 from .codex_settings import (
     codex_home,
@@ -26,8 +28,13 @@ from .codex_settings import (
 )
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .environment import SecretRedactor
-from .model_provider_client import ExternalModelClient
+from .model_provider_client import ExternalModelClient, ModelProviderRequestError
 from .model_provider_credentials import ModelProviderCredentialStore
+from .model_provider_runtime import (
+    ResolvedModelSelection,
+    effective_agent_config,
+    resolve_model_plan,
+)
 from .managed_sandbox import inspect_managed_sandbox
 from .model_tools import (
     CancelCheck,
@@ -45,6 +52,7 @@ from .subprocess_utils import (
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
+ModelSnapshotCallback = Callable[[dict[str, Any]], Awaitable[None]]
 _MAX_TOOL_ROUNDS = 64
 _BASE_ENVIRONMENT_NAMES = {
     "PATH",
@@ -93,11 +101,14 @@ class CodexModelRunner:
         self.credential_store = ModelProviderCredentialStore(
             config.database.path.parent / "model-provider-credentials"
         )
-        self._provider_semaphore = (
-            asyncio.Semaphore(self.provider.max_concurrency)
-            if self.provider.max_concurrency is not None
-            else None
-        )
+        self._provider_semaphores: dict[str, asyncio.Semaphore | None] = {
+            provider_id: (
+                asyncio.Semaphore(provider.max_concurrency)
+                if provider.max_concurrency is not None
+                else None
+            )
+            for provider_id, provider in config.model_providers.items()
+        }
         cleanup_stale_agent_homes_once()
 
     async def run(
@@ -115,17 +126,20 @@ class CodexModelRunner:
         redactor: SecretRedactor | None = None,
         log_callback: LogCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        model_plan: Sequence[ResolvedModelSelection] | None = None,
+        model_snapshot_callback: ModelSnapshotCallback | None = None,
     ) -> AgentResult:
         """准备投影与临时 HOME，然后执行带看门狗的模型工具循环。"""
 
-        provider_api_key: str | None = None
-        if not self._uses_codex_model_base:
-            try:
-                provider_api_key = self.credential_store.reveal(self.provider_id)
-            except KeyError:
-                provider_api_key = None
+        resolved_plan = tuple(model_plan or resolve_model_plan(self.config, agent).selections)
         inherited_secrets = list((redactor or SecretRedactor(())).secret_values)
-        if provider_api_key:
+        for selection in resolved_plan:
+            if selection.provider.driver == "codex_cli":
+                continue
+            try:
+                provider_api_key = self.credential_store.reveal(selection.provider_id)
+            except KeyError:
+                continue
             inherited_secrets.append(provider_api_key)
         active_redactor = SecretRedactor(inherited_secrets)
 
@@ -183,7 +197,11 @@ class CodexModelRunner:
             if projection.marker.is_file():
                 _add_git_excludes_file(environment, projection.marker)
 
-            if self._uses_codex_model_base:
+            if any(
+                item.provider.driver == "codex_cli"
+                and self.config.runtime.codex.execution_mode == "model"
+                for item in resolved_plan
+            ):
                 version_error = await asyncio.to_thread(
                     validate_codex_version,
                     self.config.runtime.codex_binary,
@@ -288,6 +306,8 @@ class CodexModelRunner:
                 redactor=active_redactor,
                 emit=emit,
                 cancel_check=cancel_check,
+                model_plan=resolved_plan,
+                model_snapshot_callback=model_snapshot_callback,
             )
         finally:
             try:
@@ -365,6 +385,8 @@ class CodexModelRunner:
         redactor: SecretRedactor,
         emit: LogCallback,
         cancel_check: CancelCheck | None,
+        model_plan: Sequence[ResolvedModelSelection],
+        model_snapshot_callback: ModelSnapshotCallback | None,
     ) -> AgentResult:
         """用统一看门狗覆盖模型请求、命令和 sub-agent 等待。"""
 
@@ -400,6 +422,8 @@ class CodexModelRunner:
                 emit=emit,
                 cancel_check=cancel_check,
                 progress=progress,
+                model_plan=model_plan,
+                model_snapshot_callback=model_snapshot_callback,
             )
         )
 
@@ -483,47 +507,187 @@ class CodexModelRunner:
         emit: LogCallback,
         cancel_check: CancelCheck | None,
         progress: Callable[[], None],
+        model_plan: Sequence[ResolvedModelSelection],
+        model_snapshot_callback: ModelSnapshotCallback | None,
     ) -> AgentResult:
         """执行 Responses/function_call_output 多轮循环。"""
 
-        model, reasoning_effort, fast_mode, verbosity, personality = self._settings(agent)
-        schema, text_config = _response_text_config(agent.output_schema, verbosity)
-        instructions = _instructions(
-            repository=repository,
-            agent=agent,
-            personality=personality,
-            skill_files=skill_files,
-            provider_name=self.provider.display_name,
-        )
-        if self._uses_codex_model_base:
-            oauth = CodexOAuthStore(codex_home(self.config.runtime.codex_home))
-            client = CodexResponsesClient(
-                oauth=oauth,
-                codex_binary=self.config.runtime.codex_binary,
-                timeout_seconds=float(agent.timeout_seconds),
-                idle_timeout_seconds=float(
-                    agent.idle_timeout_seconds
-                    or self.config.runtime.agent_idle_timeout_seconds
-                ),
-            )
-        else:
-            try:
-                api_key = self.credential_store.reveal(self.provider_id)
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"模型 Provider {self.provider.display_name} 尚未配置 API Key"
-                ) from exc
-            client = ExternalModelClient(
-                self.provider,
-                api_key,
-                timeout_seconds=float(
-                    min(agent.timeout_seconds, self.provider.request_timeout_seconds)
-                ),
-                idle_timeout_seconds=float(
-                    agent.idle_timeout_seconds
-                    or self.config.runtime.agent_idle_timeout_seconds
-                ),
-            )
+        schema: dict[str, Any] | None = None
+        text_config: dict[str, Any] = {}
+        model = ""
+        reasoning_effort: str | None = None
+        fast_mode = False
+        verbosity: str | None = None
+        personality: str | None = None
+        instructions = ""
+        client: Any = None
+        current_selection: ResolvedModelSelection | None = None
+        current_agent = agent
+        current_index = -1
+        attempts: list[dict[str, Any]] = []
+        round_had_model_events = False
+
+        def fallbackable_error(error: Exception) -> bool:
+            """只把 Provider 暂时不可用类错误交给回退链。"""
+
+            if isinstance(error, ModelProviderRequestError):
+                if error.fallbackable is not None:
+                    return error.fallbackable
+                return False
+            if isinstance(error, CodexUpstreamError):
+                if error.fallbackable is not None:
+                    return error.fallbackable
+                return error.status_code in {
+                    401,
+                    402,
+                    403,
+                    404,
+                    408,
+                    409,
+                    429,
+                } or (
+                    error.status_code is not None
+                    and error.status_code >= 500
+                )
+            if isinstance(error, CodexOAuthError):
+                return True
+            return False
+
+        def selection_identity(selection: ResolvedModelSelection) -> str:
+            """返回日志中使用的无密钥模型身份。"""
+
+            return f"{selection.provider_id}/{selection.model or 'provider-default'}"
+
+        async def activate(index: int) -> bool:
+            """切换到下一个可用候选，并为其创建协议客户端。"""
+
+            nonlocal client, current_selection, current_index
+            nonlocal current_agent, model, reasoning_effort, fast_mode
+            nonlocal verbosity, personality, instructions, text_config, schema
+            while index < len(model_plan):
+                selection = model_plan[index]
+                if not selection.provider.enabled:
+                    attempts.append(
+                        {
+                            "provider_id": selection.provider_id,
+                            "model": selection.model,
+                            "status": "skipped",
+                            "reason": "provider_disabled",
+                        }
+                    )
+                    index += 1
+                    continue
+                if not selection.model:
+                    attempts.append(
+                        {
+                            "provider_id": selection.provider_id,
+                            "model": None,
+                            "status": "skipped",
+                            "reason": selection.unresolved_reason or "model_unresolved",
+                        }
+                    )
+                    index += 1
+                    continue
+                if (
+                    selection.provider.driver == "codex_cli"
+                    and self.config.runtime.codex.execution_mode == "cli"
+                ):
+                    # 完整 Codex CLI 是不透明子进程，不能在内嵌模型循环中动态切入。
+                    attempts.append(
+                        {
+                            "provider_id": selection.provider_id,
+                            "model": selection.model,
+                            "status": "skipped",
+                            "reason": "codex_cli_opaque_mode",
+                        }
+                    )
+                    index += 1
+                    continue
+                current_selection = selection
+                current_index = index
+                current_agent = effective_agent_config(
+                    self.config,
+                    agent,
+                    selection,
+                )
+                model, reasoning_effort, fast_mode, verbosity, personality = (
+                    self._settings_for_provider(
+                        current_agent,
+                        selection.provider,
+                        codex_model_base=(
+                            selection.provider.driver == "codex_cli"
+                            and self.config.runtime.codex.execution_mode == "model"
+                        ),
+                    )
+                )
+                schema, text_config = _response_text_config(
+                    current_agent.output_schema,
+                    verbosity,
+                )
+                instructions = _instructions(
+                    repository=repository,
+                    agent=current_agent,
+                    personality=personality,
+                    skill_files=skill_files,
+                    provider_name=selection.provider.display_name,
+                )
+                uses_codex_model_base = (
+                    selection.provider.driver == "codex_cli"
+                    and self.config.runtime.codex.execution_mode == "model"
+                )
+                if uses_codex_model_base:
+                    oauth = CodexOAuthStore(codex_home(self.config.runtime.codex_home))
+                    client = CodexResponsesClient(
+                        oauth=oauth,
+                        codex_binary=self.config.runtime.codex_binary,
+                        timeout_seconds=float(agent.timeout_seconds),
+                        idle_timeout_seconds=float(
+                            agent.idle_timeout_seconds
+                            or self.config.runtime.agent_idle_timeout_seconds
+                        ),
+                    )
+                else:
+                    try:
+                        api_key = self.credential_store.reveal(selection.provider_id)
+                    except KeyError as exc:
+                        attempts.append(
+                            {
+                                "provider_id": selection.provider_id,
+                                "model": selection.model,
+                                "status": "failed",
+                                "reason": "missing_api_key",
+                            }
+                        )
+                        await emit(
+                            "system",
+                            "model.attempt_failed",
+                            {
+                                "provider_id": selection.provider_id,
+                                "model": selection.model,
+                                "reason": "Provider 尚未配置 API Key",
+                            },
+                        )
+                        index += 1
+                        continue
+                    client = ExternalModelClient(
+                        selection.provider,
+                        api_key,
+                        timeout_seconds=float(
+                            min(
+                                agent.timeout_seconds,
+                                selection.provider.request_timeout_seconds,
+                            )
+                        ),
+                        idle_timeout_seconds=float(
+                            agent.idle_timeout_seconds
+                            or self.config.runtime.agent_idle_timeout_seconds
+                        ),
+                    )
+                return True
+            return False
+
+        if not await activate(0):
+            raise RuntimeError("模型主链与回退链没有可用的 Provider/模型")
         tools = teamwork_function_tools(
             allow_sub_agents=bool(agent.allowed_sub_agents),
             allow_publish_comment=agent.managed_comment,
@@ -558,8 +722,8 @@ class CodexModelRunner:
             "turn.started",
             {
                 "execution_mode": "model",
-                "provider_id": self.provider_id,
-                "provider_driver": self.provider.driver,
+                "provider_id": current_selection.provider_id if current_selection else None,
+                "provider_driver": current_selection.provider.driver if current_selection else None,
                 "model": model,
                 "tool_count": len(tools),
                 "skill_count": len(agent.skills),
@@ -569,8 +733,9 @@ class CodexModelRunner:
         async def receive_event(event: dict[str, Any]) -> None:
             """用 SSE 事件续期，并只持久化不含加密思维链的安全摘要。"""
 
-            nonlocal thread_started
+            nonlocal thread_started, round_had_model_events
             progress()
+            round_had_model_events = True
             event_type = str(event.get("type") or "response.event")
             if event_type == "response.created":
                 response = event.get("response")
@@ -606,40 +771,127 @@ class CodexModelRunner:
                     events.append(redactor.data(safe))
 
         for round_index in range(_MAX_TOOL_ROUNDS):
-            payload: dict[str, Any] = {
-                "model": model,
-                "instructions": instructions,
-                "input": history,
-                "tools": tools,
-                "tool_choice": "auto",
-                "parallel_tool_calls": False,
-                "stream": True,
-                "store": False,
-            }
-            if reasoning_effort:
-                payload["reasoning"] = {
-                    "effort": reasoning_effort,
-                    "summary": "auto",
+            while True:
+                payload: dict[str, Any] = {
+                    "model": model,
+                    "instructions": instructions,
+                    "input": history,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                    "stream": True,
+                    "store": False,
                 }
-            if self._uses_codex_model_base:
-                payload["include"] = ["reasoning.encrypted_content"]
-            if fast_mode:
-                payload["service_tier"] = "priority"
-            if text_config:
-                payload["text"] = text_config
-            round_message_keys.clear()
-            round_message_parts.clear()
-            if self._provider_semaphore is None:
-                response = await client.create_response(
-                    payload,
-                    event_callback=receive_event,
-                )
-            else:
-                async with self._provider_semaphore:
-                    response = await client.create_response(
-                        payload,
-                        event_callback=receive_event,
+                if reasoning_effort:
+                    payload["reasoning"] = {
+                        "effort": reasoning_effort,
+                        "summary": "auto",
+                    }
+                if (
+                    current_selection is not None
+                    and current_selection.provider.driver == "codex_cli"
+                    and self.config.runtime.codex.execution_mode == "model"
+                ):
+                    payload["include"] = ["reasoning.encrypted_content"]
+                if fast_mode:
+                    payload["service_tier"] = "priority"
+                if text_config:
+                    payload["text"] = text_config
+                round_message_keys.clear()
+                round_message_parts.clear()
+                round_had_model_events = False
+                try:
+                    provider_semaphore = self._semaphore_for(
+                        current_selection.provider_id if current_selection else self.provider_id,
+                        current_selection.provider if current_selection else self.provider,
                     )
+                    if provider_semaphore is None:
+                        response = await client.create_response(
+                            payload,
+                            event_callback=receive_event,
+                        )
+                    else:
+                        async with provider_semaphore:
+                            response = await client.create_response(
+                                payload,
+                                event_callback=receive_event,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failed_selection = current_selection
+                    failure_payload = {
+                        "provider_id": (
+                            failed_selection.provider_id
+                            if failed_selection is not None
+                            else self.provider_id
+                        ),
+                        "model": model,
+                        "status": "failed",
+                        "reason": redactor.text(str(exc)),
+                    }
+                    attempts.append(failure_payload)
+                    await emit("system", "model.attempt_failed", failure_payload)
+                    if model_snapshot_callback is not None:
+                        await model_snapshot_callback(
+                            _model_snapshot_update(
+                                model_plan,
+                                attempts,
+                                current_selection=failed_selection,
+                                fallback_used=bool(attempts),
+                            )
+                        )
+                    if (
+                        not round_had_model_events
+                        and fallbackable_error(exc)
+                        and await activate(current_index + 1)
+                    ):
+                        next_selection = current_selection
+                        await emit(
+                            "system",
+                            "model.fallback",
+                            {
+                                "from": selection_identity(failed_selection)
+                                if failed_selection is not None
+                                else None,
+                                "to": selection_identity(next_selection)
+                                if next_selection is not None
+                                else None,
+                                "reason": redactor.text(str(exc)),
+                            },
+                        )
+                        if model_snapshot_callback is not None:
+                            await model_snapshot_callback(
+                                _model_snapshot_update(
+                                    model_plan,
+                                    attempts,
+                                    current_selection=next_selection,
+                                    fallback_used=True,
+                                )
+                            )
+                        continue
+                    raise
+                attempts.append(
+                    {
+                        "provider_id": current_selection.provider_id
+                        if current_selection is not None
+                        else self.provider_id,
+                        "model": model,
+                        "status": "response",
+                    }
+                )
+                if model_snapshot_callback is not None:
+                    await model_snapshot_callback(
+                        _model_snapshot_update(
+                            model_plan,
+                            attempts,
+                            current_selection=current_selection,
+                            fallback_used=any(
+                                item.get("status") == "failed" for item in attempts
+                            ),
+                        )
+                    )
+                break
             response_id = str(response.get("id") or response_id or "") or None
             response_usage = response.get("usage")
             if isinstance(response_usage, dict):
@@ -767,16 +1019,46 @@ class CodexModelRunner:
     ) -> tuple[str, str | None, bool, str | None, str | None]:
         """按 Agent、Teamwork 和 Codex 用户配置顺序解析模型参数。"""
 
+        return self._settings_for_provider(
+            agent,
+            self.provider,
+            codex_model_base=self._uses_codex_model_base,
+        )
+
+    def _semaphore_for(
+        self,
+        provider_id: str,
+        provider: Any,
+    ) -> asyncio.Semaphore | None:
+        """返回指定 Provider 的并发信号量。"""
+
+        if provider_id not in self._provider_semaphores:
+            self._provider_semaphores[provider_id] = (
+                asyncio.Semaphore(provider.max_concurrency)
+                if provider.max_concurrency is not None
+                else None
+            )
+        return self._provider_semaphores[provider_id]
+
+    def _settings_for_provider(
+        self,
+        agent: AgentConfig,
+        provider: Any,
+        *,
+        codex_model_base: bool,
+    ) -> tuple[str, str | None, bool, str | None, str | None]:
+        """按候选 Provider 的配置解析本次模型参数。"""
+
         home = codex_home(self.config.runtime.codex_home)
         user_model, _, _ = read_user_model(home)
-        model = agent.model or self.provider.default_model
-        if model is None and self.provider.models:
-            model = self.provider.models[0]
-        if model is None and self._uses_codex_model_base:
+        model = agent.model or provider.default_model
+        if model is None and provider.models:
+            model = provider.models[0]
+        if model is None and codex_model_base:
             model = self.config.runtime.codex.model or user_model
         if not model:
             raise RuntimeError(
-                f"模型 Provider {self.provider.display_name} 没有可解析的模型"
+                f"模型 Provider {provider.display_name} 没有可解析的模型"
             )
         inherited, _ = read_user_inherited_settings(home)
 
@@ -785,8 +1067,8 @@ class CodexModelRunner:
             value = item.get("value") if isinstance(item, dict) else None
             return value if isinstance(value, str) and value else None
 
-        codex_provider = self._uses_codex_model_base
-        reasoning = agent.model_reasoning_effort or self.provider.model_reasoning_effort
+        codex_provider = codex_model_base
+        reasoning = agent.model_reasoning_effort or provider.model_reasoning_effort
         if reasoning is None and codex_provider:
             reasoning = (
                 self.config.runtime.codex.model_reasoning_effort
@@ -801,16 +1083,63 @@ class CodexModelRunner:
             fast_setting = inherited_value("fast_mode") or "standard"
         if fast_setting == "inherit":
             fast_setting = "standard"
-        verbosity = agent.model_verbosity or self.provider.model_verbosity
+        verbosity = agent.model_verbosity or provider.model_verbosity
         if verbosity is None and codex_provider:
             verbosity = (
                 self.config.runtime.codex.model_verbosity
                 or inherited_value("model_verbosity")
             )
-        personality = agent.personality or self.provider.personality
+        personality = agent.personality or provider.personality
         if personality is None and codex_provider:
             personality = self.config.runtime.codex.personality
         return model, reasoning, fast_setting == "fast", verbosity, personality
+
+
+def _model_snapshot_update(
+    model_plan: Sequence[ResolvedModelSelection],
+    attempts: list[dict[str, Any]],
+    *,
+    current_selection: ResolvedModelSelection | None,
+    fallback_used: bool,
+) -> dict[str, Any]:
+    """生成回退过程中的有界模型快照，不包含任何凭据。"""
+
+    snapshot = {
+        "execution_mode": "model",
+        "provider_id": current_selection.provider_id if current_selection else None,
+        "provider_name": current_selection.provider.display_name
+        if current_selection
+        else None,
+        "provider_driver": current_selection.provider.driver
+        if current_selection
+        else None,
+        "provider_enabled": current_selection.provider.enabled
+        if current_selection
+        else None,
+        "model": current_selection.model if current_selection else None,
+        "model_source": current_selection.model_source
+        if current_selection
+        else None,
+        "resolved_label": current_selection.resolved_label
+        if current_selection
+        else None,
+        "fallback_plan": [
+            {
+                "provider_id": item.provider_id,
+                "provider_name": item.provider.display_name,
+                "provider_driver": item.provider.driver,
+                "provider_enabled": item.provider.enabled,
+                "model": item.model,
+                "model_source": item.model_source,
+                "resolved_label": item.resolved_label,
+                "unresolved_reason": item.unresolved_reason,
+            }
+            for item in model_plan
+        ],
+        "fallback_attempts": attempts[-32:],
+        "fallback_used": fallback_used,
+    }
+    return snapshot
 
 
 def _failed_result(

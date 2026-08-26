@@ -448,6 +448,7 @@ async def test_responses_client_exposes_nested_sse_failure_details(tmp_path) -> 
     assert "代码=model_unavailable" in message
     assert "参数=model" in message
     assert "请求 ID=req-sse-1" in message
+    assert raised.value.fallbackable is True
     assert requests == 1
 
 
@@ -492,6 +493,7 @@ async def test_responses_client_exposes_top_level_sse_error_details(tmp_path) ->
     assert "请求参数无效" in message
     assert "代码=invalid_request" in message
     assert "请求 ID=req-sse-2" in message
+    assert raised.value.fallbackable is False
 
 
 @pytest.mark.asyncio
@@ -547,6 +549,7 @@ async def test_responses_client_exposes_http_error_and_redacts_sensitive_text(
     assert secret not in message
     assert "Bearer [已脱敏]" in message
     assert len(message) <= 2000
+    assert raised.value.fallbackable is False
 
 
 async def _append_event(events: list[str], event: dict[str, Any]) -> None:

@@ -520,6 +520,27 @@ class ConfigManager:
                     if agent.get("model_provider") == normalized_id:
                         agent.pop("model_provider", None)
                         agent.pop("model", None)
+                    fallbacks = agent.get("model_fallbacks")
+                    if isinstance(fallbacks, list):
+                        agent["model_fallbacks"] = [
+                            item
+                            for item in fallbacks
+                            if not (
+                                isinstance(item, dict)
+                                and item.get("provider") == normalized_id
+                            )
+                        ]
+            if isinstance(runtime, dict):
+                fallbacks = runtime.get("default_model_fallbacks")
+                if isinstance(fallbacks, list):
+                    runtime["default_model_fallbacks"] = [
+                        item
+                        for item in fallbacks
+                        if not (
+                            isinstance(item, dict)
+                            and item.get("provider") == normalized_id
+                        )
+                    ]
             return self._persist_locked(document, source=source)
 
     def save_repository(

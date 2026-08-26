@@ -35,6 +35,7 @@ import type {
   ModelProviderConfig,
   ModelProviderDriver,
   ModelProviderSnapshot,
+  ModelSelection,
   PreflightRunDetail,
   PreflightRunSummary,
   Repository,
@@ -307,6 +308,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       default_model: runtimeInput.default_model ?? {
         provider: "codex-cli",
       },
+      default_model_fallbacks: runtimeInput.default_model_fallbacks ?? [],
       codex: {
         execution_mode: "model",
         fast_mode: "inherit",
@@ -2281,6 +2283,15 @@ function GlobalEnvironment(props: {
             help={`当前有效值：${defaultProvider?.display_name ?? defaultSelection.provider} / ${resolvedDefaultModel ?? "暂未解析"}`}
           />
         </div>
+        <ModelFallbackEditor
+          document={props.document}
+          codexOptions={props.codexOptions}
+          value={props.document.runtime.default_model_fallbacks ?? []}
+          onChange={(default_model_fallbacks) => patchSection("runtime", "default_model_fallbacks", default_model_fallbacks)}
+          idPrefix="global-model-fallback"
+          title="全局模型回退链"
+          description="主模型不可用时按顺序尝试；Agent 级回退链会优先于这里的全局链。整条链按 Provider / 模型自动去重。"
+        />
       </section>
       <EnvironmentEditor
         title="全局环境变量"
@@ -2737,8 +2748,9 @@ function ModelProvidersEditor(props: {
     if (!selectedSnapshot?.deletable) return null;
     const impacts = [
       selectedSnapshot.is_global_default ? "全局默认模型将回退到 Codex CLI" : "",
+      selectedSnapshot.is_global_fallback ? "全局模型回退链将移除该节点" : "",
       selectedSnapshot.referenced_agents.length
-        ? `${selectedSnapshot.referenced_agents.length} 个 Agent 将改为继承全局默认模型`
+        ? `${selectedSnapshot.referenced_agents.length} 个 Agent 将清理该 Provider 引用，显式主模型回退到全局默认`
         : "",
     ].filter(Boolean);
     return {
@@ -2749,6 +2761,7 @@ function ModelProvidersEditor(props: {
         { label: "Provider", value: selected.display_name },
         { label: "Provider ID", value: activeId, mono: true },
         { label: "全局默认", value: selectedSnapshot.is_global_default ? "是" : "否" },
+        { label: "全局回退", value: selectedSnapshot.is_global_fallback ? "是" : "否" },
         { label: "Agent 引用", value: `${selectedSnapshot.referenced_agents.length} 个` },
       ],
       impactTitle: impacts.length > 0 ? "相关引用将自动回退" : "删除 Provider 配置与凭据",
@@ -3109,6 +3122,103 @@ function agentModelDisplay(
   const globalDefault = document.runtime.default_model ?? { provider: "codex-cli" };
   const resolved = resolvedProviderModel(document, options, globalDefault.provider, globalDefault.model);
   return `继承全局默认（${resolved.providerName} / ${resolved.concrete}）`;
+}
+
+function ModelFallbackEditor(props: {
+  document: ConfigDocument;
+  codexOptions: CodexRuntimeOptions;
+  value: ModelSelection[];
+  onChange: (value: ModelSelection[]) => void;
+  idPrefix: string;
+  title: string;
+  description: string;
+}) {
+  const providerOptions = Object.entries(props.document.model_providers).map(([id, provider]) => ({
+    value: id,
+    label: `${provider.display_name}${provider.enabled === false ? "（已停用）" : ""}`,
+  }));
+  function update(index: number, patch: Partial<ModelSelection>) {
+    props.onChange(props.value.map((item, itemIndex) => (
+      itemIndex === index ? { ...item, ...patch } : item
+    )));
+  }
+  return (
+    <section className="model-fallback-section">
+      <div className="choice-title">
+        <strong>{props.title}</strong>
+        <p>{props.description}</p>
+      </div>
+      <div className="model-fallback-list">
+        {props.value.map((selection, index) => {
+          const provider = props.document.model_providers[selection.provider]
+            ?? props.document.model_providers["codex-cli"];
+          const resolved = resolvedProviderModel(
+            props.document,
+            props.codexOptions,
+            selection.provider,
+            selection.model,
+          );
+          return (
+            <div className="model-fallback-row" key={`${props.idPrefix}-${index}`}>
+              <span className="model-fallback-index">备用 {index + 1}</span>
+              <SelectControl
+                value={selection.provider}
+                onChange={(providerId) => update(index, { provider: providerId, model: undefined })}
+                options={providerOptions}
+                ariaLabel={`第 ${index + 1} 个回退 Provider`}
+              />
+              <ModelField
+                id={`${props.idPrefix}-${index}`}
+                label="模型"
+                value={selection.model ?? ""}
+                placeholder={resolved.defaultLabel}
+                models={resolved.models}
+                onChange={(model) => update(index, { model: model || undefined })}
+                help={`${provider?.display_name ?? selection.provider} / ${resolved.concrete}`}
+              />
+              <div className="model-fallback-actions">
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  disabled={index === 0}
+                  onClick={() => {
+                    const next = [...props.value];
+                    [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                    props.onChange(next);
+                  }}
+                  aria-label={`上移第 ${index + 1} 个回退模型`}
+                >↑</button>
+                <button
+                  type="button"
+                  className="button secondary compact"
+                  disabled={index === props.value.length - 1}
+                  onClick={() => {
+                    const next = [...props.value];
+                    [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                    props.onChange(next);
+                  }}
+                  aria-label={`下移第 ${index + 1} 个回退模型`}
+                >↓</button>
+                <button
+                  type="button"
+                  className="button danger compact"
+                  onClick={() => props.onChange(props.value.filter((_, itemIndex) => itemIndex !== index))}
+                >删除</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <button
+        type="button"
+        className="button secondary compact"
+        onClick={() => props.onChange([
+          ...props.value,
+          { provider: "codex-cli" },
+        ])}
+      >+ 添加回退模型</button>
+    </section>
+  );
 }
 
 type InheritedSettingKey = keyof CodexRuntimeOptions["inherited_settings"];
@@ -5714,6 +5824,15 @@ function AgentsEditor(props: {
                 <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>
+              <ModelFallbackEditor
+                document={props.document}
+                codexOptions={props.codexOptions}
+                value={agent.model_fallbacks ?? []}
+                onChange={(model_fallbacks) => update(name, { model_fallbacks })}
+                idPrefix={`agent-model-fallback-${name.replace(/[^A-Za-z0-9_-]/g, "-")}`}
+                title="Agent 级模型回退链"
+                description="主模型不可用时先按这里的顺序尝试，全部失败后再进入全局默认模型和全局回退链。"
+              />
               {props.showOverview === false && (
                 <div className="agent-workspace-note">
                   <strong>当前继承值</strong>
@@ -7786,7 +7905,12 @@ function durationText(startedAt: number, finishedAt?: number | null): string {
 function modelSettingSourceLabel(source?: string | null): string {
   const labels: Record<string, string> = {
     agent: "Agent 覆盖",
+    agent_fallback: "Agent 回退",
     runtime: "运行时默认",
+    global: "全局默认",
+    global_fallback: "全局回退",
+    provider: "Provider 默认",
+    provider_default: "Provider 默认",
     codex_user: "Codex 用户配置",
     codex_default: "Codex / 账号默认",
   };
@@ -8033,6 +8157,25 @@ function AgentRunDetailDrawer(props: {
                         ? modelSettingText(modelVerbosityLabel(detail.model_snapshot.verbosity), detail.model_snapshot.verbosity_source)
                         : "—"}</dd></div>
                     </dl>
+                    {detail.model_snapshot?.fallback_plan && detail.model_snapshot.fallback_plan.length > 0 && (
+                      <div className="run-fallback-trace">
+                        <strong>模型回退链</strong>
+                        <span>
+                          {detail.model_snapshot.fallback_plan.map((item, index) => (
+                            <span key={`${item.provider_id}-${item.model ?? "default"}-${index}`}>
+                              {index > 0 && " → "}
+                              {item.resolved_label ?? `${item.provider_name ?? item.provider_id} / ${item.model ?? "Provider 默认模型"}`}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    )}
+                    {detail.model_snapshot?.fallback_used && detail.model_snapshot.fallback_attempts && (
+                      <details className="run-fallback-attempts">
+                        <summary>模型回退轨迹 <span>{detail.model_snapshot.fallback_attempts.length}</span></summary>
+                        <pre className="detail-pre">{JSON.stringify(detail.model_snapshot.fallback_attempts, null, 2)}</pre>
+                      </details>
+                    )}
                   </details>
                   <details><summary>渲染后的 Prompt</summary><pre className="detail-pre">{detail.prompt}</pre></details>
                   <details><summary>环境变量审计</summary><pre className="detail-pre">{JSON.stringify(detail.environment, null, 2)}</pre></details>
