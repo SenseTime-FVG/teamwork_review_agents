@@ -2236,11 +2236,13 @@ function GlobalEnvironment(props: {
         supported_reasoning_levels: [],
         supports_fast_mode: false,
       }));
-  const resolvedDefaultModel = defaultSelection.model
-    || defaultProvider?.default_model
+  const defaultProviderFallbackModel = defaultProvider?.default_model
+    || defaultProvider?.models?.[0]
     || (defaultProvider?.driver === "codex_cli"
       ? props.codexOptions.inherited_model.value
       : undefined);
+  const resolvedDefaultModel = defaultSelection.model || defaultProviderFallbackModel;
+  const defaultSupportsReasoning = modelSupportsReasoningEffort(defaultProvider, resolvedDefaultModel);
   const defaultModelPlaceholder = defaultProvider?.driver === "codex_cli"
     ? `${props.document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（${resolvedDefaultModel ?? "暂未解析"}）`
     : `Provider 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`;
@@ -2263,7 +2265,10 @@ function GlobalEnvironment(props: {
           <SelectField
             label="默认 Provider"
             value={defaultSelection.provider}
-            onChange={(provider) => patchSection("runtime", "default_model", { provider })}
+            onChange={(provider) => patchSection("runtime", "default_model", {
+              provider,
+              reasoning_effort: undefined,
+            })}
             options={Object.entries(props.document.model_providers).map(([id, provider]) => ({
               value: id,
               label: `${provider.display_name}${provider.enabled === false ? "（已停用）" : ""}`,
@@ -2279,8 +2284,35 @@ function GlobalEnvironment(props: {
             onChange={(model) => patchSection("runtime", "default_model", {
               provider: defaultSelection.provider,
               model: model || undefined,
+              reasoning_effort: modelSupportsReasoningEffort(
+                defaultProvider,
+                model || defaultProviderFallbackModel,
+              )
+                ? defaultSelection.reasoning_effort
+                : undefined,
             })}
             help={`当前有效值：${defaultProvider?.display_name ?? defaultSelection.provider} / ${resolvedDefaultModel ?? "暂未解析"}`}
+          />
+          <SelectField
+            label="默认推理 effort"
+            value={defaultSupportsReasoning ? defaultSelection.reasoning_effort ?? "" : ""}
+            disabled={!defaultSupportsReasoning}
+            onChange={(reasoning_effort) => patchSection("runtime", "default_model", {
+              ...defaultSelection,
+              reasoning_effort: reasoning_effort || undefined,
+            })}
+            options={defaultSupportsReasoning
+              ? [
+                  { value: "", label: "跟随 Provider 默认" },
+                  ...reasoningLevelsForProvider(
+                    props.codexOptions,
+                    defaultProvider,
+                    resolvedDefaultModel,
+                    defaultSelection.reasoning_effort,
+                  ).map((value) => ({ value, label: value })),
+                ]
+              : [{ value: "", label: "不适用（非 GPT 模型）" }]}
+            help={defaultSupportsReasoning ? "仅 GPT 系列模型支持显式推理 effort" : "当前模型不支持推理 effort"}
           />
         </div>
         <ModelFallbackEditor
@@ -2972,7 +3004,15 @@ function ModelProvidersEditor(props: {
                       value={selected.default_model ?? ""}
                       placeholder={selectedResolved?.defaultLabel ?? "Provider 默认模型"}
                       models={selected.driver === "codex_cli" ? props.codexOptions.models : modelOptions}
-                      onChange={(default_model) => updateProvider({ default_model: default_model || undefined })}
+                      onChange={(default_model) => updateProvider({
+                        default_model: default_model || undefined,
+                        model_reasoning_effort: modelSupportsReasoningEffort(
+                          selected,
+                          default_model || selectedResolved?.model,
+                        )
+                          ? selected.model_reasoning_effort
+                          : undefined,
+                      })}
                       help={modelHelp}
                     />
                     {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
@@ -2980,12 +3020,17 @@ function ModelProvidersEditor(props: {
                     {external && (
                       <SelectField
                         label="默认推理强度（可选）"
-                        value={selected.model_reasoning_effort ?? ""}
+                        value={modelSupportsReasoningEffort(selected, selectedResolved?.model)
+                          ? selected.model_reasoning_effort ?? ""
+                          : ""}
+                        disabled={!modelSupportsReasoningEffort(selected, selectedResolved?.model)}
                         onChange={(model_reasoning_effort) => updateProvider({ model_reasoning_effort: model_reasoning_effort || undefined })}
-                        options={[
-                          { value: "", label: "不向上游显式传递" },
-                          ...REASONING_LEVELS.map((value) => ({ value, label: value })),
-                        ]}
+                        options={modelSupportsReasoningEffort(selected, selectedResolved?.model)
+                          ? [
+                              { value: "", label: "不向上游显式传递" },
+                              ...GPT_REASONING_LEVELS.map((value) => ({ value, label: value })),
+                            ]
+                          : [{ value: "", label: "不适用（非 GPT 模型）" }]}
                       />
                     )}
                     {external && (
@@ -3135,6 +3180,7 @@ function resolvedProviderModel(
   const codexProvider = provider?.driver === "codex_cli";
   const model = configuredModel
     || provider?.default_model
+    || provider?.models?.[0]
     || (codexProvider ? options.inherited_model.value ?? undefined : undefined);
   const concrete = model ?? (codexProvider
     ? "暂未解析：Codex 配置与账号未返回具体模型"
@@ -3156,6 +3202,36 @@ function resolvedProviderModel(
       : `Provider 默认模型（${concrete}）`,
     models,
   };
+}
+
+const GPT_REASONING_LEVELS = ["minimal", "low", "medium", "high"];
+
+function modelSupportsReasoningEffort(
+  provider?: ModelProviderConfig,
+  model?: string | null,
+): boolean {
+  if (!provider || !model?.trim()) return false;
+  if (provider.driver === "codex_cli") return true;
+  return (
+    (provider.driver === "openai_responses" || provider.driver === "openai_chat_completions")
+    && model.trim().toLowerCase().startsWith("gpt-")
+  );
+}
+
+function reasoningLevelsForProvider(
+  options: CodexRuntimeOptions,
+  provider: ModelProviderConfig | undefined,
+  model: string | null | undefined,
+  current?: string | null,
+): string[] {
+  if (!modelSupportsReasoningEffort(provider, model)) return [];
+  if (provider?.driver === "codex_cli") {
+    return reasoningLevels(options, model, current ?? undefined);
+  }
+  return Array.from(new Set([
+    ...GPT_REASONING_LEVELS,
+    ...(current && GPT_REASONING_LEVELS.includes(current) ? [current] : []),
+  ]));
 }
 
 function agentModelDisplay(
@@ -3208,6 +3284,11 @@ function ModelFallbackEditor(props: {
             selection.provider,
             selection.model,
           );
+          const providerDefaultResolved = resolvedProviderModel(
+            props.document,
+            props.codexOptions,
+            selection.provider,
+          );
           return (
             <div className="model-fallback-row" key={`${props.idPrefix}-${index}`}>
               <span className="model-fallback-index">备用 {index + 1}</span>
@@ -3215,7 +3296,11 @@ function ModelFallbackEditor(props: {
                 <span id={`${props.idPrefix}-${index}-provider-label`}>Provider</span>
                 <SelectControl
                   value={selection.provider}
-                  onChange={(providerId) => update(index, { provider: providerId, model: undefined })}
+                  onChange={(providerId) => update(index, {
+                    provider: providerId,
+                    model: undefined,
+                    reasoning_effort: undefined,
+                  })}
                   options={providerOptions}
                   ariaLabelledBy={`${props.idPrefix}-${index}-provider-label`}
                   className="model-fallback-provider-select"
@@ -3227,8 +3312,34 @@ function ModelFallbackEditor(props: {
                 value={selection.model ?? ""}
                 placeholder={resolved.defaultLabel}
                 models={resolved.models}
-                onChange={(model) => update(index, { model: model || undefined })}
+                onChange={(model) => update(index, {
+                  model: model || undefined,
+                  reasoning_effort: modelSupportsReasoningEffort(
+                    provider,
+                    model || providerDefaultResolved.model,
+                  )
+                    ? selection.reasoning_effort
+                    : undefined,
+                })}
                 help={`${provider?.display_name ?? selection.provider} / ${resolved.concrete}`}
+              />
+              <SelectField
+                label="推理 effort"
+                value={modelSupportsReasoningEffort(provider, resolved.model) ? selection.reasoning_effort ?? "" : ""}
+                disabled={!modelSupportsReasoningEffort(provider, resolved.model)}
+                onChange={(reasoning_effort) => update(index, { reasoning_effort: reasoning_effort || undefined })}
+                options={modelSupportsReasoningEffort(provider, resolved.model)
+                  ? [
+                      { value: "", label: "跟随 Provider 默认" },
+                      ...reasoningLevelsForProvider(
+                        props.codexOptions,
+                        provider,
+                        resolved.model,
+                        selection.reasoning_effort,
+                      ).map((value) => ({ value, label: value })),
+                    ]
+                  : [{ value: "", label: "不适用（非 GPT 模型）" }]}
+                className="model-fallback-reasoning-field"
               />
               <div className="model-fallback-actions">
                 <button
@@ -3358,6 +3469,9 @@ function runtimeInheritedSetting(
   provider?: ModelProviderConfig,
 ): CodexInheritedSetting {
   if (provider && provider.driver !== "codex_cli") {
+    if (key === "model_reasoning_effort" && !modelSupportsReasoningEffort(provider, model)) {
+      return { value: null, source: "provider", known: false };
+    }
     const providerValues: Partial<Record<InheritedSettingKey, string | undefined>> = {
       model_reasoning_effort: provider.model_reasoning_effort,
       fast_mode: "standard",
@@ -5716,7 +5830,13 @@ function AgentsEditor(props: {
             selectedProviderId,
             agent.model ?? (agent.model_provider ? undefined : globalDefault.model),
           );
+          const selectedProviderFallbackModel = resolvedProviderModel(
+            props.document,
+            props.codexOptions,
+            selectedProviderId,
+          ).model;
           const agentModel = selectedProviderModel.model || inheritedModel.value;
+          const agentSupportsReasoning = modelSupportsReasoningEffort(selectedProvider, agentModel);
           const inheritedReasoning = runtimeInheritedSetting(
             props.document,
             props.codexOptions,
@@ -5799,6 +5919,7 @@ function AgentsEditor(props: {
                   onChange={(model_provider) => update(name, {
                     model_provider: model_provider || undefined,
                     model: undefined,
+                    model_reasoning_effort: undefined,
                   })}
                   options={[
                     {
@@ -5819,7 +5940,15 @@ function AgentsEditor(props: {
                     value={agent.model ?? ""}
                     placeholder={selectedProviderModel.defaultLabel}
                     models={selectedProviderModel.models}
-                    onChange={(model) => update(name, { model: model || undefined })}
+                    onChange={(model) => update(name, {
+                      model: model || undefined,
+                      model_reasoning_effort: modelSupportsReasoningEffort(
+                        selectedProvider,
+                        model || selectedProviderFallbackModel,
+                      )
+                        ? agent.model_reasoning_effort
+                        : undefined,
+                    })}
                     help={agentModelDisplay(props.document, props.codexOptions, agent)}
                   />
                 ) : (
@@ -5896,9 +6025,10 @@ function AgentsEditor(props: {
               <div className="form-grid three agent-runtime-overrides">
                 <SelectField
                   label="推理强度（可选）"
-                  value={agent.model_reasoning_effort ?? ""}
+                  value={agentSupportsReasoning ? agent.model_reasoning_effort ?? "" : ""}
+                  disabled={!agentSupportsReasoning}
                   onChange={(value) => update(name, { model_reasoning_effort: value || undefined })}
-                  options={[
+                  options={agentSupportsReasoning ? [
                     {
                       value: "",
                       label: agentInheritanceLabel(
@@ -5906,12 +6036,13 @@ function AgentsEditor(props: {
                         inheritedReasoning,
                       ),
                     },
-                    ...reasoningLevels(
+                    ...reasoningLevelsForProvider(
                       props.codexOptions,
-                      agent.model || inheritedModel.value,
+                      selectedProvider,
+                      agentModel,
                       agent.model_reasoning_effort,
                     ).map((value) => ({ value, label: value })),
-                  ]}
+                  ] : [{ value: "", label: "不适用（非 GPT 模型）" }]}
                 />
                 <SelectField
                   label="快速模式（可选）"
@@ -7963,10 +8094,12 @@ function modelSettingSourceLabel(source?: string | null): string {
     runtime: "运行时默认",
     global: "全局默认",
     global_fallback: "全局回退",
+    model_selection: "模型节点",
     provider: "Provider 默认",
     provider_default: "Provider 默认",
     codex_user: "Codex 用户配置",
     codex_default: "Codex / 账号默认",
+    unsupported: "模型不支持",
   };
   return source ? labels[source] ?? source : "来源未记录";
 }
@@ -8219,6 +8352,7 @@ function AgentRunDetailDrawer(props: {
                             <span key={`${item.provider_id}-${item.model ?? "default"}-${index}`}>
                               {index > 0 && " → "}
                               {item.resolved_label ?? `${item.provider_name ?? item.provider_id} / ${item.model ?? "Provider 默认模型"}`}
+                              {item.reasoning_effort ? ` · effort ${item.reasoning_effort}` : ""}
                             </span>
                           ))}
                         </span>

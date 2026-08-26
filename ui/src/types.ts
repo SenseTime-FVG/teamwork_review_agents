@@ -156,6 +156,7 @@ export type Agent = {
 export type ModelSelection = {
   provider: string;
   model?: string | null;
+  reasoning_effort?: string | null;
 };
 
 export type CodexConfigValue = string | number | boolean | Array<string | number | boolean>;
@@ -197,6 +198,8 @@ export type RuntimeConfig = Record<string, unknown> & {
   default_model?: {
     provider: string;
     model?: string | null;
+    reasoning_effort?: string | null;
+    reasoning_effort_source?: string;
   };
   default_model_fallbacks?: ModelSelection[];
   codex?: CodexRuntimeConfig;
@@ -236,7 +239,7 @@ export type ModelProviderItem = ModelProviderConfig & {
 
 export type ModelProviderSnapshot = {
   providers: ModelProviderItem[];
-  default_model: { provider: string; model?: string | null };
+  default_model: { provider: string; model?: string | null; reasoning_effort?: string | null };
 };
 
 export type CodexRuntimeOptions = {
@@ -524,6 +527,7 @@ export type AgentModelSnapshot = {
     model?: string | null;
     model_source?: string;
     resolved_label?: string;
+    reasoning_effort?: string | null;
     unresolved_reason?: string | null;
   }>;
   fallback_attempts?: Array<Record<string, unknown>>;

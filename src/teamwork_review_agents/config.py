@@ -180,6 +180,7 @@ class ModelSelectionConfig(BaseModel):
 
     provider: str = BUILTIN_CODEX_CLI_PROVIDER_ID
     model: str | None = None
+    reasoning_effort: str | None = None
 
 
 class ModelProviderConfig(BaseModel):

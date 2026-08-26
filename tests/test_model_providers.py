@@ -34,6 +34,7 @@ from teamwork_review_agents.model_provider_runtime import (
     resolve_model_plan,
     resolve_model_selection,
     resolve_model_snapshot,
+    supports_reasoning_effort,
 )
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.state import StateStore
@@ -354,6 +355,70 @@ def test_model_snapshot_contains_fallback_plan(tmp_path) -> None:
     ]
     assert snapshot["fallback_attempts"] == []
     assert snapshot["fallback_used"] is False
+
+
+def test_reasoning_effort_is_bound_to_gpt_model_nodes(tmp_path) -> None:
+    """只有 GPT 模型节点能覆盖推理 effort，其他模型应安全忽略历史值。"""
+
+    config_path = _write_provider_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model_providers"]["external-openai"]["default_model"] = "gpt-5.6"
+    raw["model_providers"]["external-openai"]["models"] = ["gpt-5.6", "deepseek-v4"]
+    raw["model_providers"]["external-openai"]["model_reasoning_effort"] = "high"
+    raw["runtime"]["default_model"] = {
+        "provider": "external-openai",
+        "model": "gpt-5.6",
+        "reasoning_effort": "low",
+    }
+    raw["runtime"]["default_model_fallbacks"] = [
+        {
+            "provider": "external-openai",
+            "model": "deepseek-v4",
+            "reasoning_effort": "high",
+        }
+    ]
+    raw["agents"]["inherited"]["model_fallbacks"] = [
+        {
+            "provider": "external-openai",
+            "model": "gpt-5.6",
+            "reasoning_effort": "medium",
+        }
+    ]
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = parse_config_data(raw, config_path)
+    provider = config.model_providers["external-openai"]
+
+    assert supports_reasoning_effort(provider, "gpt-5.6") is True
+    assert supports_reasoning_effort(provider, "deepseek-v4") is False
+    plan = resolve_model_plan(config, config.agents["inherited"])
+    assert plan.selections[0].reasoning_effort == "low"
+    assert plan.selections[1].reasoning_effort == "high"
+
+    snapshot = resolve_model_snapshot(config, config.agents["inherited"])
+    assert snapshot["reasoning_effort"] == "low"
+    assert snapshot["reasoning_effort_source"] == "model_selection"
+    assert snapshot["fallback_plan"][1]["reasoning_effort"] is None
+    assert snapshot["fallback_plan"][1]["reasoning_effort_source"] == "unsupported"
+
+    non_gpt_agent = config.agents["inherited"].model_copy(
+        update={
+            "model_provider": "external-openai",
+            "model": "deepseek-v4",
+            "model_reasoning_effort": "high",
+        }
+    )
+    non_gpt_snapshot = resolve_model_snapshot(config, non_gpt_agent)
+    assert non_gpt_snapshot["reasoning_effort"] is None
+    assert non_gpt_snapshot["reasoning_effort_source"] == "unsupported"
+    _, non_gpt_reasoning, _, _, _ = CodexModelRunner(config)._settings_for_provider(
+        non_gpt_agent,
+        provider,
+        codex_model_base=False,
+    )
+    assert non_gpt_reasoning is None
 
 
 @pytest.mark.asyncio
