@@ -60,7 +60,7 @@ teamwork-review-agents start
 1. 添加 GitHub / GitLab 连接，填写 API 地址和 Token 变量名。
 2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
 3. 在“全局配置与环境”中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`，并确认全局默认模型。
-4. 在“Provider”页检查不可删除的内置 Codex CLI，或新增 API Provider、配置 API Key 和模型目录。
+4. 在“Provider”页检查不可删除的内置 Codex CLI；新增 API Provider 时填写 Base URL 和 API Key，点击“检测模型”后选择默认模型，也可以跳过检测手工维护模型目录。
 5. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
 6. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
 
@@ -199,7 +199,15 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 “Provider”页管理 Agent 的模型执行后端。页面使用整列列表直接展示每个 Provider 的协议或模式、具体默认模型和状态，点击一行后在详情抽屉中单独查看、编辑、保存或测试该 Provider。`codex-cli` 是系统自动补齐的内置 Provider：可以停用，但不能删除，初始全局默认模型也指向它。API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议，可分别配置 Base URL、默认模型、模型目录、超时和并发上限。API Key 与 `config.yaml`、配置历史分开保存；列表只显示掩码，管理员主动点击小眼睛时才通过受管理 API 临时读取明文，Key 不进入 Prompt、工具子进程、运行快照或日志。
 
+新建或编辑 API Provider 时，不需要先填写占位模型。填写 Base URL 和 API Key 后点击“检测模型”，Teamwork 会按所选协议读取模型目录，用户可在表单内选择默认模型；检测失败不会保存半成品，也可以改用手工模型目录。已保存 Provider 在未输入新 Key 时会复用受管凭据。检测和保存之外，详情抽屉还提供“连接测试”，只发送不带固定推理等级和工具声明的最小请求，用于验证凭据、地址和模型是否可用。
+
+连接测试或模型目录请求失败时，详情抽屉会显示上游返回的 HTTP 状态和具体原因，例如不支持的参数、认证失败、限流、模型不存在或服务端错误；可用的错误类型、代码、参数和请求 ID 会一并展示。错误正文经过长度限制和凭据脱敏，不会把完整响应、API Key 或 Token 写入配置、运行记录或日志。
+
 Agent 可以显式选择 Provider 和模型，也可以继承“全局配置与环境”页的全局默认模型。选择框会把继承结果显示为具体值，例如 `继承全局默认（Codex CLI / gpt-5.6-sol）` 或 `Codex CLI / 基座默认模型（gpt-5.6-sol）`；无法从 Codex 配置和账号可靠解析时会明确显示原因。运行开始后会把实际 Provider、驱动和模型固化到运行快照，后续修改或删除 Provider 不会改写历史记录。
+
+全局默认模型和 Agent 都可以配置有序回退链。Agent 显式主模型的顺序是“Agent 主模型 → Agent 回退链 → 全局默认模型 → 全局回退链”；未显式指定主模型时从全局默认模型开始。相同 Provider 和模型只尝试一次，运行快照会记录每次实际尝试及脱敏原因。只有认证/额度拒绝、限流、模型不可用、连接超时和临时 5xx 等 Provider 不可用类故障会回退；Prompt、工具协议、Git/工作区、取消、总超时和输出校验错误不会误触发回退。
+
+推理 effort 是具体模型能力，不是通用 Provider 参数。OpenAI Responses 和 Chat Completions 的 GPT 系列模型才会显示并发送 effort；Anthropic、Gemini、DeepSeek 等非 GPT 模型会省略该参数。节点配置优先于 Agent 配置，再回退到 Provider 默认值；切换到不支持的模型后，历史 effort 会安全忽略。
 
 删除 API Provider 时，如果全局默认模型引用它，全局默认会先回退到 `codex-cli`；所有显式引用它的 Agent 会清除自己的 Provider 与模型并改为继承新的全局默认。停用与删除不同：停用会保留全部引用，新运行直接明确失败，不会悄悄改用其他模型。如果回退后的 Codex CLI 本身处于停用状态，配置迁移仍会完成，但需要重新启用或更换全局默认后才能运行。
 
@@ -388,6 +396,9 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
 | [`docs/architecture.md`](docs/architecture.md) | 架构、Agent 边界和数据流 |
 | [`docs/design.md`](docs/design.md) | 精确实现语义 |
+| [`docs/design-overview-change-request-multi-status-filter.md`](docs/design-overview-change-request-multi-status-filter.md) | 运行概览筛选与手动事件交互设计 |
+| [`docs/design-managed-comment-model-signature.md`](docs/design-managed-comment-model-signature.md) | 托管评论模型签名设计 |
+| [`docs/design-model-runtime-log-normalization.md`](docs/design-model-runtime-log-normalization.md) | 模型运行消息与日志归一化设计 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 本地开发、测试和前端联调 |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | 历史实施阶段和验收记录 |
 | [`deploy/`](deploy/) | systemd / launchd 模板 |
