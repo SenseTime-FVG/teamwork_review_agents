@@ -34,6 +34,7 @@ from .model_provider_runtime import (
     ResolvedModelSelection,
     effective_agent_config,
     resolve_model_plan,
+    supports_reasoning_effort,
 )
 from .managed_sandbox import inspect_managed_sandbox
 from .model_tools import (
@@ -516,6 +517,7 @@ class CodexModelRunner:
         text_config: dict[str, Any] = {}
         model = ""
         reasoning_effort: str | None = None
+        reasoning_effort_source = "provider_default"
         fast_mode = False
         verbosity: str | None = None
         personality: str | None = None
@@ -562,7 +564,7 @@ class CodexModelRunner:
             """切换到下一个可用候选，并为其创建协议客户端。"""
 
             nonlocal client, current_selection, current_index
-            nonlocal current_agent, model, reasoning_effort, fast_mode
+            nonlocal current_agent, model, reasoning_effort, reasoning_effort_source, fast_mode
             nonlocal verbosity, personality, instructions, text_config, schema
             while index < len(model_plan):
                 selection = model_plan[index]
@@ -620,6 +622,27 @@ class CodexModelRunner:
                         ),
                     )
                 )
+                if reasoning_effort:
+                    reasoning_effort_source = (
+                        "model_selection"
+                        if selection.reasoning_effort
+                        else "agent"
+                        if agent.model_reasoning_effort
+                        else "provider"
+                        if selection.provider.model_reasoning_effort
+                        else "runtime"
+                        if selection.provider.driver == "codex_cli"
+                        else "provider_default"
+                    )
+                else:
+                    reasoning_effort_source = (
+                        "unsupported"
+                        if selection.model and not supports_reasoning_effort(
+                            selection.provider,
+                            selection.model,
+                        )
+                        else "provider_default"
+                    )
                 schema, text_config = _response_text_config(
                     current_agent.output_schema,
                     verbosity,
@@ -725,6 +748,8 @@ class CodexModelRunner:
                 "provider_id": current_selection.provider_id if current_selection else None,
                 "provider_driver": current_selection.provider.driver if current_selection else None,
                 "model": model,
+                "reasoning_effort": reasoning_effort,
+                "reasoning_effort_source": reasoning_effort_source,
                 "tool_count": len(tools),
                 "skill_count": len(agent.skills),
             },
@@ -827,6 +852,8 @@ class CodexModelRunner:
                             else self.provider_id
                         ),
                         "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "reasoning_effort_source": reasoning_effort_source,
                         "status": "failed",
                         "reason": redactor.text(str(exc)),
                     }
@@ -838,6 +865,8 @@ class CodexModelRunner:
                                 model_plan,
                                 attempts,
                                 current_selection=failed_selection,
+                                reasoning_effort=reasoning_effort,
+                                reasoning_effort_source=reasoning_effort_source,
                                 fallback_used=bool(attempts),
                             )
                         )
@@ -866,6 +895,8 @@ class CodexModelRunner:
                                     model_plan,
                                     attempts,
                                     current_selection=next_selection,
+                                    reasoning_effort=reasoning_effort,
+                                    reasoning_effort_source=reasoning_effort_source,
                                     fallback_used=True,
                                 )
                             )
@@ -877,6 +908,8 @@ class CodexModelRunner:
                         if current_selection is not None
                         else self.provider_id,
                         "model": model,
+                        "reasoning_effort": reasoning_effort,
+                        "reasoning_effort_source": reasoning_effort_source,
                         "status": "response",
                     }
                 )
@@ -886,6 +919,8 @@ class CodexModelRunner:
                             model_plan,
                             attempts,
                             current_selection=current_selection,
+                            reasoning_effort=reasoning_effort,
+                            reasoning_effort_source=reasoning_effort_source,
                             fallback_used=any(
                                 item.get("status") == "failed" for item in attempts
                             ),
@@ -1069,6 +1104,8 @@ class CodexModelRunner:
 
         codex_provider = codex_model_base
         reasoning = agent.model_reasoning_effort or provider.model_reasoning_effort
+        if not supports_reasoning_effort(provider, model):
+            reasoning = None
         if reasoning is None and codex_provider:
             reasoning = (
                 self.config.runtime.codex.model_reasoning_effort
@@ -1100,6 +1137,8 @@ def _model_snapshot_update(
     attempts: list[dict[str, Any]],
     *,
     current_selection: ResolvedModelSelection | None,
+    reasoning_effort: str | None,
+    reasoning_effort_source: str,
     fallback_used: bool,
 ) -> dict[str, Any]:
     """生成回退过程中的有界模型快照，不包含任何凭据。"""
@@ -1123,6 +1162,8 @@ def _model_snapshot_update(
         "resolved_label": current_selection.resolved_label
         if current_selection
         else None,
+        "reasoning_effort": reasoning_effort,
+        "reasoning_effort_source": reasoning_effort_source,
         "fallback_plan": [
             {
                 "provider_id": item.provider_id,
@@ -1132,6 +1173,18 @@ def _model_snapshot_update(
                 "model": item.model,
                 "model_source": item.model_source,
                 "resolved_label": item.resolved_label,
+                "reasoning_effort": (
+                    item.reasoning_effort
+                    if supports_reasoning_effort(item.provider, item.model)
+                    else None
+                ),
+                "reasoning_effort_source": (
+                    "model_selection"
+                    if item.reasoning_effort and supports_reasoning_effort(item.provider, item.model)
+                    else "unsupported"
+                    if item.model and not supports_reasoning_effort(item.provider, item.model)
+                    else "provider_default"
+                ),
                 "unresolved_reason": item.unresolved_reason,
             }
             for item in model_plan

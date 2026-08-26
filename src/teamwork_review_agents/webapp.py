@@ -44,6 +44,7 @@ from .model_provider_client import (
     discover_provider_models,
 )
 from .model_provider_credentials import ModelProviderCredentialStore
+from .model_provider_runtime import supports_reasoning_effort
 from .preflight_manager import ManualPreflightManager
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
@@ -876,24 +877,24 @@ def create_app(
                 timeout_seconds=min(float(provider.request_timeout_seconds), 30.0),
                 idle_timeout_seconds=30.0,
             )
-            response = await asyncio.wait_for(
-                client.create_response(
+            test_payload: dict[str, Any] = {
+                "model": model,
+                "instructions": "只回复 hi，不调用任何工具。",
+                "input": [
                     {
-                        "model": model,
-                        "instructions": "只回复 hi，不调用任何工具。",
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": "hi"}],
-                            }
-                        ],
-                        "tools": [],
-                        "tool_choice": "none",
-                        "stream": False,
-                        "store": False,
-                        "reasoning": {"effort": "minimal"},
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
                     }
-                ),
+                ],
+                "tools": [],
+                "tool_choice": "none",
+                "stream": False,
+                "store": False,
+            }
+            if supports_reasoning_effort(provider, model):
+                test_payload["reasoning"] = {"effort": "minimal"}
+            response = await asyncio.wait_for(
+                client.create_response(test_payload),
                 timeout=30.0,
             )
             reply = _provider_response_text(response)

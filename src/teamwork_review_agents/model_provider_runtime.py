@@ -23,6 +23,7 @@ class ResolvedModelSelection:
     model: str | None
     model_source: str
     resolved_label: str
+    reasoning_effort: str | None = None
     unresolved_reason: str | None = None
 
 
@@ -42,6 +43,7 @@ def _resolve_provider_selection(
     *,
     provider_id: str,
     configured_model: str | None,
+    configured_reasoning_effort: str | None = None,
     source: str,
     require_enabled: bool,
 ) -> ResolvedModelSelection:
@@ -103,8 +105,25 @@ def _resolve_provider_selection(
         model=model,
         model_source=model_source,
         resolved_label=label,
+        reasoning_effort=configured_reasoning_effort,
         unresolved_reason=unresolved_reason,
     )
+
+
+def supports_reasoning_effort(
+    provider: ModelProviderConfig,
+    model: str | None,
+) -> bool:
+    """判断最终 Provider/模型是否支持推理 effort。"""
+
+    if not model:
+        return False
+    if provider.driver == "codex_cli":
+        return True
+    return provider.driver in {
+        "openai_responses",
+        "openai_chat_completions",
+    } and model.strip().lower().startswith("gpt-")
 
 
 def resolve_model_selection(
@@ -124,6 +143,11 @@ def resolve_model_selection(
         config,
         provider_id=provider_id,
         configured_model=agent.model,
+        configured_reasoning_effort=(
+            None
+            if explicit_provider or agent.model
+            else config.runtime.default_model.reasoning_effort
+        ),
         source=source,
         require_enabled=require_enabled,
     )
@@ -141,6 +165,7 @@ def resolve_model_plan(
             config,
             provider_id=item.provider,
             configured_model=item.model,
+            configured_reasoning_effort=item.reasoning_effort,
             source="agent_fallback",
             require_enabled=False,
         )
@@ -150,6 +175,7 @@ def resolve_model_plan(
         config,
         provider_id=config.runtime.default_model.provider,
         configured_model=config.runtime.default_model.model,
+        configured_reasoning_effort=config.runtime.default_model.reasoning_effort,
         source="global",
         require_enabled=False,
     )
@@ -158,6 +184,7 @@ def resolve_model_plan(
             config,
             provider_id=item.provider,
             configured_model=item.model,
+            configured_reasoning_effort=item.reasoning_effort,
             source="global_fallback",
             require_enabled=False,
         )
@@ -194,8 +221,13 @@ def effective_agent_config(
         "model_provider": selection.provider_id,
         "model": selection.model,
     }
-    if agent.model_reasoning_effort is None and provider.model_reasoning_effort:
-        updates["model_reasoning_effort"] = provider.model_reasoning_effort
+    if supports_reasoning_effort(provider, selection.model):
+        if selection.reasoning_effort:
+            updates["model_reasoning_effort"] = selection.reasoning_effort
+        elif agent.model_reasoning_effort is None and provider.model_reasoning_effort:
+            updates["model_reasoning_effort"] = provider.model_reasoning_effort
+    else:
+        updates["model_reasoning_effort"] = None
     if agent.model_verbosity is None and provider.model_verbosity:
         updates["model_verbosity"] = provider.model_verbosity
     if agent.personality is None and provider.personality:
@@ -221,10 +253,17 @@ def resolve_model_snapshot(
         value = item.get("value") if isinstance(item, dict) else None
         return str(value) if value is not None else None
 
-    if effective_agent.model_reasoning_effort:
+    if effective_agent.model_reasoning_effort and supports_reasoning_effort(
+        provider,
+        selection.model,
+    ):
         reasoning = effective_agent.model_reasoning_effort
         reasoning_source = (
-            "agent" if agent.model_reasoning_effort else "provider"
+            "model_selection"
+            if selection.reasoning_effort
+            else "agent"
+            if agent.model_reasoning_effort
+            else "provider"
         )
     elif provider.driver == "codex_cli":
         reasoning = (
@@ -240,7 +279,13 @@ def resolve_model_snapshot(
         )
     else:
         reasoning = None
-        reasoning_source = "provider_default"
+        reasoning_source = (
+            "provider_default"
+            if supports_reasoning_effort(provider, selection.model)
+            else "unsupported"
+            if selection.model
+            else "provider_default"
+        )
 
     if agent.fast_mode != "inherit":
         fast_mode = agent.fast_mode
@@ -309,6 +354,18 @@ def resolve_model_snapshot(
             "model": item.model,
             "model_source": item.model_source,
             "resolved_label": item.resolved_label,
+            "reasoning_effort": (
+                item.reasoning_effort
+                if supports_reasoning_effort(item.provider, item.model)
+                else None
+            ),
+            "reasoning_effort_source": (
+                "model_selection"
+                if item.reasoning_effort and supports_reasoning_effort(item.provider, item.model)
+                else "unsupported"
+                if item.model and not supports_reasoning_effort(item.provider, item.model)
+                else "provider_default"
+            ),
             "unresolved_reason": item.unresolved_reason,
         }
         for item in plan.selections

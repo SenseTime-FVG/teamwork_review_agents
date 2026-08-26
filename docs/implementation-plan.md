@@ -1257,3 +1257,13 @@
 - 增加草稿检测接口的四类协议成功、HTTP/认证/连接/响应格式失败、Key 不落盘、默认模型选择和检测结果写入草稿测试；补充 Provider 表单检测中、成功、失败、切换和窄屏布局回归，执行后端定向及全量测试、前端生产构建、编译和补丁检查，不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
 
 验收：用户输入 Base URL 与 API Key 后点击“检测模型”即可在保存前看到可用模型并选择默认值，无需填写占位模型；检测失败能看到真实且脱敏的原因并可改用手工目录；已保存 Provider 可重复检测，旧配置、连接测试、凭据保护和模型运行语义不回归。
+
+## 阶段一百一十三：GPT 模型推理 effort 能力边界
+
+- 为全局默认模型、全局回退链和 Agent 回退链的模型节点增加可选 `reasoning_effort`，并在前端仅对 GPT 系列模型展示 effort 选择；非 GPT 模型隐藏或禁用该项。
+- 保留 Provider 默认推理 effort 作为 GPT 模型兜底，但根据最终 `(Provider, Model)` 能力判断过滤；OpenAI Responses 使用 `reasoning.effort`，Chat Completions 使用 `reasoning_effort`，其他协议和非 GPT 模型不发送任何 effort 字段。
+- 调整 Agent/Provider/节点推理参数合并顺序，节点显式值优先，其次 Agent 级设置，再其次 Provider 默认；切换到非 GPT 或历史配置带有无效 effort 时安全忽略，不改变模型回退顺序。
+- 扩展运行快照和回退尝试的脱敏信息，记录实际 effort 及来源或“不支持”；补充 GPT 与非 GPT、Responses 与 Chat、Provider 默认与节点覆盖、旧配置兼容测试。
+- 重新生成前端静态资源，执行 Python 定向及全量测试、前端生产构建、编译和补丁检查；不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
+
+验收：GPT 模型可在全局默认、回退节点和 Agent 回退节点分别配置 effort，并向对应 OpenAI 接口传递；DeepSeek、Anthropic、Gemini 等非 GPT 模型不显示且不发送该参数；Provider 默认与 Agent/节点覆盖按既定优先级解析，旧配置和现有 Codex CLI 推理行为不回归。
