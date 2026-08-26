@@ -26,6 +26,7 @@ from .codex_connection import (
     CodexConnectionTestTimeout,
     test_codex_connection,
 )
+from .config import ModelProviderConfig
 from .config_manager import ConfigManager, ConfigRevisionConflict
 from .codex_settings import codex_home, inspect_runtime_options
 from .environment import PromptRenderError, render_prompt
@@ -37,7 +38,11 @@ from .events import (
     detect_events,
 )
 from .prompt_files import MAX_PROMPT_FILE_BYTES, import_prompt_file, list_prompt_files
-from .model_provider_client import ExternalModelClient, discover_provider_models
+from .model_provider_client import (
+    ExternalModelClient,
+    discover_model_catalog,
+    discover_provider_models,
+)
 from .model_provider_credentials import ModelProviderCredentialStore
 from .preflight_manager import ManualPreflightManager
 from .repository_initialization import RepositoryInitializationManager
@@ -171,6 +176,21 @@ class ModelProviderRefreshRequest(BaseModel):
     """刷新模型目录时绑定的配置版本。"""
 
     revision: str
+
+
+class ModelProviderDiscoveryRequest(BaseModel):
+    """使用 Provider 草稿参数检测模型目录，不保存草稿。"""
+
+    driver: Literal[
+        "openai_responses",
+        "openai_chat_completions",
+        "anthropic_messages",
+        "gemini_generate_content",
+    ]
+    base_url: str = Field(min_length=1)
+    request_timeout_seconds: int = Field(default=120, gt=0)
+    provider_id: str | None = None
+    api_key: str | None = Field(default=None, min_length=1)
 
 
 class RepositoryConfigRequest(BaseModel):
@@ -740,6 +760,50 @@ def create_app(
             body.api_key,
         )
         return await asyncio.to_thread(model_provider_snapshot)
+
+    @app.post("/api/model-providers/discover-models")
+    async def discover_model_provider_models(
+        body: ModelProviderDiscoveryRequest,
+    ) -> dict[str, Any]:
+        """使用当前 Provider 草稿参数检测模型目录，不写入配置。"""
+
+        api_key = body.api_key
+        if body.provider_id:
+            saved_provider = manager.config.model_providers.get(body.provider_id)
+            if saved_provider is None:
+                raise HTTPException(status_code=404, detail="模型 Provider 不存在")
+            if not api_key:
+                try:
+                    api_key = await asyncio.to_thread(
+                        model_provider_credentials.reveal,
+                        body.provider_id,
+                    )
+                except KeyError as exc:
+                    raise HTTPException(status_code=422, detail="API Key 尚未配置") from exc
+        if not api_key:
+            raise HTTPException(status_code=422, detail="请先填写 API Key")
+        try:
+            # 借用同一配置模型校验 Base URL，避免草稿和已保存配置出现不同规则。
+            draft_provider = ModelProviderConfig.model_validate(
+                {
+                    "display_name": "草稿 Provider",
+                    "driver": body.driver,
+                    "base_url": body.base_url,
+                    "default_model": "__model_discovery__",
+                    "request_timeout_seconds": body.request_timeout_seconds,
+                }
+            )
+            models = await discover_model_catalog(
+                driver=body.driver,
+                base_url=str(draft_provider.base_url or ""),
+                api_key=api_key,
+                timeout_seconds=min(float(body.request_timeout_seconds), 60.0),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"models": models}
 
     @app.post("/api/model-providers/{provider_id}/refresh-models")
     async def refresh_model_provider_models(
