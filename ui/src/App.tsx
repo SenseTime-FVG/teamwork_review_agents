@@ -2394,6 +2394,8 @@ function ModelProvidersEditor(props: {
   const [visibleKey, setVisibleKey] = useState("");
   const [keyInput, setKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [modelDiscoveryBusy, setModelDiscoveryBusy] = useState(false);
+  const [modelDiscoveryMessage, setModelDiscoveryMessage] = useState("");
   const [connectionResult, setConnectionResult] = useState("");
   const [detailError, setDetailError] = useState("");
   const [pendingAction, setPendingAction] = useState<ModelProviderPendingAction | null>(null);
@@ -2474,6 +2476,7 @@ function ModelProvidersEditor(props: {
     setDraftDocument(null);
     setDraftId("");
     setKeyInput("");
+    setModelDiscoveryMessage("");
   }
 
   function applyTransition(transition: ModelProviderTransition) {
@@ -2483,6 +2486,7 @@ function ModelProvidersEditor(props: {
     props.onError("");
     setVisibleKey("");
     setConnectionResult("");
+    setModelDiscoveryMessage("");
     if (transition.kind === "cancel-edit") return;
     if (transition.kind === "close") {
       setSelectedId(null);
@@ -2549,6 +2553,7 @@ function ModelProvidersEditor(props: {
     setEditing(true);
     setVisibleKey("");
     setConnectionResult("");
+    setModelDiscoveryMessage("");
   }
 
   function cancelEdit() {
@@ -2557,6 +2562,9 @@ function ModelProvidersEditor(props: {
 
   function updateProvider(patch: Partial<ModelProviderConfig>) {
     if (!draftDocument || !selected) return;
+    if (Object.hasOwn(patch, "driver") || Object.hasOwn(patch, "base_url")) {
+      setModelDiscoveryMessage("");
+    }
     setDraftDocument({
       ...draftDocument,
       model_providers: {
@@ -2678,6 +2686,40 @@ function ModelProvidersEditor(props: {
     }
   }
 
+  async function detectDraftModels() {
+    if (!editing || !selected || !external) return;
+    setBusy(true);
+    setModelDiscoveryBusy(true);
+    beginDetailAction();
+    setModelDiscoveryMessage("");
+    try {
+      const result = await api<{ models: string[] }>(
+        "/api/model-providers/discover-models",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            provider_id: creating ? undefined : selectedId,
+            driver: selected.driver,
+            base_url: selected.base_url ?? "",
+            request_timeout_seconds: Number(selected.request_timeout_seconds ?? 120),
+            api_key: keyInput.trim() || undefined,
+          }),
+        },
+      );
+      if (result.models.length > 0) {
+        updateProvider({ models: result.models });
+        setModelDiscoveryMessage(`已检测到 ${result.models.length} 个模型，请从“Provider 默认模型”中选择。`);
+      } else {
+        setModelDiscoveryMessage("检测成功，但上游未返回可用模型；现有目录未改变，可手工填写模型 ID。");
+      }
+    } catch (reason) {
+      showDetailError(reason, "模型检测失败");
+    } finally {
+      setBusy(false);
+      setModelDiscoveryBusy(false);
+    }
+  }
+
   async function testConnection() {
     if (!selectedId) return;
     setBusy(true);
@@ -2792,6 +2834,7 @@ function ModelProvidersEditor(props: {
         supports_fast_mode: false,
       }))
     : [];
+  const modelHelp = modelDiscoveryMessage || `当前解析：${selected?.display_name ?? "Provider"} / ${selectedResolved?.concrete ?? "暂未解析"}`;
 
   return (
     <>
@@ -2930,7 +2973,7 @@ function ModelProvidersEditor(props: {
                       placeholder={selectedResolved?.defaultLabel ?? "Provider 默认模型"}
                       models={selected.driver === "codex_cli" ? props.codexOptions.models : modelOptions}
                       onChange={(default_model) => updateProvider({ default_model: default_model || undefined })}
-                      help={`当前解析：${selected.display_name} / ${selectedResolved?.concrete ?? "暂未解析"}`}
+                      help={modelHelp}
                     />
                     {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
                     {external && <Field label="并发上限（可选）" type="number" value={selected.max_concurrency ?? ""} onChange={(value) => updateProvider({ max_concurrency: value ? Number(value) : null })} />}
@@ -2983,7 +3026,7 @@ function ModelProvidersEditor(props: {
                         })}
                         placeholder="每行一个模型 ID"
                       />
-                      <small>保存后可使用“检测并刷新模型”读取上游目录。</small>
+                      <small>可以点击“检测模型”读取上游目录，也可以手工维护模型 ID。</small>
                     </label>
                   )}
                 </fieldset>
@@ -3010,9 +3053,16 @@ function ModelProvidersEditor(props: {
                     />
                     <div className="field-action">
                       {!creating && <button className="button secondary" type="button" disabled={busy || !keyInput.trim()} onClick={() => void replaceKey()}>安全保存</button>}
-                      {!creating && <button className="button secondary" type="button" disabled={busy || editing || !selectedSnapshot?.api_key_configured} onClick={() => void refreshModels()}>检测并刷新模型</button>}
+                      {editing ? (
+                        <button className="button secondary" type="button" disabled={busy || !selected.base_url?.trim() || !selected.driver || (creating ? !keyInput.trim() : (!keyInput.trim() && !selectedSnapshot?.api_key_configured))} onClick={() => void detectDraftModels()}>
+                          {modelDiscoveryBusy ? "检测中…" : "检测模型"}
+                        </button>
+                      ) : (
+                        <button className="button secondary" type="button" disabled={busy || !selectedSnapshot?.api_key_configured} onClick={() => void refreshModels()}>检测并刷新模型</button>
+                      )}
                     </div>
                   </div>
+                  {modelDiscoveryMessage && <div className="provider-model-discovery-note" role="status">{modelDiscoveryMessage}</div>}
                 </section>
               )}
 

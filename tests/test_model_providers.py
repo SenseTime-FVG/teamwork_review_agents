@@ -24,6 +24,7 @@ from teamwork_review_agents.model_provider_client import (
     ExternalModelClient,
     ModelProviderRequestError,
     _chat_messages,
+    discover_model_catalog,
 )
 from teamwork_review_agents.model_provider_credentials import (
     ModelProviderCredentialStore,
@@ -565,6 +566,67 @@ async def test_external_http_error_marks_fallbackability(
     assert raised.value.fallbackable is expected_fallbackable
 
 
+@pytest.mark.parametrize(
+    ("driver", "base_url", "expected_path", "response_document"),
+    [
+        (
+            "openai_responses",
+            "https://models.example.test/v1",
+            "/v1/models",
+            {"data": [{"id": "gpt-draft"}, {"id": "gpt-draft"}]},
+        ),
+        (
+            "openai_chat_completions",
+            "https://models.example.test/v1",
+            "/v1/models",
+            {"data": [{"id": "chat-draft"}]},
+        ),
+        (
+            "anthropic_messages",
+            "https://models.example.test/v1",
+            "/v1/models",
+            {"data": [{"id": "claude-draft"}]},
+        ),
+        (
+            "gemini_generate_content",
+            "https://models.example.test",
+            "/v1beta/models",
+            {"models": [{"name": "models/gemini-draft"}]},
+        ),
+    ],
+)
+async def test_draft_model_catalog_discovery_uses_normalized_endpoint(
+    driver: str,
+    base_url: str,
+    expected_path: str,
+    response_document: dict[str, Any],
+) -> None:
+    """草稿检测应按协议请求模型目录并去重模型 ID。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == expected_path
+        assert (
+            request.headers.get("authorization") == "Bearer draft-secret"
+            or request.headers.get("x-goog-api-key") == "draft-secret"
+            or request.headers.get("x-api-key") == "draft-secret"
+        )
+        return httpx.Response(200, json=response_document)
+
+    result = await discover_model_catalog(
+        driver=driver,
+        base_url=base_url,
+        api_key="draft-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result in (
+        ["gpt-draft"],
+        ["chat-draft"],
+        ["claude-draft"],
+        ["gemini-draft"],
+    )
+
+
 async def test_openai_chat_protocol_normalizes_tool_call() -> None:
     """Chat Completions 的函数调用应转换为统一工具调用。"""
 
@@ -820,3 +882,103 @@ def test_model_provider_web_api_masks_reveals_and_deletes(tmp_path) -> None:
         assert client.get(
             "/api/model-providers/external-openai/key"
         ).status_code == 404
+
+
+def test_model_provider_draft_discovery_does_not_save_key_or_provider(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """新建 Provider 检测模型时只使用草稿参数，不提前写配置或凭据。"""
+
+    config_path = _write_provider_config(tmp_path)
+    calls: list[dict[str, Any]] = []
+
+    async def fake_discovery(**kwargs):
+        calls.append(kwargs)
+        return ["draft-model", "draft-backup"]
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.discover_model_catalog",
+        fake_discovery,
+    )
+    original = config_path.read_text(encoding="utf-8")
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/model-providers/discover-models",
+            json={
+                "driver": "openai_responses",
+                "base_url": "https://draft.example.test/v1",
+                "request_timeout_seconds": 20,
+                "api_key": "sk-draft-secret",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"models": ["draft-model", "draft-backup"]}
+    assert calls == [
+        {
+            "driver": "openai_responses",
+            "base_url": "https://draft.example.test/v1",
+            "api_key": "sk-draft-secret",
+            "timeout_seconds": 20.0,
+        }
+    ]
+    assert config_path.read_text(encoding="utf-8") == original
+    assert "sk-draft-secret" not in response.text
+
+
+def test_model_provider_draft_discovery_can_reuse_saved_key(tmp_path, monkeypatch) -> None:
+    """已保存 Provider 未输入新 Key 时，草稿检测应复用受管凭据。"""
+
+    config_path = _write_provider_config(tmp_path)
+    captured: dict[str, Any] = {}
+
+    async def fake_discovery(**kwargs):
+        captured.update(kwargs)
+        return ["saved-key-model"]
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.webapp.discover_model_catalog",
+        fake_discovery,
+    )
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        saved = client.put(
+            "/api/model-providers/external-openai/key",
+            json={"api_key": "sk-saved-secret"},
+        )
+        assert saved.status_code == 200
+        response = client.post(
+            "/api/model-providers/discover-models",
+            json={
+                "provider_id": "external-openai",
+                "driver": "openai_responses",
+                "base_url": "https://models.example.test",
+                "request_timeout_seconds": 15,
+            },
+        )
+
+    assert current["revision"]
+    assert response.status_code == 200
+    assert response.json() == {"models": ["saved-key-model"]}
+    assert captured["api_key"] == "sk-saved-secret"
+    assert "sk-saved-secret" not in response.text
+
+
+def test_model_provider_draft_discovery_requires_key_for_new_provider(tmp_path) -> None:
+    """新建 Provider 未提供 API Key 时检测应明确拒绝。"""
+
+    app = create_app(_write_provider_config(tmp_path), start_scheduler=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/model-providers/discover-models",
+            json={
+                "driver": "openai_responses",
+                "base_url": "https://models.example.test/v1",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "请先填写 API Key"

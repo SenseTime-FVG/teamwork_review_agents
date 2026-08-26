@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 import httpx
@@ -324,22 +324,46 @@ async def discover_provider_models(
 
     if provider.driver == "codex_cli":
         return list(provider.models)
-    if provider.driver == "gemini_generate_content":
-        url = _api_url(provider, "/v1beta/models")
+    return await discover_model_catalog(
+        driver=provider.driver,
+        base_url=str(provider.base_url or ""),
+        api_key=api_key,
+        timeout_seconds=float(provider.request_timeout_seconds),
+        transport=transport,
+    )
+
+
+async def discover_model_catalog(
+    *,
+    driver: Literal[
+        "openai_responses",
+        "openai_chat_completions",
+        "anthropic_messages",
+        "gemini_generate_content",
+    ],
+    base_url: str,
+    api_key: str,
+    timeout_seconds: float = 120.0,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[str]:
+    """使用未保存的 Provider 草稿参数读取模型目录。"""
+
+    if driver == "gemini_generate_content":
+        url = _join_api_url(base_url, "/v1beta/models")
         headers = {"x-goog-api-key": api_key}
     else:
-        url = _api_url(provider, "/v1/models")
+        url = _join_api_url(base_url, "/v1/models")
         headers = (
             {
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
             }
-            if provider.driver == "anthropic_messages"
+            if driver == "anthropic_messages"
             else {"Authorization": f"Bearer {api_key}"}
         )
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(float(provider.request_timeout_seconds), connect=30.0),
+            timeout=httpx.Timeout(float(timeout_seconds), connect=30.0),
             transport=transport,
         ) as client:
             response = await client.get(url, headers=headers)
@@ -353,14 +377,14 @@ async def discover_provider_models(
         document = response.json()
     except ValueError as exc:
         raise ModelProviderRequestError("模型目录返回了无效 JSON") from exc
-    raw_models = document.get("models") if provider.driver == "gemini_generate_content" else document.get("data")
+    raw_models = document.get("models") if driver == "gemini_generate_content" else document.get("data")
     if not isinstance(raw_models, list):
         raise ModelProviderRequestError("模型目录响应缺少模型数组")
     result: list[str] = []
     for item in raw_models:
         if not isinstance(item, dict):
             continue
-        model = item.get("name") if provider.driver == "gemini_generate_content" else item.get("id")
+        model = item.get("name") if driver == "gemini_generate_content" else item.get("id")
         if isinstance(model, str) and model:
             result.append(model.removeprefix("models/"))
     return sorted(set(result))
@@ -383,7 +407,13 @@ async def _emit_normalized_events(
 def _api_url(provider: ModelProviderConfig, path: str) -> str:
     """避免 Base URL 已含版本段时重复拼接。"""
 
-    root = str(provider.base_url or "").rstrip("/")
+    return _join_api_url(str(provider.base_url or ""), path)
+
+
+def _join_api_url(base_url: str, path: str) -> str:
+    """拼接模型 API 地址并避免版本段重复。"""
+
+    root = base_url.rstrip("/")
     if root.endswith("/v1") and path.startswith("/v1/"):
         return f"{root}{path[3:]}"
     if root.endswith("/v1beta") and path.startswith("/v1beta/"):
