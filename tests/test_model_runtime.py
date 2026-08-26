@@ -18,6 +18,7 @@ import pytest
 from teamwork_review_agents.codex_model_client import (
     CodexOAuthStore,
     CodexResponsesClient,
+    CodexUpstreamError,
 )
 from teamwork_review_agents.codex_model_runner import (
     CodexModelRunner,
@@ -396,6 +397,156 @@ async def test_responses_client_parses_sse_without_local_api(tmp_path) -> None:
         "response.output_item.done",
         "response.completed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_responses_client_exposes_nested_sse_failure_details(tmp_path) -> None:
+    """response.failed 应保留上游错误字段，而不是只返回通用失败文案。"""
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    access = _jwt({"exp": int(time.time()) + 3600})
+    (codex_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": access, "refresh_token": "refresh-secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"type":"response.failed","response":{"status":"failed",'
+                '"error":{"message":"模型暂时不可用","type":"server_error",'
+                '"code":"model_unavailable","param":"model",'
+                '"request_id":"req-sse-1"}}}\n\n'
+                "data: [DONE]\n\n"
+            ),
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = CodexResponsesClient(
+        oauth=CodexOAuthStore(codex_home, transport=transport),
+        codex_binary="missing-codex-for-test",
+        transport=transport,
+    )
+
+    with pytest.raises(CodexUpstreamError) as raised:
+        await client.create_response({"model": "gpt-test", "input": []})
+
+    message = str(raised.value)
+    assert "模型暂时不可用" in message
+    assert "类型=server_error" in message
+    assert "代码=model_unavailable" in message
+    assert "参数=model" in message
+    assert "请求 ID=req-sse-1" in message
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_client_exposes_top_level_sse_error_details(tmp_path) -> None:
+    """顶层 error 事件没有嵌套 response 时也应保留消息和代码。"""
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    access = _jwt({"exp": int(time.time()) + 3600})
+    (codex_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": access, "refresh_token": "refresh-secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"type":"error","message":"请求参数无效",'
+                '"code":"invalid_request","requestId":"req-sse-2"}\n\n'
+            ),
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = CodexResponsesClient(
+        oauth=CodexOAuthStore(codex_home, transport=transport),
+        codex_binary="missing-codex-for-test",
+        transport=transport,
+    )
+
+    with pytest.raises(CodexUpstreamError) as raised:
+        await client.create_response({"model": "gpt-test", "input": []})
+
+    message = str(raised.value)
+    assert "请求参数无效" in message
+    assert "代码=invalid_request" in message
+    assert "请求 ID=req-sse-2" in message
+
+
+@pytest.mark.asyncio
+async def test_responses_client_exposes_http_error_and_redacts_sensitive_text(
+    tmp_path,
+) -> None:
+    """非 2xx JSON 错误应展示原因，同时限制长度并脱敏凭据。"""
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    access = _jwt({"exp": int(time.time()) + 3600})
+    (codex_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": access, "refresh_token": "refresh-secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    secret = "sk-test-secret-value-123456"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": f"请求被拒绝 Bearer {secret}",
+                    "type": "invalid_request_error",
+                    "code": "unsupported_model",
+                    "param": "model",
+                    "request_id": "req-http-1",
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = CodexResponsesClient(
+        oauth=CodexOAuthStore(codex_home, transport=transport),
+        codex_binary="missing-codex-for-test",
+        transport=transport,
+    )
+
+    with pytest.raises(CodexUpstreamError) as raised:
+        await client.create_response({"model": "gpt-test", "input": []})
+
+    message = str(raised.value)
+    assert "HTTP 400" in message
+    assert "请求被拒绝" in message
+    assert "类型=invalid_request_error" in message
+    assert "代码=unsupported_model" in message
+    assert "请求 ID=req-http-1" in message
+    assert secret not in message
+    assert "Bearer [已脱敏]" in message
+    assert len(message) <= 2000
 
 
 async def _append_event(events: list[str], event: dict[str, Any]) -> None:

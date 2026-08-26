@@ -28,6 +28,8 @@ OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_REFRESH_SKEW_MS = 60_000
 RETRYABLE_HTTP_STATUS = {502, 503, 504}
+_UPSTREAM_ERROR_MAX_CHARS = 2000
+_UPSTREAM_ERROR_FIELD_MAX_CHARS = 500
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 _OAUTH_LOCKS: dict[str, asyncio.Lock] = {}
 _OAUTH_LOCKS_GUARD = threading.Lock()
@@ -293,7 +295,12 @@ class CodexResponsesClient:
                     ):
                         response = event["response"]
                     elif event_type in {"response.failed", "error"}:
-                        raise CodexUpstreamError("Codex 上游报告模型回合失败")
+                        raise CodexUpstreamError(
+                            _format_upstream_error(
+                                event_type=event_type,
+                                payload=event,
+                            )
+                        )
                 if response is None:
                     raise CodexUpstreamError("Codex SSE 在 completed 事件前结束")
                 aggregated = dict(response)
@@ -342,7 +349,7 @@ class CodexResponsesClient:
                         json=request_payload,
                     ) as response:
                         if response.status_code >= 400:
-                            await response.aread()
+                            body = await response.aread()
                             if response.status_code == 401 and auth_attempt == 0:
                                 latest = self.oauth.load()
                                 credentials = await self.oauth.credentials(
@@ -353,7 +360,10 @@ class CodexResponsesClient:
                                 )
                                 continue
                             raise CodexUpstreamError(
-                                f"Codex 上游请求失败（HTTP {response.status_code}）",
+                                _format_upstream_error(
+                                    payload=_decode_error_body(body),
+                                    status_code=response.status_code,
+                                ),
                                 status_code=response.status_code,
                             )
                         content_type = response.headers.get("content-type", "")
@@ -374,6 +384,10 @@ class CodexResponsesClient:
                                 ) from exc
                             if not isinstance(document, dict):
                                 raise CodexUpstreamError("Codex 上游 JSON 响应格式无效")
+                            if _contains_upstream_error(document):
+                                raise CodexUpstreamError(
+                                    _format_upstream_error(payload=document)
+                                )
                             yield {"type": "response.completed", "response": document}
                             return
                         async for line in response.aiter_lines():
@@ -468,6 +482,184 @@ def _retryable_error(error: Exception) -> bool:
             httpx.ReadError,
         ),
     )
+
+
+def _decode_error_body(body: bytes) -> Any:
+    """解析 HTTP 错误正文，无法解析时仅保留原始文本供有界脱敏。"""
+
+    text = body.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _contains_upstream_error(document: dict[str, Any]) -> bool:
+    """判断非 SSE JSON 是否是上游错误，而不是正常 completed 响应。"""
+
+    candidates: list[Any] = [document]
+    while candidates:
+        candidate = candidates.pop()
+        if not isinstance(candidate, dict):
+            continue
+        status = candidate.get("status")
+        event_type = candidate.get("type")
+        if any(
+            isinstance(candidate.get(key), (dict, list, str))
+            for key in ("error", "errors")
+        ):
+            return True
+        if isinstance(status, str) and status in {"failed", "error"}:
+            return True
+        if isinstance(event_type, str) and event_type in {
+            "error",
+            "response.failed",
+        }:
+            return True
+        nested_response = candidate.get("response")
+        if isinstance(nested_response, dict):
+            candidates.append(nested_response)
+    return False
+
+
+def _format_upstream_error(
+    *,
+    payload: Any,
+    event_type: str | None = None,
+    status_code: int | None = None,
+) -> str:
+    """提取上游有限错误字段并生成可写入运行记录的脱敏文本。"""
+
+    fields = _extract_upstream_error_fields(payload)
+    if status_code is not None:
+        prefix = f"Codex 上游请求失败（HTTP {status_code}）"
+    elif event_type in {"response.failed", "error"}:
+        prefix = "Codex 上游报告模型回合失败"
+    else:
+        prefix = "Codex 上游返回错误"
+
+    message = fields.get("message")
+    if not message:
+        message = "上游未提供具体错误消息"
+    details = [
+        f"类型={fields['type']}" if fields.get("type") else "",
+        f"代码={fields['code']}" if fields.get("code") else "",
+        f"参数={fields['param']}" if fields.get("param") else "",
+        f"请求 ID={fields['request_id']}" if fields.get("request_id") else "",
+    ]
+    suffix = f"（{'，'.join(item for item in details if item)}）" if any(details) else ""
+    text = f"{prefix}：{message}{suffix}"
+    return _sanitize_upstream_text(text, limit=_UPSTREAM_ERROR_MAX_CHARS)
+
+
+def _extract_upstream_error_fields(payload: Any) -> dict[str, str]:
+    """只读取错误对象中的白名单字段，避免持久化完整上游载荷。"""
+
+    aliases = {
+        "message": "message",
+        "detail": "message",
+        "error_description": "message",
+        "reason": "message",
+        "failure_reason": "message",
+        "type": "type",
+        "error_type": "type",
+        "code": "code",
+        "error_code": "code",
+        "param": "param",
+        "parameter": "param",
+        "request_id": "request_id",
+        "requestid": "request_id",
+        "x_request_id": "request_id",
+        "x-request-id": "request_id",
+    }
+    fields: dict[str, str] = {}
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    inspected = 0
+    while queue and inspected < 32:
+        candidate = queue.pop(0)
+        inspected += 1
+        if isinstance(candidate, str):
+            if "message" not in fields:
+                fields["message"] = _sanitize_upstream_text(
+                    candidate,
+                    limit=_UPSTREAM_ERROR_FIELD_MAX_CHARS,
+                )
+            continue
+        if not isinstance(candidate, (dict, list)):
+            continue
+        identity = id(candidate)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(candidate, list):
+            queue.extend(candidate[:8])
+            continue
+        for key, value in candidate.items():
+            normalized = str(key).lower().replace(" ", "_")
+            field = aliases.get(normalized)
+            if field and field not in fields:
+                if field == "type" and str(value) in {
+                    "response.failed",
+                    "error",
+                }:
+                    continue
+                sanitized = _sanitize_upstream_text(
+                    value,
+                    limit=_UPSTREAM_ERROR_FIELD_MAX_CHARS,
+                )
+                if sanitized:
+                    fields[field] = sanitized
+            if str(key).lower() in {
+                "error",
+                "errors",
+                "response",
+                "details",
+                "status_details",
+                "incomplete_details",
+                "data",
+            }:
+                queue.append(value)
+    return fields
+
+
+def _sanitize_upstream_text(value: Any, *, limit: int) -> str:
+    """清除控制字符、常见凭据格式并限制上游错误文本长度。"""
+
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"(?i)\bBearer\s+[^\s,;，；（）()]+",
+        "Bearer [已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}",
+        "[已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization)"
+        r"\s*[:=]\s*[^\s,;，；（）()]+",
+        r"\1=[已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|token|access_token|refresh_token)=)[^&#\s]+",
+        r"\1[已脱敏]",
+        text,
+    )
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
 
 
 def _buffered_sse_events(body: str) -> list[dict[str, Any]]:
