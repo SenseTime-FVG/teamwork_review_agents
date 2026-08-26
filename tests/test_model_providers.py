@@ -631,6 +631,67 @@ async def test_external_http_error_marks_fallbackability(
     assert raised.value.fallbackable is expected_fallbackable
 
 
+async def test_external_http_error_exposes_sanitized_upstream_reason() -> None:
+    """外部 Provider 的嵌套错误应显示真实原因并隐藏凭据。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"X-Request-Id": "header-request-id"},
+            json={
+                "error": {
+                    "message": (
+                        "Unsupported value: 'minimal' is not supported with the "
+                        "'gpt-5.6-terra' model. Bearer sk-test-secret-value"
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "unsupported_value",
+                    "param": "reasoning.effort",
+                }
+            },
+        )
+
+    client = ExternalModelClient(
+        _provider("openai_responses"),
+        "secret",
+        timeout_seconds=10,
+        idle_timeout_seconds=10,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ModelProviderRequestError) as raised:
+        await client.create_response(_payload())
+
+    message = str(raised.value)
+    assert "HTTP 400" in message
+    assert "Unsupported value" in message
+    assert "类型=invalid_request_error" in message
+    assert "代码=unsupported_value" in message
+    assert "参数=reasoning.effort" in message
+    assert "请求 ID=header-request-id" in message
+    assert "sk-test-secret-value" not in message
+
+
+async def test_external_http_error_with_plain_text_keeps_bounded_reason() -> None:
+    """非 JSON 错误正文也应保留有界脱敏文本。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="upstream unavailable\n" * 1000)
+
+    client = ExternalModelClient(
+        _provider("openai_responses"),
+        "secret",
+        timeout_seconds=10,
+        idle_timeout_seconds=10,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ModelProviderRequestError) as raised:
+        await client.create_response(_payload())
+
+    message = str(raised.value)
+    assert message.startswith("模型 Provider 请求失败（HTTP 502）：")
+    assert len(message) <= 2000
+
+
 @pytest.mark.parametrize(
     ("driver", "base_url", "expected_path", "response_document"),
     [
@@ -947,6 +1008,44 @@ def test_model_provider_web_api_masks_reveals_and_deletes(tmp_path) -> None:
         assert client.get(
             "/api/model-providers/external-openai/key"
         ).status_code == 404
+
+
+def test_model_provider_connection_test_does_not_force_reasoning_effort(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """连接测试不应为 GPT 模型强制发送可能不兼容的 minimal。"""
+
+    config_path = _write_provider_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model_providers"]["external-openai"]["default_model"] = "gpt-5.6-terra"
+    raw["model_providers"]["external-openai"]["model_reasoning_effort"] = "high"
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake_create_response(self, payload, *, event_callback=None):
+        captured.update(payload)
+        return {"output": [], "output_text": "hi"}
+
+    monkeypatch.setattr(ExternalModelClient, "create_response", fake_create_response)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        key_response = client.put(
+            "/api/model-providers/external-openai/key",
+            json={"api_key": "sk-connection-test"},
+        )
+        assert key_response.status_code == 200
+        response = client.post("/api/model-providers/external-openai/connection-test")
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert captured["model"] == "gpt-5.6-terra"
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
+    assert "reasoning" not in captured
 
 
 def test_model_provider_draft_discovery_does_not_save_key_or_provider(
