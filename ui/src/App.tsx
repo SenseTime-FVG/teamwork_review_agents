@@ -3161,12 +3161,16 @@ function ModelFallbackEditor(props: {
           return (
             <div className="model-fallback-row" key={`${props.idPrefix}-${index}`}>
               <span className="model-fallback-index">备用 {index + 1}</span>
-              <SelectControl
-                value={selection.provider}
-                onChange={(providerId) => update(index, { provider: providerId, model: undefined })}
-                options={providerOptions}
-                ariaLabel={`第 ${index + 1} 个回退 Provider`}
-              />
+              <div className="field model-fallback-provider-field">
+                <span id={`${props.idPrefix}-${index}-provider-label`}>Provider</span>
+                <SelectControl
+                  value={selection.provider}
+                  onChange={(providerId) => update(index, { provider: providerId, model: undefined })}
+                  options={providerOptions}
+                  ariaLabelledBy={`${props.idPrefix}-${index}-provider-label`}
+                  className="model-fallback-provider-select"
+                />
+              </div>
               <ModelField
                 id={`${props.idPrefix}-${index}`}
                 label="模型"
