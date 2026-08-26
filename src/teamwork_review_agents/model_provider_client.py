@@ -28,7 +28,18 @@ class ModelResponseClient(Protocol):
 
 
 class ModelProviderRequestError(RuntimeError):
-    """表示外部模型 Provider 请求失败。"""
+    """表示外部模型 Provider 请求失败，并保留可安全判断的状态信息。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        fallbackable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.fallbackable = fallbackable
 
 
 class ExternalModelClient:
@@ -283,11 +294,16 @@ class ExternalModelClient:
                 )
         except httpx.HTTPError as exc:
             raise ModelProviderRequestError(
-                f"模型 Provider 连接失败：{type(exc).__name__}"
+                f"模型 Provider 连接失败：{type(exc).__name__}",
+                fallbackable=True,
             ) from exc
         if response.status_code >= 400:
             raise ModelProviderRequestError(
-                f"模型 Provider 请求失败（HTTP {response.status_code}）"
+                f"模型 Provider 请求失败（HTTP {response.status_code}）",
+                status_code=response.status_code,
+                fallbackable=response.status_code
+                in {401, 402, 403, 404, 408, 409, 429}
+                or response.status_code >= 500,
             )
         try:
             document = response.json()

@@ -26,6 +26,87 @@ class ResolvedModelSelection:
     unresolved_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ResolvedModelPlan:
+    """一次 Agent 运行按优先级展开后的去重模型候选链。"""
+
+    selections: tuple[ResolvedModelSelection, ...]
+    primary: ResolvedModelSelection
+    agent_fallbacks: tuple[ResolvedModelSelection, ...]
+    global_default: ResolvedModelSelection
+    global_fallbacks: tuple[ResolvedModelSelection, ...]
+
+
+def _resolve_provider_selection(
+    config: AppConfig,
+    *,
+    provider_id: str,
+    configured_model: str | None,
+    source: str,
+    require_enabled: bool,
+) -> ResolvedModelSelection:
+    """解析一个显式 Provider/模型节点，不读取其他 Agent 的覆盖。"""
+
+    provider = config.model_providers.get(provider_id)
+    if provider is None:
+        raise ModelProviderUnavailableError(f"模型 Provider 不存在：{provider_id}")
+    if require_enabled and not provider.enabled:
+        raise ModelProviderUnavailableError(
+            f"模型 Provider 已停用：{provider.display_name}（{provider_id}）"
+        )
+
+    if configured_model:
+        model = configured_model
+        model_source = source
+    elif source == "global" and config.runtime.default_model.model:
+        model = config.runtime.default_model.model
+        model_source = "global"
+    elif provider.default_model:
+        model = provider.default_model
+        model_source = "provider"
+    elif provider.models:
+        model = provider.models[0]
+        model_source = "provider"
+    else:
+        model = None
+        model_source = "provider_default"
+
+    unresolved_reason: str | None = None
+    if model is None and provider.driver == "codex_cli":
+        runtime_model = config.runtime.codex.model
+        user_model, error, _ = read_user_model(codex_home(config.runtime.codex_home))
+        if runtime_model:
+            model = runtime_model
+            model_source = "runtime"
+        elif user_model:
+            model = user_model
+            model_source = "codex_user"
+        else:
+            unresolved_reason = error or "Codex 配置和账号目录未给出具体默认模型"
+    elif model is None:
+        unresolved_reason = "Provider 未配置默认模型"
+
+    concrete = model or f"暂未解析：{unresolved_reason}"
+    if source == "global":
+        label = f"继承全局默认（{provider.display_name} / {concrete}）"
+    elif source == "agent":
+        label = f"{provider.display_name} / {concrete}"
+    elif source == "agent_fallback":
+        label = f"Agent 回退（{provider.display_name} / {concrete}）"
+    elif source == "global_fallback":
+        label = f"全局回退（{provider.display_name} / {concrete}）"
+    else:
+        label = f"{provider.display_name} / Provider 默认模型（{concrete}）"
+    return ResolvedModelSelection(
+        provider_id=provider_id,
+        provider=provider,
+        model=model,
+        model_source=model_source,
+        resolved_label=label,
+        unresolved_reason=unresolved_reason,
+    )
+
+
 def resolve_model_selection(
     config: AppConfig,
     agent: AgentConfig,
@@ -36,58 +117,68 @@ def resolve_model_selection(
 
     explicit_provider = bool(agent.model_provider)
     provider_id = agent.model_provider or config.runtime.default_model.provider
-    provider = config.model_providers.get(provider_id)
-    if provider is None:
-        raise ModelProviderUnavailableError(f"模型 Provider 不存在：{provider_id}")
-    if require_enabled and not provider.enabled:
-        raise ModelProviderUnavailableError(
-            f"模型 Provider 已停用：{provider.display_name}（{provider_id}）"
-        )
-
-    if agent.model:
-        model = agent.model
-        source = "agent"
-    elif explicit_provider and provider.default_model:
-        model = provider.default_model
-        source = "provider"
-    elif not explicit_provider and config.runtime.default_model.model:
-        model = config.runtime.default_model.model
+    source = "agent" if agent.model else "provider"
+    if not explicit_provider and not agent.model:
         source = "global"
-    elif provider.default_model:
-        model = provider.default_model
-        source = "provider"
-    elif provider.models:
-        model = provider.models[0]
-        source = "provider"
-    else:
-        model = None
-        source = "provider_default"
-
-    unresolved_reason: str | None = None
-    if model is None and provider.driver == "codex_cli":
-        user_model, error, _ = read_user_model(codex_home(config.runtime.codex_home))
-        if user_model:
-            model = user_model
-            source = "codex_user"
-        else:
-            unresolved_reason = error or "Codex 配置和账号目录未给出具体默认模型"
-    elif model is None:
-        unresolved_reason = "Provider 未配置默认模型"
-
-    concrete = model or f"暂未解析：{unresolved_reason}"
-    if source == "agent":
-        label = f"{provider.display_name} / {concrete}"
-    elif explicit_provider:
-        label = f"{provider.display_name} / Provider 默认模型（{concrete}）"
-    else:
-        label = f"继承全局默认（{provider.display_name} / {concrete}）"
-    return ResolvedModelSelection(
+    return _resolve_provider_selection(
+        config,
         provider_id=provider_id,
-        provider=provider,
-        model=model,
-        model_source=source,
-        resolved_label=label,
-        unresolved_reason=unresolved_reason,
+        configured_model=agent.model,
+        source=source,
+        require_enabled=require_enabled,
+    )
+
+
+def resolve_model_plan(
+    config: AppConfig,
+    agent: AgentConfig,
+) -> ResolvedModelPlan:
+    """组合 Agent 与全局模型链，并按 Provider/模型身份去重。"""
+
+    primary = resolve_model_selection(config, agent, require_enabled=False)
+    agent_fallbacks = tuple(
+        _resolve_provider_selection(
+            config,
+            provider_id=item.provider,
+            configured_model=item.model,
+            source="agent_fallback",
+            require_enabled=False,
+        )
+        for item in (agent.model_fallbacks or [])
+    )
+    global_default = _resolve_provider_selection(
+        config,
+        provider_id=config.runtime.default_model.provider,
+        configured_model=config.runtime.default_model.model,
+        source="global",
+        require_enabled=False,
+    )
+    global_fallbacks = tuple(
+        _resolve_provider_selection(
+            config,
+            provider_id=item.provider,
+            configured_model=item.model,
+            source="global_fallback",
+            require_enabled=False,
+        )
+        for item in config.runtime.default_model_fallbacks
+    )
+
+    candidates: list[ResolvedModelSelection] = []
+    ordered = (primary,) + agent_fallbacks + (global_default,) + global_fallbacks
+    seen: set[tuple[str, str | None]] = set()
+    for selection in ordered:
+        identity = (selection.provider_id, selection.model)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append(selection)
+    return ResolvedModelPlan(
+        selections=tuple(candidates),
+        primary=primary,
+        agent_fallbacks=agent_fallbacks,
+        global_default=global_default,
+        global_fallbacks=global_fallbacks,
     )
 
 
@@ -119,7 +210,8 @@ def resolve_model_snapshot(
 ) -> dict[str, Any]:
     """生成包含 Provider 身份和最终具体模型的运行快照。"""
 
-    selection = resolve_model_selection(config, agent, require_enabled=False)
+    plan = resolve_model_plan(config, agent)
+    selection = plan.selections[0]
     effective_agent = effective_agent_config(config, agent, selection)
     provider = selection.provider
     inherited, _ = read_user_inherited_settings(codex_home(configured_home))
@@ -187,7 +279,7 @@ def resolve_model_snapshot(
         verbosity = None
         verbosity_source = "provider_default"
 
-    return {
+    snapshot = {
         "execution_mode": (
             config.runtime.codex.execution_mode
             if provider.driver == "codex_cli"
@@ -208,3 +300,19 @@ def resolve_model_snapshot(
         "verbosity": verbosity,
         "verbosity_source": verbosity_source,
     }
+    snapshot["fallback_plan"] = [
+        {
+            "provider_id": item.provider_id,
+            "provider_name": item.provider.display_name,
+            "provider_driver": item.provider.driver,
+            "provider_enabled": item.provider.enabled,
+            "model": item.model,
+            "model_source": item.model_source,
+            "resolved_label": item.resolved_label,
+            "unresolved_reason": item.unresolved_reason,
+        }
+        for item in plan.selections
+    ]
+    snapshot["fallback_attempts"] = []
+    snapshot["fallback_used"] = False
+    return snapshot

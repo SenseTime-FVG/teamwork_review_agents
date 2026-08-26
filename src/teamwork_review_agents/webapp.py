@@ -564,9 +564,16 @@ def create_app(
         referenced_agents: dict[str, list[str]] = {
             provider_id: [] for provider_id in config.model_providers
         }
+        global_fallback_providers = {
+            selection.provider
+            for selection in config.runtime.default_model_fallbacks
+        }
         for agent_name, agent in config.agents.items():
             if agent.model_provider in referenced_agents:
                 referenced_agents[agent.model_provider].append(agent_name)
+            for selection in agent.model_fallbacks or []:
+                if selection.provider in referenced_agents:
+                    referenced_agents[selection.provider].append(agent_name)
         providers: list[dict[str, Any]] = []
         for provider_id, provider in config.model_providers.items():
             is_external = provider.driver != "codex_cli"
@@ -586,10 +593,11 @@ def create_app(
                         if is_external
                         else None
                     ),
-                    "referenced_agents": sorted(referenced_agents[provider_id]),
+                    "referenced_agents": sorted(set(referenced_agents[provider_id])),
                     "is_global_default": (
                         config.runtime.default_model.provider == provider_id
                     ),
+                    "is_global_fallback": provider_id in global_fallback_providers,
                 }
             )
         return {

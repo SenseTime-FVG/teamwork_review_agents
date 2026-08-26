@@ -2583,6 +2583,36 @@ class StateStore:
                 ),
             )
 
+    def update_agent_run_model_snapshot(
+        self,
+        run_id: str,
+        model_snapshot: dict[str, Any],
+    ) -> None:
+        """在模型回退或成功后更新当前运行的模型快照。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT model_snapshot FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            existing: dict[str, Any] = {}
+            if row is not None and row["model_snapshot"]:
+                try:
+                    parsed = json.loads(row["model_snapshot"])
+                    if isinstance(parsed, dict):
+                        existing = parsed
+                except (TypeError, json.JSONDecodeError):
+                    existing = {}
+            merged = {**existing, **model_snapshot}
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET model_snapshot = ?
+                WHERE run_id = ?
+                """,
+                (json.dumps(merged, ensure_ascii=False), run_id),
+            )
+
     def update_agent_run_workspace(
         self,
         run_id: str,

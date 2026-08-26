@@ -46,9 +46,16 @@ class CodexOAuthError(CodexModelError):
 class CodexUpstreamError(CodexModelError):
     """表示 Codex 上游响应失败或协议不完整。"""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        fallbackable: bool | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.fallbackable = fallbackable
 
 
 @dataclass(frozen=True)
@@ -299,7 +306,8 @@ class CodexResponsesClient:
                             _format_upstream_error(
                                 event_type=event_type,
                                 payload=event,
-                            )
+                            ),
+                            fallbackable=_upstream_error_fallbackable(event),
                         )
                 if response is None:
                     raise CodexUpstreamError("Codex SSE 在 completed 事件前结束")
@@ -365,6 +373,9 @@ class CodexResponsesClient:
                                     status_code=response.status_code,
                                 ),
                                 status_code=response.status_code,
+                                fallbackable=response.status_code
+                                in {401, 402, 403, 404, 408, 409, 429}
+                                or response.status_code >= 500,
                             )
                         content_type = response.headers.get("content-type", "")
                         if "text/event-stream" not in content_type:
@@ -380,13 +391,18 @@ class CodexResponsesClient:
                                 document = json.loads(body)
                             except json.JSONDecodeError as exc:
                                 raise CodexUpstreamError(
-                                    "Codex 上游返回了非 SSE 且非 JSON 的响应"
+                                    "Codex 上游返回了非 SSE 且非 JSON 的响应",
+                                    fallbackable=False,
                                 ) from exc
                             if not isinstance(document, dict):
-                                raise CodexUpstreamError("Codex 上游 JSON 响应格式无效")
+                                raise CodexUpstreamError(
+                                    "Codex 上游 JSON 响应格式无效",
+                                    fallbackable=False,
+                                )
                             if _contains_upstream_error(document):
                                 raise CodexUpstreamError(
-                                    _format_upstream_error(payload=document)
+                                    _format_upstream_error(payload=document),
+                                    fallbackable=_upstream_error_fallbackable(document),
                                 )
                             yield {"type": "response.completed", "response": document}
                             return
@@ -410,7 +426,8 @@ class CodexResponsesClient:
                         return
             except httpx.HTTPError as exc:
                 raise CodexUpstreamError(
-                    f"Codex 上游连接失败：{type(exc).__name__}"
+                    f"Codex 上游连接失败：{type(exc).__name__}",
+                    fallbackable=True,
                 ) from exc
 
 
@@ -550,6 +567,29 @@ def _format_upstream_error(
     suffix = f"（{'，'.join(item for item in details if item)}）" if any(details) else ""
     text = f"{prefix}：{message}{suffix}"
     return _sanitize_upstream_text(text, limit=_UPSTREAM_ERROR_MAX_CHARS)
+
+
+def _upstream_error_fallbackable(payload: Any) -> bool:
+    """区分模型服务不可用与请求内容本身无效的上游错误。"""
+
+    fields = _extract_upstream_error_fields(payload)
+    markers = " ".join(
+        fields.get(name, "")
+        for name in ("type", "code", "message")
+    ).lower()
+    non_fallbackable_markers = (
+        "invalid_request",
+        "invalid prompt",
+        "context_length",
+        "context window",
+        "unsupported parameter",
+        "tool schema",
+        "validation_error",
+        "malformed",
+    )
+    if any(marker in markers for marker in non_fallbackable_markers):
+        return False
+    return True
 
 
 def _extract_upstream_error_fields(payload: Any) -> dict[str, str]:
