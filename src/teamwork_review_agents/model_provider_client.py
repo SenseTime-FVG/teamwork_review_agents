@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Protocol
@@ -14,6 +15,34 @@ from .config import ModelProviderConfig
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+_PROVIDER_ERROR_MAX_CHARS = 2000
+_PROVIDER_ERROR_FIELD_MAX_CHARS = 500
+_PROVIDER_ERROR_FIELD_ALIASES = {
+    "message": "message",
+    "detail": "message",
+    "error_description": "message",
+    "reason": "message",
+    "failure_reason": "message",
+    "type": "type",
+    "error_type": "type",
+    "code": "code",
+    "error_code": "code",
+    "param": "param",
+    "parameter": "param",
+    "request_id": "request_id",
+    "requestid": "request_id",
+    "x_request_id": "request_id",
+}
+_PROVIDER_ERROR_NESTED_KEYS = {
+    "error",
+    "errors",
+    "response",
+    "details",
+    "status_details",
+    "data",
+}
 
 
 class ModelResponseClient(Protocol):
@@ -299,7 +328,7 @@ class ExternalModelClient:
             ) from exc
         if response.status_code >= 400:
             raise ModelProviderRequestError(
-                f"模型 Provider 请求失败（HTTP {response.status_code}）",
+                _format_provider_http_error(response),
                 status_code=response.status_code,
                 fallbackable=response.status_code
                 in {401, 402, 403, 404, 408, 409, 429}
@@ -372,7 +401,9 @@ async def discover_model_catalog(
             f"模型目录连接失败：{type(exc).__name__}"
         ) from exc
     if response.status_code >= 400:
-        raise ModelProviderRequestError(f"模型目录请求失败（HTTP {response.status_code}）")
+        raise ModelProviderRequestError(
+            _format_provider_http_error(response, prefix="模型目录请求失败")
+        )
     try:
         document = response.json()
     except ValueError as exc:
@@ -402,6 +433,131 @@ async def _emit_normalized_events(
         if isinstance(item, dict):
             await callback({"type": "response.output_item.done", "item": item})
     await callback({"type": "response.completed", "response": response})
+
+
+def _format_provider_http_error(
+    response: httpx.Response,
+    *,
+    prefix: str = "模型 Provider 请求失败",
+) -> str:
+    """从外部 Provider 错误响应中提取有界且脱敏的真实原因。"""
+
+    fields = _extract_provider_error_fields(_decode_provider_error_body(response.content))
+    for header in ("x-request-id", "request-id"):
+        if "request_id" not in fields:
+            request_id = _sanitize_provider_error_text(
+                response.headers.get(header),
+                limit=_PROVIDER_ERROR_FIELD_MAX_CHARS,
+            )
+            if request_id:
+                fields["request_id"] = request_id
+    result = f"{prefix}（HTTP {response.status_code}）"
+    if not fields:
+        return result
+    message = fields.get("message") or "上游未提供具体错误消息"
+    details = [
+        f"类型={fields['type']}" if fields.get("type") else "",
+        f"代码={fields['code']}" if fields.get("code") else "",
+        f"参数={fields['param']}" if fields.get("param") else "",
+        f"请求 ID={fields['request_id']}" if fields.get("request_id") else "",
+    ]
+    suffix = f"（{'，'.join(item for item in details if item)}）" if any(details) else ""
+    return _sanitize_provider_error_text(
+        f"{result}：{message}{suffix}",
+        limit=_PROVIDER_ERROR_MAX_CHARS,
+    )
+
+
+def _decode_provider_error_body(body: bytes) -> Any:
+    """解析错误正文；无法解析时仅保留文本供有界脱敏。"""
+
+    text = body.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _extract_provider_error_fields(payload: Any) -> dict[str, str]:
+    """只读取外部 Provider 错误中的白名单字段。"""
+
+    fields: dict[str, str] = {}
+    queue: list[Any] = [payload]
+    visited: set[int] = set()
+    inspected = 0
+    while queue and inspected < 32:
+        candidate = queue.pop(0)
+        inspected += 1
+        if isinstance(candidate, str):
+            if "message" not in fields:
+                message = _sanitize_provider_error_text(
+                    candidate,
+                    limit=_PROVIDER_ERROR_FIELD_MAX_CHARS,
+                )
+                if message:
+                    fields["message"] = message
+            continue
+        if not isinstance(candidate, (dict, list)):
+            continue
+        identity = id(candidate)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(candidate, list):
+            queue.extend(candidate[:8])
+            continue
+        for key, value in candidate.items():
+            normalized = str(key).lower().replace("-", "_").replace(" ", "_")
+            field = _PROVIDER_ERROR_FIELD_ALIASES.get(normalized)
+            if field and field not in fields:
+                text = _sanitize_provider_error_text(
+                    value,
+                    limit=_PROVIDER_ERROR_FIELD_MAX_CHARS,
+                )
+                if text:
+                    fields[field] = text
+            if normalized in _PROVIDER_ERROR_NESTED_KEYS:
+                queue.append(value)
+    return fields
+
+
+def _sanitize_provider_error_text(value: Any, *, limit: int) -> str:
+    """清理控制字符、常见凭据格式并限制外部错误文本长度。"""
+
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"(?i)\bBearer\s+[^\s,;，；（）()]+",
+        "Bearer [已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}",
+        "[已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|authorization)"
+        r"\s*[:=]\s*[^\s,;，；（）()]+",
+        r"\1=[已脱敏]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|token|access_token|refresh_token)=)[^&#\s]+",
+        r"\1[已脱敏]",
+        text,
+    )
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
 
 
 def _api_url(provider: ModelProviderConfig, path: str) -> str:
