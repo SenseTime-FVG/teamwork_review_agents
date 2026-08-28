@@ -7977,7 +7977,17 @@ function PreflightRunDetailDrawer(props: {
           <div>
             <span className="eyebrow">{runId}</span>
             <h2>本地 Preflight / CI</h2>
-            {detail && <p>{detail.repository_id} · {detail.number ? `#${detail.number}` : detail.branch ?? "默认分支"} · {detail.trigger_source === "manual" ? "手动执行" : detail.event_type ?? "事件检查"}</p>}
+            {detail && (
+              <p>
+                {detail.repository_id} · {detail.number ? (
+                  <ChangeRequestNumberLink
+                    repositoryId={detail.repository_id}
+                    number={detail.number}
+                    url={detail.change_request_url}
+                  />
+                ) : detail.branch ?? "默认分支"} · {detail.trigger_source === "manual" ? "手动执行" : detail.event_type ?? "事件检查"}
+              </p>
+            )}
           </div>
           <div className="run-drawer-actions">
             {detail && <span className={`status-pill status-${preflightStatusClass(detail.status)}`}>{preflightStatusLabel(detail.status)}</span>}
@@ -8136,6 +8146,45 @@ function runTargetText(run: RunSummary): string {
   return run.resource_key;
 }
 
+function ChangeRequestNumberLink(props: {
+  repositoryId?: string | null;
+  number: number;
+  url?: string | null;
+}) {
+  const { repositoryId, number, url } = props;
+  if (!url) return <>#{number}</>;
+  return (
+    <a
+      className="event-change-request-link"
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`打开 ${repositoryId ?? "变更请求"} #${number}`}
+    >
+      #{number}
+    </a>
+  );
+}
+
+function RunTargetLabel({ run }: { run: RunSummary }) {
+  if (
+    run.repository_id
+    && run.change_request_number !== undefined
+    && run.change_request_number !== null
+  ) {
+    return (
+      <>
+        {run.repository_id} · <ChangeRequestNumberLink
+          repositoryId={run.repository_id}
+          number={run.change_request_number}
+          url={run.change_request_url}
+        />
+      </>
+    );
+  }
+  return <>{run.resource_key}</>;
+}
+
 function AgentRunDetailDrawer(props: {
   initialRunId: string;
   depth?: number;
@@ -8272,7 +8321,7 @@ function AgentRunDetailDrawer(props: {
               <div>
                 <span className="eyebrow">{detail?.run_id ?? selectedId}</span>
                 <h2>{detail?.agent_name ?? "正在加载…"}</h2>
-                {detail && <p>{runTargetText(detail)} · {detail.rule_name ?? "Sub-agent 调用"}</p>}
+                {detail && <p><RunTargetLabel run={detail} /> · {detail.rule_name ?? "Sub-agent 调用"}</p>}
               </div>
               <div className="run-drawer-actions">
                 {detail && (["queued", "preparing", "running"].includes(detail.status)) && (
