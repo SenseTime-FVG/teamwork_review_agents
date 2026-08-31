@@ -118,7 +118,10 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
     assert "security-review, style-review" in general
     assert "docs/design" in general
     assert "docs/changes" in general
-    assert "不得通过 Bash、`env`、`printenv`" in general
+    assert "Teamwork" not in general
+    assert "REVIEW_SKILLS" not in general
+    assert "REVIEW_DESIGN_DOC_DIR" not in general
+    assert "REVIEW_CHANGE_HISTORY_DIR" not in general
 
     runner_template = (PROJECT_ROOT / "prompts/增量文档更新入口.md").read_text(
         encoding="utf-8"
@@ -128,7 +131,7 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
         {"INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater"},
     )
     assert "<文档更新 Agent 名称>\nincremental-doc-updater\n</文档更新 Agent 名称>" in runner
-    assert "必须显式读取环境变量" not in runner
+    assert "INCREMENTAL_DOC_UPDATE_AGENT_NAME" not in runner
 
     updater_template = (PROJECT_ROOT / "prompts/增量文档更新.md").read_text(
         encoding="utf-8"
@@ -147,6 +150,9 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
     assert "${DOC_UPDATE_REPOSITORY_ROOT}" not in updater
     assert "${DOC_UPDATE_EXCLUDE_DIRECTORIES}" not in updater
     assert "${DOC_UPDATE_INDEX_PATH}" not in updater
+    assert "DOC_UPDATE_REPOSITORY_ROOT" not in updater
+    assert "DOC_UPDATE_EXCLUDE_DIRECTORIES" not in updater
+    assert "DOC_UPDATE_INDEX_PATH" not in updater
 
 
 def test_builtin_prompt_environment_values_default_to_empty() -> None:
