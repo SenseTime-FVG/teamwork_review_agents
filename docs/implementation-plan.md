@@ -1300,6 +1300,7 @@
 
 - 将 `general-review.md` 中要求模型通过第一次工具操作读取 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR` 的旧契约改为直接使用 `{{ REVIEW_* }}` 渲染值；保留空值自动发现、无效目录阻止合并和 Skill 加载校验，但删除 Bash/`env`/`printenv` 读取要求。
 - 将 `增量文档更新入口.md` 中的 `INCREMENTAL_DOC_UPDATE_AGENT_NAME` 改为渲染后的只读配置，将 `增量文档更新.md` 中的 `DOC_UPDATE_REPOSITORY_ROOT`、`DOC_UPDATE_EXCLUDE_DIRECTORIES` 和 `DOC_UPDATE_INDEX_PATH` 改为 Jinja 原生变量；同步移除“仍是 `${...}` 占位符”的判断，改为空值 fallback，保持仓库路径、排除目录和索引路径安全校验。
+- 整理三份 Prompt 的展示层，只保留“审核 Skill”“设计文档目录”“文档更新 Agent 名称”等业务字段和对应规则，不在模型上下文中重复配置键名或描述模板、注入和进程读取实现。
 - 明确 `MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA`、`DOC_TASK_START_SHA` 及分支名仍来自父 Agent 任务消息的结构化输入，不误改为环境变量模板；Provider Token、API Key 和其他 Secret 继续不进入 Prompt。
 - 在配置示例和 Prompt 渲染测试中覆盖配置变量的直接注入、缺失值 fallback、变量内容不二次执行、旧 Bash 读取要求移除以及三份内置 Prompt 的渲染占位符；不修改本地忽略配置和运行数据。
 - 执行 Prompt/配置定向测试、Python 全量测试、编译、`git diff --check`，不启动、停止或重启用户服务；验证通过后自动提交并推送当前分支。

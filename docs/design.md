@@ -1067,6 +1067,6 @@ README 仅增加面向用户的流程、配置提示和排障入口，具体实�
 
 内置 Prompt 中属于 Agent 环境配置的变量统一在 Teamwork 组装 Prompt 时通过 Jinja 原生语法 `{{ VARIABLE_NAME }}` 注入。模型收到的 Prompt 已包含本轮解析后的文本，不再通过 Bash、`printenv`、`env` 或其他命令再次读取同一环境变量，也不再要求把变量读取作为第一次工具操作。环境变量仍按全局、仓库、Agent 和系统运行变量的既有优先级解析；只有配置为 `expose_to_prompt` 的非 Provider 变量进入模板上下文，Provider Token、API Key 和其他 Secret 继续禁止渲染。
 
-通用审核 Prompt 直接渲染 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR`，在模型侧只对已经渲染的值执行空值、路径和内容校验。文档更新入口直接渲染 `INCREMENTAL_DOC_UPDATE_AGENT_NAME`，模型只校验该值并按其调用白名单中的 sub-agent。文档更新子 Agent 直接渲染 `DOC_UPDATE_REPOSITORY_ROOT`、`DOC_UPDATE_EXCLUDE_DIRECTORIES` 和 `DOC_UPDATE_INDEX_PATH`；空值 fallback、仓库内路径校验、默认排除目录和默认索引路径保持不变。
+通用审核 Prompt 直接渲染 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR`，在模型侧只对审核 Skill、设计文档目录和历史变更目录执行空值、路径和内容校验。文档更新入口直接提供文档更新 Agent 名称，模型只校验该名称并按其调用白名单中的 sub-agent。文档更新子 Agent 直接提供仓库根目录、排除目录和文档索引路径；空值 fallback、仓库内路径校验、默认排除目录和默认索引路径保持不变。三份 Prompt 只展示这些业务字段，不向模型说明环境变量名、模板引擎或注入过程。
 
 Prompt 中由父 Agent 任务消息传入的 `MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA`、`DOC_TASK_START_SHA`、分支名等结构化边界不属于环境变量，继续按任务输入协议解析，不通过模板变量替代。环境变量值只参与一次渲染，值中的 Jinja 片段不得二次执行；缺失变量继续渲染为空字符串，具体 Prompt 按既有安全规则决定 fallback 或提前结束。运行记录保存脱敏后的渲染 Prompt，不能记录 Provider 凭据或未授权环境变量。

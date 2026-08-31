@@ -1092,6 +1092,8 @@ def test_incremental_document_prompts_support_github_and_gitlab() -> None:
     assert "{{ DOC_UPDATE_REPOSITORY_ROOT }}" in updater_prompt
     assert "{{ DOC_UPDATE_EXCLUDE_DIRECTORIES }}" in updater_prompt
     assert "{{ DOC_UPDATE_INDEX_PATH }}" in updater_prompt
+    assert "由 Teamwork 预先渲染" not in runner_prompt
+    assert "由 Teamwork 预先渲染" not in updater_prompt
     assert "必须显式读取环境变量" not in runner_prompt
     assert "仍然是 `${DOC_UPDATE_REPOSITORY_ROOT}`" not in updater_prompt
 
