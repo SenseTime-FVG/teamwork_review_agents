@@ -1295,3 +1295,13 @@
 - 不修改详情接口、数据库和抽屉层级行为；重新生成前端静态资源，执行前端生产构建和补丁检查，不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
 
 验收：从事件详情分别进入 CI 和 Agent 二级详情后，标题中的编号都能直接打开正确的 GitHub PR 或 GitLab MR；手动 CI、非 PR / MR 运行和缺少历史地址的记录仍能正常展示且不会生成无效链接，事件详情原有链接和抽屉关闭行为不回归。
+
+## 阶段一百一十七：内置 Prompt 环境变量渲染
+
+- 将 `general-review.md` 中要求模型通过第一次工具操作读取 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR` 的旧契约改为直接使用 `{{ REVIEW_* }}` 渲染值；保留空值自动发现、无效目录阻止合并和 Skill 加载校验，但删除 Bash/`env`/`printenv` 读取要求。
+- 将 `增量文档更新入口.md` 中的 `INCREMENTAL_DOC_UPDATE_AGENT_NAME` 改为渲染后的只读配置，将 `增量文档更新.md` 中的 `DOC_UPDATE_REPOSITORY_ROOT`、`DOC_UPDATE_EXCLUDE_DIRECTORIES` 和 `DOC_UPDATE_INDEX_PATH` 改为 Jinja 原生变量；同步移除“仍是 `${...}` 占位符”的判断，改为空值 fallback，保持仓库路径、排除目录和索引路径安全校验。
+- 明确 `MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA`、`DOC_TASK_START_SHA` 及分支名仍来自父 Agent 任务消息的结构化输入，不误改为环境变量模板；Provider Token、API Key 和其他 Secret 继续不进入 Prompt。
+- 在配置示例和 Prompt 渲染测试中覆盖配置变量的直接注入、缺失值 fallback、变量内容不二次执行、旧 Bash 读取要求移除以及三份内置 Prompt 的渲染占位符；不修改本地忽略配置和运行数据。
+- 执行 Prompt/配置定向测试、Python 全量测试、编译、`git diff --check`，不启动、停止或重启用户服务；验证通过后自动提交并推送当前分支。
+
+验收：模型收到的三份内置 Prompt 已包含配置环境变量的渲染结果，不需要调用 Bash 读取这些变量；缺失值仍按各 Prompt 的既有安全 fallback 或提前结束规则处理；任务消息中的固定 SHA 和分支边界解析不受影响，Secret 不出现在渲染 Prompt、运行快照或日志中。

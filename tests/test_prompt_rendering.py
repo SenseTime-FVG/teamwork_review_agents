@@ -99,6 +99,69 @@ def test_general_review_renders_exclusive_final_policy() -> None:
         assert "本轮操作模式：审核并自动合并" not in rendered
 
 
+def test_builtin_prompts_render_configured_environment_values_directly() -> None:
+    """内置 Prompt 应直接显示已暴露配置，不要求模型通过 Shell 读取。"""
+
+    general_template = (PROJECT_ROOT / "prompts" / "general-review.md").read_text(
+        encoding="utf-8"
+    )
+    general = render_prompt(
+        general_template,
+        {
+            "REVIEW_AUTO_MERGE": "false",
+            "REVIEW_SKILLS": "security-review, style-review",
+            "REVIEW_DESIGN_DOC_DIR": "docs/design",
+            "REVIEW_CHANGE_HISTORY_DIR": "docs/changes",
+        },
+    )
+
+    assert "security-review, style-review" in general
+    assert "docs/design" in general
+    assert "docs/changes" in general
+    assert "不得通过 Bash、`env`、`printenv`" in general
+
+    runner_template = (PROJECT_ROOT / "prompts/增量文档更新入口.md").read_text(
+        encoding="utf-8"
+    )
+    runner = render_prompt(
+        runner_template,
+        {"INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater"},
+    )
+    assert "<文档更新 Agent 名称>\nincremental-doc-updater\n</文档更新 Agent 名称>" in runner
+    assert "必须显式读取环境变量" not in runner
+
+    updater_template = (PROJECT_ROOT / "prompts/增量文档更新.md").read_text(
+        encoding="utf-8"
+    )
+    updater = render_prompt(
+        updater_template,
+        {
+            "DOC_UPDATE_REPOSITORY_ROOT": "/workspace/project",
+            "DOC_UPDATE_EXCLUDE_DIRECTORIES": ".cache, generated",
+            "DOC_UPDATE_INDEX_PATH": "docs/index.md",
+        },
+    )
+    assert "/workspace/project" in updater
+    assert ".cache, generated" in updater
+    assert "docs/index.md" in updater
+    assert "${DOC_UPDATE_REPOSITORY_ROOT}" not in updater
+    assert "${DOC_UPDATE_EXCLUDE_DIRECTORIES}" not in updater
+    assert "${DOC_UPDATE_INDEX_PATH}" not in updater
+
+
+def test_builtin_prompt_environment_values_default_to_empty() -> None:
+    """未配置的环境变量应渲染为空，并交由 Prompt 的默认规则处理。"""
+
+    updater_template = (PROJECT_ROOT / "prompts/增量文档更新.md").read_text(
+        encoding="utf-8"
+    )
+    updater = render_prompt(updater_template, {})
+
+    assert "<仓库根目录>\n\n</仓库根目录>" in updater
+    assert "<排除目录>\n\n</排除目录>" in updater
+    assert "<文档索引路径>\n\n</文档索引路径>" in updater
+
+
 def test_prompt_preview_uses_same_jinja_renderer(tmp_path) -> None:
     """管理 API 预览必须与 Agent 执行复用同一渲染规则。"""
 

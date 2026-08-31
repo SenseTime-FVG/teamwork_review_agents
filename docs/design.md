@@ -265,7 +265,7 @@ Agent 运行使用独立状态。运行记录创建后先为 `queued`，表示�
 
 ## 25. 设计、历史变更与目标分支一致性审核
 
-通用审核 Prompt 增加 `REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR` 两个单目录环境变量。它们与 `REVIEW_SKILLS` 在第一次工具操作中同时读取。非空值必须解析为当前仓库内可读的单个目录，错误配置阻止合并且不回退自动扫描；空值则在排除依赖、缓存、构建、临时和第三方目录后，扫描仓库中的设计、架构、ADR、spec、change 与历史归档目录。未找到相关目录只记录审核来源缺失，不自动阻塞。
+通用审核 Prompt 增加 `REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR` 两个单目录环境变量。它们与 `REVIEW_SKILLS` 在模型启动前直接渲染到 Prompt，再由模型对已渲染值执行校验。非空值必须解析为当前仓库内可读的单个目录，错误配置阻止合并且不回退自动扫描；空值则在排除依赖、缓存、构建、临时和第三方目录后，扫描仓库中的设计、架构、ADR、spec、change 与历史归档目录。未找到相关目录只记录审核来源缺失，不自动阻塞。
 
 审核者优先从本次 diff 中的设计文档识别当前功能意图，并与代码、测试、配置和对外契约交叉验证；随后扫描已定位目录的全部文件名和可检索内容，完整读取与功能、模块、接口、配置、数据模型、路由和状态相关的文档及其必要引用。只有能同时给出本次变更证据、既有设计或历史 change 位置，并证明两者无法同时成立的未解决矛盾，才构成一致性冲突；已明确替代旧设计并具有文档、兼容、迁移、回滚和测试证据的正常演进不属于未解决冲突。
 
@@ -1062,3 +1062,11 @@ README 仅增加面向用户的流程、配置提示和排障入口，具体实�
 从事件详情继续打开本地 Preflight / CI 或 Agent 运行详情时，二级抽屉标题中的变更请求编号应继续保留平台跳转能力，不能因为详情层级加深而退化为不可点击文本。两个详情接口已经返回对应的 `change_request_url`，前端直接使用该地址，不新增接口字段、存储结构或数据库迁移。
 
 标题区只把 `#编号` 渲染为链接，仓库名称、事件类型、规则名称、分支回退文本以及抽屉层级交互保持不变。链接在新标签页打开，并使用 `noopener` / `noreferrer` 隔离外部页面；复用事件详情现有的链接颜色、下划线、键盘焦点和手指光标反馈。手动 CI、非变更请求 Agent 运行、历史记录缺少编号或平台地址时继续显示原有普通文本，不能根据仓库或 Provider 猜测 URL。
+
+## 117. 内置 Prompt 环境变量渲染
+
+内置 Prompt 中属于 Agent 环境配置的变量统一在 Teamwork 组装 Prompt 时通过 Jinja 原生语法 `{{ VARIABLE_NAME }}` 注入。模型收到的 Prompt 已包含本轮解析后的文本，不再通过 Bash、`printenv`、`env` 或其他命令再次读取同一环境变量，也不再要求把变量读取作为第一次工具操作。环境变量仍按全局、仓库、Agent 和系统运行变量的既有优先级解析；只有配置为 `expose_to_prompt` 的非 Provider 变量进入模板上下文，Provider Token、API Key 和其他 Secret 继续禁止渲染。
+
+通用审核 Prompt 直接渲染 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR`，在模型侧只对已经渲染的值执行空值、路径和内容校验。文档更新入口直接渲染 `INCREMENTAL_DOC_UPDATE_AGENT_NAME`，模型只校验该值并按其调用白名单中的 sub-agent。文档更新子 Agent 直接渲染 `DOC_UPDATE_REPOSITORY_ROOT`、`DOC_UPDATE_EXCLUDE_DIRECTORIES` 和 `DOC_UPDATE_INDEX_PATH`；空值 fallback、仓库内路径校验、默认排除目录和默认索引路径保持不变。
+
+Prompt 中由父 Agent 任务消息传入的 `MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA`、`DOC_TASK_START_SHA`、分支名等结构化边界不属于环境变量，继续按任务输入协议解析，不通过模板变量替代。环境变量值只参与一次渲染，值中的 Jinja 片段不得二次执行；缺失变量继续渲染为空字符串，具体 Prompt 按既有安全规则决定 fallback 或提前结束。运行记录保存脱敏后的渲染 Prompt，不能记录 Provider 凭据或未授权环境变量。
