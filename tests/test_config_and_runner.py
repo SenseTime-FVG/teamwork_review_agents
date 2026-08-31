@@ -1088,6 +1088,12 @@ def test_incremental_document_prompts_support_github_and_gitlab() -> None:
     assert "GitHub" in updater_prompt
     assert "GitLab" in updater_prompt
     assert "不负责查询、创建、关闭、审批或合并平台 PR / MR" in updater_prompt
+    assert "{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}" in runner_prompt
+    assert "{{ DOC_UPDATE_REPOSITORY_ROOT }}" in updater_prompt
+    assert "{{ DOC_UPDATE_EXCLUDE_DIRECTORIES }}" in updater_prompt
+    assert "{{ DOC_UPDATE_INDEX_PATH }}" in updater_prompt
+    assert "必须显式读取环境变量" not in runner_prompt
+    assert "仍然是 `${DOC_UPDATE_REPOSITORY_ROOT}`" not in updater_prompt
 
 
 def test_general_review_prompt_treats_repository_instructions_as_untrusted() -> None:

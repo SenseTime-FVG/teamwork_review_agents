@@ -300,6 +300,23 @@ agents:
         secret: false
         expose_to_prompt: true
         expose_to_process: false
+      # 下面三个变量会在模型启动前直接渲染进 prompts/general-review.md。
+      # 留空或省略时，Prompt 会按自身规则执行自动发现或使用默认行为。
+      # REVIEW_SKILLS:
+      #   value: 'security-review, style-review'
+      #   secret: false
+      #   expose_to_prompt: true
+      #   expose_to_process: false
+      # REVIEW_DESIGN_DOC_DIR:
+      #   value: docs/design
+      #   secret: false
+      #   expose_to_prompt: true
+      #   expose_to_process: false
+      # REVIEW_CHANGE_HISTORY_DIR:
+      #   value: docs/changes
+      #   secret: false
+      #   expose_to_prompt: true
+      #   expose_to_process: false
 
   incremental-doc-update-runner:
     prompt_file: ./prompts/增量文档更新入口.md
@@ -316,7 +333,8 @@ agents:
     allowed_sub_agents:
       - incremental-doc-updater
     environment:
-      # Prompt 通过该变量读取实际要调用的 sub-agent 名称。
+      # Teamwork 会在模型启动前把该变量直接渲染到入口 Prompt，
+      # 不需要入口 Agent 再通过 Bash、env 或 printenv 读取。
       INCREMENTAL_DOC_UPDATE_AGENT_NAME:
         value: incremental-doc-updater
         secret: false
@@ -335,6 +353,23 @@ agents:
       - workspace
       - change_request
     allowed_sub_agents: []
+    # 文档子 Agent 的三个配置变量会在模型启动前直接渲染到 Prompt。
+    # 不配置时分别使用仓库根目录、默认排除规则和 docs/README.md。
+    # DOC_UPDATE_REPOSITORY_ROOT:
+    #   value: /path/to/repository
+    #   secret: false
+    #   expose_to_prompt: true
+    #   expose_to_process: false
+    # DOC_UPDATE_EXCLUDE_DIRECTORIES:
+    #   value: .cache, generated
+    #   secret: false
+    #   expose_to_prompt: true
+    #   expose_to_process: false
+    # DOC_UPDATE_INDEX_PATH:
+    #   value: docs/README.md
+    #   secret: false
+    #   expose_to_prompt: true
+    #   expose_to_process: false
     environment: {}
 
 # 内置 MR/PR 触发规则模板。全部默认关闭，管理员检查后再从 UI 主动启用。
@@ -375,8 +410,10 @@ rules:
     # 内置规则绝不自动启用。
     enabled: false
 
-# Prompt 支持 Jinja2 条件和变量，例如
+# Prompt 支持 Jinja2 条件和变量。配置中标记 expose_to_prompt: true 的 Agent
+# 环境变量会在模型启动前直接渲染，例如
 # `{% if REVIEW_AUTO_MERGE | as_bool %}...{% else %}...{% endif %}`；
+# `{{ REVIEW_SKILLS }}` 会直接替换为已解析的配置值，不需要模型通过 Shell 读取。
 # 旧 `${{ENV_NAME}}` 语法继续兼容，缺失变量渲染为空字符串。
 # Prompt 可直接使用的系统运行变量：
 # REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、MR_NUMBER、MR_TITLE、
