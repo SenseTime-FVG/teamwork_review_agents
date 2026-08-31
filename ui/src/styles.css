@@ -385,7 +385,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .toggle:disabled { cursor: not-allowed; opacity: .55; }
 
 .env-list { display: flex; flex-direction: column; gap: 7px; }
-.env-row { display: grid; grid-template-columns: minmax(130px, 1.1fr) 102px minmax(170px, 1.6fr) auto auto auto 31px; align-items: center; gap: 7px; }
+.env-row { display: grid; grid-template-columns: minmax(130px, 1.1fr) 140px minmax(170px, 1.6fr) auto auto auto 31px; align-items: center; gap: 7px; }
 .env-row input, .env-row .select-combobox-trigger { padding: 8px 9px; font-size: 11px; }
 .env-row .select-combobox { width: 100%; }
 .env-name-cell { min-width: 0; }
@@ -862,7 +862,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .run-table-head, .run-row { grid-template-columns: minmax(150px, 1fr) minmax(210px, 1.25fr) 100px 150px 75px 15px; }
   .run-table-head > span:nth-child(3), .run-source-cell { display: none; }
-  .env-row { grid-template-columns: 1fr 100px 1.4fr auto auto auto 31px; }
+  .env-row { grid-template-columns: 1fr 130px 1.4fr auto auto auto 31px; }
   .agent-config-table-head, .agent-config-row { grid-template-columns: minmax(190px, 1.25fr) minmax(160px, 1fr) minmax(100px, .65fr) minmax(95px, .65fr) 68px 18px; }
   .agent-config-table-head > span:nth-child(6), .agent-config-row > span:nth-child(6) { display: none; }
   .rule-config-table-head, .rule-config-row { grid-template-columns: minmax(180px, 1.2fr) 104px minmax(140px, .95fr) minmax(115px, .8fr) minmax(115px, .8fr) 18px; }
@@ -989,7 +989,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .prompt-file-actions .select-combobox, .prompt-file-actions .button { width: 100%; }
   .history-layout { grid-template-columns: 1fr; }
   .multi-choice-list { grid-template-columns: 1fr; }
-  .env-row { grid-template-columns: 1fr 90px 1.3fr 31px; }
+  .env-row { grid-template-columns: 1fr 120px 1.3fr 31px; }
   .env-row .mini-check { display: none; }
   .prompt-toolbar { align-items: flex-start; flex-direction: column; gap: 8px; }
   .runs-list { min-height: auto; }
