@@ -336,12 +336,12 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
 function createEmptyAgent(): Agent {
   return {
     prompt: "请处理当前 MR / PR。",
-    sandbox: "read-only",
+    sandbox: "workspace-write",
     home_mode: "inherit",
-    network_access: false,
+    network_access: true,
     network_domains: [],
     timeout_seconds: 1200,
-    write_scopes: [],
+    write_scopes: ["change_request", "workspace"],
     managed_comment: false,
     managed_comment_model_signature: false,
     allowed_sub_agents: [],
