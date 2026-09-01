@@ -529,12 +529,12 @@ async def test_unmatched_event_settles_while_same_batch_agent_is_running(
     assert summary.processed_events == 2
 
 
-async def test_deduplicated_run_is_linked_to_every_matching_event(
+async def test_deduplicated_run_only_triggers_latest_matching_event(
     monkeypatch,
     configured_app_factory,
     snapshot_factory,
 ) -> None:
-    """单轮去重产生的一次运行应同时计入所有被合并事件。"""
+    """单轮去重只为最新匹配事件创建运行，较早事件保持未触发。"""
 
     from teamwork_review_agents.events import detect_events
 
@@ -573,9 +573,94 @@ async def test_deduplicated_run_is_linked_to_every_matching_event(
     await orchestrator.process_events(summary)
 
     assert summary.agent_runs == 1
-    records = orchestrator.store.list_events()
-    assert {item["status"] for item in records} == {"completed"}
-    assert {item["trigger_count"] for item in records} == {1}
+    records = {item["event_id"]: item for item in orchestrator.store.list_events()}
+    representative = max(events, key=lambda event: (event.occurred_at, event.id))
+    assert records[representative.id]["status"] == "completed"
+    assert records[representative.id]["trigger_count"] == 1
+    for event in events:
+        if event.id == representative.id:
+            continue
+        assert records[event.id]["status"] == "unmatched"
+        assert records[event.id]["trigger_count"] == 0
+
+
+async def test_source_branch_dedup_suppresses_older_change_request(
+    monkeypatch,
+    configured_app_factory,
+    snapshot_factory,
+) -> None:
+    """跨 MR / PR 的源分支去重只让最新事件触发且不建立旧事件关联。"""
+
+    config = configured_app_factory()
+    config.rules = [
+        RuleConfig(
+            name="source-review",
+            events=["change_request.commits_changed"],
+            agents=["code-reviewer"],
+            deduplicate_source_branch_per_scan=True,
+        )
+    ]
+    old_one = snapshot_factory(
+        provider="github-main",
+        repository_id="demo",
+        number=7,
+        source_branch="feature/shared",
+        head_sha="a" * 40,
+    )
+    old_two = old_one.model_copy(update={"number": 8, "head_sha": "c" * 40})
+    event_one = next(
+        event
+        for event in detect_events(
+            old_one,
+            old_one.model_copy(
+                update={
+                    "head_sha": "b" * 40,
+                    "updated_at": datetime(2026, 8, 17, 8, 1, tzinfo=UTC),
+                }
+            ),
+            batch_id="scan-source",
+        )
+        if event.type == "change_request.commits_changed"
+    )
+    event_two = next(
+        event
+        for event in detect_events(
+            old_two,
+            old_two.model_copy(
+                update={
+                    "head_sha": "d" * 40,
+                    "updated_at": datetime(2026, 8, 17, 8, 2, tzinfo=UTC),
+                }
+            ),
+            batch_id="scan-source",
+        )
+        if event.type == "change_request.commits_changed"
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(old_one, [event_one])
+    orchestrator.store.save_snapshot_and_events(old_two, [event_two])
+
+    async def fake_execute(**kwargs):
+        """跳过真实 Codex，仅验证代表事件的调度。"""
+
+        return AgentResult(
+            run_id="source-deduplicated-run",
+            root_run_id="source-deduplicated-run",
+            agent_name=kwargs["agent_name"],
+            status="completed",
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "execute", fake_execute)
+    summary = CycleSummary()
+    await orchestrator.process_events(summary)
+
+    records = {item["event_id"]: item for item in orchestrator.store.list_events(None)}
+    assert summary.agent_runs == 1
+    assert records[event_one.id]["status"] == "unmatched"
+    assert records[event_one.id]["unmatched_reason"] == "scan_deduplicated"
+    assert records[event_one.id]["trigger_count"] == 0
+    assert records[event_two.id]["status"] == "completed"
+    assert records[event_two.id]["trigger_count"] == 1
 
 
 async def test_failed_agent_marks_matching_event_as_failed(

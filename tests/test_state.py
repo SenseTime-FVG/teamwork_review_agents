@@ -535,6 +535,41 @@ def test_settle_pending_events_as_unmatched_does_not_override_claimed_event(
     assert records["change_request.updated"]["queue_reason"] is None
 
 
+def test_settle_events_as_unmatched_records_dedup_reason_for_retryable_event(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """扫描去重收敛可重试失败事件时，应保留未触发原因且不建立调度。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    old = snapshot_factory()
+    current = snapshot_factory(
+        state="closed",
+        updated_at="2026-08-17T08:05:00Z",
+    )
+    event = next(
+        item
+        for item in detect_events(old, current, batch_id="scan-dedup")
+        if item.type == "change_request.updated"
+    )
+    store.save_snapshot_and_events(current, [event])
+    assert store.claim_event(event.id, max_attempts=2)
+    store.finish_event(event.id, error="临时失败")
+
+    settled = store.settle_events_as_unmatched(
+        [event.id],
+        max_attempts=2,
+        reason="scan_deduplicated",
+    )
+
+    assert settled == (event.id,)
+    record = store.list_events(None, event_id=event.id)[0]
+    assert record["status"] == "unmatched"
+    assert record["unmatched_reason"] == "scan_deduplicated"
+    assert record["trigger_count"] == 0
+
+
 def test_service_shutdown_release_does_not_consume_event_attempt(
     tmp_path,
     snapshot_factory,

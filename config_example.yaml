@@ -407,8 +407,12 @@ rules:
       - general-reviewer
     # 留空表示不限制仓库，也不附加快照字段条件。
     conditions: {}
-    # 同轮多个匹配事件对每个目标 Agent 合并为一次运行。
+    # 同轮同一 MR / PR 的多个匹配事件只保留最新事件触发。
     deduplicate_per_scan: true
+    # 同轮同一仓库源分支的多个匹配事件只保留最新事件触发。
+    deduplicate_source_branch_per_scan: false
+    # 同轮同一仓库目标分支的多个匹配事件只保留最新事件触发。
+    deduplicate_target_branch_per_scan: false
     # 仓库已启用本地 CI 且 PR 仍打开时先执行门禁；仓库未配置时直接运行 Agent。
     run_preflight: true
     # 内置规则绝不自动启用。
@@ -421,6 +425,8 @@ rules:
       - dependency&incremental-doc-update-runner
     conditions: {}
     deduplicate_per_scan: true
+    deduplicate_source_branch_per_scan: false
+    deduplicate_target_branch_per_scan: false
     # 合并后文档更新不需要执行 PR Head 的本地 CI。
     run_preflight: false
     # sub-agent 复用入口 Agent 的 Git 工作区、分支、暂存区和未提交文件。

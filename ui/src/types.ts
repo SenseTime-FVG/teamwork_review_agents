@@ -370,6 +370,8 @@ export type Rule = {
   repositories?: string[];
   conditions?: Record<string, unknown>;
   deduplicate_per_scan?: boolean;
+  deduplicate_source_branch_per_scan?: boolean;
+  deduplicate_target_branch_per_scan?: boolean;
   inherit_workspace?: boolean;
   run_preflight?: boolean;
   enabled?: boolean;
@@ -563,6 +565,7 @@ export type EventRecord = {
   attempts: number;
   error?: string | null;
   queue_reason?: string | null;
+  unmatched_reason?: string | null;
   trigger_count: number;
   sub_agent_count: number;
   agent_queued_count: number;
