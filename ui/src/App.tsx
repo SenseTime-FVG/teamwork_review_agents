@@ -6604,6 +6604,8 @@ function createEmptyRule(document: ConfigDocument, events: string[]): Rule {
     agents: Object.keys(document.agents).slice(0, 1),
     conditions: {},
     deduplicate_per_scan: false,
+    deduplicate_source_branch_per_scan: false,
+    deduplicate_target_branch_per_scan: false,
     inherit_workspace: false,
     run_preflight: false,
     enabled: true,
@@ -6682,11 +6684,27 @@ function RulesEditor(props: {
               </div>
               <div className="rule-option">
                 <Toggle
-                  label="单轮扫描同一 MR / PR 只触发一次"
+                  label="单轮按 MR / PR 去重"
                   checked={rule.deduplicate_per_scan ?? false}
                   onChange={(deduplicate_per_scan) => update(index, { deduplicate_per_scan })}
                 />
-                <p>开启后，本轮同一 MR / PR 的多个已选事件会合并为一次 Agent 运行，动作统一写入 mr.action 数组。</p>
+                <p>开启后，本轮同一 MR / PR 的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
+              </div>
+              <div className="rule-option">
+                <Toggle
+                  label="单轮按源分支去重"
+                  checked={rule.deduplicate_source_branch_per_scan ?? false}
+                  onChange={(deduplicate_source_branch_per_scan) => update(index, { deduplicate_source_branch_per_scan })}
+                />
+                <p>开启后，本轮同一仓库源分支的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
+              </div>
+              <div className="rule-option">
+                <Toggle
+                  label="单轮按目标分支去重"
+                  checked={rule.deduplicate_target_branch_per_scan ?? false}
+                  onChange={(deduplicate_target_branch_per_scan) => update(index, { deduplicate_target_branch_per_scan })}
+                />
+                <p>开启后，本轮同一仓库目标分支的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
               </div>
               <div className="rule-option">
                 <Toggle
@@ -6966,9 +6984,12 @@ function RulesView(props: {
             {visibleRules.map((rule) => {
               const conditionCount = Object.keys(rule.conditions ?? {}).length;
               const optionLabels = [
-                rule.deduplicate_per_scan ? "单轮去重" : "逐事件触发",
+                rule.deduplicate_per_scan ? "MR / PR 去重" : "",
+                rule.deduplicate_source_branch_per_scan ? "源分支去重" : "",
+                rule.deduplicate_target_branch_per_scan ? "目标分支去重" : "",
+                !rule.deduplicate_per_scan && !rule.deduplicate_source_branch_per_scan && !rule.deduplicate_target_branch_per_scan ? "逐事件触发" : "",
                 rule.inherit_workspace ? "继承工作区" : "独立工作区",
-              ];
+              ].filter(Boolean);
               const enabled = rule.enabled !== false;
               const toggling = togglingRuleName === rule.name;
               return (
@@ -7072,6 +7093,14 @@ function queueReasonLabel(reason?: string | null): string | null {
   return labels[reason] ?? reason;
 }
 
+function unmatchedReasonLabel(reason?: string | null): string | null {
+  if (!reason) return null;
+  const labels: Record<string, string> = {
+    scan_deduplicated: "本扫描周期内已被更新事件替代",
+  };
+  return labels[reason] ?? reason;
+}
+
 function eventStatusPresentation(event: EventRecord): {
   label: string;
   visualStatus: string;
@@ -7107,6 +7136,7 @@ function eventStatusPresentation(event: EventRecord): {
   }
   const details = event.error
     ?? event.preflight_error
+    ?? unmatchedReasonLabel(event.unmatched_reason)
     ?? (event.preflight_failed_step ? `失败步骤：${event.preflight_failed_step}` : undefined);
   return { label, visualStatus, details };
 }
@@ -7345,7 +7375,10 @@ function eventStatusExplanation(event: EventRecord): string {
     return queueReasonLabel(event.queue_reason) ?? "事件正在等待调度。";
   }
   if (event.status === "processing") return "正在匹配触发规则并准备后续处理。";
-  if (event.status === "unmatched") return "没有启用的触发规则匹配这个事件。";
+  if (event.status === "unmatched") {
+    const reason = unmatchedReasonLabel(event.unmatched_reason);
+    return reason ? `事件未触发：${reason}。` : "没有启用的触发规则匹配这个事件。";
+  }
   if (event.status === "triggered") return "规则已匹配，Agent 正在排队或运行。";
   if (event.status === "failed") return "事件处理发生异常，详情见错误信息。";
   if (event.status === "cancelled") return "事件关联的运行已被取消。";
@@ -7778,6 +7811,9 @@ function EventDetailDrawer(props: {
                   <div><dt>事件状态</dt><dd>{detail.status}</dd></div>
                   <div><dt>尝试次数</dt><dd>{detail.attempts}</dd></div>
                   <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
+                  {detail.unmatched_reason && (
+                    <div><dt>未触发原因</dt><dd>{unmatchedReasonLabel(detail.unmatched_reason) ?? detail.unmatched_reason}</dd></div>
+                  )}
                   <div><dt>平台活动</dt><dd>{detail.source_activity_type ?? "—"}</dd></div>
                   <div><dt>平台活动时间</dt><dd>{dateTimeText(detail.source_occurred_at)}</dd></div>
                   <div><dt>来源事件 ID</dt><dd className="mono">{detail.source_event_id ?? "—"}</dd></div>

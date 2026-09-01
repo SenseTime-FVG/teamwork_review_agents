@@ -20,6 +20,7 @@ from teamwork_review_agents.config import (
     AgentConfig,
     CodexRuntimeConfig,
     RepositoryConfig,
+    RuleConfig,
     RuntimeConfig,
     ScannerConfig,
     load_config,
@@ -188,6 +189,8 @@ def test_example_config_is_valid() -> None:
     ]
     assert all(not rule.enabled for rule in config.rules)
     assert config.rules[0].deduplicate_per_scan is True
+    assert config.rules[0].deduplicate_source_branch_per_scan is False
+    assert config.rules[0].deduplicate_target_branch_per_scan is False
     assert config.rules[1].inherit_workspace is True
     assert config.database.path.is_absolute()
     assert config.scanner.interval_seconds == 300
@@ -207,6 +210,34 @@ def test_example_config_is_valid() -> None:
         assert config.agents[agent_name].home_mode == "temporary"
         assert config.agents[agent_name].network_access is True
         assert config.agents[agent_name].network_domains == []
+
+
+def test_rule_scan_dedup_fields_preserve_legacy_defaults() -> None:
+    """旧规则缺少新增分支去重字段时必须继续按关闭处理。"""
+
+    legacy = RuleConfig.model_validate(
+        {
+            "name": "legacy-review",
+            "events": ["change_request.updated"],
+            "agents": ["reviewer"],
+            "deduplicate_per_scan": True,
+        }
+    )
+    extended = RuleConfig.model_validate(
+        {
+            "name": "branch-review",
+            "events": ["change_request.updated"],
+            "agents": ["reviewer"],
+            "deduplicate_source_branch_per_scan": True,
+            "deduplicate_target_branch_per_scan": True,
+        }
+    )
+
+    assert legacy.deduplicate_per_scan is True
+    assert legacy.deduplicate_source_branch_per_scan is False
+    assert legacy.deduplicate_target_branch_per_scan is False
+    assert extended.deduplicate_source_branch_per_scan is True
+    assert extended.deduplicate_target_branch_per_scan is True
 
 
 def test_scanner_migrates_legacy_pagination_settings() -> None:

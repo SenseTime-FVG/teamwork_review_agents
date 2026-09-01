@@ -82,24 +82,108 @@ class RuleInvocation:
         )
 
 
+def _event_batch_key(event: ChangeEvent) -> str:
+    """返回事件所属扫描批次；缺少批次时禁止跨事件猜测合并。"""
+
+    return event.batch_id or f"event:{event.id}"
+
+
+def _event_dedup_keys(rule: RuleConfig, event: ChangeEvent) -> tuple[str, ...]:
+    """按规则开关生成事件的去重键，分支键限定在 Provider 与仓库内。"""
+
+    keys: list[str] = []
+    if rule.deduplicate_per_scan:
+        keys.append(f"change_request:{event.resource_key}")
+    snapshot = event.current_snapshot
+    repository_prefix = f"{event.provider}:{event.repository_id}:"
+    if rule.deduplicate_source_branch_per_scan and snapshot.source_branch:
+        keys.append(f"source_branch:{repository_prefix}{snapshot.source_branch}")
+    if rule.deduplicate_target_branch_per_scan and snapshot.target_branch:
+        keys.append(f"target_branch:{repository_prefix}{snapshot.target_branch}")
+    return tuple(keys)
+
+
+def _event_order_key(event: ChangeEvent) -> tuple[datetime, str]:
+    """返回用于选择最新事件的稳定排序键。"""
+
+    return event.occurred_at, event.id
+
+
+def _deduplicated_matches(
+    rule: RuleConfig,
+    events: list[ChangeEvent],
+) -> list[ChangeEvent]:
+    """先按扫描批次分组，再保留每个连通去重组中时间最新的事件。"""
+
+    if not (
+        rule.deduplicate_per_scan
+        or rule.deduplicate_source_branch_per_scan
+        or rule.deduplicate_target_branch_per_scan
+    ):
+        return events
+
+    winners: list[ChangeEvent] = []
+    by_batch: dict[str, list[ChangeEvent]] = {}
+    for event in events:
+        by_batch.setdefault(_event_batch_key(event), []).append(event)
+
+    for batch_events in by_batch.values():
+        parent = list(range(len(batch_events)))
+
+        def find(index: int) -> int:
+            """查找并压缩并查集根节点。"""
+
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            """合并两个共享任一去重键的事件组。"""
+
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        owners: dict[str, int] = {}
+        for index, event in enumerate(batch_events):
+            for key in _event_dedup_keys(rule, event):
+                owner = owners.get(key)
+                if owner is None:
+                    owners[key] = index
+                else:
+                    union(index, owner)
+
+        groups: dict[int, list[ChangeEvent]] = {}
+        for index, event in enumerate(batch_events):
+            groups.setdefault(find(index), []).append(event)
+        winners.extend(
+            max(group, key=_event_order_key)
+            for group in groups.values()
+        )
+    # 保留候选首次出现的组顺序，避免改变不同资源的既有调度顺序。
+    positions = {event.id: index for index, event in enumerate(events)}
+    winners.sort(key=lambda event: positions[event.id])
+    return winners
+
+
 def plan_rule_invocations(
     rules: list[RuleConfig],
     events: list[ChangeEvent],
 ) -> list[RuleInvocation]:
-    """按规则配置将同批次事件规划为一次或多次 Agent 调用。"""
+    """按规则配置将匹配事件规划为一次或多次 Agent 调用。"""
 
     invocations: list[RuleInvocation] = []
     for rule in rules:
         matched = [event for event in events if rule_matches(rule, event)]
         if not matched:
             continue
+        selected = _deduplicated_matches(rule, matched)
         for agent_name in dict.fromkeys(rule.agents):
-            if rule.deduplicate_per_scan:
-                invocations.append(RuleInvocation(rule, agent_name, tuple(matched)))
-            else:
-                invocations.extend(
-                    RuleInvocation(rule, agent_name, (event,)) for event in matched
-                )
+            invocations.extend(
+                RuleInvocation(rule, agent_name, (event,)) for event in selected
+            )
     return invocations
 
 
@@ -500,6 +584,60 @@ class Orchestrator:
         settled = set(settled_event_ids)
         return [event for event in events if event.id not in settled]
 
+    async def _settle_scan_deduplicated_events(
+        self,
+        summary: CycleSummary,
+    ) -> None:
+        """在启动资源队列前收敛跨 MR / PR 去重所抑制的旧事件。"""
+
+        if not any(
+            rule.enabled
+            and (
+                rule.deduplicate_per_scan
+                or rule.deduplicate_source_branch_per_scan
+                or rule.deduplicate_target_branch_per_scan
+            )
+            for rule in self.config.rules
+        ):
+            return
+        max_attempts = self.config.runtime.event_retry_count + 1
+        events = await asyncio.to_thread(
+            self.store.pending_events_for_dedup,
+            max_attempts,
+        )
+        if not events:
+            return
+        try:
+            invocations = plan_rule_invocations(self.config.rules, events)
+            matched_ids = {
+                event.id
+                for rule in self.config.rules
+                if rule.enabled and rule.agents
+                for event in events
+                if rule_matches(rule, event)
+            }
+        except Exception:
+            # 条件解析异常仍交给既有单资源流程记录，不能阻断整个调度器。
+            return
+        winner_ids = {
+            event.id
+            for invocation in invocations
+            for event in invocation.events
+        }
+        suppressed_ids = matched_ids - winner_ids
+        settled_ids = await asyncio.to_thread(
+            self.store.settle_events_as_unmatched,
+            suppressed_ids,
+            max_attempts=max_attempts,
+            reason="scan_deduplicated",
+        )
+        for event_id in settled_ids:
+            await asyncio.to_thread(
+                self.store.finalize_terminal_target_event_context,
+                event_id,
+            )
+        summary.processed_events += len(settled_ids)
+
     async def _process_resource_events(
         self,
         summary: CycleSummary,
@@ -818,6 +956,7 @@ class Orchestrator:
     async def process_events(self, summary: CycleSummary) -> None:
         """并发处理不同 PR / MR，并在活动期间持续补充新事件。"""
 
+        await self._settle_scan_deduplicated_events(summary)
         active: dict[tuple[str, int], asyncio.Task[str | None]] = {}
         max_attempts = self.config.runtime.event_retry_count + 1
         stop_scheduling = False

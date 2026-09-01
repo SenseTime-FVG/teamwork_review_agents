@@ -89,6 +89,7 @@ class StateStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     queue_reason TEXT,
+                    unmatched_reason TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -363,6 +364,7 @@ class StateStore:
             self._ensure_column(connection, "agent_runs", "queue_reason", "TEXT")
             self._ensure_column(connection, "agent_runs", "model_snapshot", "TEXT")
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
+            self._ensure_column(connection, "event_inbox", "unmatched_reason", "TEXT")
             cancel_source_added = self._ensure_column(
                 connection,
                 "agent_runs",
@@ -1214,6 +1216,31 @@ class StateStore:
             ).fetchall()
         return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
 
+    def pending_events_for_dedup(
+        self,
+        max_attempts: int,
+        limit: int | None = None,
+    ) -> list[ChangeEvent]:
+        """读取当前可调度事件，供扫描批次级去重预处理使用。"""
+
+        limit_clause = ""
+        parameters: list[Any] = [max_attempts]
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT payload FROM event_inbox
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND attempts < ?)
+                ORDER BY created_at ASC, event_id ASC
+                {limit_clause}
+                """,
+                parameters,
+            ).fetchall()
+        return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
+
     def pending_event_resources(
         self,
         max_attempts: int,
@@ -1330,7 +1357,7 @@ class StateStore:
                     f"""
                     UPDATE event_inbox
                     SET status = 'unmatched', error = NULL,
-                        queue_reason = NULL, updated_at = ?
+                        queue_reason = NULL, unmatched_reason = NULL, updated_at = ?
                     WHERE event_id IN ({pending_placeholders})
                       AND status = 'pending'
                     """,
@@ -1338,6 +1365,51 @@ class StateStore:
                 )
             connection.commit()
         return tuple(event_id for event_id in ids if event_id in pending_ids)
+
+    def settle_events_as_unmatched(
+        self,
+        event_ids: Iterable[str],
+        *,
+        max_attempts: int,
+        reason: str | None = None,
+    ) -> tuple[str, ...]:
+        """原子收敛当前可重试事件，供扫描周期去重抑制旧事件。"""
+
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return ()
+        placeholders = ", ".join("?" for _ in ids)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                f"""
+                SELECT event_id FROM event_inbox
+                WHERE event_id IN ({placeholders})
+                  AND (
+                      status = 'pending'
+                      OR (status = 'failed' AND attempts < ?)
+                  )
+                """,
+                (*ids, max_attempts),
+            ).fetchall()
+            matched_ids = {str(row["event_id"]) for row in rows}
+            if matched_ids:
+                matched_placeholders = ", ".join("?" for _ in matched_ids)
+                connection.execute(
+                    f"""
+                    UPDATE event_inbox
+                    SET status = 'unmatched', error = NULL,
+                        queue_reason = NULL, unmatched_reason = ?, updated_at = ?
+                    WHERE event_id IN ({matched_placeholders})
+                      AND (
+                          status = 'pending'
+                          OR (status = 'failed' AND attempts < ?)
+                      )
+                    """,
+                    (reason, time.time(), *matched_ids, max_attempts),
+                )
+            connection.commit()
+        return tuple(event_id for event_id in ids if event_id in matched_ids)
 
     def claim_event(self, event_id: str, max_attempts: int) -> bool:
         """原子领取一个事件，并限制总尝试次数。"""
@@ -1360,7 +1432,8 @@ class StateStore:
                 """
                 UPDATE event_inbox
                 SET status = 'processing', attempts = attempts + 1,
-                    error = NULL, queue_reason = NULL, updated_at = ?
+                    error = NULL, queue_reason = NULL, unmatched_reason = NULL,
+                    updated_at = ?
                 WHERE event_id = ?
                 """,
                 (now, event_id),
@@ -1393,7 +1466,8 @@ class StateStore:
                 connection.execute(
                     """
                     UPDATE event_inbox
-                    SET status = ?, error = NULL, queue_reason = NULL, updated_at = ?
+                    SET status = ?, error = NULL, queue_reason = NULL,
+                        unmatched_reason = NULL, updated_at = ?
                     WHERE event_id = ?
                     """,
                     (
@@ -1419,7 +1493,8 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE event_inbox
-                SET status = ?, error = ?, queue_reason = NULL, updated_at = ?
+                SET status = ?, error = ?, queue_reason = NULL,
+                    unmatched_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                 """,
                 (final_status, error, time.time(), event_id),
@@ -1435,7 +1510,7 @@ class StateStore:
                 SET status = 'pending',
                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                     error = '服务停止中断，事件已重新入队',
-                    queue_reason = NULL, updated_at = ?
+                    queue_reason = NULL, unmatched_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                   AND status IN ('processing', 'triggered', 'failed')
                 """,
@@ -3071,6 +3146,7 @@ class StateStore:
                        event_inbox.repository_id, event_inbox.number,
                        event_inbox.status, event_inbox.attempts,
                        event_inbox.error, event_inbox.queue_reason,
+                       event_inbox.unmatched_reason,
                        event_inbox.created_at,
                        event_inbox.updated_at,
                        json_extract(event_inbox.payload, '$.occurred_at')

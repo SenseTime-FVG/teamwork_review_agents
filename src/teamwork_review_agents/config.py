@@ -601,6 +601,8 @@ class RuleConfig(BaseModel):
     repositories: list[str] | None = None
     conditions: dict[str, Any] = Field(default_factory=dict)
     deduplicate_per_scan: bool = False
+    deduplicate_source_branch_per_scan: bool = False
+    deduplicate_target_branch_per_scan: bool = False
     inherit_workspace: bool = False
     run_preflight: bool = False
     enabled: bool = True
