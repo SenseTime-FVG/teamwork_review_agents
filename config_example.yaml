@@ -424,9 +424,9 @@ rules:
     agents:
       - dependency&incremental-doc-update-runner
     conditions: {}
-    deduplicate_per_scan: true
+    deduplicate_per_scan: false
     deduplicate_source_branch_per_scan: false
-    deduplicate_target_branch_per_scan: false
+    deduplicate_target_branch_per_scan: true
     # 合并后文档更新不需要执行 PR Head 的本地 CI。
     run_preflight: false
     # sub-agent 复用入口 Agent 的 Git 工作区、分支、暂存区和未提交文件。
