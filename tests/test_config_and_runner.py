@@ -150,7 +150,8 @@ def test_example_config_is_valid() -> None:
     assert config.repositories == []
     assert set(config.agents) == {
         "general-reviewer",
-        "incremental-doc-update-runner",
+        "dependency&incremental-doc-update-runner",
+        "dependency-reviewer",
         "incremental-doc-updater",
     }
     assert all(
@@ -158,11 +159,32 @@ def test_example_config_is_valid() -> None:
         for agent in config.agents.values()
     )
     assert config.agents[
-        "incremental-doc-update-runner"
-    ].allowed_sub_agents == ["incremental-doc-updater"]
+        "dependency&incremental-doc-update-runner"
+    ].allowed_sub_agents == ["dependency-reviewer", "incremental-doc-updater"]
+    assert config.agents["dependency-reviewer"].allowed_sub_agents == []
+    assert (
+        config.agents["dependency&incremental-doc-update-runner"].prompt_file.name
+        == "依赖review&增量文档更新 入口.md"
+    )
+    assert config.agents["dependency-reviewer"].prompt_file.name == "依赖review.md"
+    runner_environment = config.agents[
+        "dependency&incremental-doc-update-runner"
+    ].environment
+    assert runner_environment[
+        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME"
+    ].expose_to_prompt is True
+    assert runner_environment[
+        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME"
+    ].expose_to_process is False
+    assert runner_environment[
+        "INCREMENTAL_DOC_UPDATE_AGENT_NAME"
+    ].expose_to_prompt is True
+    assert runner_environment[
+        "INCREMENTAL_DOC_UPDATE_AGENT_NAME"
+    ].expose_to_process is False
     assert [rule.name for rule in config.rules] == [
         "general-review",
-        "增量文档更新",
+        "依赖更新&增量文档更新",
     ]
     assert all(not rule.enabled for rule in config.rules)
     assert config.rules[0].deduplicate_per_scan is True
@@ -178,7 +200,8 @@ def test_example_config_is_valid() -> None:
     assert config.runtime.codex.fast_mode == "inherit"
     for agent_name in (
         "general-reviewer",
-        "incremental-doc-update-runner",
+        "dependency&incremental-doc-update-runner",
+        "dependency-reviewer",
         "incremental-doc-updater",
     ):
         assert config.agents[agent_name].home_mode == "temporary"
@@ -1064,31 +1087,36 @@ async def test_executor_cancellation_interrupts_resource_lock_wait(
             await asyncio.gather(task, return_exceptions=True)
 
 
-def test_incremental_document_prompts_support_github_and_gitlab() -> None:
-    """内置文档更新链必须显式支持 GitHub PR 与 GitLab MR。"""
+def test_combined_update_prompts_support_github_and_gitlab() -> None:
+    """内置依赖与文档更新链必须显式支持 GitHub PR 与 GitLab MR。"""
 
     root = Path(__file__).resolve().parents[1]
-    runner_prompt = (root / "prompts/增量文档更新入口.md").read_text(
+    runner_prompt = (root / "prompts/依赖review&增量文档更新 入口.md").read_text(
         encoding="utf-8"
     )
+    dependency_prompt = (root / "prompts/依赖review.md").read_text(encoding="utf-8")
     updater_prompt = (root / "prompts/增量文档更新.md").read_text(
         encoding="utf-8"
     )
 
     assert "mr.repository.provider_kind" in runner_prompt
-    assert "provider_kind = github" in runner_prompt
+    assert "provider_kind=github" in runner_prompt
     assert "gh pr create" in runner_prompt
-    assert "Check Suites / Check Runs" in runner_prompt
+    assert "Checks" in runner_prompt
     assert "Branch Protection" in runner_prompt
-    assert "provider_kind = gitlab" in runner_prompt
+    assert "provider_kind=gitlab" in runner_prompt
     assert "glab mr create" in runner_prompt
     assert "Pipeline / Job" in runner_prompt
     assert "输入中会提供一条已经合并的 GitLab Merge Request" not in runner_prompt
+    assert "{{ DEPENDENCY_AUTO_UPDATE_AGENT_NAME }}" in runner_prompt
+    assert "{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}" in runner_prompt
+    assert "MR 合并前目标分支 SHA" in dependency_prompt
+    assert "DEPENDENCY_UPDATE_BRANCH" in dependency_prompt
+    assert "ALREADY_UPDATED_AND_PUSHED" not in dependency_prompt
     assert "平台无关的兼容协议" in updater_prompt
     assert "GitHub" in updater_prompt
     assert "GitLab" in updater_prompt
     assert "不负责查询、创建、关闭、审批或合并平台 PR / MR" in updater_prompt
-    assert "{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}" in runner_prompt
     assert "{{ DOC_UPDATE_REPOSITORY_ROOT }}" in updater_prompt
     assert "{{ DOC_UPDATE_EXCLUDE_DIRECTORIES }}" in updater_prompt
     assert "{{ DOC_UPDATE_INDEX_PATH }}" in updater_prompt

@@ -20,8 +20,9 @@ Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转�
 
 | Agent | 职责 | 触发时机 |
 | --- | --- | --- |
-| `general-reviewer` | 审核代码和门禁；全部通过才评论并合并 | PR / MR `opened`、`reopened` |
-| `incremental-doc-update-runner` | 编排文档分支、sub-agent、文档 PR / MR 和清理 | GitHub PR / GitLab MR `merged` |
+| `general-reviewer` | 审核代码和门禁；全部通过才评论并合并 | PR / MR `opened`、`reopened`、源/目标分支提交变化 |
+| `dependency&incremental-doc-update-runner` | 编排依赖更新与增量文档更新，统一创建、门禁、合并和清理 | GitHub PR / GitLab MR `merged` |
+| `dependency-reviewer` | 扫描并升级全仓依赖，提交并推送依赖变更 | 组合 Runner 通过 MCP 委托 |
 | `incremental-doc-updater` | 增量更新受影响文档 | Runner 通过 MCP 委托 |
 
 内置规则默认关闭。先验证扫描，再按需启用。
@@ -150,6 +151,7 @@ Teamwork 启动的后台 Codex 会关闭原生项目指令发现，因此源分�
 | `REVIEW_DESIGN_DOC_DIR` | `docs/design` |
 | `REVIEW_CHANGE_HISTORY_DIR` | `docs/changes` |
 | `REVIEW_AUTO_MERGE` | `false` |
+| `DEPENDENCY_AUTO_UPDATE_AGENT_NAME` | `dependency-reviewer` |
 | `INCREMENTAL_DOC_UPDATE_AGENT_NAME` | `incremental-doc-updater` |
 | `DOC_UPDATE_REPOSITORY_ROOT` | `/workspace/project` |
 | `DOC_UPDATE_INDEX_PATH` | `docs/README.md` |
@@ -163,9 +165,9 @@ Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` �
 
 1. 保持规则关闭，执行一次“立即扫描”。
 2. 启用 `general-review`，用新的 PR / MR 验证审核链。
-3. 准备好 `docs/README.md` 后，再启用“增量文档更新”。
+3. 准备好 `docs/README.md` 后，再启用“依赖更新&增量文档更新”。
 
-当前内置文档 Runner 与通用审核都支持 GitHub PR 和 GitLab MR。Runner 根据运行上下文中的平台类型选择 `gh` / GitHub API 或 `glab` / GitLab API；不会根据 URL 或 Git remote 猜测平台。
+当前内置组合更新 Runner、依赖更新 Agent、文档更新 Agent 与通用审核 Agent 都支持 GitHub PR 和 GitLab MR。Runner 根据运行上下文中的平台类型选择 `gh` / GitHub API 或 `glab` / GitLab API；不会根据 URL 或 Git remote 猜测平台。
 
 ## 运行概览与手动事件
 

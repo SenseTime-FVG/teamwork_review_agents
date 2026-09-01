@@ -9,7 +9,8 @@ config.yaml
 /prompts/*
 !/prompts/general-review.md
 !/prompts/增量文档更新.md
-!/prompts/增量文档更新入口.md
+!/prompts/依赖review&增量文档更新 入口.md
+!/prompts/依赖review.md
 /skills/
 /workspaces/
 ui/node_modules/
