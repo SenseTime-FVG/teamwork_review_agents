@@ -123,14 +123,21 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
     assert "REVIEW_DESIGN_DOC_DIR" not in general
     assert "REVIEW_CHANGE_HISTORY_DIR" not in general
 
-    runner_template = (PROJECT_ROOT / "prompts/增量文档更新入口.md").read_text(
+    runner_template = (
+        PROJECT_ROOT / "prompts/依赖review&增量文档更新 入口.md"
+    ).read_text(
         encoding="utf-8"
     )
     runner = render_prompt(
         runner_template,
-        {"INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater"},
+        {
+            "DEPENDENCY_AUTO_UPDATE_AGENT_NAME": "dependency-reviewer",
+            "INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater",
+        },
     )
+    assert "<依赖更新 Agent 名称>\ndependency-reviewer\n</依赖更新 Agent 名称>" in runner
     assert "<文档更新 Agent 名称>\nincremental-doc-updater\n</文档更新 Agent 名称>" in runner
+    assert "DEPENDENCY_AUTO_UPDATE_AGENT_NAME" not in runner
     assert "INCREMENTAL_DOC_UPDATE_AGENT_NAME" not in runner
 
     updater_template = (PROJECT_ROOT / "prompts/增量文档更新.md").read_text(

@@ -253,7 +253,7 @@ web:
 agents:
   general-reviewer:
     # prompt_file 和 prompt 必须且只能配置一个；相对路径以 config.yaml 为基准。
-    # 这三个明确列出的文件是项目内置 Prompt，其他 prompts/ 文件仍被 Git 忽略。
+    # 下面列出的 Prompt 文件是项目内置 Prompt，其他 prompts/ 文件仍被 Git 忽略。
     prompt_file: ./prompts/general-review.md
     # 可选：model_provider 与 model 共同覆盖全局默认模型；两者都省略时继承
     # runtime.default_model。只指定 Provider 时使用该 Provider 的默认模型。
@@ -318,8 +318,8 @@ agents:
       #   expose_to_prompt: true
       #   expose_to_process: false
 
-  incremental-doc-update-runner:
-    prompt_file: ./prompts/增量文档更新入口.md
+  dependency&incremental-doc-update-runner:
+    prompt_file: ./prompts/依赖review&增量文档更新 入口.md
     sandbox: workspace-write
     home_mode: temporary
     # 允许入口 Agent 按需通过自身 gh / glab 登录态读取平台信息。
@@ -329,17 +329,35 @@ agents:
     write_scopes:
       - workspace
       - change_request
-    # 入口 Agent 只能委托这个内置文档更新 Agent。
+    # 入口 Agent 只能委托这两个内置更新 Agent。
     allowed_sub_agents:
+      - dependency-reviewer
       - incremental-doc-updater
     environment:
-      # Teamwork 会在模型启动前把该变量直接渲染到入口 Prompt，
+      # Teamwork 会在模型启动前把 Agent 名称直接渲染到入口 Prompt，
       # 不需要入口 Agent 再通过 Bash、env 或 printenv 读取。
+      DEPENDENCY_AUTO_UPDATE_AGENT_NAME:
+        value: dependency-reviewer
+        secret: false
+        expose_to_prompt: true
+        expose_to_process: false
       INCREMENTAL_DOC_UPDATE_AGENT_NAME:
         value: incremental-doc-updater
         secret: false
         expose_to_prompt: true
-        expose_to_process: true
+        expose_to_process: false
+
+  dependency-reviewer:
+    prompt_file: ./prompts/依赖review.md
+    sandbox: workspace-write
+    home_mode: temporary
+    # 依赖扫描和 Git 推送需要访问远程仓库及依赖源。
+    network_access: true
+    network_domains: []
+    timeout_seconds: 1200
+    write_scopes:
+      - workspace
+    allowed_sub_agents: []
 
   incremental-doc-updater:
     prompt_file: ./prompts/增量文档更新.md
@@ -396,11 +414,11 @@ rules:
     # 内置规则绝不自动启用。
     enabled: false
 
-  - name: 增量文档更新
+  - name: 依赖更新&增量文档更新
     events:
       - change_request.merged
     agents:
-      - incremental-doc-update-runner
+      - dependency&incremental-doc-update-runner
     conditions: {}
     deduplicate_per_scan: true
     # 合并后文档更新不需要执行 PR Head 的本地 CI。
