@@ -11,7 +11,12 @@ import yaml
 from fastapi.testclient import TestClient
 
 from teamwork_review_agents.codex_runner import CodexRunner, _add_git_excludes_file
-from teamwork_review_agents.config import load_config
+from teamwork_review_agents.config import (
+    AgentConfig,
+    RepositoryConfig,
+    effective_skill_ids,
+    load_config,
+)
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.skill_files import (
@@ -180,6 +185,79 @@ def test_config_validates_agent_skill_references(tmp_path) -> None:
     assert load_config(config_path).agents["reviewer"].skills == ["docs"]
 
 
+def test_config_validates_repository_skill_references(tmp_path) -> None:
+    """仓库非空白名单只能引用已经注册的 Skill。"""
+
+    skill_path = tmp_path / "configured-skill"
+    skill_path.mkdir()
+    (skill_path / "SKILL.md").write_text(SKILL_MD, encoding="utf-8")
+    document = {
+        "database": {"path": str(tmp_path / "state.db")},
+        "providers": {
+            "github-main": {
+                "kind": "github",
+                "base_url": "https://api.github.com",
+                "token_env": "GITHUB_TOKEN",
+            }
+        },
+        "repositories": [
+            {
+                "id": "example",
+                "provider": "github-main",
+                "project": "owner/example",
+                "workspace": str(tmp_path / "workspace"),
+                "allowed_skills": ["missing"],
+            }
+        ],
+        "skills": {"docs": {"path": str(skill_path)}},
+    }
+    config_path = tmp_path / "repository-skills.yaml"
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="仓库 example 引用了不存在的 Skill"):
+        load_config(config_path)
+    document["repositories"][0]["allowed_skills"] = ["docs"]
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    assert load_config(config_path).repositories[0].allowed_skills == ["docs"]
+    document["repositories"][0]["allowed_skills"] = None
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    assert load_config(config_path).repositories[0].allowed_skills is None
+    del document["repositories"][0]["allowed_skills"]
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    assert load_config(config_path).repositories[0].allowed_skills == []
+
+
+def test_effective_skill_ids_supports_repository_three_state_policy(tmp_path) -> None:
+    """仓库 Skill 策略应区分默认放行、非空交集和全部禁止。"""
+
+    agent = AgentConfig(prompt="检查项目", skills=["docs", "security"])
+    repository = RepositoryConfig(
+        id="example",
+        provider="github-main",
+        project="owner/example",
+        workspace=tmp_path / "workspace",
+    )
+
+    assert repository.allowed_skills == []
+    assert effective_skill_ids(agent, repository) == ["docs", "security"]
+    repository.allowed_skills = ["security", "unused"]
+    assert effective_skill_ids(agent, repository) == ["security"]
+    repository.allowed_skills = None
+    assert effective_skill_ids(agent, repository) == []
+
+
 def test_skill_projection_is_reused_and_cleaned(tmp_path) -> None:
     """继承工作区的 sub-agent 复用投影，但只有创建者负责清理。"""
 
@@ -218,12 +296,12 @@ def test_skill_projection_is_reused_and_cleaned(tmp_path) -> None:
     assert not (workspace / ".agents").exists()
 
 
-def test_runner_enables_only_selected_managed_skills(
+def test_runner_enables_only_agent_and_repository_skill_intersection(
     tmp_path,
     snapshot_factory,
     configured_app_factory,
 ) -> None:
-    """Codex 命令应显式启用当前 Agent 选择并禁用其他应用 Skill。"""
+    """Codex 命令应只启用 Agent 与仓库共同允许的 Skill。"""
 
     config = configured_app_factory()
     repository = config.repositories[0]
@@ -237,7 +315,8 @@ def test_runner_enables_only_selected_managed_skills(
         event=event,
     )
     agent = config.agents["code-reviewer"]
-    agent.skills = ["docs"]
+    agent.skills = ["docs", "security"]
+    repository.allowed_skills = ["security"]
     command = CodexRunner(config).build_command(
         agent,
         repository,
@@ -249,8 +328,8 @@ def test_runner_enables_only_selected_managed_skills(
     )
     joined = " ".join(command)
     assert "skills.config=[" in joined
-    assert f'path = "{tmp_path / "docs" / "SKILL.md"}", enabled = true' in joined
-    assert f'path = "{tmp_path / "security" / "SKILL.md"}", enabled = false' in joined
+    assert f'path = "{tmp_path / "docs" / "SKILL.md"}", enabled = false' in joined
+    assert f'path = "{tmp_path / "security" / "SKILL.md"}", enabled = true' in joined
 
 
 def test_skill_directory_web_api_imports_whole_folder(tmp_path) -> None:

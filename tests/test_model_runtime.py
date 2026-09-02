@@ -872,23 +872,45 @@ def test_selected_skill_is_injected_into_model_instructions(
     """模型基座模式应完整注入选中 Skill，而不是依赖 Codex CLI 发现。"""
 
     config = configured_app_factory()
-    skill_file = tmp_path / "skills" / "docs" / "SKILL.md"
-    skill_file.parent.mkdir(parents=True)
-    skill_file.write_text(
+    docs_skill_file = tmp_path / "skills" / "docs" / "SKILL.md"
+    docs_skill_file.parent.mkdir(parents=True)
+    docs_skill_file.write_text(
         "---\nname: docs\ndescription: 文档规则\n---\n\n必须先检查文档索引。\n",
         encoding="utf-8",
     )
-    config.skills["docs"] = SkillConfig(path=skill_file.parent)
-    agent = config.agents["code-reviewer"].model_copy(update={"skills": ["docs"]})
+    security_skill_file = tmp_path / "skills" / "security" / "SKILL.md"
+    security_skill_file.parent.mkdir(parents=True)
+    security_skill_file.write_text(
+        "---\nname: security\ndescription: 安全规则\n---\n\n必须执行安全检查。\n",
+        encoding="utf-8",
+    )
+    config.skills["docs"] = SkillConfig(path=docs_skill_file.parent)
+    config.skills["security"] = SkillConfig(path=security_skill_file.parent)
+    agent = config.agents["code-reviewer"].model_copy(
+        update={"skills": ["docs", "security"]}
+    )
+    repository = config.repositories[0].model_copy(
+        update={"allowed_skills": ["docs"]}
+    )
     instructions = _instructions(
-        repository=config.repositories[0],
+        repository=repository,
         agent=agent,
         personality=None,
-        skill_files={"docs": skill_file},
+        skill_files={"docs": docs_skill_file, "security": security_skill_file},
     )
 
     assert "已启用 Skill：docs" in instructions
     assert "必须先检查文档索引" in instructions
+    assert "已启用 Skill：security" not in instructions
+    assert "必须执行安全检查" not in instructions
+
+    disabled_instructions = _instructions(
+        repository=repository.model_copy(update={"allowed_skills": None}),
+        agent=agent,
+        personality=None,
+        skill_files={"docs": docs_skill_file, "security": security_skill_file},
+    )
+    assert "已启用 Skill" not in disabled_instructions
 
 
 @pytest.mark.asyncio

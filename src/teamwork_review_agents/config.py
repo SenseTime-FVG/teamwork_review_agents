@@ -421,6 +421,7 @@ class RepositoryConfig(BaseModel):
     workspace: Path
     clone_url: str | None = None
     enabled: bool = True
+    allowed_skills: list[str] | None = Field(default_factory=list)
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
     agent_workspace: AgentWorkspaceConfig = Field(
         default_factory=AgentWorkspaceConfig,
@@ -592,6 +593,20 @@ class AgentConfig(BaseModel):
             # 完全访问沙箱本身不隔离网络，统一记录为真实的有效状态。
             self.network_access = True
         return self
+
+
+def effective_skill_ids(
+    agent: AgentConfig,
+    repository: RepositoryConfig,
+) -> list[str]:
+    """按 Agent 白名单顺序计算当前仓库实际装载的 Skill。"""
+
+    if repository.allowed_skills is None:
+        return []
+    if not repository.allowed_skills:
+        return list(agent.skills)
+    allowed = set(repository.allowed_skills)
+    return [skill_id for skill_id in agent.skills if skill_id in allowed]
 
 
 class RuleConfig(BaseModel):
@@ -783,6 +798,13 @@ class AppConfig(BaseModel):
                     f"{metadata.name}"
                 )
             skill_metadata_names[metadata.name] = skill_id
+        for repository in self.repositories:
+            unknown_skills = set(repository.allowed_skills or ()) - skill_names
+            if unknown_skills:
+                raise ValueError(
+                    f"仓库 {repository.id} 引用了不存在的 Skill："
+                    f"{sorted(unknown_skills)}"
+                )
         for agent_name, agent in self.agents.items():
             if (
                 agent.model_provider is not None

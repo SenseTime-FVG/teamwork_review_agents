@@ -84,6 +84,8 @@ type PaginatedOverviewResponse<T> = OverviewPage & {
 
 type ExecutionTypeFilter = "all" | "agent" | "preflight";
 
+type RepositorySkillPolicy = "unrestricted" | "selected" | "disabled";
+
 type ExecutionStatusFilter = "waiting" | "running" | "success" | "failure" | "timed_out" | "cancelled";
 
 type ExecutionFilter = {
@@ -1216,6 +1218,42 @@ function ChoiceCards(props: {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+function SingleChoiceCards(props: {
+  title: string;
+  description: string;
+  value: string;
+  options: Array<{ value: string; label: string; description: string; disabled?: boolean }>;
+  onChange: (value: string) => void;
+}) {
+  const name = useId();
+  return (
+    <div className="choice-section">
+      <div className="choice-title"><strong>{props.title}</strong><p>{props.description}</p></div>
+      <div className="choice-list">
+        {props.options.map((option) => {
+          const checked = props.value === option.value;
+          return (
+            <label
+              className={`choice-card ${checked ? "selected" : ""} ${option.disabled ? "disabled" : ""}`.trim()}
+              key={option.value}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={option.value}
+                checked={checked}
+                disabled={option.disabled}
+                onChange={() => props.onChange(option.value)}
+              />
+              <span><strong>{option.label}</strong><small>{option.description}</small></span>
+            </label>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -4601,6 +4639,16 @@ function RepositoryDetailEditor(props: {
   const providerNames = Object.keys(props.document.providers);
   const protectedNames = providerCredentialNames(props.document);
   if (!repository) return <div className="empty tall">仓库配置不存在</div>;
+  const skillOptions = Object.entries(props.document.skills).map(([skillId, skill]) => ({
+    value: skillId,
+    label: skillId,
+    description: skill.path,
+  }));
+  const skillPolicy: RepositorySkillPolicy = repository.allowed_skills === null
+    ? "disabled"
+    : repository.allowed_skills?.length
+      ? "selected"
+      : "unrestricted";
   const providerTokenName = String(
     props.document.providers[repository.provider]?.token_env ?? "",
   ).trim();
@@ -4648,6 +4696,24 @@ function RepositoryDetailEditor(props: {
 
   function updateAgentWorkspace(patch: Partial<RepositoryAgentWorkspace>) {
     update({ agent_workspace: { ...agentWorkspace, ...patch } });
+  }
+
+  function updateSkillPolicy(policy: RepositorySkillPolicy) {
+    if (policy === "unrestricted") {
+      update({ allowed_skills: [] });
+      return;
+    }
+    if (policy === "disabled") {
+      update({ allowed_skills: null });
+      return;
+    }
+    if (skillOptions.length === 0) return;
+    const current = repository.allowed_skills;
+    update({
+      allowed_skills: Array.isArray(current) && current.length > 0
+        ? current
+        : skillOptions.map((option) => option.value),
+    });
   }
 
   function updateAgentWorkspaceStep(
@@ -4730,6 +4796,54 @@ function RepositoryDetailEditor(props: {
             />
           </div>
         </fieldset>
+        <section className="repository-preflight-section">
+          <div className="repository-preflight-head">
+            <div>
+              <strong>仓库 Skill 策略</strong>
+              <p>在 Agent 自身 Skill 白名单之上增加仓库限制；根 Agent 和 sub-agent 都按当前仓库重新计算。</p>
+            </div>
+          </div>
+          <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
+            <div className="repository-preflight-content">
+              <SingleChoiceCards
+                title="当前策略"
+                description="默认不额外限制；需要收窄能力时选择指定 Skill，也可以明确禁止全部 Skill。"
+                value={skillPolicy}
+                options={[
+                  {
+                    value: "unrestricted",
+                    label: "不额外限制",
+                    description: "使用 Agent 自身配置的 Skill 白名单。",
+                  },
+                  {
+                    value: "selected",
+                    label: "仅允许所选",
+                    description: "最终只装载 Agent 白名单与下方所选 Skill 的交集。",
+                    disabled: skillOptions.length === 0,
+                  },
+                  {
+                    value: "disabled",
+                    label: "禁止所有 Skill",
+                    description: "此仓库运行的所有 Agent 都不装载 Skill。",
+                  },
+                ]}
+                onChange={(value) => updateSkillPolicy(value as RepositorySkillPolicy)}
+              />
+              {skillPolicy === "selected" && (
+                <ChoiceCards
+                  title="允许的 Skill"
+                  description="至少保留一项；如果希望清空，请改选“禁止所有 Skill”。"
+                  values={repository.allowed_skills ?? []}
+                  options={skillOptions}
+                  emptyText="暂无已配置 Skill。请先到左侧“SKILL”页面新建、导入或配置。"
+                  onChange={(allowed_skills) => {
+                    if (allowed_skills.length > 0) update({ allowed_skills });
+                  }}
+                />
+              )}
+            </div>
+          </fieldset>
+        </section>
         <section className="repository-preflight-section">
           <div className="repository-preflight-head">
             <div>
@@ -5198,6 +5312,7 @@ function RepositoriesView(props: {
       project: "owner/repository",
       workspace: `./workspaces/${repositoryId}`,
       enabled: true,
+      allowed_skills: [],
       environment: {},
     });
     setDetailId(null);
@@ -5939,7 +6054,13 @@ function SkillsEditor(props: {
         },
       ]),
     );
-    props.onChange({ ...props.document, skills, agents });
+    const repositories = props.document.repositories.map((repository) => ({
+      ...repository,
+      allowed_skills: Array.isArray(repository.allowed_skills)
+        ? repository.allowed_skills.map((skillId) => skillId === id ? nextId : skillId)
+        : repository.allowed_skills,
+    }));
+    props.onChange({ ...props.document, skills, agents, repositories });
     return true;
   }
 
@@ -6031,7 +6152,17 @@ function SkillsEditor(props: {
                           { ...agent, skills: agent.skills?.filter((skillId) => skillId !== id) },
                         ]),
                       );
-                      props.onChange({ ...props.document, skills, agents });
+                      const repositories = props.document.repositories.map((repository) => {
+                        if (!Array.isArray(repository.allowed_skills)) return repository;
+                        const allowed_skills = repository.allowed_skills.filter((skillId) => skillId !== id);
+                        return {
+                          ...repository,
+                          allowed_skills: repository.allowed_skills.length > 0 && allowed_skills.length === 0
+                            ? null
+                            : allowed_skills,
+                        };
+                      });
+                      props.onChange({ ...props.document, skills, agents, repositories });
                     }}>×</button>
                   </div>
                 </div>

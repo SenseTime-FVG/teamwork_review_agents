@@ -212,6 +212,9 @@ web:
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true
+#     # 可选：仓库级 Skill 策略。省略或 [] 表示不额外限制，继续使用 Agent 白名单；
+#     # 非空列表表示仅允许所选 Skill，运行时与 Agent skills 取交集；null 表示禁止所有 Skill。
+#     allowed_skills: []
 #     # 可选：只覆盖当前仓库的环境变量。Provider Token 可按相同变量名覆盖，
 #     # 推荐引用每个仓库独立的宿主机变量；默认不进入 Prompt 或进程，可显式开启对应开关。
 #     environment:
