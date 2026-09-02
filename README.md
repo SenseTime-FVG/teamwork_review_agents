@@ -2,28 +2,43 @@
 
 > Vibe coding 负责快速产出代码；本项目负责让代码可靠进入主分支。
 
-PR / MR 越来越快、越来越多，但审核、CI、合并门禁和文档同步仍靠人工。结果是审核缺少上下文、旧结论误用于新提交、合并后文档过期。
+PR / MR 越来越快、越来越多，但审核、CI、合并门禁、依赖维护和文档同步仍靠人工。结果是审核缺少上下文、旧结论误用于新提交、合并后文档过期，周期性维护任务也难以稳定执行。
 
-Teamwork Review Agents 持续扫描 GitHub PR / GitLab MR，把状态变化转换为事件，再按规则启动隔离的模型 Agent，完成审核、合并和文档更新。
+Teamwork Review Agents 是一个自托管的 GitHub / GitLab Agent 编排服务。它既能持续扫描 PR / MR 并把变化转换为可审计事件，也能按固定间隔或 Cron 直接在仓库默认分支上运行 Agent；模型可以来自内置 Codex CLI，也可以来自多个外部 API Provider。
 
 ## 方案
 
-- 固定源、目标 SHA，结合完整 diff、设计、历史变更和 CI 审核。
-- 每次 Agent 使用独立 Git 工作区：可写 Agent 使用自带 `.git` 的本地 clone，只读 Agent 使用轻量 worktree，避免并发任务互相污染。
-- 合并后按净差异和文档索引，只更新受影响文档。
-- 快照、事件、规则、运行和日志统一写入 SQLite，并在管理界面展示。
-- GitHub PR 可在 Review Agent 前执行仓库自定义的确定性 Preflight CI。
+- 固定 PR / MR 的源、目标 SHA，结合完整 diff、设计、历史变更和 CI 审核。
+- 每次根 Agent 使用独立 Git 工作区：可写 Agent 使用自带 `.git` 的本地 clone，只读 Agent 使用轻量 worktree，避免并发任务互相污染。
+- 支持 MR / PR 事件规则、扫描周期多维去重，以及固定间隔 / Cron 定时规则。
+- 支持全局和 Agent 级模型回退链，运行时固化实际 Provider、模型、推理参数与回退轨迹。
+- 合并后可以编排依赖升级和增量文档更新，只处理真正受影响的内容。
+- 快照、事件、Preflight、Agent 运行和日志统一写入 SQLite，并在管理界面分层追溯。
 
-主链路：`扫描 PR/MR → 语义事件 → 规则匹配 → 模型 Agent → 审计与日志`
+两条触发主链路：
+
+- `扫描 PR / MR → 语义事件 → 规则匹配 → 可选 Preflight → 模型 Agent → 审计与日志`
+- `固定间隔 / Cron → 仓库默认分支最新提交 → 模型 Agent → 审计与日志`
 
 ![Teamwork Review Agents 的当前架构与 Agent 流程](docs/assets/teamwork-review-agents-architecture.png)
 
+| 能力 | 当前行为 |
+| --- | --- |
+| 平台接入 | 统一扫描 GitHub PR 与 GitLab MR，保留快照、Timeline 参考和变化事件 |
+| 模型执行 | 内置且不可删除的 Codex CLI，以及 OpenAI Responses、Chat Completions、Anthropic Messages、Gemini GenerateContent API Provider |
+| 模型容错 | Agent 回退链优先，再进入全局默认模型与全局回退链；仅 Provider 不可用类故障触发 |
+| 规则调度 | MR / PR 事件规则、按 MR / PR/源分支/目标分支去重，以及固定间隔或五段 Cron 定时规则 |
+| 运行隔离 | 独立 clone / worktree、跨平台外层沙盒、临时 HOME、命令联网和写操作声明分离 |
+| 自动门禁 | GitHub PR 可在 Agent 前执行仓库自定义 Preflight，缓存依赖并回写 Commit Status |
+| Agent 协作 | 白名单 sub-agent、可选工作区继承、受管 Skill、托管评论与模型签名 |
+| 可观测性 | 服务端分页、组合筛选、实时日志、运行取消，以及 MR / PR → 事件 → CI / Agent 的分层详情 |
+
 | Agent | 职责 | 触发时机 |
 | --- | --- | --- |
-| `general-reviewer` | 审核代码和门禁；全部通过才评论并合并 | PR / MR `opened`、`reopened`、源/目标分支提交变化 |
+| `general-reviewer` | 审核代码和门禁、发布结论；可按配置自动合并 | PR / MR `opened`、`reopened`、源/目标分支提交变化 |
 | `dependency&incremental-doc-update-runner` | 编排依赖更新与增量文档更新，统一创建、门禁、合并和清理 | GitHub PR / GitLab MR `merged` |
-| `dependency-reviewer` | 扫描并升级全仓依赖，提交并推送依赖变更 | 组合 Runner 通过 MCP 委托 |
-| `incremental-doc-updater` | 增量更新受影响文档 | Runner 通过 MCP 委托 |
+| `dependency-reviewer` | 扫描并升级全仓依赖，提交并推送依赖变更 | 组合 Runner 通过 MCP 委托，也可由规则直接运行 |
+| `incremental-doc-updater` | 增量更新受影响文档 | Runner 通过 MCP 委托，也可由规则直接运行 |
 
 内置规则默认关闭。先验证扫描，再按需启用。
 
@@ -64,7 +79,7 @@ teamwork-review-agents start
 4. 在“Provider”页检查不可删除的内置 Codex CLI；新增 API Provider 时填写 Base URL 和 API Key，点击“检测模型”后选择默认模型，也可以跳过检测手工维护模型目录。
 5. 如需项目专属能力，在“SKILL”页直接新建 `SKILL.md`、导入完整 Skill 文件夹或配置服务端已有目录，再为对应 Agent 选择允许装载的 Skill。`description` 会供 Codex 发现和匹配，Markdown 正文会在 Skill 被使用时作为完整指令读取。
 6. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
-7. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
+7. 确认仓库、事件和日志正常，再启用 MR / PR 事件规则或新建定时规则；需要在 Agent 前执行本地 CI 的事件规则，同时选择“执行仓库 CI（如已启用）”。
 
 平台连接与仓库配置：
 
@@ -170,13 +185,83 @@ Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` �
 
 当前内置组合更新 Runner、依赖更新 Agent、文档更新 Agent 与通用审核 Agent 都支持 GitHub PR 和 GitLab MR。Runner 根据运行上下文中的平台类型选择 `gh` / GitHub API 或 `glab` / GitLab API；不会根据 URL 或 Git remote 猜测平台。
 
+## Agent、权限与 Skill
+
+一个 Agent 配置同时定义 Prompt、模型选择与回退链、超时和并发、环境变量、文件与联网权限、写操作声明、可调用的 sub-agent、可装载 Skill，以及托管评论策略。管理界面按 Agent 列表展示摘要，点击后只编辑和保存当前 Agent，不需要整体覆盖其他配置。
+
+通过管理界面“添加 Agent”创建的新草稿默认使用“工作区可写”、允许命令联网，并勾选“MR / PR 写操作”和“本地仓库写操作”，适合直接创建能修改代码、提交、推送和写回平台的 Agent。这个默认只作用于前端新建草稿；直接编写 YAML 时，未填写的后端默认值仍是 `read-only`、关闭命令联网且不声明写操作，已有 Agent 也不会被自动提权。
+
+| 配置 | 控制范围 |
+| --- | --- |
+| `sandbox` | `read-only`、`workspace-write` 或显式高风险的 `danger-full-access` 本地文件权限 |
+| `network_access` / `network_domains` | 命令是否联网，以及可选的精确域名或通配域名白名单 |
+| `write_scopes: [workspace]` | 声明代码、提交和推送写操作，并为相关工作区申请串行锁 |
+| `write_scopes: [change_request]` | 声明评论、标签、审批或合并等平台写操作，并为对应 PR / MR 申请串行锁 |
+| `allowed_sub_agents` | 限定 `invoke_agent` 可以调用的 Agent 名称；sub-agent 仍使用自己的模型、权限和 Skill |
+| `skills` | 只为当前 Agent 装载指定 Skill，不自动继承给 sub-agent |
+
+“SKILL”页支持三种来源：直接新建受管 `SKILL.md`、从电脑导入完整 Skill 文件夹，以及注册服务端已有目录。受管 Skill 可以在线编辑名称、用于发现和匹配的 `description` 及 Markdown 操作说明；更新根 `SKILL.md` 时会保留扩展 frontmatter 和同目录的 `scripts/`、`references/`、`assets/` 等资源。外部目录保持只读，移除配置引用也不会删除磁盘上的 Skill 文件。
+
+## 触发规则与定时调度
+
+“触发规则”页同时管理两类独立入口：
+
+| 规则类型 | 输入 | 适用场景 |
+| --- | --- | --- |
+| MR / PR 事件规则 | Provider 扫描得到的变更请求快照和语义事件 | 代码审核、合并门禁、合并后更新 |
+| 定时规则 | 仓库远端默认分支在计划时间的最新提交 | 定期依赖检查、文档巡检、仓库维护 |
+
+MR / PR 规则可以组合事件类型、Agent、仓库范围、JSON 条件、Preflight 和工作区继承。事件覆盖发现、打开、重开、关闭、合并、源分支提交变化、目标分支提交变化、草稿、标签、审批、流水线、合并状态与普通更新。`change_request.commits_changed` 表示源分支 Head 变化，`change_request.target_commits_changed` 表示打开状态变更请求的目标分支 Head 变化。
+
+每条 MR / PR 规则有三个可独立叠加的单轮去重开关：按 MR / PR、按源分支和按目标分支。开启任意多个开关时采用“或”关系：同一扫描周期、同一规则和同一 Agent 下，只要候选事件共享任一启用的键，就归入同一去重组，并且只有发生时间最新的事件触发 Preflight 或 Agent。被替代的旧事件会保留在事件历史中并标记为“未触发”，不会关联到最新事件创建的 CI 或 Agent 运行。
+
+定时规则支持正整数分钟、小时、天的固定间隔，也支持带 IANA 时区的标准五段 Cron。仓库不选表示每个周期动态执行当前全部已启用仓库；显式选择后只执行指定仓库。每次到期都会为每个“仓库 × Agent”组合创建独立根运行，即使上一个周期尚未结束也不会跳过，只会按全局并发、Agent 并发或写锁排队。暂停或停机期间错过的周期不会恢复后补跑。
+
+定时运行基于远端默认分支的真实 Head SHA，不创建虚构的 MR / PR 事件，不执行 MR 专属 Preflight，也不发布 MR / PR 评论。运行详情会记录规则、计划时间、周期 ID、仓库、默认分支和 Head SHA。MR / PR 规则和定时规则都可以开启“sub-agent 继承当前工作区”；开启后，sub-agent 复用父 Agent 本轮临时 clone 或 worktree，看到相同分支、暂存区和未提交文件，但不会自动继承父 Agent 对话。
+
+```yaml
+rules:
+  - name: review-latest-change
+    events:
+      - change_request.opened
+      - change_request.commits_changed
+      - change_request.target_commits_changed
+    agents: [general-reviewer]
+    repositories: [example-github]
+    conditions:
+      state: opened
+      draft: false
+    deduplicate_per_scan: true
+    deduplicate_source_branch_per_scan: true
+    deduplicate_target_branch_per_scan: false
+    inherit_workspace: false
+    run_preflight: true
+    enabled: true
+
+scheduled_rules:
+  - name: weekday-maintenance
+    agents: [dependency-reviewer]
+    # 留空表示每次到期动态选择全部已启用仓库。
+    repositories: []
+    inherit_workspace: false
+    schedule:
+      kind: cron
+      cron: "0 9 * * 1-5"
+      timezone: Asia/Shanghai
+    enabled: true
+```
+
+完整字段、固定间隔示例和默认值见 [`config_example.yaml`](config_example.yaml)。
+
 ## 运行概览与手动事件
 
-“已扫描 MR / PR”和“最近变化事件”可以分别按启用仓库、状态和展示数量筛选。MR / PR 按远端更新时间倒序，事件按实际发生时间倒序；每张列表默认显示 10 条，也可选择 20、50、全部或输入自定义正整数。
+“已扫描 MR / PR”和“最近变化事件”都使用服务端分页。前者可以按启用仓库、多个状态和展示数量筛选，后者还可以按编号筛选；MR / PR 按远端更新时间倒序，事件按实际发生时间倒序。每张列表默认显示 10 条，也可选择 20、50、全部或输入自定义正整数。
 
 GitHub 历史 PR 的列表行会展示 Timeline 原始顺序中最后一条可转换为规则事件的“最新平台事件”。它是可手动触发的 Provider 活动参考，不等同于已经写入规则队列、可在详情中追踪的关联事件；首次回看窗口内的活动仍会全部自动记录和调度，窗口内没有活动的历史 PR 只缓存最新平台事件，不自动重放旧事件。点击行内“手动触发”会基于该参考创建一条具有独立 ID 的手动事件；也可以点击列表上方“选择”，勾选多个 PR 后批量触发，每个 PR 分别使用自己的最新平台事件并按当前规则调度。Timeline 最新性不按活动时间字段重新排序，`committed` 条目展示的时间可能是提交作者或提交者时间。此操作不会重新请求 GitHub，也不会直接修改远端 PR。GitLab 当前没有统一活动流实现，因此不会按 MR 当前状态猜测最新平台事件。
 
-“最近变化事件”支持单条和批量手动触发。每次操作都会复制来源事件保存的快照上下文并创建新的独立手动事件，来源事件及其状态保持不变；相同 Head 与配置版本通常复用已有 Preflight / CI 结果，但已耗尽重试次数的基础设施异常会创建新的 CI 运行重新验证。MR / PR 详情会展示最新平台事件参考和触发按钮，关联事件保持左键查看详情，并可通过右键或键盘上下文菜单手动触发。
+“最近变化事件”支持单条和批量手动触发。每次操作都会复制来源事件保存的快照上下文并创建新的独立手动事件，来源事件及其状态保持不变；相同 Head 与配置版本通常复用已有 Preflight / CI 结果，但已耗尽重试次数的基础设施异常会创建新的 CI 运行重新验证。MR / PR 详情会展示最新平台事件参考和触发按钮；关联事件按时间倒序，状态和事件类型均支持多选筛选，选择“全部”会清除同组其他选项。关联事件保持左键查看详情，并可通过右键或键盘上下文菜单手动触发。
+
+事件、Preflight / CI 和 Agent 详情中的 `#编号` 都会链接到对应平台的 PR / MR；历史记录缺少平台地址时才降级为普通文本。事件详情继续分层展示本地 CI 与根 Agent / sub-agent 运行，Agent 详情把消息、最终结果和运行上下文分开，并显示本轮固化的模型、推理强度、回退链、Token 用量、环境审计和工作区状态。
 
 GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产生的 `closed`；系统将其归并为一次 `change_request.merged`，不会把自动关闭另算为普通关闭，也不会重复触发合并规则。
 
@@ -186,7 +271,7 @@ GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产�
 
 Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，所选模型 Provider 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，Teamwork 外层沙盒会允许该 clone 及其独立 `.git` 写入，因此 Agent 可以执行 fetch、建分支和提交；Codex 的工作区权限档案还允许系统临时目录写入，用于每轮临时 HOME 和工具缓存，但基础仓库不在可写范围内。只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
-不同 PR / MR 的事件批次可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。“全局配置与环境”页的 `runtime.max_concurrent_agents` 和 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
+不同 PR / MR 的事件批次和不同定时周期可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。“全局配置与环境”页的 `runtime.max_concurrent_agents` 和 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
 
 排队记录会说明当前是在等待全局/运行时额度、此 Agent 额度、同一 PR / MR 前序批次、前序事件重试、业务资源锁还是基础仓库锁。前序事件发生可重试失败时只短暂延迟当前 PR / MR，其他变更请求继续使用空闲额度；达到重试上限后，该失败事件保留终态并立即继续同一 PR / MR 的后续批次。修改并发配置只影响尚未取得额度的新运行，不会强制终止已经开始准备或执行的任务。
 
@@ -316,23 +401,7 @@ rules:
     # 仓库未启用或未配置 CI 时不报错，直接运行 Agent。
     run_preflight: true
     enabled: true
-
-# 可选：按时间直接在仓库远端默认分支的最新提交上运行 Agent。
-scheduled_rules:
-  - name: example-scheduled-maintenance
-    agents: [general-reviewer]
-    # 留空表示每次触发时动态选择全部已启用仓库。
-    repositories: []
-    # 可选：让 sub-agent 复用父 Agent 当前的临时工作区。
-    inherit_workspace: false
-    schedule:
-      kind: cron
-      cron: "0 9 * * 1-5"
-      timezone: Asia/Shanghai
-    enabled: true
 ```
-
-定时规则也支持 `kind: interval`，并通过 `interval_value` 与 `interval_unit`（`minutes`、`hours` 或 `days`）设置固定间隔。`repositories` 为空或省略时，每次触发都会动态选择当前全部已启用仓库；非空时只执行明确选择的仓库。每个到期周期都会独立创建“仓库 × Agent”根运行；即使上一周期尚未结束，新周期也不会被跳过。`inherit_workspace: true` 时，sub-agent 会复用父 Agent 当前的临时 clone 或 worktree。定时运行不绑定虚构的 MR / PR，不执行 MR 专属 Preflight，也不发布 MR 评论；运行详情会记录规则名、计划时间、周期实例、默认分支和 Head SHA。服务暂停或停止期间错过的周期不会在恢复后补跑。
 
 可写 Agent 建议启用每次运行独立的临时 HOME，避免仓库程序把缓存、工具配置或测试产物写进服务账号真实的 `~/`：
 
@@ -421,6 +490,7 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 | [`docs/design-overview-change-request-multi-status-filter.md`](docs/design-overview-change-request-multi-status-filter.md) | 运行概览筛选与手动事件交互设计 |
 | [`docs/design-managed-comment-model-signature.md`](docs/design-managed-comment-model-signature.md) | 托管评论模型签名设计 |
 | [`docs/design-model-runtime-log-normalization.md`](docs/design-model-runtime-log-normalization.md) | 模型运行消息与日志归一化设计 |
+| [`docs/design-managed-skill-authoring.md`](docs/design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 本地开发、测试和前端联调 |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | 历史实施阶段和验收记录 |
 | [`deploy/`](deploy/) | systemd / launchd 模板 |
