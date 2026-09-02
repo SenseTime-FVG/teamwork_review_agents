@@ -357,7 +357,8 @@ def test_web_api_manages_scheduled_rules_with_revision_checks(tmp_path) -> None:
                 "rule": {
                     "name": "hourly-review",
                     "agents": ["reviewer"],
-                    "repositories": ["first"],
+                    "repositories": [],
+                    "inherit_workspace": True,
                     "schedule": {
                         "kind": "interval",
                         "interval_value": 1,
@@ -371,6 +372,8 @@ def test_web_api_manages_scheduled_rules_with_revision_checks(tmp_path) -> None:
         assert created.status_code == 200
         created_body = created.json()
         assert created_body["document"]["scheduled_rules"][0]["name"] == "hourly-review"
+        assert created_body["document"]["scheduled_rules"][0]["repositories"] == []
+        assert created_body["document"]["scheduled_rules"][0]["inherit_workspace"] is True
 
         stale = client.put(
             "/api/config/scheduled-rules/hourly-review",

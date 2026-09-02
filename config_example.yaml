@@ -446,8 +446,10 @@ rules:
 #   - name: 定时仓库维护
 #     agents:
 #       - dependency-reviewer
-#     repositories:
-#       - example-github
+#     # 留空或省略时，每次触发动态选择全部已启用仓库。
+#     repositories: []
+#     # 开启后，sub-agent 复用父 Agent 当前的临时 clone 或 worktree。
+#     inherit_workspace: false
 #     schedule:
 #       # interval 支持 minutes、hours、days；也可改为 kind: cron 并填写五段 cron。
 #       kind: interval
