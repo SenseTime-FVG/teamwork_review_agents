@@ -114,7 +114,7 @@ def build_preflight_environment(
     cache_environment: dict[str, str] | None = None,
     windows: bool | None = None,
 ) -> dict[str, str]:
-    """只继承运行工具所需的宿主机变量，不传递平台或模型凭据。"""
+    """只继承运行工具所需的宿主机变量，不隐式传递平台或模型凭据。"""
 
     environment = selected_environment(SAFE_HOST_ENVIRONMENT)
     environment.update(

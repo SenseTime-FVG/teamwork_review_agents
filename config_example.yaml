@@ -172,9 +172,11 @@ web:
 #     # Provider 的 token_env 可以引用这里的同名变量。推荐使用 from_system，避免 Token 明文落盘。
 #     GITHUB_TOKEN:
 #       from_system: GITHUB_TOKEN
-#       # Provider 凭据会被系统强制设为 Secret，且永远不会进入 Prompt 或 Codex 进程。
+#       # Provider 凭据会被系统强制设为 Secret；Prompt 与进程暴露默认关闭。
 #       secret: true
+#       # 改为 true 会把 Token 明文交给模型；管理界面开启时会要求确认风险。
 #       expose_to_prompt: false
+#       # 改为 true 会把 Token 传给 Agent、工具命令和仓库 CI；管理界面会要求确认风险。
 #       expose_to_process: false
 
 # 可选：GitHub / GitLab API 连接。后台用它扫描远端 MR / PR；它不是 Git clone 或 SSH 连接。
@@ -211,7 +213,7 @@ web:
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true
 #     # 可选：只覆盖当前仓库的环境变量。Provider Token 可按相同变量名覆盖，
-#     # 推荐引用每个仓库独立的宿主机变量；它仍不会进入 Prompt 或 Agent 进程。
+#     # 推荐引用每个仓库独立的宿主机变量；默认不进入 Prompt 或进程，可显式开启对应开关。
 #     environment:
 #       REPOSITORY_TIER: production
 #       GITHUB_TOKEN:

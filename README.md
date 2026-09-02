@@ -77,7 +77,7 @@ Agent 权限与能力摘要：
 
 ![运行概览中的服务状态、扫描快照和变化事件](docs/assets/first-time-setup/05-overview.png)
 
-Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 只供扫描、Commit Status 和托管评论等服务侧平台 API 使用，不会传给 Codex，也不能代替 Agent 所需的本机 `gh` / `glab` 登录态。
+Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 始终按 Secret 脱敏，默认只供扫描、Commit Status 和托管评论等服务侧平台 API 使用；管理员也可以在环境变量中分别开启“进入 Prompt”和“进入进程”，每次从关闭切换为开启时管理界面都会提示泄露风险。该 Token 默认不能代替 Agent 所需的本机 `gh` / `glab` 登录态。
 
 本地 CI 当前仅支持 GitHub。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub 本地 CI 门禁](#github-本地-ci-门禁)。
 
@@ -240,9 +240,9 @@ agents:
     network_domains: [api.github.com, github.com]
 ```
 
-`read-only` 使用只读外层档案；`workspace-write` 允许写当前独立运行 clone（含它自己的 `.git`）和 Codex 权限档案定义的系统临时目录，后者承载每轮临时 HOME 与工具缓存；基础仓库和真实 HOME 不会因此变成可写。`danger-full-access` 会绕过受限外层沙盒，属于明确的高风险配置。网络关闭和普通联网由外层档案执行；域名白名单非空时，Teamwork 还会显式启用 Codex 网络代理，确保规则不只是配置声明。Provider Token 仍会从 Codex 环境中移除。
+`read-only` 使用只读外层档案；`workspace-write` 允许写当前独立运行 clone（含它自己的 `.git`）和 Codex 权限档案定义的系统临时目录，后者承载每轮临时 HOME 与工具缓存；基础仓库和真实 HOME 不会因此变成可写。`danger-full-access` 会绕过受限外层沙盒，属于明确的高风险配置。网络关闭和普通联网由外层档案执行；域名白名单非空时，Teamwork 还会显式启用 Codex 网络代理，确保规则不只是配置声明。Provider Token 默认从 Codex 环境中移除，明确开启“进入进程”后除外。
 
-sub-agent 和托管评论都不需要为此获得配置文件、数据库或 Provider Token 权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 与 `publish_comment` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行白名单、写作用域、源版本代次、幂等和并发校验。`publish_comment` 只接收完整正文，仓库、PR/MR、Agent 槽位和源版本代次全部来自服务签发的可信上下文。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、Provider Token、基础仓库或其他 Agent 工作区；通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
+sub-agent 和托管评论都不需要为此获得配置文件、数据库或 Provider Token 权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 与 `publish_comment` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行白名单、写作用域、源版本代次、幂等和并发校验。`publish_comment` 只接收完整正文，仓库、PR/MR、Agent 槽位和源版本代次全部来自服务签发的可信上下文。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、基础仓库或其他 Agent 工作区；Provider Token 默认也不可见，除非管理员明确开启对应变量的 Prompt 或进程暴露。通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
 
 Agent 详情页可以开启“按源版本托管顶层评论”。开启后必须同时声明 `change_request` 写作用域，并保存一个不会随 Agent 重命名变化的 `managed_comment_slot`。同一 Agent、同一 PR/MR、同一源版本代次只维护一条顶层评论：目标分支变化但源分支未变时更新原评论；源分支新增提交或 force-push 时创建下一代评论，保留时间线中的旧审核记录。人工删除评论不会被后台立即补回，只有该 Agent 下一次实际调用 `publish_comment` 时才会重新创建。关闭开关也不会删除历史评论。
 
@@ -339,7 +339,7 @@ agents:
     home_mode: temporary
 ```
 
-`home_mode: temporary` 是通用运行隔离，不需要随仓库配置 `BOX_AGENT_HOME`、`UV_HOME` 等项目专用变量。根 Agent 和 sub-agent 每次运行各自创建临时 HOME，并在成功、失败、取消或超时后清理；服务异常退出遗留的目录会在后续启动执行器时回收。真实 `CODEX_HOME` 继续显式传入，已有的 `gh`、`glab`、Git 全局配置和 SSH Agent 只桥接必要入口，不会复制整个用户目录、私钥或其他凭据。macOS 会额外把临时 HOME 的 `Library/Keychains` 链接到当前系统用户的钥匙串目录，使 `gh` 在 HOME 隔离后仍能使用原有 Keychain 登录态；任务清理只删除链接，不会删除真实钥匙串。该过程不会生成 `GH_TOKEN`，Provider Token 仍不会进入 Codex 进程。只读 Agent 不能选择临时 HOME；`danger-full-access` 仅改变默认 HOME，并不形成文件系统安全边界。
+`home_mode: temporary` 是通用运行隔离，不需要随仓库配置 `BOX_AGENT_HOME`、`UV_HOME` 等项目专用变量。根 Agent 和 sub-agent 每次运行各自创建临时 HOME，并在成功、失败、取消或超时后清理；服务异常退出遗留的目录会在后续启动执行器时回收。真实 `CODEX_HOME` 继续显式传入，已有的 `gh`、`glab`、Git 全局配置和 SSH Agent 只桥接必要入口，不会复制整个用户目录、私钥或其他凭据。macOS 会额外把临时 HOME 的 `Library/Keychains` 链接到当前系统用户的钥匙串目录，使 `gh` 在 HOME 隔离后仍能使用原有 Keychain 登录态；任务清理只删除链接，不会删除真实钥匙串。该过程不会生成 `GH_TOKEN`，Provider Token 也不会被隐式注入 Codex 进程；只有明确开启对应变量的“进入进程”后才会传入。只读 Agent 不能选择临时 HOME；`danger-full-access` 仅改变默认 HOME，并不形成文件系统安全边界。
 
 接入仓库中的 `ci/preflight.sh` 应当是可独立运行、首个错误即退出的确定性脚本，例如：
 
@@ -374,7 +374,7 @@ Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改
 
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token、Codex/OpenAI 凭据不会通过环境变量传入。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只隐式继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token 默认不传入，只有对应环境变量明确开启“进入进程”后才会加入 CI 环境。Codex/OpenAI 模型凭据始终不会通过该开关进入 CI。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 
 Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 

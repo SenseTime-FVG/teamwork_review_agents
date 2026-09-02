@@ -674,6 +674,15 @@ class AppConfig(BaseModel):
     config_path: Path = Field(exclude=True)
     revision: str = Field(exclude=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def default_provider_credential_exposure(cls, value: Any) -> Any:
+        """Provider Token 始终按 Secret 处理，未声明的暴露选项默认关闭。"""
+
+        if isinstance(value, dict):
+            return protect_provider_credentials(value)
+        return value
+
     @model_validator(mode="after")
     def validate_references(self) -> "AppConfig":
         """检查配置中的名称引用，尽早阻止运行期错误。"""
@@ -718,7 +727,7 @@ class AppConfig(BaseModel):
                     f"{provider.token_env}"
                 )
 
-        # Provider 凭据属于扫描器，不允许被 Prompt 或 Codex 子进程继承。
+        # Provider Token 始终是 Secret；是否暴露由对应变量的显式配置决定。
         environment_maps = [self.environment.global_variables]
         environment_maps.extend(
             repository.environment for repository in self.repositories
@@ -728,8 +737,6 @@ class AppConfig(BaseModel):
             for name in provider_token_names & environment_map.keys():
                 definition = environment_map[name]
                 definition.secret = True
-                definition.expose_to_prompt = False
-                definition.expose_to_process = False
 
         environment_names = set(self.environment.global_variables)
         for repository in self.repositories:
@@ -873,7 +880,7 @@ def _resolve_path(base_dir: Path, value: str | Path) -> Path:
 
 
 def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
-    """复制配置并强制隔离所有与 Provider Token 同名的变量。"""
+    """复制配置并为所有 Provider Token 设置安全的默认暴露策略。"""
 
     data = copy.deepcopy(raw)
     providers = data.get("providers", {})
@@ -921,8 +928,8 @@ def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
                 # 非法结构留给 Pydantic 给出原始校验错误。
                 continue
             definition["secret"] = True
-            definition["expose_to_prompt"] = False
-            definition["expose_to_process"] = False
+            definition.setdefault("expose_to_prompt", False)
+            definition.setdefault("expose_to_process", False)
             environment_map[name] = definition
     return data
 

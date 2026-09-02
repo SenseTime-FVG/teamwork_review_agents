@@ -111,7 +111,7 @@ sub-agent 不是模型内部的逻辑角色，而是由编排器启动的另一�
 
 ## 9. 凭据与权限
 
-Provider Token 按仓库环境、全局环境、服务进程宿主机环境的顺序解析同名变量。它只用于服务侧平台 API，并被强制标记为 Secret；启动 Codex CLI 前会从 Prompt 和子进程环境中移除，不把高权限 Provider Token 直接交给模型。
+Provider Token 按仓库环境、全局环境、服务进程宿主机环境的顺序解析同名变量。它始终被强制标记为 Secret，默认只用于服务侧平台 API；阶段 123 允许管理员在确认风险后分别把它显式传入 Prompt 或子进程。
 
 需要平台写操作时，推荐使用权限受控的 `gh`/`glab` 登录身份。生产版本可进一步增加窄权限的平台 MCP 工具，将评论、审批和合并变成可审计的确定性接口。
 
@@ -317,7 +317,7 @@ Agent 的本地文件能力与命令联网能力采用两个独立配置维度�
 
 联网参数由 Teamwork 作为应用托管的 Codex CLI 覆盖项注入。Agent 高级配置不得覆盖 `sandbox_workspace_write.network_access` 或 `features.network_proxy`，避免绕过 UI 与配置校验。未开启联网时显式传入关闭状态；开启且白名单为空时显式关闭域名代理；开启且存在白名单时显式启用代理并传入域名映射，使行为不受用户 `config.toml` 中同名设置影响。
 
-Provider Token 与命令联网权限完全分离。GitHub、GitLab 等 Provider 的 `token_env` 在创建 Codex 子进程前始终移除，不能通过开启联网、配置域名或 Agent 环境变量进入 Prompt 和命令环境。Codex 子进程继续继承宿主机 `HOME` 等基础环境，因此 `gh`、`glab` 可以使用各自已经建立的系统钥匙串或 CLI 登录态；Teamwork 不复制、不代理也不展示这些登录凭据。三个内置 Agent 默认都开启命令联网且不设置域名白名单，以便审核和增量文档任务按需使用自身 `gh` / `glab` 登录态；部署配置仍可由管理员收紧。
+Provider Token 与命令联网权限完全分离。GitHub、GitLab 等 Provider 的 `token_env` 默认不会进入 Prompt 或命令环境；阶段 123 增加显式暴露开关后，只有管理员单独确认对应风险才允许传入。Codex 子进程继续继承宿主机 `HOME` 等基础环境，因此 `gh`、`glab` 可以使用各自已经建立的系统钥匙串或 CLI 登录态；Teamwork 不复制、不代理也不展示这些登录凭据。三个内置 Agent 默认都开启命令联网且不设置域名白名单，以便审核和增量文档任务按需使用自身 `gh` / `glab` 登录态；部署配置仍可由管理员收紧。
 
 ## 31. 独立 Codex Home 账户登录与额度展示
 
@@ -391,7 +391,7 @@ Agent 管理首页使用紧凑列表替代把全部长表单连续铺在同一�
 
 ## 39. gh 与 glab 本地登录说明
 
-README 必须把本机 `gh` / `glab` 登录列为执行平台操作的明确前置条件，并链接独立的简短配置文档。配置文档只说明对应 CLI 的登录、指定平台主机和登录状态验证命令，同时强调登录必须由启动 Teamwork 服务的同一系统用户完成；Provider Token 只供扫描器使用，不能替代 Agent 所用的 CLI 登录态。文档不扩展到部署、Codex Home、SSH 排障或其他运维主题。
+README 必须把本机 `gh` / `glab` 登录列为执行平台操作的默认前置条件，并链接独立的简短配置文档。配置文档只说明对应 CLI 的登录、指定平台主机和登录状态验证命令，同时强调登录必须由启动 Teamwork 服务的同一系统用户完成；Provider Token 默认只供扫描器使用，阶段 123 即使允许显式暴露，也不自动替代 Agent 所用的 CLI 登录态。文档不扩展到部署、Codex Home、SSH 排障或其他运维主题。
 
 ## 40. 触发规则列表、独立详情与原子保存
 
@@ -493,9 +493,9 @@ Agent 增加 `home_mode` 配置，支持 `inherit` 和 `temporary`。`inherit` �
 
 临时 HOME 只允许用于可写沙箱。`read-only` 不得配置 `temporary`，避免把不可写目录误导为可用能力；`workspace-write` 依赖 Codex 对系统临时目录的既有可写边界，`danger-full-access` 只改变默认用户目录位置，不能阻止命令通过绝对路径访问宿主机。每次正常完成、失败、取消或超时都在 Codex 及后代进程收尾后清理临时 HOME。服务进程首次创建 Runner 时还会删除目录名所记录的宿主进程已经不存在的遗留 HOME；不能删除仍由存活服务进程持有的目录。
 
-切换 HOME 不能改变 Codex 与平台 CLI 的既有认证边界。Runner 在替换 `HOME` 前解析并固定实际 `CODEX_HOME`，使 Codex 登录、模型缓存和用户配置继续使用运行时指定目录或宿主机原目录。GitHub CLI 和 GitLab CLI 分别通过 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR` 显式引用宿主机已有配置目录；Git 通过 `GIT_CONFIG_GLOBAL` 只读引用已有全局配置，SSH 只继承 `SSH_AUTH_SOCK` 等 Agent 连接信息。不存在的桥接目录不创建也不复制，Teamwork 不复制整个用户目录、SSH 私钥、Codex 凭据或 CLI Token。Provider 的 `token_env` 仍在最终子进程环境中强制移除，Agent 环境变量不能把它重新注入。
+切换 HOME 不能改变 Codex 与平台 CLI 的既有认证边界。Runner 在替换 `HOME` 前解析并固定实际 `CODEX_HOME`，使 Codex 登录、模型缓存和用户配置继续使用运行时指定目录或宿主机原目录。GitHub CLI 和 GitLab CLI 分别通过 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR` 显式引用宿主机已有配置目录；Git 通过 `GIT_CONFIG_GLOBAL` 只读引用已有全局配置，SSH 只继承 `SSH_AUTH_SOCK` 等 Agent 连接信息。不存在的桥接目录不创建也不复制，Teamwork 不复制整个用户目录、SSH 私钥、Codex 凭据或 CLI Token。Provider 的 `token_env` 默认不会进入最终子进程；阶段 123 允许管理员在对应环境变量上显式开启进程暴露。
 
-macOS 的系统钥匙串搜索列表会受到 `HOME` 影响，仅设置 `GH_CONFIG_DIR` 不能保证 `gh` 找到原登录态。临时 HOME 模式在宿主机 `~/Library/Keychains` 已存在时，只在本次临时 HOME 的 `Library/Keychains` 创建指向该目录的符号链接，使 `gh` 继续通过 macOS Keychain 读取既有登录态。该桥接不复制钥匙串数据库、不读取或输出 Token，也不把 `GH_TOKEN` 或 Provider Token 注入 Codex 环境；宿主目录不存在或平台不是 macOS 时保持原有行为。运行清理与遗留目录回收只能删除临时 HOME 和符号链接本身，绝不能跟随链接删除真实钥匙串目录。
+macOS 的系统钥匙串搜索列表会受到 `HOME` 影响，仅设置 `GH_CONFIG_DIR` 不能保证 `gh` 找到原登录态。临时 HOME 模式在宿主机 `~/Library/Keychains` 已存在时，只在本次临时 HOME 的 `Library/Keychains` 创建指向该目录的符号链接，使 `gh` 继续通过 macOS Keychain 读取既有登录态。该桥接不复制钥匙串数据库、不读取或输出 Token，也不自动把 `GH_TOKEN` 或 Provider Token 注入 Codex 环境；Provider Token 只有通过阶段 123 的显式进程开关才会传入。宿主目录不存在或平台不是 macOS 时保持原有行为。运行清理与遗留目录回收只能删除临时 HOME 和符号链接本身，绝不能跟随链接删除真实钥匙串目录。
 
 运行日志记录临时 HOME 的准备、桥接项和清理结果，但不读取或记录被桥接配置文件的内容。Agent 管理详情在本地文件权限附近提供“继承系统 HOME / 每次运行使用临时 HOME”选项，列表摘要显示当前模式，并明确说明临时 HOME 与 Git 工作区是两个不同维度：运行 clone/worktree 隔离仓库状态，临时 HOME 隔离用户级缓存和配置写入。
 
@@ -515,7 +515,7 @@ macOS 的系统钥匙串搜索列表会受到 `HOME` 影响，仅设置 `GH_CONF
 
 入口 Prompt 统一使用“变更请求”表达业务流程：GitHub 上是 Pull Request（PR），通过已登录的 `gh` 或 GitHub API 核验原始 PR、创建文档 PR、查询精确文档提交的 Check Runs / Status Checks、Review 和分支保护或 Ruleset，最后在不绕过保护的前提下合并并删除源分支；GitLab 上是 Merge Request（MR），通过已登录的 `glab` 或 GitLab API 执行等价的 MR、Pipeline / Job、Approval、保护分支与合并流程。未知、冲突或不可认证的平台必须安全停止，不得混用另一平台的状态和命令。
 
-文档更新 sub-agent 仍只负责 Git 差异、文档候选、索引、验证、唯一提交与普通推送，不调用 GitHub 或 GitLab 的变更请求 API。为了兼容现有入口与结构化状态，`MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA` 及“MR 目标分支”等字段名继续保留，但 Prompt 必须明确这些是平台无关的历史协议名，对 GitHub PR 与 GitLab MR 含义完全一致。Provider Token 仍不进入 Agent，平台操作依赖启动 Teamwork 的同一系统用户已建立的 `gh` / `glab` 登录态。
+文档更新 sub-agent 仍只负责 Git 差异、文档候选、索引、验证、唯一提交与普通推送，不调用 GitHub 或 GitLab 的变更请求 API。为了兼容现有入口与结构化状态，`MR_TARGET_BEFORE_SHA`、`MR_TARGET_AFTER_SHA` 及“MR 目标分支”等字段名继续保留，但 Prompt 必须明确这些是平台无关的历史协议名，对 GitHub PR 与 GitLab MR 含义完全一致。Provider Token 默认不进入 Agent，平台操作默认依赖启动 Teamwork 的同一系统用户已建立的 `gh` / `glab` 登录态；阶段 123 的显式暴露不改变该 Agent 的职责边界。
 
 ## 54. 首次配置文档的跨平台一致性
 
@@ -599,7 +599,7 @@ Agent 的本地文件权限不能继续只依赖内层 `codex exec --sandbox`。
 
 `read-only` 使用外层只读档案，内层命令不能写仓库；`workspace-write` 使用 Codex 内置工作区档案，并对本次运行工作区显式增加 Git 元数据写权限，使独立 clone 中的普通文件与 `.git` 同属本轮可写边界。该内置档案还允许写系统临时目录，用于本轮临时 HOME 与工具缓存；不能把它表述为“机器上只有 clone 可写”，但基础仓库和真实 HOME 仍不加入可写根。可写 clone 创建时必须解除对基础仓库对象库的 alternates 借用，确保运行开始后 Git 元数据和对象都自包含。`danger-full-access` 的定义就是不受文件或网络沙盒限制，因此不套用受限外层档案，继续作为管理员明确选择的高风险模式直接执行。
 
-命令联网仍由 Agent 的 `network_access` 与 `network_domains` 控制。关闭联网时外层沙盒禁用网络；开启且白名单非空时，外层只允许列出的域名，并必须同时注入 `features.network_proxy=true`，因为权限档案的 `network.enabled` 只允许联网，不会自行启动负责强制域名规则的代理；开启且白名单为空时允许普通网络访问。内层 Codex 不再拥有第二份可能冲突的网络策略。macOS 的 `SSH_AUTH_SOCK` 等确有需要的 Unix Socket 只能按已继承的具体路径加入外层允许列表，不能开放任意 Socket 根目录。Provider Token 继续从 Codex 环境移除；`gh`、`glab`、Git、SSH 和 Codex 登录继续通过既有临时 HOME 安全桥接使用宿主用户登录态，不复制整个真实 HOME。
+命令联网仍由 Agent 的 `network_access` 与 `network_domains` 控制。关闭联网时外层沙盒禁用网络；开启且白名单非空时，外层只允许列出的域名，并必须同时注入 `features.network_proxy=true`，因为权限档案的 `network.enabled` 只允许联网，不会自行启动负责强制域名规则的代理；开启且白名单为空时允许普通网络访问。内层 Codex 不再拥有第二份可能冲突的网络策略。macOS 的 `SSH_AUTH_SOCK` 等确有需要的 Unix Socket 只能按已继承的具体路径加入外层允许列表，不能开放任意 Socket 根目录。Provider Token 默认从 Codex 环境移除，阶段 123 显式开启进程暴露后除外；`gh`、`glab`、Git、SSH 和 Codex 登录继续通过既有临时 HOME 安全桥接使用宿主用户登录态，不复制整个真实 HOME。
 
 外层沙盒进程是 Codex、沙盒内 MCP 代理、shell、Git 和其他 Agent 命令的共同祖先进程。完整 MCP Broker 作为 Teamwork 管理的同级进程运行在外层沙盒之外，继续读取配置与 SQLite 并复用既有 sub-agent 白名单、调用深度、幂等和并发校验；沙盒内代理只暴露 `invoke_agent`，通过本轮专属、权限为 `0700`、带随机令牌的临时文件通道交换请求与响应。权限档案只额外放行这一个通道目录，不能由此读取配置、数据库、基础仓库或其他 Agent 工作区。通道在 Broker 和全部委托退出后删除。
 
@@ -655,7 +655,7 @@ GitHub 合并 PR 时会在 Timeline 中先后记录 `merged` 与自动 `closed`�
 
 ## 68. 沙盒化 Jinja Prompt 渲染与审核合并开关
 
-Prompt 模板需要在保留现有 `${{ENV_NAME}}` 环境变量替换语义的同时支持条件分支。项目直接依赖 Jinja2，并使用不配置文件加载器的 `SandboxedEnvironment` 渲染内置、内联和管理界面导入的 Prompt。模板上下文只包含本轮允许进入 Prompt 的变量；Provider 凭据和未开启 `expose_to_prompt` 的值仍不可见。Jinja 不提供宿主对象、文件读取函数或项目自定义全局对象，环境变量值只作为数据参与一次渲染，不能作为模板源码再次执行。
+Prompt 模板需要在保留现有 `${{ENV_NAME}}` 环境变量替换语义的同时支持条件分支。项目直接依赖 Jinja2，并使用不配置文件加载器的 `SandboxedEnvironment` 渲染内置、内联和管理界面导入的 Prompt。模板上下文只包含本轮允许进入 Prompt 的变量；Provider 凭据默认不可见，但阶段 123 允许管理员显式开启其 `expose_to_prompt`，其他未开启该字段的值仍不可见。Jinja 不提供宿主对象、文件读取函数或项目自定义全局对象，环境变量值只作为数据参与一次渲染，不能作为模板源码再次执行。
 
 旧语法 `${{NAME}}` 在解析模板前只转换为等价的 Jinja 变量节点，再由同一次 Jinja 渲染求值。这样已有 Prompt 保持“存在则替换、缺失则为空字符串”的行为，同时变量内容中的 `{{ ... }}` 或 `{% ... %}` 只作为普通文本输出，不会形成二次模板注入。新模板可以使用原生 `{{ NAME }}`、`{% if %}`、`{% else %}` 和 `{% endif %}`。项目提供 `as_bool` 过滤器；只有布尔真或去除空白后不区分大小写等于 `true` 的字符串为真，其余值均为假。缺失变量使用 Jinja 的安全空值语义，字符串输出为空、条件判断为假。
 
@@ -775,7 +775,7 @@ Preflight 输出从“结束时一次写入”改为有界增量日志。步骤�
 
 Windows 上 Git 对象、包缓存和工具生成文件可能带只读属性，直接调用 `shutil.rmtree` 会让已完成的 Agent 被误判为“工作区保留”，也会使 Skill 投影、临时 HOME、MCP 通道或 Preflight 临时目录无法回收。项目统一使用跨平台目录删除器：只在删除遇到权限错误时清除目标自身的只读属性并重试，对短暂占用执行有界重试，最终失败仍保留原异常。删除器不能跟随目录符号链接，也不能把清理失败静默改写成成功；工作区安全校验和“有未提交修改则保留”策略保持不变。
 
-后台 Agent 和 Preflight 不继承宿主机全部环境变量，但原生 Windows 创建进程所需的 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`APPDATA` 和 `LOCALAPPDATA` 必须进入允许列表。使用临时 HOME 时，`HOME`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP` 和 `TMP` 统一重定向到本轮目录；Codex 登录仍通过显式 `CODEX_HOME` 访问，Provider Token 仍在最终环境中按不区分大小写的变量名移除。Windows 的 GitHub CLI 默认配置目录 `%APPDATA%/GitHub CLI` 与 GitLab CLI 默认目录 `%APPDATA%/glab-cli` 在宿主目录实际存在时分别通过 `GH_CONFIG_DIR` 和 `GLAB_CONFIG_DIR` 只读桥接，不复制凭据，不把 Token 写入环境或日志。
+后台 Agent 和 Preflight 不继承宿主机全部环境变量，但原生 Windows 创建进程所需的 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`APPDATA` 和 `LOCALAPPDATA` 必须进入允许列表。使用临时 HOME 时，`HOME`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP` 和 `TMP` 统一重定向到本轮目录；Codex 登录仍通过显式 `CODEX_HOME` 访问，Provider Token 默认不进入最终环境，阶段 123 显式开启进程暴露后除外。Windows 的 GitHub CLI 默认配置目录 `%APPDATA%/GitHub CLI` 与 GitLab CLI 默认目录 `%APPDATA%/glab-cli` 在宿主目录实际存在时分别通过 `GH_CONFIG_DIR` 和 `GLAB_CONFIG_DIR` 只读桥接，不复制凭据，不把 Token 写入环境或日志。
 
 后台 `stop` / `restart` 在 Windows 不能把 `psutil.Process.terminate()` 当作优雅终止，因为该操作等价于强制结束进程。每个配置对应一个原子停止请求文件，内容绑定目标 PID 和进程启动时间；受管服务轮询到属于自己的请求后设置 Uvicorn 的退出标记，从而进入 FastAPI lifespan，依次停止扫描、取消 Agent、回收 Codex 与 Preflight 子进程并释放单实例锁。管理命令等待正常退出，超过既有停止超时后才强制结束完整进程树。POSIX 继续使用系统终止信号，同时写入同一请求以保持行为一致；陈旧请求在成功停止或取得新服务锁后清除，不能因 PID 重用误停新实例。
 
@@ -1121,4 +1121,14 @@ Provider 的 `token_env` 是平台凭据的逻辑变量名。每次对具体仓�
 
 扫描器仍保持一个扫描周期和现有仓库顺序，但 Provider HTTP 客户端改为在每个仓库边界内创建和关闭，创建时使用该仓库解析出的 Token。一个仓库的 Token 缺失、认证失败或权限不足只记录为该仓库扫描错误，不能阻止同一 Provider 下其他仓库继续扫描。Commit Status、Preflight 失败评论、Agent 托管评论及评论删除等所有服务侧平台写操作必须复用相同的仓库级解析规则，避免扫描与写回身份不一致。
 
-Provider Token 无论来自仓库、全局还是宿主机，都继续强制标记为 Secret，并从 Prompt、Agent/CI 子进程环境、配置历史明文和普通日志中移除。错误摘要与 Preflight 输出继续使用本仓库实际解析出的 Token 脱敏。管理界面的 Provider Token 说明和仓库环境变量说明应明确该覆盖关系；旧配置没有仓库级 Token 时保持现有“全局 → 宿主机”行为，不新增配置字段或数据库迁移。
+Provider Token 无论来自仓库、全局还是宿主机，都继续强制标记为 Secret；默认不进入 Prompt 或 Agent/CI 子进程，是否显式暴露由阶段 123 的独立开关控制。配置历史明文和普通日志始终移除凭据，错误摘要与 Preflight 输出继续使用本仓库实际解析出的 Token 脱敏。管理界面的 Provider Token 说明和仓库环境变量说明应明确该覆盖关系；旧配置没有仓库级 Token 时保持现有“全局 → 宿主机”行为，不新增 Provider 字段或数据库迁移。
+
+## 123. Provider Token 显式暴露控制与风险确认
+
+Provider Token 继续强制按 Secret 处理，固定值在配置读取、配置历史、运行快照、日志和错误摘要中保持脱敏；Secret 身份本身不再等同于禁止运行使用。Provider Token 的 `expose_to_prompt` 与 `expose_to_process` 改为独立、显式的用户配置：两项缺省都为 `false`，旧配置未声明时保持不暴露；用户明确配置 `true` 时，运行时不得再按变量名将其静默删除。
+
+开启 `expose_to_prompt` 后，本轮按全局、仓库、Agent 优先级解析出的 Token 可以进入 Prompt 模板上下文，模型能够读取该明文，但持久化的 Prompt 快照和普通日志仍必须经 Secret 脱敏。开启 `expose_to_process` 后，Token 可以进入 Agent 的 Codex CLI 环境、模型基座工具命令环境和仓库 Preflight / CI 环境；关闭时上述进程都不得继承。Provider 服务侧扫描、状态和评论继续按阶段 122 的仓库、全局、宿主机优先级解析，不受暴露开关影响。
+
+管理界面识别到名称被任一 Provider 的 `token_env` 使用时，自动将变量设为 Secret，并默认关闭 Prompt 与进程暴露。用户把任一关闭的暴露开关改为开启时，必须先显示风险确认弹窗：Prompt 确认明确说明 Token 会发送给模型并可能被模型输出；进程确认明确说明 Agent、仓库代码和 CI 命令可读取并可能外传 Token。取消不改变开关，关闭开关不需要确认，已开启状态在编辑其他字段或保存时不重复确认。直接编辑 YAML 视为显式配置，不依赖管理界面弹窗。
+
+Provider Token 的 Secret 开关保持锁定开启，避免用户允许运行使用后又意外关闭审计脱敏。配置加载器只为未显式声明的暴露字段应用安全默认值，不能覆盖用户明确保存的 `true`；前后端均应覆盖新建变量、变量重命名为 Provider Token、已有配置回读和开关确认。保留 Provider Token 与 Codex/OpenAI 模型凭据变量不可复用的限制，不改变 `gh` / `glab` 独立登录边界。

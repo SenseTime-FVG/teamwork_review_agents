@@ -849,7 +849,7 @@ def test_model_tool_environment_uses_empty_run_codex_home(
         {
             "OPENAI_API_KEY": "do-not-forward",
             "CODEX_API_KEY": "do-not-forward",
-            "Github_Token": "do-not-forward",
+            "Github_Token": "explicit-provider-token",
         },
         temporary_home=None,
         tool_codex_home=tool_codex_home,
@@ -860,7 +860,7 @@ def test_model_tool_environment_uses_empty_run_codex_home(
     assert "OPENAI_API_KEY" not in environment
     assert "CODEX_API_KEY" not in environment
     assert "GITHUB_TOKEN" not in environment
-    assert "Github_Token" not in environment
+    assert environment["Github_Token"] == "explicit-provider-token"
     assert environment["SYSTEMROOT"] == "C:/Windows"
     assert environment["COMSPEC"] == "C:/Windows/System32/cmd.exe"
 

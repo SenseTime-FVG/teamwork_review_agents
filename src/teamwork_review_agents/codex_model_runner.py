@@ -356,13 +356,12 @@ class CodexModelRunner:
             )
         # 模型客户端单独读取真实登录；工具只看见空的本轮 Codex 运行目录。
         environment["CODEX_HOME"] = str(tool_codex_home)
-        # OAuth 与 Provider 凭据都不能进入 Teamwork 工具子进程。
+        # 模型凭据始终隔离；Provider Token 仅在用户显式允许时由 Agent 环境传入。
         remove_environment_names(
             environment,
             (
                 "CODEX_API_KEY",
                 "OPENAI_API_KEY",
-                *(provider.token_env for provider in self.config.providers.values()),
             ),
         )
         environment["PYTHONUNBUFFERED"] = "1"
