@@ -59,7 +59,7 @@ jobs:
           tests/test_process_manager.py
           tests/test_preflight.py
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
-          tests/test_config_and_runner.py::test_runner_scrubs_provider_tokens
+          tests/test_config_and_runner.py::test_runner_only_accepts_explicit_provider_token_environment
           tests/test_model_runtime.py::test_model_tool_environment_uses_empty_run_codex_home
           tests/test_model_runtime.py::test_shell_command_uses_final_child_path
       - name: 检查 Python 编译
