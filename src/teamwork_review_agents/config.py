@@ -635,24 +635,23 @@ class ScheduleConfig(BaseModel):
 
 
 class ScheduledRuleConfig(BaseModel):
-    """按时间为明确仓库与 Agent 创建独立根运行的规则。"""
+    """按时间为仓库与 Agent 创建独立根运行的规则。"""
 
     name: str
     agents: list[str]
-    repositories: list[str]
+    repositories: list[str] = Field(default_factory=list)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    inherit_workspace: bool = False
     enabled: bool = True
 
     @model_validator(mode="after")
     def validate_targets(self) -> "ScheduledRuleConfig":
-        """定时规则必须显式限定执行目标。"""
+        """定时规则必须显式选择 Agent，空仓库范围表示全部。"""
 
         if not self.name.strip():
             raise ValueError("定时规则名称不能为空")
         if not self.agents:
             raise ValueError(f"定时规则 {self.name} 至少需要一个 Agent")
-        if not self.repositories:
-            raise ValueError(f"定时规则 {self.name} 至少需要一个仓库")
         return self
 
 

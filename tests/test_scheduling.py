@@ -94,6 +94,16 @@ def test_schedule_config_validates_interval_cron_and_timezone(tmp_path) -> None:
         tzinfo=UTC,
     )
 
+    all_repositories_rule = ScheduledRuleConfig.model_validate(
+        {
+            "name": "all-repositories",
+            "agents": ["maintainer"],
+            "schedule": {"kind": "interval"},
+        }
+    )
+    assert all_repositories_rule.repositories == []
+    assert all_repositories_rule.inherit_workspace is False
+
     with pytest.raises(ValueError, match="标准五段"):
         ScheduledRuleConfig.model_validate(
             {
@@ -257,6 +267,69 @@ async def test_scheduled_occurrences_overlap_and_each_period_is_idempotent(tmp_p
     )
     assert duplicate.scheduled_occurrences == 0
     assert len(executor.calls) == 2
+
+
+async def test_empty_scheduled_repository_scope_uses_all_enabled_repositories(
+    tmp_path,
+) -> None:
+    """空仓库范围应动态覆盖全部已启用仓库并传递工作区继承策略。"""
+
+    config = scheduled_config(tmp_path)
+    config.repositories.extend(
+        [
+            config.repositories[0].model_copy(
+                update={
+                    "id": "second",
+                    "project": "owner/second",
+                    "workspace": tmp_path / "second-workspace",
+                }
+            ),
+            config.repositories[0].model_copy(
+                update={
+                    "id": "disabled",
+                    "project": "owner/disabled",
+                    "workspace": tmp_path / "disabled-workspace",
+                    "enabled": False,
+                }
+            ),
+        ]
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+
+    class FakeExecutor:
+        """记录动态仓库范围和继承参数，不启动真实 Agent。"""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        async def execute(
+            self,
+            *,
+            schedule: ScheduledRunContext,
+            inherit_workspace: bool,
+            **_kwargs,
+        ) -> AgentResult:
+            self.calls.append((schedule.repository_id, inherit_workspace))
+            return AgentResult(
+                run_id=f"run-{schedule.repository_id}",
+                root_run_id=f"run-{schedule.repository_id}",
+                agent_name="maintainer",
+                status="completed",
+            )
+
+    executor = FakeExecutor()
+    orchestrator.executor = executor
+    rule = config.scheduled_rules[0].model_copy(
+        update={"repositories": [], "inherit_workspace": True}
+    )
+    summary = await orchestrator.run_scheduled_rule(
+        rule,
+        scheduled_at=300.0,
+        schedule_signature="all-enabled-signature",
+    )
+
+    assert summary.agent_runs == 2
+    assert executor.calls == [("demo", True), ("second", True)]
 
 
 async def test_runtime_does_not_wait_for_previous_scheduled_period(

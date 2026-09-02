@@ -381,6 +381,7 @@ export type ScheduledRule = {
   name: string;
   agents: string[];
   repositories: string[];
+  inherit_workspace?: boolean;
   schedule: {
     kind: "interval" | "cron";
     interval_value?: number;

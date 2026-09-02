@@ -585,8 +585,13 @@ class Orchestrator:
         summary.scheduled_occurrences = 1
         created_at = datetime.now(UTC)
         repository_map = self.config.repository_map()
+        repository_ids = rule.repositories or [
+            repository.id
+            for repository in self.config.repositories
+            if repository.enabled
+        ]
         tasks: list[tuple[str, str, asyncio.Task[AgentResult | None]]] = []
-        for repository_id in dict.fromkeys(rule.repositories):
+        for repository_id in dict.fromkeys(repository_ids):
             repository = repository_map.get(repository_id)
             if repository is None or not repository.enabled:
                 summary.errors.append(
@@ -606,6 +611,7 @@ class Orchestrator:
                         agent_name=agent_name,
                         schedule=schedule,
                         rule_name=rule.name,
+                        inherit_workspace=rule.inherit_workspace,
                         idempotency_key=stable_hash(
                             "scheduled-run",
                             occurrence_id,

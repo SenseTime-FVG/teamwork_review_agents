@@ -1138,6 +1138,8 @@ function MultiSelect(props: {
   values: string[];
   options: string[];
   onChange: (values: string[]) => void;
+  emptySummary?: string;
+  help?: string;
 }) {
   function toggle(option: string) {
     props.onChange(
@@ -1151,7 +1153,7 @@ function MultiSelect(props: {
     <div className="multi-choice-field">
       <div className="multi-choice-head">
         <span>{props.label}</span>
-        <small>已选择 {props.values.length} 个</small>
+        <small>{props.values.length ? `已选择 ${props.values.length} 个` : props.emptySummary ?? "已选择 0 个"}</small>
       </div>
       {props.options.length === 0 ? (
         <div className="multi-choice-empty">暂无可选项</div>
@@ -1172,7 +1174,7 @@ function MultiSelect(props: {
           })}
         </div>
       )}
-      <small className="multi-choice-help">直接点击选项即可多选或取消，不需要按 Command / Ctrl。</small>
+      <small className="multi-choice-help">{props.help ?? "直接点击选项即可多选或取消，不需要按 Command / Ctrl。"}</small>
     </div>
   );
 }
@@ -7197,7 +7199,8 @@ function createEmptyScheduledRule(document: ConfigDocument): ScheduledRule {
   return {
     name,
     agents: Object.keys(document.agents).slice(0, 1),
-    repositories: document.repositories.slice(0, 1).map((repository) => repository.id),
+    repositories: [],
+    inherit_workspace: false,
     schedule: {
       kind: "interval",
       interval_value: 1,
@@ -7328,8 +7331,8 @@ function ScheduledRulesView(props: {
 
   async function saveRule() {
     if (!editing || !draftRule || !draftName.trim()) return;
-    if (draftRule.agents.length === 0 || draftRule.repositories.length === 0) {
-      props.onError("定时规则至少需要选择一个 Agent 和一个仓库");
+    if (draftRule.agents.length === 0) {
+      props.onError("定时规则至少需要选择一个 Agent");
       return;
     }
     setSaving(true);
@@ -7434,7 +7437,7 @@ function ScheduledRulesView(props: {
       details: [
         { label: "规则", value: detailName, mono: true },
         { label: "周期", value: scheduledRuleSummary(originalRule) },
-        { label: "运行组合", value: `${originalRule.repositories.length} 个仓库 × ${originalRule.agents.length} 个 Agent` },
+        { label: "运行组合", value: `${originalRule.repositories.length ? `${originalRule.repositories.length} 个仓库` : "全部已启用仓库"} × ${originalRule.agents.length} 个 Agent` },
       ],
       impactTitle: "停止后续定时运行",
       impact: "已经产生的定时运行和日志不会删除；删除时不会取消正在执行的 Agent。",
@@ -7498,7 +7501,7 @@ function ScheduledRulesView(props: {
                   </span>
                   <span className="agent-config-summary"><strong>{scheduledRuleSummary(rule)}</strong><small>{rule.schedule.kind === "cron" ? "标准 5 段 Cron" : "固定间隔"}</small></span>
                   <span className="agent-config-summary"><strong>{rule.agents.length} 个</strong><small>{rule.agents.join("、") || "未选择 Agent"}</small></span>
-                  <span className="agent-config-summary"><strong>{rule.repositories.length} 个</strong><small>{rule.repositories.join("、") || "未选择仓库"}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.repositories.length ? `${rule.repositories.length} 个` : "全部"}</strong><small>{rule.repositories.join("、") || "全部已启用仓库"}</small></span>
                   <span className="agent-config-summary"><strong>{enabled ? timeText(runtime?.next_scheduled_at) : "已停用"}</strong><small>{enabled ? "不补跑停机期间的周期" : "启用后重新计算"}</small></span>
                   <button
                     type="button"
@@ -7525,7 +7528,6 @@ function ScheduledRulesView(props: {
   const valid = Boolean(
     activeName.trim()
     && activeRule.agents.length > 0
-    && activeRule.repositories.length > 0
     && (schedule.kind === "cron" ? schedule.cron?.trim() : (schedule.interval_value ?? 0) > 0),
   );
   return (
@@ -7605,7 +7607,24 @@ function ScheduledRulesView(props: {
           </div>
           <div className="form-grid two scheduled-rule-targets">
             <MultiSelect label="执行 Agent" values={activeRule.agents} options={Object.keys(props.document.agents)} onChange={(agents) => updateDraft({ agents })} />
-            <MultiSelect label="执行仓库" values={activeRule.repositories} options={props.document.repositories.map((repository) => repository.id)} onChange={(repositories) => updateDraft({ repositories })} />
+            <MultiSelect
+              label="执行仓库"
+              values={activeRule.repositories}
+              options={props.document.repositories.map((repository) => repository.id)}
+              emptySummary="全部已启用仓库"
+              help="不选择时，每次触发动态执行全部已启用仓库；选择后只执行指定仓库。"
+              onChange={(repositories) => updateDraft({ repositories })}
+            />
+          </div>
+          <div className="rule-options scheduled-rule-options">
+            <div className="rule-option">
+              <Toggle
+                label="sub-agent 继承当前工作区"
+                checked={activeRule.inherit_workspace ?? false}
+                onChange={(inherit_workspace) => updateDraft({ inherit_workspace })}
+              />
+              <p>开启后，sub-agent 复用父 Agent 本次运行的临时 clone 或 worktree，共享当前分支、暂存区和未提交文件；只继承工作区，不自动继承父 Agent 对话。</p>
+            </div>
           </div>
           <div className="agent-workspace-note scheduled-rule-note">
             <strong>并行策略</strong>
