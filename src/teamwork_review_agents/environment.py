@@ -19,7 +19,7 @@ from .config import (
     ProviderConfig,
     RepositoryConfig,
 )
-from .models import ChangeEvent
+from .models import ChangeEvent, ScheduledRunContext
 
 
 TEMPLATE_PATTERN = re.compile(r"\$\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}")
@@ -81,10 +81,11 @@ def resolve_provider_token(config: AppConfig, provider: ProviderConfig) -> str:
 
 def runtime_variables(
     repository: RepositoryConfig,
-    event: ChangeEvent,
+    event: ChangeEvent | None,
     run_id: str,
     *,
     include_change_request: bool = True,
+    schedule: ScheduledRunContext | None = None,
 ) -> dict[str, str]:
     """生成不可由用户覆盖的仓库、MR 和运行变量。"""
 
@@ -94,7 +95,15 @@ def runtime_variables(
         "REPOSITORY_WORKSPACE": str(repository.workspace),
         "RUN_ID": run_id,
     }
-    if not include_change_request:
+    if schedule is not None:
+        variables.update({
+            "SCHEDULE_RULE_NAME": schedule.rule_name,
+            "SCHEDULE_OCCURRENCE_ID": schedule.occurrence_id,
+            "SCHEDULED_AT": schedule.scheduled_at.isoformat(),
+            "SCHEDULE_BRANCH": schedule.branch,
+            "SCHEDULE_HEAD_SHA": schedule.head_sha,
+        })
+    if not include_change_request or event is None:
         return variables
 
     snapshot = event.current_snapshot
@@ -115,10 +124,11 @@ def resolve_environment(
     config: AppConfig,
     repository: RepositoryConfig,
     agent: AgentConfig,
-    event: ChangeEvent,
+    event: ChangeEvent | None,
     run_id: str,
     *,
     include_change_request: bool = True,
+    schedule: ScheduledRunContext | None = None,
 ) -> ResolvedEnvironment:
     """按全局、仓库、Agent、运行变量顺序合并。"""
 
@@ -156,6 +166,7 @@ def resolve_environment(
         event,
         run_id,
         include_change_request=include_change_request,
+        schedule=schedule,
     )
     all_values.update(builtins)
     prompt_values.update(builtins)

@@ -199,6 +199,16 @@ class ConfigManager:
                         next_name if item == current_name else item
                         for item in rule["agents"]
                     ]
+                for rule in document.get("scheduled_rules", []):
+                    if (
+                        not isinstance(rule, dict)
+                        or not isinstance(rule.get("agents"), list)
+                    ):
+                        continue
+                    rule["agents"] = [
+                        next_name if item == current_name else item
+                        for item in rule["agents"]
+                    ]
             document["agents"] = next_agents
             merged = protect_provider_credentials(
                 self._merge_masked(document, current_raw)
@@ -220,6 +230,17 @@ class ConfigManager:
             agents = current_raw.get("agents", {})
             if not isinstance(agents, dict) or name not in agents:
                 raise ValueError(f"Agent 不存在：{name}")
+            referencing_schedules = [
+                str(rule.get("name", ""))
+                for rule in current_raw.get("scheduled_rules", [])
+                if isinstance(rule, dict)
+                and isinstance(rule.get("agents"), list)
+                and name in rule["agents"]
+            ]
+            if referencing_schedules:
+                raise ValueError(
+                    f"Agent {name} 仍被定时规则引用：{referencing_schedules}"
+                )
 
             document = copy.deepcopy(current_raw)
             next_agents = {
@@ -320,6 +341,84 @@ class ConfigManager:
 
             document = copy.deepcopy(current_raw)
             document["rules"] = [
+                copy.deepcopy(item)
+                for item in rules
+                if not (isinstance(item, dict) and item.get("name") == name)
+            ]
+            return self._persist_locked(document, source=source)
+
+    def save_scheduled_rule(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        rule: dict[str, Any],
+        original_name: str | None = None,
+        source: str = "ui-scheduled-rule",
+    ) -> AppConfig:
+        """基于最新配置原子创建或更新一条定时触发规则。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            next_name = name.strip()
+            if not next_name:
+                raise ValueError("定时规则名称不能为空")
+            rules = current_raw.get("scheduled_rules", [])
+            if not isinstance(rules, list):
+                raise ValueError("scheduled_rules 配置必须是数组")
+            if not all(isinstance(item, dict) for item in rules):
+                raise ValueError("scheduled_rules 中的每一项都必须是对象")
+
+            current_name = original_name.strip() if original_name is not None else None
+            rule_names = [str(item.get("name", "")) for item in rules]
+            if current_name is None:
+                if next_name in rule_names:
+                    raise ValueError(f"定时规则已存在：{next_name}")
+                target_index = len(rules)
+            else:
+                if current_name not in rule_names:
+                    raise ValueError(f"定时规则不存在：{current_name}")
+                if next_name != current_name and next_name in rule_names:
+                    raise ValueError(f"定时规则已存在：{next_name}")
+                target_index = rule_names.index(current_name)
+
+            next_rule = copy.deepcopy(rule)
+            next_rule["name"] = next_name
+            next_rules = [copy.deepcopy(item) for item in rules]
+            if current_name is None:
+                next_rules.append(next_rule)
+            else:
+                next_rules[target_index] = next_rule
+            document = copy.deepcopy(current_raw)
+            document["scheduled_rules"] = next_rules
+            merged = protect_provider_credentials(
+                self._merge_masked(document, current_raw)
+            )
+            return self._persist_locked(merged, source=source)
+
+    def delete_scheduled_rule(
+        self,
+        *,
+        expected_revision: str,
+        name: str,
+        source: str = "ui-scheduled-rule-delete",
+    ) -> AppConfig:
+        """基于最新配置原子删除一条定时触发规则。"""
+
+        with self._lock:
+            current_raw = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current_raw, expected_revision)
+            rules = current_raw.get("scheduled_rules", [])
+            if not isinstance(rules, list):
+                raise ValueError("scheduled_rules 配置必须是数组")
+            if not any(
+                isinstance(item, dict) and item.get("name") == name
+                for item in rules
+            ):
+                raise ValueError(f"定时规则不存在：{name}")
+            document = copy.deepcopy(current_raw)
+            document["scheduled_rules"] = [
                 copy.deepcopy(item)
                 for item in rules
                 if not (isinstance(item, dict) and item.get("name") == name)
@@ -623,6 +722,18 @@ class ConfigManager:
             if referencing_rules:
                 raise ValueError(
                     f"仓库 {repository_id} 仍被触发规则引用：{referencing_rules}"
+                )
+            referencing_schedules = [
+                str(rule.get("name", ""))
+                for rule in current_raw.get("scheduled_rules", [])
+                if isinstance(rule, dict)
+                and isinstance(rule.get("repositories"), list)
+                and repository_id in rule["repositories"]
+            ]
+            if referencing_schedules:
+                raise ValueError(
+                    f"仓库 {repository_id} 仍被定时规则引用："
+                    f"{referencing_schedules}"
                 )
 
             document = copy.deepcopy(current_raw)

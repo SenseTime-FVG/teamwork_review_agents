@@ -6,11 +6,13 @@ import copy
 import os
 import hashlib
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
+from croniter import croniter
 from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator
 
 
@@ -608,6 +610,52 @@ class RuleConfig(BaseModel):
     enabled: bool = True
 
 
+class ScheduleConfig(BaseModel):
+    """固定间隔或 Cron 调度定义。"""
+
+    kind: Literal["interval", "cron"] = "interval"
+    interval_value: PositiveInt = 1
+    interval_unit: Literal["minutes", "hours", "days"] = "hours"
+    cron: str = "0 * * * *"
+    timezone: str = "Asia/Shanghai"
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> "ScheduleConfig":
+        """校验五段 Cron 和 IANA 时区，阻止运行期才暴露配置错误。"""
+
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"无效时区：{self.timezone}") from exc
+        if self.kind == "cron":
+            fields = self.cron.split()
+            if len(fields) != 5 or not croniter.is_valid(self.cron):
+                raise ValueError("Cron 表达式必须是有效的标准五段格式")
+        return self
+
+
+class ScheduledRuleConfig(BaseModel):
+    """按时间为明确仓库与 Agent 创建独立根运行的规则。"""
+
+    name: str
+    agents: list[str]
+    repositories: list[str]
+    schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "ScheduledRuleConfig":
+        """定时规则必须显式限定执行目标。"""
+
+        if not self.name.strip():
+            raise ValueError("定时规则名称不能为空")
+        if not self.agents:
+            raise ValueError(f"定时规则 {self.name} 至少需要一个 Agent")
+        if not self.repositories:
+            raise ValueError(f"定时规则 {self.name} 至少需要一个仓库")
+        return self
+
+
 class AppConfig(BaseModel):
     """应用完整配置。"""
 
@@ -622,6 +670,7 @@ class AppConfig(BaseModel):
     skills: dict[str, SkillConfig] = Field(default_factory=dict)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
     rules: list[RuleConfig] = Field(default_factory=list)
+    scheduled_rules: list[ScheduledRuleConfig] = Field(default_factory=list)
     config_path: Path = Field(exclude=True)
     revision: str = Field(exclude=True)
 
@@ -789,6 +838,23 @@ class AppConfig(BaseModel):
                     raise ValueError(
                         f"规则 {rule.name} 引用了不存在的仓库：{sorted(unknown_repositories)}"
                     )
+        scheduled_rule_names: set[str] = set()
+        for rule in self.scheduled_rules:
+            if rule.name in scheduled_rule_names:
+                raise ValueError(f"存在重复定时规则名：{rule.name}")
+            scheduled_rule_names.add(rule.name)
+            unknown_agents = set(rule.agents) - agent_names
+            if unknown_agents:
+                raise ValueError(
+                    f"定时规则 {rule.name} 引用了不存在的 Agent："
+                    f"{sorted(unknown_agents)}"
+                )
+            unknown_repositories = set(rule.repositories) - known_repositories
+            if unknown_repositories:
+                raise ValueError(
+                    f"定时规则 {rule.name} 引用了不存在的仓库："
+                    f"{sorted(unknown_repositories)}"
+                )
         return self
 
     def repository_map(self) -> dict[str, RepositoryConfig]:

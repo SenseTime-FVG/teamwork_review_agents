@@ -1171,8 +1171,7 @@ def temporary_change_request_worktree(
             )
 
 
-@contextmanager
-def temporary_default_branch_worktree(
+def prepare_default_branch_workspace(
     provider: ProviderConfig,
     repository: RepositoryConfig,
     *,
@@ -1180,8 +1179,8 @@ def temporary_default_branch_worktree(
     initialization_timeout_seconds: int = 1800,
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
-) -> Iterator[tuple[Path, str, str]]:
-    """更新基础仓库，并在临时 worktree 检出远端默认分支最新提交。"""
+) -> tuple[Path, str, str]:
+    """更新基础仓库，并解析远端默认分支及其最新提交。"""
 
     workspace, _ = initialize_repository_workspace(
         provider,
@@ -1257,6 +1256,29 @@ def temporary_default_branch_worktree(
         remote_ref.removeprefix("origin/")
         if remote_ref.startswith("origin/")
         else remote_ref
+    )
+    return workspace, branch, head_sha
+
+
+@contextmanager
+def temporary_default_branch_worktree(
+    provider: ProviderConfig,
+    repository: RepositoryConfig,
+    *,
+    timeout_seconds: int = 600,
+    initialization_timeout_seconds: int = 1800,
+    cancel_check: GitCancelCheck | None = None,
+    progress_callback: GitProgressCallback | None = None,
+) -> Iterator[tuple[Path, str, str]]:
+    """更新基础仓库，并在临时 worktree 检出远端默认分支最新提交。"""
+
+    workspace, branch, head_sha = prepare_default_branch_workspace(
+        provider,
+        repository,
+        timeout_seconds=timeout_seconds,
+        initialization_timeout_seconds=initialization_timeout_seconds,
+        cancel_check=cancel_check,
+        progress_callback=progress_callback,
     )
     with temporary_directory(
         directory=workspace.parent,

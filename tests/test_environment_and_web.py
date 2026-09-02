@@ -289,6 +289,82 @@ def test_config_manager_saves_one_rule_without_changing_order(tmp_path) -> None:
     ]
 
 
+def test_web_api_manages_scheduled_rules_with_revision_checks(tmp_path) -> None:
+    """定时规则应支持单项创建、更新、删除和配置热加载通知。"""
+
+    config_path = write_config(tmp_path)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/scheduled-rules",
+            json={
+                "revision": current["revision"],
+                "name": "hourly-review",
+                "rule": {
+                    "name": "hourly-review",
+                    "agents": ["reviewer"],
+                    "repositories": ["first"],
+                    "schedule": {
+                        "kind": "interval",
+                        "interval_value": 1,
+                        "interval_unit": "hours",
+                        "timezone": "Asia/Shanghai",
+                    },
+                    "enabled": True,
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert created_body["document"]["scheduled_rules"][0]["name"] == "hourly-review"
+
+        stale = client.put(
+            "/api/config/scheduled-rules/hourly-review",
+            json={
+                "revision": current["revision"],
+                "name": "weekday-review",
+                "rule": created_body["document"]["scheduled_rules"][0],
+            },
+        )
+        assert stale.status_code == 409
+
+        rule = created_body["document"]["scheduled_rules"][0]
+        rule["schedule"] = {
+            "kind": "cron",
+            "cron": "0 9 * * 1-5",
+            "timezone": "Asia/Shanghai",
+        }
+        updated = client.put(
+            "/api/config/scheduled-rules/hourly-review",
+            json={
+                "revision": created_body["revision"],
+                "name": "weekday-review",
+                "rule": rule,
+            },
+        )
+        assert updated.status_code == 200
+        updated_body = updated.json()
+        assert updated_body["document"]["scheduled_rules"][0]["name"] == "weekday-review"
+        assert updated_body["document"]["scheduled_rules"][0]["schedule"]["kind"] == "cron"
+
+        blocked_agent_delete = client.request(
+            "DELETE",
+            "/api/config/agents/reviewer",
+            json={"revision": updated_body["revision"]},
+        )
+        assert blocked_agent_delete.status_code == 422
+        assert "定时规则" in blocked_agent_delete.json()["detail"]
+
+        deleted = client.request(
+            "DELETE",
+            "/api/config/scheduled-rules/weekday-review",
+            json={"revision": updated_body["revision"]},
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["document"]["scheduled_rules"] == []
+
+
 def test_config_manager_saves_and_safely_deletes_one_repository(tmp_path) -> None:
     """单仓库保存应保持身份和顺序，并阻止删除规则引用。"""
 

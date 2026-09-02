@@ -85,6 +85,7 @@ async def invoke_agent(
     execute_arguments = {
         "agent_name": agent_name,
         "event": context.event,
+        "schedule": context.schedule,
         "task": task,
         "extra_context": extra_context,
         "root_run_id": context.root_run_id,
@@ -99,7 +100,11 @@ async def invoke_agent(
             root_run_id=context.root_run_id,
             parent_run_id=context.run_id,
             agent_name=agent_name,
-            event_id=context.event.id,
+            event_id=(
+                context.event.id
+                if context.event is not None
+                else context.schedule.occurrence_id
+            ),
             task=task,
             extra_context=extra_context,
         ),
@@ -132,6 +137,8 @@ async def publish_comment(body: str) -> dict[str, Any]:
     """只接受正文，其余目标信息全部来自服务签发的可信上下文。"""
 
     config, context = _load_invocation()
+    if context.event is None:
+        raise PermissionError("当前定时运行没有 MR / PR 上下文，不能发布评论")
     store = StateStore(config.database.path)
     await asyncio.to_thread(store.initialize)
     return await ManagedCommentService(

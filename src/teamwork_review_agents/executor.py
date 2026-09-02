@@ -23,7 +23,13 @@ from .environment import (
     resolve_environment,
 )
 from .locks import ResourceLease
-from .models import AgentResult, ChangeEvent, InvocationContext, stable_hash
+from .models import (
+    AgentResult,
+    ChangeEvent,
+    InvocationContext,
+    ScheduledRunContext,
+    stable_hash,
+)
 from .model_tools import InvokeAgentStartedCallback
 from .model_provider_runtime import (
     effective_agent_config,
@@ -45,6 +51,7 @@ from .workspace import (
     ensure_isolated_worktree,
     mark_active_worktree,
     prepare_change_request_workspace,
+    prepare_default_branch_workspace,
     repository_git_lock_key,
     run_workspace_kind,
     validate_run_workspace,
@@ -123,6 +130,24 @@ def _mr_payload(
     if snapshot.source_project:
         payload["source_project"] = snapshot.source_project
     return payload
+
+
+def _schedule_payload(
+    schedule: ScheduledRunContext,
+    repository: RepositoryConfig,
+    provider: ProviderConfig,
+) -> dict[str, Any]:
+    """返回定时根 Agent 所需的默认分支执行上下文。"""
+
+    return {
+        "name": schedule.rule_name,
+        "scheduled_at": schedule.scheduled_at.isoformat(),
+        "created_at": schedule.created_at.isoformat(),
+        "occurrence_id": schedule.occurrence_id,
+        "repository": _repository_payload(repository, provider),
+        "branch": schedule.branch,
+        "head_sha": schedule.head_sha,
+    }
 
 
 class AgentExecutor:
@@ -207,6 +232,7 @@ class AgentExecutor:
         execute_arguments = {
             "agent_name": agent_name,
             "event": context.event,
+            "schedule": context.schedule,
             "task": task,
             "extra_context": extra_context,
             "root_run_id": context.root_run_id,
@@ -221,7 +247,11 @@ class AgentExecutor:
                 root_run_id=context.root_run_id,
                 parent_run_id=context.run_id,
                 agent_name=agent_name,
-                event_id=context.event.id,
+                event_id=(
+                    context.event.id
+                    if context.event is not None
+                    else context.schedule.occurrence_id
+                ),
                 task=task,
                 extra_context=extra_context,
             ),
@@ -323,7 +353,7 @@ class AgentExecutor:
         self,
         *,
         agent_name: str,
-        event: ChangeEvent,
+        event: ChangeEvent | None,
         repository: RepositoryConfig,
         task: str | None,
         extra_context: dict[str, Any] | None,
@@ -331,6 +361,7 @@ class AgentExecutor:
         change_ref: str,
         actions: Sequence[str],
         target_head_sha: str | None = None,
+        schedule: ScheduledRunContext | None = None,
     ) -> str:
         """组合 Agent 固定角色、触发上下文和临时委托任务。"""
 
@@ -344,7 +375,7 @@ class AgentExecutor:
         except PromptRenderError as exc:
             raise AgentExecutionError(str(exc)) from exc
         provider = self.config.providers[repository.provider]
-        if task is None:
+        if task is None and event is not None:
             if not target_head_sha:
                 raise AgentExecutionError("根 Agent 缺少目标分支当前提交")
             context: dict[str, Any] = {
@@ -357,6 +388,10 @@ class AgentExecutor:
                     target_head_sha,
                 ),
             }
+        elif task is None and schedule is not None:
+            context = {
+                "schedule": _schedule_payload(schedule, repository, provider),
+            }
         else:
             context = {
                 "repository": _repository_payload(repository, provider),
@@ -364,8 +399,14 @@ class AgentExecutor:
             }
             if extra_context:
                 context["delegated_context"] = extra_context
+            if schedule is not None:
+                context["schedule"] = _schedule_payload(
+                    schedule,
+                    repository,
+                    provider,
+                )
         managed_comment_instruction = ""
-        if agent.managed_comment:
+        if agent.managed_comment and event is not None:
             managed_comment_instruction = (
                 "最终顶层评论必须调用 `publish_comment` 工具进行发布或更新；"
                 "不得使用 `gh`、`glab` 或平台 API 另行发布顶层总结评论。"
@@ -385,19 +426,26 @@ class AgentExecutor:
     def lock_keys(
         self,
         agent_name: str,
-        event: ChangeEvent,
+        event: ChangeEvent | None,
         repository: RepositoryConfig,
+        schedule: ScheduledRunContext | None = None,
     ) -> list[str]:
         """按 Agent 声明生成变更请求级和源分支级写锁。"""
 
         scopes = self.config.agents[agent_name].write_scopes
         keys: list[str] = []
-        if "change_request" in scopes:
+        if "change_request" in scopes and event is not None:
             keys.append(f"change_request:{event.resource_key}")
         if "workspace" in scopes:
+            if event is not None:
+                branch = event.current_snapshot.source_branch
+                provider_name = event.provider
+            else:
+                branch = schedule.branch if schedule is not None else "default"
+                provider_name = repository.provider
             keys.append(
                 "repository_branch:"
-                f"{event.provider}:{repository.id}:{event.current_snapshot.source_branch}"
+                f"{provider_name}:{repository.id}:{branch or 'default'}"
             )
         return keys
 
@@ -405,7 +453,8 @@ class AgentExecutor:
         self,
         *,
         agent_name: str,
-        event: ChangeEvent,
+        event: ChangeEvent | None = None,
+        schedule: ScheduledRunContext | None = None,
         idempotency_key: str,
         rule_name: str | None = None,
         task: str | None = None,
@@ -424,10 +473,15 @@ class AgentExecutor:
         if self._shutdown_requested.is_set():
             raise AgentExecutionError("服务正在停止，不再创建新的 Agent 运行")
 
+        if (event is None) == (schedule is None):
+            raise AgentExecutionError("运行必须且只能包含事件或定时触发来源")
         if agent_name not in self.config.agents:
             raise AgentExecutionError(f"不存在 Agent：{agent_name}")
-        if event.repository_id not in self.repositories:
-            raise AgentExecutionError(f"不存在仓库：{event.repository_id}")
+        repository_id = (
+            event.repository_id if event is not None else schedule.repository_id
+        )
+        if repository_id not in self.repositories:
+            raise AgentExecutionError(f"不存在仓库：{repository_id}")
         if depth > self.config.runtime.max_sub_agent_depth:
             raise AgentExecutionError(
                 f"sub-agent 深度 {depth} 超过限制 {self.config.runtime.max_sub_agent_depth}"
@@ -444,7 +498,7 @@ class AgentExecutor:
                 f"{self.config.runtime.max_agent_runs_per_root}"
             )
 
-        configured_repository = self.repositories[event.repository_id]
+        configured_repository = self.repositories[repository_id]
         provider = self.config.providers[configured_repository.provider]
         configured_agent = self.config.agents[agent_name]
         model_plan = resolve_model_plan(self.config, configured_agent)
@@ -492,15 +546,27 @@ class AgentExecutor:
             root_run_id=root_run_id,
             parent_run_id=parent_run_id,
             idempotency_key=idempotency_key,
-            event_id=event.id,
+            event_id=event.id if event is not None else None,
             rule_name=rule_name,
             agent_name=agent_name,
-            resource_key=event.resource_key,
+            resource_key=(
+                event.resource_key
+                if event is not None
+                else f"schedule:{schedule.rule_name}:{repository_id}:"
+                f"{schedule.occurrence_id}"
+            ),
             prompt="",
             environment={},
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
             model_snapshot=model_snapshot,
+            repository_id=repository_id,
+            trigger_source="event" if event is not None else "schedule",
+            trigger_context=(
+                schedule.model_dump(mode="json")
+                if schedule is not None
+                else None
+            ),
         )
         if reservation is None:
             status = await asyncio.to_thread(
@@ -541,7 +607,12 @@ class AgentExecutor:
             depth=depth,
         )
 
-        keys = self.lock_keys(agent_name, event, configured_repository)
+        keys = self.lock_keys(
+            agent_name,
+            event,
+            configured_repository,
+            schedule,
+        )
         if keys:
             await asyncio.to_thread(
                 self.store.set_agent_run_queue_reason,
@@ -576,7 +647,10 @@ class AgentExecutor:
         active_workspace: Path | None = None
         owned_workspace = False
         workspace_prepared = False
-        starting_head = event.current_snapshot.head_sha
+        resolved_schedule = schedule
+        starting_head = (
+            event.current_snapshot.head_sha if event is not None else schedule.head_sha
+        )
         target_head_sha: str | None = None
         result: AgentResult
         try:
@@ -600,7 +674,11 @@ class AgentExecutor:
                         parent_workspace,
                         timeout_seconds=self.config.runtime.git_timeout_seconds,
                     )
-                    change_ref = change_request_ref(provider, event.number)[1]
+                    change_ref = (
+                        change_request_ref(provider, event.number)[1]
+                        if event is not None
+                        else schedule.head_sha
+                    )
                     inherited_kind = await asyncio.to_thread(
                         run_workspace_kind,
                         active_workspace,
@@ -658,18 +736,46 @@ class AgentExecutor:
                         git_cancel_check = lambda: self._cancel_requested(
                             reservation.run_id
                         )
-                        change_ref = await asyncio.to_thread(
-                            prepare_change_request_workspace,
-                            provider,
-                            configured_repository,
-                            event.current_snapshot,
-                            timeout_seconds=self.config.runtime.git_timeout_seconds,
-                            initialization_timeout_seconds=(
-                                self.config.runtime.repository_initialization_timeout_seconds
-                            ),
-                            cancel_check=git_cancel_check,
-                            progress_callback=report_git_progress,
-                        )
+                        if event is not None:
+                            change_ref = await asyncio.to_thread(
+                                prepare_change_request_workspace,
+                                provider,
+                                configured_repository,
+                                event.current_snapshot,
+                                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                                initialization_timeout_seconds=(
+                                    self.config.runtime.repository_initialization_timeout_seconds
+                                ),
+                                cancel_check=git_cancel_check,
+                                progress_callback=report_git_progress,
+                            )
+                        else:
+                            _, branch, head_sha = await asyncio.to_thread(
+                                prepare_default_branch_workspace,
+                                provider,
+                                configured_repository,
+                                timeout_seconds=self.config.runtime.git_timeout_seconds,
+                                initialization_timeout_seconds=(
+                                    self.config.runtime.repository_initialization_timeout_seconds
+                                ),
+                                cancel_check=git_cancel_check,
+                                progress_callback=report_git_progress,
+                            )
+                            selected_branch = schedule.branch or branch
+                            selected_head_sha = schedule.head_sha or head_sha
+                            resolved_schedule = schedule.model_copy(
+                                update={
+                                    "branch": selected_branch,
+                                    "head_sha": selected_head_sha,
+                                },
+                            )
+                            starting_head = selected_head_sha
+                            change_ref = selected_head_sha
+                            await asyncio.to_thread(
+                                self.store.update_agent_run_trigger_context,
+                                reservation.run_id,
+                                resolved_schedule.model_dump(mode="json"),
+                            )
                         await asyncio.to_thread(
                             cleanup_expired_worktrees,
                             configured_repository.workspace,
@@ -736,7 +842,8 @@ class AgentExecutor:
                     agent,
                     event,
                     reservation.run_id,
-                    include_change_request=task is None,
+                    include_change_request=task is None and event is not None,
+                    schedule=resolved_schedule,
                 )
                 redactor = SecretRedactor(resolved_environment.secret_values)
                 cache_root, cache_environment = agent_repository_cache_environment(
@@ -752,8 +859,10 @@ class AgentExecutor:
                     audit_environment["TEAMWORK_REPOSITORY_CACHE_DIR"] = str(
                         cache_root.resolve()
                     )
-                effective_actions = tuple(actions or (event.type,))
-                if task is None and target_head_sha is None:
+                effective_actions = tuple(
+                    actions or ((event.type,) if event is not None else ())
+                )
+                if task is None and event is not None and target_head_sha is None:
                     target_head_sha = await asyncio.to_thread(
                         worktree_ref_head,
                         active_workspace,
@@ -763,6 +872,7 @@ class AgentExecutor:
                 prompt = self.build_prompt(
                     agent_name=agent_name,
                     event=event,
+                    schedule=resolved_schedule,
                     repository=repository,
                     task=task,
                     extra_context=extra_context,
@@ -869,6 +979,7 @@ class AgentExecutor:
                         inherit_workspace=inherit_workspace,
                         active_workspace=str(active_workspace),
                         event=event,
+                        schedule=resolved_schedule,
                     )
                     result = await runner.run(
                         run_id=reservation.run_id,

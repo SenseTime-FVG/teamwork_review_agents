@@ -47,6 +47,7 @@ import type {
   RepositoryWorkspaceStatus,
   RepositoryWorkspaceWarmupStatus,
   Rule,
+  ScheduledRule,
   RunDetail,
   RunLog,
   RunSummary,
@@ -330,6 +331,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
     skills: value.skills ?? {},
     agents: value.agents ?? {},
     rules: value.rules ?? [],
+    scheduled_rules: value.scheduled_rules ?? [],
   };
 }
 
@@ -5054,6 +5056,13 @@ function RepositoriesView(props: {
   const referencingRules = detailId
     ? props.document.rules.filter((rule) => rule.repositories?.includes(detailId))
     : [];
+  const referencingScheduledRules = detailId
+    ? props.document.scheduled_rules.filter((rule) => rule.repositories.includes(detailId))
+    : [];
+  const referencingRuleNames = [
+    ...referencingRules.map((rule) => rule.name),
+    ...referencingScheduledRules.map((rule) => rule.name),
+  ];
 
   useEffect(() => {
     props.onDirtyChange(dirty);
@@ -5162,7 +5171,7 @@ function RepositoriesView(props: {
   }
 
   async function deleteRepository() {
-    if (!detailId || referencingRules.length > 0 || gitActive) return;
+    if (!detailId || referencingRuleNames.length > 0 || gitActive) return;
     setSaving(true);
     props.onError("");
     try {
@@ -5423,8 +5432,8 @@ function RepositoriesView(props: {
               <button
                 type="button"
                 className="button danger"
-                disabled={gitActive || referencingRules.length > 0}
-                title={gitActive ? "仓库正在执行 Git 操作" : referencingRules.length > 0 ? `仍被规则引用：${referencingRules.map((rule) => rule.name).join("、")}` : "删除仓库配置"}
+                disabled={gitActive || referencingRuleNames.length > 0}
+                title={gitActive ? "仓库正在执行 Git 操作" : referencingRuleNames.length > 0 ? `仍被规则引用：${referencingRuleNames.join("、")}` : "删除仓库配置"}
                 onClick={() => setPendingAction({ kind: "delete" })}
               >删除仓库</button>
               <button type="button" className="button primary" disabled={gitActive} title={gitActive ? "仓库正在执行 Git 操作" : "编辑仓库"} onClick={beginEdit}>编辑仓库</button>
@@ -5432,10 +5441,10 @@ function RepositoriesView(props: {
           )}
         </div>
       </header>
-      {referencingRules.length > 0 && !creating && (
+      {referencingRuleNames.length > 0 && !creating && (
         <div className="repository-reference-warning">
           <strong>当前仓库不能删除</strong>
-          <span>仍被触发规则引用：{referencingRules.map((rule) => rule.name).join("、")}。请先修改这些规则的仓库范围。</span>
+          <span>仍被事件或定时触发规则引用：{referencingRuleNames.join("、")}。请先修改这些规则的仓库范围。</span>
         </div>
       )}
       {activeRepository && (
@@ -6299,6 +6308,11 @@ function AgentsView(props: {
   }, [names, query]);
   const originalAgent = detailName ? props.document.agents[detailName] : undefined;
   const draftAgent = draftDocument?.agents[draftName];
+  const scheduledReferenceNames = detailName
+    ? props.document.scheduled_rules
+      .filter((rule) => rule.agents.includes(detailName))
+      .map((rule) => rule.name)
+    : [];
   const dirty = editing && Boolean(
     creating
     || draftName !== detailName
@@ -6393,7 +6407,7 @@ function AgentsView(props: {
   }
 
   async function deleteAgent() {
-    if (!detailName) return;
+    if (!detailName || scheduledReferenceNames.length > 0) return;
     setSaving(true);
     props.onError("");
     try {
@@ -6539,12 +6553,24 @@ function AgentsView(props: {
             </>
           ) : (
             <>
-              <button type="button" className="button danger" onClick={() => setPendingAction({ kind: "delete" })}>删除 Agent</button>
+              <button
+                type="button"
+                className="button danger"
+                disabled={scheduledReferenceNames.length > 0}
+                title={scheduledReferenceNames.length > 0 ? `仍被定时规则引用：${scheduledReferenceNames.join("、")}` : "删除 Agent"}
+                onClick={() => setPendingAction({ kind: "delete" })}
+              >删除 Agent</button>
               <button type="button" className="button primary" onClick={beginEdit}>编辑 Agent</button>
             </>
           )}
         </div>
       </header>
+      {scheduledReferenceNames.length > 0 && !creating && (
+        <div className="repository-reference-warning">
+          <strong>当前 Agent 不能删除</strong>
+          <span>仍被定时触发规则引用：{scheduledReferenceNames.join("、")}。请先修改或删除这些定时规则。</span>
+        </div>
+      )}
       <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving}>
         <AgentsEditor
           document={activeDocument}
@@ -6723,7 +6749,7 @@ function RulesEditor(props: {
   );
 }
 
-function RulesView(props: {
+function EventRulesView(props: {
   document: ConfigDocument;
   revision: string;
   events: string[];
@@ -7071,6 +7097,492 @@ function RulesView(props: {
         onCancel={() => { if (!saving) setPendingAction(null); }}
         onConfirm={confirmPendingAction}
       />
+    </div>
+  );
+}
+
+function createEmptyScheduledRule(document: ConfigDocument): ScheduledRule {
+  let sequence = 1;
+  let name = `定时规则-${sequence}`;
+  while (document.scheduled_rules.some((rule) => rule.name === name)) {
+    sequence += 1;
+    name = `定时规则-${sequence}`;
+  }
+  return {
+    name,
+    agents: Object.keys(document.agents).slice(0, 1),
+    repositories: document.repositories.slice(0, 1).map((repository) => repository.id),
+    schedule: {
+      kind: "interval",
+      interval_value: 1,
+      interval_unit: "hours",
+      cron: "0 * * * *",
+      timezone: "Asia/Shanghai",
+    },
+    enabled: true,
+  };
+}
+
+function scheduledRuleSummary(rule: ScheduledRule): string {
+  if (rule.schedule.kind === "cron") {
+    return `Cron ${rule.schedule.cron || "—"}`;
+  }
+  const unitLabels = { minutes: "分钟", hours: "小时", days: "天" };
+  const unit = rule.schedule.interval_unit ?? "hours";
+  return `每 ${rule.schedule.interval_value ?? 1} ${unitLabels[unit]}`;
+}
+
+function ScheduledRulesView(props: {
+  document: ConfigDocument;
+  revision: string;
+  status: RuntimeStatus;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [detailName, setDetailName] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftRule, setDraftRule] = useState<ScheduledRule | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [togglingRuleName, setTogglingRuleName] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "discard"; nextName: string | null } | { kind: "delete" } | null
+  >(null);
+
+  const rules = useMemo(
+    () => [...props.document.scheduled_rules].sort((left, right) => left.name.localeCompare(right.name)),
+    [props.document.scheduled_rules],
+  );
+  const visibleRules = useMemo(() => {
+    const keyword = query.trim().toLocaleLowerCase();
+    if (!keyword) return rules;
+    return rules.filter((rule) => [
+      rule.name,
+      scheduledRuleSummary(rule),
+      ...rule.agents,
+      ...rule.repositories,
+    ].some((value) => value.toLocaleLowerCase().includes(keyword)));
+  }, [query, rules]);
+  const originalRule = detailName
+    ? props.document.scheduled_rules.find((rule) => rule.name === detailName)
+    : undefined;
+  const dirty = editing && Boolean(
+    creating
+    || draftName !== detailName
+    || JSON.stringify(draftRule) !== JSON.stringify(originalRule),
+  );
+  const activeRule = editing ? draftRule : originalRule;
+  const runtimeRule = props.status.scheduled_rules?.find((rule) => rule.name === (detailName ?? draftName));
+
+  useEffect(() => {
+    props.onDirtyChange(dirty);
+  }, [dirty, props.onDirtyChange]);
+  useEffect(() => () => props.onDirtyChange(false), [props.onDirtyChange]);
+
+  function clearDraft() {
+    setCreating(false);
+    setEditing(false);
+    setDraftRule(null);
+    setDraftName("");
+  }
+
+  function openDetail(name: string) {
+    clearDraft();
+    setDetailName(name);
+  }
+
+  function requestDetail(name: string | null) {
+    if (dirty) {
+      setPendingAction({ kind: "discard", nextName: name });
+      return;
+    }
+    if (name) openDetail(name);
+    else {
+      clearDraft();
+      setDetailName(null);
+    }
+  }
+
+  function beginCreate() {
+    const rule = createEmptyScheduledRule(props.document);
+    setDetailName(null);
+    setCreating(true);
+    setEditing(true);
+    setDraftName(rule.name);
+    setDraftRule(rule);
+  }
+
+  function beginEdit() {
+    if (!originalRule || !detailName) return;
+    setCreating(false);
+    setEditing(true);
+    setDraftName(detailName);
+    setDraftRule(structuredClone(originalRule));
+  }
+
+  function cancelEdit() {
+    if (creating) setDetailName(null);
+    clearDraft();
+  }
+
+  function updateDraft(patch: Partial<ScheduledRule>) {
+    setDraftRule((current) => current ? { ...current, ...patch } : current);
+  }
+
+  function updateSchedule(patch: Partial<ScheduledRule["schedule"]>) {
+    setDraftRule((current) => current ? {
+      ...current,
+      schedule: { ...current.schedule, ...patch },
+    } : current);
+  }
+
+  async function saveRule() {
+    if (!editing || !draftRule || !draftName.trim()) return;
+    if (draftRule.agents.length === 0 || draftRule.repositories.length === 0) {
+      props.onError("定时规则至少需要选择一个 Agent 和一个仓库");
+      return;
+    }
+    setSaving(true);
+    props.onError("");
+    try {
+      const endpoint = creating
+        ? "/api/config/scheduled-rules"
+        : `/api/config/scheduled-rules/${encodeURIComponent(detailName ?? "")}`;
+      const result = await api<{ revision: string; document: ConfigDocument }>(endpoint, {
+        method: creating ? "POST" : "PUT",
+        body: JSON.stringify({
+          revision: props.revision,
+          name: draftName.trim(),
+          rule: { ...draftRule, name: draftName.trim() },
+        }),
+      });
+      const normalized = normalizeDocument(result.document);
+      props.onSaved(normalized, result.revision);
+      setDetailName(draftName.trim());
+      clearDraft();
+      props.onNotice(creating ? `定时规则 ${draftName.trim()} 已创建并热加载` : `定时规则 ${draftName.trim()} 已保存并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "保存定时规则失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteRule() {
+    if (!detailName) return;
+    setSaving(true);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/scheduled-rules/${encodeURIComponent(detailName)}`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({ revision: props.revision }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`定时规则 ${detailName} 已删除并热加载`);
+      setPendingAction(null);
+      setDetailName(null);
+      clearDraft();
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "删除定时规则失败");
+      setPendingAction(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleRule(rule: ScheduledRule) {
+    if (togglingRuleName !== null) return;
+    const enabled = rule.enabled === false;
+    setTogglingRuleName(rule.name);
+    props.onError("");
+    try {
+      const result = await api<{ revision: string; document: ConfigDocument }>(
+        `/api/config/scheduled-rules/${encodeURIComponent(rule.name)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            revision: props.revision,
+            name: rule.name,
+            rule: { ...rule, enabled },
+          }),
+        },
+      );
+      props.onSaved(normalizeDocument(result.document), result.revision);
+      props.onNotice(`定时规则 ${rule.name} 已${enabled ? "启用" : "停用"}并热加载`);
+    } catch (reason) {
+      props.onError(reason instanceof Error ? reason.message : "更新定时规则启用状态失败");
+    } finally {
+      setTogglingRuleName(null);
+    }
+  }
+
+  const confirmation = useMemo<AgentActionConfirmation | null>(() => {
+    if (!pendingAction) return null;
+    if (pendingAction.kind === "discard") {
+      return {
+        eyebrow: "SCHEDULED RULE",
+        title: "放弃未保存的定时规则修改？",
+        description: "当前详情中的修改尚未保存，继续后无法从页面恢复。",
+        details: [
+          { label: "规则", value: draftName || detailName || "新定时规则", mono: true },
+          { label: "配置版本", value: shortRevision(props.revision), mono: true },
+        ],
+        impactTitle: "只放弃当前草稿",
+        impact: "已保存配置、历史运行和正在执行的 Agent 不会受到影响。",
+        confirmLabel: "放弃修改",
+        dangerous: true,
+      };
+    }
+    if (!detailName || !originalRule) return null;
+    return {
+      eyebrow: "SCHEDULED RULE",
+      title: `删除定时规则 ${detailName}？`,
+      description: "删除后会立即保存配置并通知后台热加载。",
+      details: [
+        { label: "规则", value: detailName, mono: true },
+        { label: "周期", value: scheduledRuleSummary(originalRule) },
+        { label: "运行组合", value: `${originalRule.repositories.length} 个仓库 × ${originalRule.agents.length} 个 Agent` },
+      ],
+      impactTitle: "停止后续定时运行",
+      impact: "已经产生的定时运行和日志不会删除；删除时不会取消正在执行的 Agent。",
+      confirmLabel: "确认删除",
+      dangerous: true,
+    };
+  }, [detailName, draftName, originalRule, pendingAction, props.revision]);
+
+  function confirmPendingAction() {
+    if (pendingAction?.kind === "delete") {
+      void deleteRule();
+      return;
+    }
+    if (pendingAction?.kind === "discard") {
+      const nextName = pendingAction.nextName;
+      setPendingAction(null);
+      if (nextName) openDetail(nextName);
+      else {
+        clearDraft();
+        setDetailName(null);
+      }
+    }
+  }
+
+  if (!creating && detailName === null) {
+    return (
+      <section className="section-card rule-list-page">
+        <div className="section-title-row agent-list-title">
+          <div>
+            <h2>定时触发规则</h2>
+            <p>每个到期周期都独立创建运行；上一周期未结束时，新周期仍会并行进入调度。</p>
+          </div>
+          <button type="button" className="button primary" onClick={beginCreate}>+ 添加定时规则</button>
+        </div>
+        <div className="agent-list-toolbar">
+          <label>
+            <span>搜索定时规则</span>
+            <input value={query} placeholder="输入规则、周期、Agent 或仓库…" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <span>共 {rules.length} 条规则</span>
+        </div>
+        <div className="rule-config-table scheduled-rule-table">
+          <div className="rule-config-table-head" aria-hidden="true">
+            <span>规则</span><span>状态</span><span>触发周期</span><span>Agent</span><span>仓库</span><span>下次触发</span><span />
+          </div>
+          <div className="rule-config-items">
+            {visibleRules.map((rule) => {
+              const enabled = rule.enabled !== false;
+              const toggling = togglingRuleName === rule.name;
+              const runtime = props.status.scheduled_rules?.find((item) => item.name === rule.name);
+              return (
+                <div className="rule-config-row" key={rule.name} onClick={() => requestDetail(rule.name)}>
+                  <span className="agent-config-identity"><span className="rule-config-avatar scheduled" aria-hidden="true">C</span><span><strong>{rule.name}</strong><small>{rule.schedule.timezone ?? "Asia/Shanghai"}</small></span></span>
+                  <span className={`rule-config-status ${enabled ? "enabled" : ""}`} onClick={(event) => event.stopPropagation()}>
+                    <Toggle
+                      label={toggling ? "保存中…" : enabled ? "已启用" : "已停用"}
+                      checked={enabled}
+                      disabled={togglingRuleName !== null}
+                      onChange={() => { void toggleRule(rule); }}
+                    />
+                  </span>
+                  <span className="agent-config-summary"><strong>{scheduledRuleSummary(rule)}</strong><small>{rule.schedule.kind === "cron" ? "标准 5 段 Cron" : "固定间隔"}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.agents.length} 个</strong><small>{rule.agents.join("、") || "未选择 Agent"}</small></span>
+                  <span className="agent-config-summary"><strong>{rule.repositories.length} 个</strong><small>{rule.repositories.join("、") || "未选择仓库"}</small></span>
+                  <span className="agent-config-summary"><strong>{enabled ? timeText(runtime?.next_scheduled_at) : "已停用"}</strong><small>{enabled ? "不补跑停机期间的周期" : "启用后重新计算"}</small></span>
+                  <button
+                    type="button"
+                    className="agent-config-arrow rule-config-detail-button"
+                    aria-label={`查看定时规则 ${rule.name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      requestDetail(rule.name);
+                    }}
+                  >›</button>
+                </div>
+              );
+            })}
+            {visibleRules.length === 0 && <div className="empty tall">{rules.length === 0 ? "尚未配置定时触发规则" : "没有匹配的定时触发规则"}</div>}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (!activeRule) return null;
+  const activeName = editing ? draftName : detailName ?? "";
+  const schedule = activeRule.schedule;
+  const valid = Boolean(
+    activeName.trim()
+    && activeRule.agents.length > 0
+    && activeRule.repositories.length > 0
+    && (schedule.kind === "cron" ? schedule.cron?.trim() : (schedule.interval_value ?? 0) > 0),
+  );
+  return (
+    <div className="agent-detail-page rule-detail-page">
+      <header className="agent-detail-header">
+        <button type="button" className="agent-detail-back" onClick={() => requestDetail(null)}><span aria-hidden="true">←</span>返回定时规则列表</button>
+        <div className="agent-detail-heading">
+          <div>
+            <span className="eyebrow">SCHEDULED RULE</span>
+            <h2>{activeName}</h2>
+            <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新规则" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
+          </div>
+          <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
+        </div>
+        <div className="button-group agent-detail-actions">
+          {editing ? (
+            <>
+              <button type="button" className="button secondary" disabled={saving} onClick={cancelEdit}>取消</button>
+              <button type="button" className="button primary" disabled={!dirty || !valid || saving} onClick={() => { void saveRule(); }}>{saving ? "保存中…" : "保存规则"}</button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="button danger" onClick={() => setPendingAction({ kind: "delete" })}>删除规则</button>
+              <button type="button" className="button primary" onClick={beginEdit}>编辑规则</button>
+            </>
+          )}
+        </div>
+      </header>
+      <fieldset className="config-editor-surface agent-detail-surface" disabled={!editing || saving}>
+        <section className="section-card scheduled-rule-editor">
+          <div className="section-title-row">
+            <div>
+              <h2>定时调度</h2>
+              <p>使用仓库远端默认分支的最新提交；不虚构 MR / PR，也不执行 MR 专属 Preflight 或评论回写。</p>
+            </div>
+            <Toggle label={activeRule.enabled === false ? "已停用" : "已启用"} checked={activeRule.enabled !== false} onChange={(enabled) => updateDraft({ enabled })} />
+          </div>
+          <div className="form-grid two scheduled-rule-fields">
+            <Field label="规则名称" value={activeName} onChange={setDraftName} />
+            <SelectField
+              label="周期类型"
+              value={schedule.kind}
+              onChange={(kind) => updateSchedule({ kind: kind as "interval" | "cron" })}
+              options={[{ value: "interval", label: "固定间隔" }, { value: "cron", label: "Cron 表达式" }]}
+            />
+            {schedule.kind === "interval" ? (
+              <>
+                <Field
+                  label="间隔数值"
+                  type="number"
+                  value={schedule.interval_value ?? 1}
+                  onChange={(value) => updateSchedule({ interval_value: Math.max(1, Number.parseInt(value, 10) || 1) })}
+                />
+                <SelectField
+                  label="间隔单位"
+                  value={schedule.interval_unit ?? "hours"}
+                  onChange={(interval_unit) => updateSchedule({ interval_unit: interval_unit as "minutes" | "hours" | "days" })}
+                  options={[{ value: "minutes", label: "分钟" }, { value: "hours", label: "小时" }, { value: "days", label: "天" }]}
+                />
+              </>
+            ) : (
+              <Field
+                label="Cron 表达式"
+                value={schedule.cron ?? "0 * * * *"}
+                placeholder="0 * * * *"
+                help="使用标准 5 段格式：分钟 小时 日 月 星期。"
+                onChange={(cron) => updateSchedule({ cron })}
+              />
+            )}
+            <Field
+              label="时区"
+              value={schedule.timezone ?? "Asia/Shanghai"}
+              placeholder="Asia/Shanghai"
+              help="使用 IANA 时区名称。"
+              onChange={(timezone) => updateSchedule({ timezone })}
+            />
+          </div>
+          <div className="form-grid two scheduled-rule-targets">
+            <MultiSelect label="执行 Agent" values={activeRule.agents} options={Object.keys(props.document.agents)} onChange={(agents) => updateDraft({ agents })} />
+            <MultiSelect label="执行仓库" values={activeRule.repositories} options={props.document.repositories.map((repository) => repository.id)} onChange={(repositories) => updateDraft({ repositories })} />
+          </div>
+          <div className="agent-workspace-note scheduled-rule-note">
+            <strong>并行策略</strong>
+            <span>每个周期都会为每个“仓库 × Agent”组合创建独立根运行。上一周期尚未结束时不会跳过；新运行仍会进入并发调度，必要时仅按全局、Agent 并发上限或写锁排队。</span>
+          </div>
+          {!editing && runtimeRule && (
+            <div className="agent-workspace-note scheduled-rule-note">
+              <strong>下次触发</strong>
+              <span>{activeRule.enabled === false ? "规则已停用" : `${timeText(runtimeRule.next_scheduled_at)} · ${runtimeRule.timezone}`}</span>
+            </div>
+          )}
+        </section>
+      </fieldset>
+      <AgentActionConfirmationDialog
+        model={confirmation}
+        busy={saving}
+        onCancel={() => { if (!saving) setPendingAction(null); }}
+        onConfirm={confirmPendingAction}
+      />
+    </div>
+  );
+}
+
+function RulesView(props: {
+  document: ConfigDocument;
+  revision: string;
+  events: string[];
+  status: RuntimeStatus;
+  onSaved: (document: ConfigDocument, revision: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const [kind, setKind] = useState<"event" | "schedule">("event");
+  const [dirty, setDirty] = useState(false);
+
+  return (
+    <div className="rules-page-stack">
+      <nav className="rule-kind-tabs" aria-label="触发规则类型">
+        <button type="button" className={kind === "event" ? "active" : ""} disabled={dirty && kind !== "event"} onClick={() => setKind("event")}>MR / PR 事件规则</button>
+        <button type="button" className={kind === "schedule" ? "active" : ""} disabled={dirty && kind !== "schedule"} onClick={() => setKind("schedule")}>定时触发规则</button>
+      </nav>
+      {kind === "event" ? (
+        <EventRulesView
+          document={props.document}
+          revision={props.revision}
+          events={props.events}
+          onSaved={props.onSaved}
+          onDirtyChange={(value) => { setDirty(value); props.onDirtyChange(value); }}
+          onError={props.onError}
+          onNotice={props.onNotice}
+        />
+      ) : (
+        <ScheduledRulesView
+          document={props.document}
+          revision={props.revision}
+          status={props.status}
+          onSaved={props.onSaved}
+          onDirtyChange={(value) => { setDirty(value); props.onDirtyChange(value); }}
+          onError={props.onError}
+          onNotice={props.onNotice}
+        />
+      )}
     </div>
   );
 }
@@ -8179,6 +8691,9 @@ function runTargetText(run: RunSummary): string {
   if (run.repository_id && run.change_request_number !== undefined && run.change_request_number !== null) {
     return `${run.repository_id} · #${run.change_request_number}`;
   }
+  if (run.trigger_source === "schedule" && run.repository_id) {
+    return `${run.repository_id} · ${run.trigger_context?.branch || "默认分支"}`;
+  }
   return run.resource_key;
 }
 
@@ -8217,6 +8732,9 @@ function RunTargetLabel({ run }: { run: RunSummary }) {
         />
       </>
     );
+  }
+  if (run.trigger_source === "schedule" && run.repository_id) {
+    return <>{run.repository_id} · {run.trigger_context?.branch || "默认分支"}</>;
   }
   return <>{run.resource_key}</>;
 }
@@ -8405,9 +8923,18 @@ function AgentRunDetailDrawer(props: {
                     <dl className="run-metadata">
                       <div><dt>运行 ID</dt><dd>{detail.run_id}</dd></div>
                       <div><dt>触发规则</dt><dd>{detail.rule_name ?? "Sub-agent 调用"}</dd></div>
+                      <div><dt>触发来源</dt><dd>{detail.trigger_source === "schedule" ? "定时触发" : "MR / PR 事件"}</dd></div>
                       <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
                       <div><dt>开始时间</dt><dd>{timeText(detail.started_at)}</dd></div>
                       <div><dt>结束时间</dt><dd>{timeText(detail.finished_at)}</dd></div>
+                      {detail.trigger_source === "schedule" && (
+                        <>
+                          <div><dt>计划时间</dt><dd>{dateTimeText(detail.trigger_context?.scheduled_at)}</dd></div>
+                          <div><dt>周期实例</dt><dd className="mono">{detail.trigger_context?.occurrence_id ?? "—"}</dd></div>
+                          <div><dt>默认分支</dt><dd>{detail.trigger_context?.branch || "—"}</dd></div>
+                          <div><dt>Head SHA</dt><dd className="mono">{detail.trigger_context?.head_sha || "—"}</dd></div>
+                        </>
+                      )}
                       <div><dt>模型会话</dt><dd>{detail.thread_id ?? "—"}</dd></div>
                       <div><dt>执行模式</dt><dd>{modelExecutionModeLabel(detail.model_snapshot?.execution_mode)}</dd></div>
                       <div><dt>Provider</dt><dd>{detail.model_snapshot
@@ -8704,8 +9231,8 @@ function RunsView(props: {
                 return (
                   <button key={`agent:${run.run_id}`} className={`run-row ${selected?.kind === "agent" && selected.id === run.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "agent", id: run.run_id })}>
                     <span className="run-agent-cell"><span className="run-status-dot" data-status={run.status} /><span><strong>{run.agent_name}</strong><small>Agent · {run.run_id.slice(0, 8)}</small></span></span>
-                    <span className="run-target-cell"><strong>{runTargetText(run)}</strong><small>{run.change_request_title ?? run.resource_key}</small></span>
-                    <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
+                    <span className="run-target-cell"><strong>{runTargetText(run)}</strong><small>{run.trigger_source === "schedule" ? run.trigger_context?.head_sha || run.resource_key : run.change_request_title ?? run.resource_key}</small></span>
+                    <span className="run-source-cell"><strong>{run.rule_name ?? "Sub-agent 调用"}</strong><small>{run.trigger_source === "schedule" ? `${run.parent_run_id ? "定时触发 · Sub-agent" : "定时触发 · 根 Agent"} · ${dateTimeText(run.trigger_context?.scheduled_at)}` : run.parent_run_id ? "Sub-agent" : "根 Agent"}</small></span>
                     <span className="run-status-cell"><StatusPill value={run.status} />{run.status === "queued" && queueReasonLabel(run.queue_reason) && <small>{queueReasonLabel(run.queue_reason)}</small>}{run.workspace_status === "retained" && <em className="workspace-retained">工作区待清理</em>}</span>
                     <span className="run-time-cell"><strong>{timeText(run.started_at)}</strong></span>
                     <span className="run-duration-cell"><strong>{durationText(run.started_at, run.finished_at)}</strong></span>
@@ -9521,6 +10048,7 @@ export default function App() {
                   document={document}
                   revision={revision}
                   events={eventOptions}
+                  status={status}
                   onSaved={acceptItemConfig}
                   onDirtyChange={setRuleDetailDirty}
                   onError={setError}
