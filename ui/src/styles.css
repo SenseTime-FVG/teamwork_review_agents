@@ -263,6 +263,12 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .agent-config-arrow { color: #506077; font-size: 20px; transition: transform .15s ease; }
 .agent-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
 .rule-list-page { min-height: 560px; }
+.rules-page-stack { display: flex; flex-direction: column; gap: 12px; }
+.rule-kind-tabs { width: max-content; max-width: 100%; display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #091019; }
+.rule-kind-tabs button { min-height: 34px; padding: 0 14px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #718096; cursor: pointer; font-size: 10px; font-weight: 700; transition: .15s ease; }
+.rule-kind-tabs button:hover:not(:disabled) { color: #b8c5d4; background: #111a26; }
+.rule-kind-tabs button.active { border-color: #346448; background: #102119; color: var(--accent); }
+.rule-kind-tabs button:disabled { cursor: not-allowed; opacity: .45; }
 .rule-config-table { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #091019; }
 .rule-config-table-head, .rule-config-row { display: grid; grid-template-columns: minmax(190px, 1.25fr) 110px minmax(150px, 1fr) minmax(125px, .85fr) minmax(125px, .85fr) minmax(120px, .8fr) 18px; gap: 16px; align-items: center; }
 .rule-config-table-head { min-height: 43px; padding: 0 17px; border-bottom: 1px solid var(--line); background: #0c131e; color: #65758a; font-size: 9px; }
@@ -282,7 +288,12 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .rule-config-detail-button { width: 18px; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: center; }
 .rule-config-detail-button:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; border-radius: 3px; color: var(--accent); }
 .rule-config-avatar { width: 34px; height: 34px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid #38516b; border-radius: 10px; background: #101d2a; color: #82b8e8; font: 700 12px "SFMono-Regular", Consolas, monospace; }
+.rule-config-avatar.scheduled { border-color: #5b4931; background: #241d13; color: #e1b976; }
 .rule-config-row:hover .agent-config-arrow { color: var(--accent); transform: translateX(2px); }
+.scheduled-rule-editor { min-height: 420px; }
+.scheduled-rule-fields { margin-top: 18px; }
+.scheduled-rule-targets { margin-top: 18px; }
+.scheduled-rule-note { margin: 18px 0 0; }
 .repository-list-page { min-height: 420px; }
 .repository-config-table { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #091019; }
 .repository-config-table-head, .repository-config-row { display: grid; grid-template-columns: minmax(180px, 1.15fr) 110px minmax(105px, .7fr) minmax(155px, 1fr) minmax(145px, .95fr) minmax(125px, .8fr) 18px; gap: 16px; align-items: center; }

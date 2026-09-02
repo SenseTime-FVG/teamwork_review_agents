@@ -135,6 +135,8 @@ class StateStore:
                     change_request_number INTEGER,
                     change_request_title TEXT,
                     change_request_url TEXT,
+                    trigger_source TEXT NOT NULL DEFAULT 'event',
+                    trigger_context TEXT,
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 1,
                     prompt TEXT NOT NULL,
@@ -159,6 +161,18 @@ class StateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_agent_runs_root
                 ON agent_runs(root_run_id, started_at);
+
+                CREATE TABLE IF NOT EXISTS scheduled_occurrences (
+                    occurrence_id TEXT PRIMARY KEY,
+                    rule_name TEXT NOT NULL,
+                    schedule_signature TEXT NOT NULL,
+                    scheduled_at REAL NOT NULL,
+                    config_revision TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_scheduled_occurrences_time
+                ON scheduled_occurrences(scheduled_at DESC);
 
                 CREATE TABLE IF NOT EXISTS preflight_runs (
                     run_id TEXT PRIMARY KEY,
@@ -363,6 +377,13 @@ class StateStore:
             )
             self._ensure_column(connection, "agent_runs", "queue_reason", "TEXT")
             self._ensure_column(connection, "agent_runs", "model_snapshot", "TEXT")
+            self._ensure_column(
+                connection,
+                "agent_runs",
+                "trigger_source",
+                "TEXT NOT NULL DEFAULT 'event'",
+            )
+            self._ensure_column(connection, "agent_runs", "trigger_context", "TEXT")
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             self._ensure_column(connection, "event_inbox", "unmatched_reason", "TEXT")
             cancel_source_added = self._ensure_column(
@@ -2230,6 +2251,9 @@ class StateStore:
         config_revision: str | None = None,
         max_attempts: int,
         model_snapshot: dict[str, Any] | None = None,
+        repository_id: str | None = None,
+        trigger_source: str = "event",
+        trigger_context: dict[str, Any] | None = None,
     ) -> RunReservation | None:
         """幂等创建 Agent 运行，失败记录可在上限内复用重试。"""
 
@@ -2251,9 +2275,11 @@ class StateStore:
                     INSERT INTO agent_runs (
                         run_id, root_run_id, parent_run_id, idempotency_key,
                         event_id, rule_name, agent_name, resource_key,
+                        repository_id, trigger_source, trigger_context,
                         status, attempts, prompt, environment, config_revision,
                         model_snapshot, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1,
+                              ?, ?, ?, ?, ?)
                     """,
                     (
                         proposed_run_id,
@@ -2264,6 +2290,13 @@ class StateStore:
                         rule_name,
                         agent_name,
                         resource_key,
+                        repository_id,
+                        trigger_source,
+                        (
+                            json.dumps(trigger_context, ensure_ascii=False)
+                            if trigger_context is not None
+                            else None
+                        ),
                         prompt,
                         json.dumps(environment or {}, ensure_ascii=False),
                         config_revision,
@@ -2298,7 +2331,9 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = 'queued', attempts = ?, prompt = ?, environment = ?,
-                    config_revision = ?, model_snapshot = ?, error = NULL,
+                    config_revision = ?, model_snapshot = ?,
+                    repository_id = COALESCE(?, repository_id),
+                    trigger_source = ?, trigger_context = ?, error = NULL,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
@@ -2317,6 +2352,13 @@ class StateStore:
                         if model_snapshot is not None
                         else None
                     ),
+                    repository_id,
+                    trigger_source,
+                    (
+                        json.dumps(trigger_context, ensure_ascii=False)
+                        if trigger_context is not None
+                        else None
+                    ),
                     now,
                     row["run_id"],
                 ),
@@ -2327,6 +2369,51 @@ class StateStore:
                 row["root_run_id"],
                 row["parent_run_id"],
                 attempts,
+            )
+
+    def reserve_scheduled_occurrence(
+        self,
+        *,
+        occurrence_id: str,
+        rule_name: str,
+        schedule_signature: str,
+        scheduled_at: float,
+        config_revision: str,
+    ) -> bool:
+        """幂等记录一次到期周期，重复唤醒不能再次分发。"""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO scheduled_occurrences (
+                    occurrence_id, rule_name, schedule_signature,
+                    scheduled_at, config_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    occurrence_id,
+                    rule_name,
+                    schedule_signature,
+                    scheduled_at,
+                    config_revision,
+                    time.time(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def update_agent_run_trigger_context(
+        self,
+        run_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        """在默认分支解析完成后固化定时运行上下文。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs SET trigger_context = ? WHERE run_id = ?
+                """,
+                (json.dumps(context, ensure_ascii=False), run_id),
             )
 
     def try_acquire_agent_run_capacity(
@@ -2968,7 +3055,7 @@ class StateStore:
                 (run_id,),
             ).fetchall()
         result = self._decorate_run_record(dict(row))
-        for key in ("environment", "usage", "model_snapshot"):
+        for key in ("environment", "usage", "model_snapshot", "trigger_context"):
             if result.get(key):
                 result[key] = json.loads(result[key])
         result.pop("events", None)
@@ -3070,6 +3157,8 @@ class StateStore:
                        agent_runs.change_request_number,
                        agent_runs.change_request_title,
                        agent_runs.change_request_url,
+                       agent_runs.trigger_source,
+                       agent_runs.trigger_context,
                        event_inbox.repository_id AS event_repository_id,
                        event_inbox.number AS event_change_request_number,
                        event_inbox.payload AS event_payload
@@ -3081,7 +3170,11 @@ class StateStore:
                 """,
                 parameters,
             ).fetchall()
-        return [self._decorate_run_record(dict(row)) for row in rows]
+        results = [self._decorate_run_record(dict(row)) for row in rows]
+        for result in results:
+            if result.get("trigger_context"):
+                result["trigger_context"] = json.loads(result["trigger_context"])
+        return results
 
     def dashboard_stats(self) -> dict[str, Any]:
         """返回管理首页需要的运行与事件统计。"""

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .config import AppConfig, RepositoryConfig, RuleConfig
+from .config import AppConfig, RepositoryConfig, RuleConfig, ScheduledRuleConfig
 from .environment import resolve_provider_token
 from .events import (
     detect_activity_events,
@@ -23,6 +23,7 @@ from .models import (
     ChangeEvent,
     ChangeRequestActivityBatch,
     ChangeRequestSnapshot,
+    ScheduledRunContext,
     stable_hash,
 )
 from .preflight import PreflightExecutor
@@ -50,6 +51,7 @@ class CycleSummary:
     preflight_failures: int = 0
     preflight_errors: int = 0
     agent_runs: int = 0
+    scheduled_occurrences: int = 0
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -549,6 +551,89 @@ class Orchestrator:
             inherit_workspace=invocation.rule.inherit_workspace,
             idempotency_key=invocation.idempotency_key,
         )
+
+    async def run_scheduled_rule(
+        self,
+        rule: ScheduledRuleConfig,
+        *,
+        scheduled_at: float,
+        schedule_signature: str,
+    ) -> CycleSummary:
+        """持久化一次到期周期并并行创建所有仓库与 Agent 根运行。"""
+
+        summary = CycleSummary()
+        occurrence_id = stable_hash(
+            "scheduled-occurrence",
+            rule.name,
+            schedule_signature,
+            scheduled_at,
+        )
+        reserved = await asyncio.to_thread(
+            self.store.reserve_scheduled_occurrence,
+            occurrence_id=occurrence_id,
+            rule_name=rule.name,
+            schedule_signature=schedule_signature,
+            scheduled_at=scheduled_at,
+            config_revision=self.config.revision,
+        )
+        if not reserved:
+            return summary
+        summary.scheduled_occurrences = 1
+        created_at = datetime.now(UTC)
+        repository_map = self.config.repository_map()
+        tasks: list[tuple[str, str, asyncio.Task[AgentResult | None]]] = []
+        for repository_id in dict.fromkeys(rule.repositories):
+            repository = repository_map.get(repository_id)
+            if repository is None or not repository.enabled:
+                summary.errors.append(
+                    f"定时规则 {rule.name} 的仓库 {repository_id} 不存在或已停用"
+                )
+                continue
+            for agent_name in dict.fromkeys(rule.agents):
+                schedule = ScheduledRunContext(
+                    rule_name=rule.name,
+                    occurrence_id=occurrence_id,
+                    scheduled_at=datetime.fromtimestamp(scheduled_at, tz=UTC),
+                    created_at=created_at,
+                    repository_id=repository_id,
+                )
+                task = asyncio.create_task(
+                    self.executor.execute(
+                        agent_name=agent_name,
+                        schedule=schedule,
+                        rule_name=rule.name,
+                        idempotency_key=stable_hash(
+                            "scheduled-run",
+                            occurrence_id,
+                            repository_id,
+                            agent_name,
+                        ),
+                    ),
+                    name=(
+                        f"scheduled-run-{rule.name}-{repository_id}-{agent_name}"
+                    ),
+                )
+                tasks.append((repository_id, agent_name, task))
+        if not tasks:
+            return summary
+        results = await asyncio.gather(
+            *(task for _, _, task in tasks),
+            return_exceptions=True,
+        )
+        summary.agent_runs = sum(
+            isinstance(result, AgentResult) for result in results
+        )
+        for (repository_id, agent_name, _), result in zip(
+            tasks,
+            results,
+            strict=True,
+        ):
+            if isinstance(result, BaseException):
+                summary.errors.append(
+                    f"定时规则 {rule.name} 执行 {repository_id} / "
+                    f"{agent_name} 失败：{result}"
+                )
+        return summary
 
     async def _settle_unmatched_waiting_events(
         self,

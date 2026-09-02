@@ -377,6 +377,20 @@ export type Rule = {
   enabled?: boolean;
 };
 
+export type ScheduledRule = {
+  name: string;
+  agents: string[];
+  repositories: string[];
+  schedule: {
+    kind: "interval" | "cron";
+    interval_value?: number;
+    interval_unit?: "minutes" | "hours" | "days";
+    cron?: string;
+    timezone?: string;
+  };
+  enabled?: boolean;
+};
+
 export type ConfigDocument = {
   database: { path: string };
   scanner: Record<string, unknown>;
@@ -389,6 +403,7 @@ export type ConfigDocument = {
   skills: Record<string, Skill>;
   agents: Record<string, Agent>;
   rules: Rule[];
+  scheduled_rules: ScheduledRule[];
 };
 
 export type RuntimeStatus = {
@@ -405,6 +420,17 @@ export type RuntimeStatus = {
   last_dispatch_finished_at?: number | null;
   last_dispatch_summary?: Record<string, unknown> | null;
   last_dispatch_error?: string | null;
+  last_schedule_started_at?: number | null;
+  last_schedule_finished_at?: number | null;
+  last_schedule_summary?: Record<string, unknown> | null;
+  last_schedule_error?: string | null;
+  scheduled_rules?: Array<{
+    name: string;
+    enabled: boolean;
+    summary: string;
+    timezone: string;
+    next_scheduled_at?: number | null;
+  }>;
   stats: {
     runs: Record<string, number>;
     events: Record<string, number>;
@@ -494,6 +520,16 @@ export type RunSummary = {
   change_request_number?: number | null;
   change_request_title?: string | null;
   change_request_url?: string | null;
+  trigger_source?: "event" | "schedule" | string;
+  trigger_context?: {
+    rule_name?: string;
+    occurrence_id?: string;
+    scheduled_at?: string;
+    created_at?: string;
+    repository_id?: string;
+    branch?: string;
+    head_sha?: string;
+  } | null;
   status: string;
   queue_reason?: string | null;
   attempts: number;

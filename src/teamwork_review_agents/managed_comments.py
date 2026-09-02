@@ -38,6 +38,8 @@ class ManagedCommentService:
         agent = self.config.agents.get(context.current_agent)
         if agent is None:
             raise RuntimeError(f"当前 Agent 不存在：{context.current_agent}")
+        if context.event is None:
+            raise PermissionError("当前定时运行没有 MR / PR 上下文，不能发布评论")
         if not agent.managed_comment:
             raise PermissionError(
                 f"Agent {context.current_agent} 未启用托管顶层评论"

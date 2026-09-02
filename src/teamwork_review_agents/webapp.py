@@ -136,6 +136,20 @@ class RuleDeleteRequest(BaseModel):
     revision: str
 
 
+class ScheduledRuleConfigRequest(BaseModel):
+    """UI 提交的单条定时触发规则配置。"""
+
+    revision: str
+    name: str
+    rule: dict[str, Any]
+
+
+class ScheduledRuleDeleteRequest(BaseModel):
+    """UI 删除单条定时触发规则时提交的配置版本。"""
+
+    revision: str
+
+
 class ProviderConfigRequest(BaseModel):
     """UI 提交的单个平台连接配置。"""
 
@@ -491,6 +505,70 @@ def create_app(
         try:
             config = await asyncio.to_thread(
                 manager.delete_rule,
+                expected_revision=body.revision,
+                name=rule_name,
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.post("/api/config/scheduled-rules")
+    async def create_scheduled_rule(
+        body: ScheduledRuleConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本创建一条定时触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_scheduled_rule,
+                expected_revision=body.revision,
+                name=body.name,
+                rule=body.rule,
+                source="ui-scheduled-rule-create",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.put("/api/config/scheduled-rules/{rule_name:path}")
+    async def update_scheduled_rule(
+        rule_name: str,
+        body: ScheduledRuleConfigRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本更新或重命名一条定时触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.save_scheduled_rule,
+                expected_revision=body.revision,
+                original_name=rule_name,
+                name=body.name,
+                rule=body.rule,
+                source="ui-scheduled-rule-update",
+            )
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
+
+    @app.delete("/api/config/scheduled-rules/{rule_name:path}")
+    async def delete_scheduled_rule(
+        rule_name: str,
+        body: ScheduledRuleDeleteRequest,
+    ) -> dict[str, Any]:
+        """基于指定版本删除一条定时触发规则。"""
+
+        try:
+            config = await asyncio.to_thread(
+                manager.delete_scheduled_rule,
                 expected_revision=body.revision,
                 name=rule_name,
             )

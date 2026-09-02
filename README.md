@@ -315,7 +315,20 @@ rules:
     # 仓库未启用或未配置 CI 时不报错，直接运行 Agent。
     run_preflight: true
     enabled: true
+
+# 可选：按时间直接在仓库远端默认分支的最新提交上运行 Agent。
+scheduled_rules:
+  - name: example-scheduled-maintenance
+    agents: [general-reviewer]
+    repositories: [example-github]
+    schedule:
+      kind: cron
+      cron: "0 9 * * 1-5"
+      timezone: Asia/Shanghai
+    enabled: true
 ```
+
+定时规则也支持 `kind: interval`，并通过 `interval_value` 与 `interval_unit`（`minutes`、`hours` 或 `days`）设置固定间隔。每个到期周期都会独立创建“仓库 × Agent”根运行；即使上一周期尚未结束，新周期也不会被跳过。定时运行不绑定虚构的 MR / PR，不执行 MR 专属 Preflight，也不发布 MR 评论；运行详情会记录规则名、计划时间、周期实例、默认分支和 Head SHA。服务暂停或停止期间错过的周期不会在恢复后补跑。
 
 可写 Agent 建议启用每次运行独立的临时 HOME，避免仓库程序把缓存、工具配置或测试产物写进服务账号真实的 `~/`：
 

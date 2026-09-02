@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 ChangeRequestState = Literal["opened", "closed", "merged"]
@@ -141,6 +141,18 @@ class PreflightResult(BaseModel):
     reused: bool = False
 
 
+class ScheduledRunContext(BaseModel):
+    """一次定时周期传递给根 Agent 与 sub-agent 的可信上下文。"""
+
+    rule_name: str
+    occurrence_id: str
+    scheduled_at: datetime
+    created_at: datetime
+    repository_id: str
+    branch: str = ""
+    head_sha: str = ""
+
+
 class InvocationContext(BaseModel):
     """传递给 sub-agent MCP Server 的最小调用上下文。"""
 
@@ -152,7 +164,16 @@ class InvocationContext(BaseModel):
     call_chain: tuple[str, ...] = ()
     inherit_workspace: bool = False
     active_workspace: str = ""
-    event: ChangeEvent
+    event: ChangeEvent | None = None
+    schedule: ScheduledRunContext | None = None
+
+    @model_validator(mode="after")
+    def validate_trigger_context(self) -> "InvocationContext":
+        """一次调用必须且只能携带一种根触发来源。"""
+
+        if (self.event is None) == (self.schedule is None):
+            raise ValueError("调用上下文必须且只能包含事件或定时触发来源")
+        return self
 
 
 def stable_hash(*parts: Any) -> str:

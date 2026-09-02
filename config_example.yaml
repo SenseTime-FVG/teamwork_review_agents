@@ -434,11 +434,32 @@ rules:
     # 内置规则绝不自动启用。
     enabled: false
 
+# 定时触发规则直接使用仓库远端默认分支的最新提交，不创建伪造的 MR / PR 上下文。
+# 每个到期周期都会为每个“仓库 × Agent”组合创建独立根运行；上一周期未结束时
+# 新周期仍会进入调度，只可能受全局/Agent 并发额度和写锁影响而排队。
+# scheduled_rules:
+#   - name: 定时仓库维护
+#     agents:
+#       - dependency-reviewer
+#     repositories:
+#       - example-github
+#     schedule:
+#       # interval 支持 minutes、hours、days；也可改为 kind: cron 并填写五段 cron。
+#       kind: interval
+#       interval_value: 6
+#       interval_unit: hours
+#       cron: "0 */6 * * *"
+#       timezone: Asia/Shanghai
+#     enabled: false
+
 # Prompt 支持 Jinja2 条件和变量。配置中标记 expose_to_prompt: true 的 Agent
 # 环境变量会在模型启动前直接渲染，例如
 # `{% if REVIEW_AUTO_MERGE | as_bool %}...{% else %}...{% endif %}`；
 # `{{ REVIEW_SKILLS }}` 会直接替换为已解析的配置值，不需要模型通过 Shell 读取。
 # 旧 `${{ENV_NAME}}` 语法继续兼容，缺失变量渲染为空字符串。
 # Prompt 可直接使用的系统运行变量：
-# REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、MR_NUMBER、MR_TITLE、
-# MR_STATE、MR_HEAD_SHA、MR_SOURCE_BRANCH、MR_TARGET_BRANCH、MR_URL、EVENT_TYPE、RUN_ID。
+# REPOSITORY_ID、REPOSITORY_PROJECT、REPOSITORY_WORKSPACE、RUN_ID。
+# MR / PR 事件额外提供 MR_NUMBER、MR_TITLE、MR_STATE、MR_HEAD_SHA、
+# MR_SOURCE_BRANCH、MR_TARGET_BRANCH、MR_URL、EVENT_TYPE。
+# 定时触发额外提供 SCHEDULE_RULE_NAME、SCHEDULE_OCCURRENCE_ID、SCHEDULED_AT、
+# SCHEDULE_BRANCH、SCHEDULE_HEAD_SHA。
