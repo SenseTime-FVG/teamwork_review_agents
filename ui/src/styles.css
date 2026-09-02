@@ -473,6 +473,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .skill-heading { width: 100%; min-width: 0; display: grid; grid-template-columns: minmax(240px, .55fr) minmax(320px, 1.45fr); gap: 18px; align-items: end; }
 .skill-heading .field { min-width: 0; }
 .skill-heading .field input { color: var(--bright); font-family: "SFMono-Regular", Consolas, monospace; font-weight: 600; }
+.skill-card-actions { flex: 0 0 auto; flex-wrap: nowrap; }
+.skill-readonly-badge { padding: 4px 8px; border: 1px solid #344154; border-radius: 9px; background: #111925; color: #718096; font-size: 9px; white-space: nowrap; }
 .skill-metadata { min-width: 0; padding: 9px 11px; border: 1px solid #2f5b42; border-radius: 7px; background: #102118; }
 .skill-metadata.invalid { border-color: #61373b; background: #211419; }
 .skill-metadata strong, .skill-metadata span { display: block; }
@@ -488,6 +490,19 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .managed-skill span { margin-top: 4px; color: #748398; font-size: 10px; line-height: 1.45; }
 .managed-skill code { margin-top: 5px; color: #536278; font-size: 9px; }
 .managed-skill.invalid { border-color: #4a3034; }
+.skill-document-drawer { width: min(920px, 88vw); }
+.skill-document-body { padding: 22px 26px 30px; }
+.skill-document-form { display: flex; flex-direction: column; gap: 18px; }
+.skill-document-form .section-title-row { margin-bottom: 0; padding-bottom: 17px; border-bottom: 1px solid var(--line-soft); }
+.skill-document-form .field > span { color: #9cabbd; font-weight: 600; }
+.skill-document-form textarea { resize: vertical; }
+.skill-body-field textarea { min-height: 390px; font: 400 11px/1.7 "SFMono-Regular", Consolas, monospace; tab-size: 2; }
+.skill-editor-context { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 5px 14px; align-items: center; padding: 11px 13px; border: 1px solid #263243; border-radius: 8px; background: #0a111a; }
+.skill-editor-context span { color: #7f8ea2; font-size: 10px; }
+.skill-editor-context code { color: #b8c6d8; font-size: 10px; }
+.skill-editor-context small { grid-column: 2; color: #5f6d80; font-size: 9px; }
+.skill-editor-alert { margin-bottom: 14px; overflow-wrap: anywhere; }
+.skill-editor-loading { min-height: 45vh; }
 .json-field { margin-top: 16px; }
 .json-field textarea { font-size: 10px; line-height: 1.55; resize: vertical; }
 .rule-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }

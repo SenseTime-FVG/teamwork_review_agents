@@ -215,7 +215,9 @@ Agent 配置本身不绑定仓库或固定目录。管理 UI 在 Agent 页面说
 
 配置顶层增加 `skills`，每个条目引用一个符合 Codex Skill 规范的目录；目录中必须存在带 `name` 与 `description` 元数据的 `SKILL.md`，并可同时包含 `scripts/`、`references/`、`assets/` 等资源。Agent 通过 `skills` 字符串数组独立选择本次运行允许装载的技能。sub-agent 使用自己的 Agent 配置，不继承父 Agent 的技能选择；规则的 `inherit_workspace` 仍只控制文件系统与 Git 状态。
 
-管理 UI 增加独立的 SKILL 页面，支持填写服务端已有目录，也支持从浏览器选择整个技能文件夹并复制到配置文件旁的 `./skills/`。导入时校验目录层级、文件数量、总大小和 `SKILL.md` 元数据，并拒绝路径穿越、重复目标及非法文件。导入只负责保存技能目录，管理员仍需将其加入配置后再在 Agent 中选择。
+管理 UI 增加独立的 SKILL 页面，支持在线新建受管 `SKILL.md`、填写服务端已有目录，也支持从浏览器选择整个技能文件夹并复制到配置文件旁的 `./skills/`。在线表单分别编辑 Teamwork 配置 ID、frontmatter `name`、用于 Codex 技能发现与 UI 展示的 `description`，以及命中 Skill 后读取的 Markdown 正文；创建文件后仍需保存页面配置，才能持久化配置引用。导入时校验目录层级、文件数量、总大小和 `SKILL.md` 元数据，并拒绝路径穿越、重复目标及非法文件。导入只负责保存技能目录，管理员仍需将其加入配置后再在 Agent 中选择。
+
+只有配置文件同级 `./skills/` 下的直接、非符号链接子目录可以在线编辑。更新根 `SKILL.md` 时只替换 `name`、`description` 和正文，保留其他 frontmatter 字段以及 `scripts`、`references`、`assets` 等资源；服务端外部路径继续可注册和装载，但 UI 明确标记为只读。移除配置引用不删除磁盘目录，未配置的受管 Skill 继续显示在可重新加入配置的列表中。
 
 运行 Codex CLI 前，执行器把应用配置中的技能完整投影到本次临时 Git 工作区的 `.agents/skills/` 下，并通过当前 Agent 的 Codex 配置显式启用已选技能、禁用其他由本应用管理的技能。投影保留技能内部相对路径和资源，但不修改技能源目录；Codex 子进程同时使用仅对本次进程生效的 Git 忽略文件，使投影不会出现在 `git status` 或普通 `git add -A` 中；进程结束后立即清理。根 Agent 与继承工作区的 sub-agent 可以看到同一份稳定投影，但各自的启用列表仍由各自 Agent 配置决定。未继承工作区的 sub-agent 在自己的临时 clone 或 worktree 中创建和清理投影。
 

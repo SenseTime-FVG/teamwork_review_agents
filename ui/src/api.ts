@@ -39,7 +39,23 @@ export type ManagedSkillDirectory = {
   name: string;
   description: string;
   valid: boolean;
+  managed?: boolean;
+  editable?: boolean;
+  body?: string;
   error?: string | null;
+};
+
+export type ManagedSkillDocument = ManagedSkillDirectory & {
+  directory: string;
+  managed: true;
+  editable: true;
+  body: string;
+};
+
+export type ManagedSkillDocumentInput = {
+  name: string;
+  description: string;
+  body: string;
 };
 
 export async function uploadPromptFile(file: File): Promise<ManagedPromptFile> {
@@ -84,6 +100,36 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(body.detail ?? `请求失败：${response.status}`);
   }
   return body as T;
+}
+
+export async function createManagedSkill(
+  input: ManagedSkillDocumentInput,
+): Promise<ManagedSkillDocument> {
+  return api<ManagedSkillDocument>("/api/skill-directories", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function loadManagedSkill(
+  directory: string,
+): Promise<ManagedSkillDocument> {
+  return api<ManagedSkillDocument>(
+    `/api/skill-directories/${encodeURIComponent(directory)}/document`,
+  );
+}
+
+export async function updateManagedSkill(
+  directory: string,
+  input: ManagedSkillDocumentInput,
+): Promise<ManagedSkillDocument> {
+  return api<ManagedSkillDocument>(
+    `/api/skill-directories/${encodeURIComponent(directory)}/document`,
+    {
+      method: "PUT",
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 export async function streamRunLogs(

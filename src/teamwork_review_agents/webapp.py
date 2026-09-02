@@ -51,9 +51,12 @@ from .skill_files import (
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_FILES,
     MAX_SKILL_TOTAL_BYTES,
+    create_managed_skill,
     import_skill_directory,
     inspect_skill_path,
     list_skill_directories,
+    read_managed_skill_document,
+    update_managed_skill,
 )
 
 
@@ -251,6 +254,14 @@ class SkillInspectRequest(BaseModel):
     """服务端 Skill 目录检查请求。"""
 
     path: str
+
+
+class SkillDocumentRequest(BaseModel):
+    """UI 新建或更新受管 SKILL.md 的请求。"""
+
+    name: str = Field(max_length=128)
+    description: str = Field(max_length=4096)
+    body: str = Field(max_length=1024 * 1024)
 
 
 def _provider_response_text(response: dict[str, Any]) -> str:
@@ -1316,12 +1327,59 @@ def create_app(
 
         return await asyncio.to_thread(list_skill_directories, manager.path)
 
+    @app.post("/api/skill-directories")
+    async def create_skill(body: SkillDocumentRequest) -> dict[str, Any]:
+        """在配置目录旁创建一个可由 UI 管理的 Skill。"""
+
+        try:
+            return await asyncio.to_thread(
+                create_managed_skill,
+                manager.path,
+                name=body.name,
+                description=body.description,
+                body=body.body,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/skill-directories/inspect")
     async def inspect_skill(body: SkillInspectRequest) -> dict[str, Any]:
         """检查服务端已有 Skill 路径并读取展示元数据。"""
 
         try:
             return await asyncio.to_thread(inspect_skill_path, manager.path, body.path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/skill-directories/{directory}/document")
+    async def managed_skill_document(directory: str) -> dict[str, Any]:
+        """读取受管 Skill 根部的可编辑 SKILL.md。"""
+
+        try:
+            return await asyncio.to_thread(
+                read_managed_skill_document,
+                manager.path,
+                directory,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put("/api/skill-directories/{directory}/document")
+    async def save_managed_skill_document(
+        directory: str,
+        body: SkillDocumentRequest,
+    ) -> dict[str, Any]:
+        """更新受管 Skill 根部的 SKILL.md。"""
+
+        try:
+            return await asyncio.to_thread(
+                update_managed_skill,
+                manager.path,
+                directory,
+                name=body.name,
+                description=body.description,
+                body=body.body,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

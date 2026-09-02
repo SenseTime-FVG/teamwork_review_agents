@@ -16,9 +16,12 @@ from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.skill_files import (
     SkillProjection,
+    create_managed_skill,
     import_skill_directory,
     list_skill_directories,
+    read_managed_skill_document,
     read_skill_metadata,
+    update_managed_skill,
 )
 from teamwork_review_agents.webapp import create_app
 
@@ -77,6 +80,72 @@ def test_skill_import_rejects_path_traversal(tmp_path) -> None:
             config_path,
             [("selected/../SKILL.md", SKILL_MD.encode())],
         )
+
+
+def test_managed_skill_create_and_update_preserve_extended_content(tmp_path) -> None:
+    """在线创建和编辑应保留扩展 frontmatter 与同目录资源。"""
+
+    config_path = _write_minimal_config(tmp_path)
+    created = create_managed_skill(
+        config_path,
+        name="Review Helper",
+        description="发现常见审核风险。",
+        body="# 审核助手\n\n先读取变更。",
+    )
+    assert created["directory"] == "review-helper"
+    assert created["editable"] is True
+    assert read_managed_skill_document(config_path, "review-helper")["body"].startswith(
+        "# 审核助手"
+    )
+
+    directory = tmp_path / "skills" / "review-helper"
+    manifest = directory / "SKILL.md"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "description: 发现常见审核风险。\n",
+            "description: 发现常见审核风险。\nlicense: MIT\n",
+        ),
+        encoding="utf-8",
+    )
+    (directory / "references").mkdir()
+    resource = directory / "references" / "policy.md"
+    resource.write_text("保留此文件\n", encoding="utf-8")
+
+    updated = update_managed_skill(
+        config_path,
+        "review-helper",
+        name="Review Helper",
+        description="更新后的技能发现描述。",
+        body="# 新说明\n\n执行新的审核流程。",
+    )
+    rendered = manifest.read_text(encoding="utf-8")
+    assert updated["description"] == "更新后的技能发现描述。"
+    assert updated["body"].startswith("# 新说明")
+    assert "license: MIT" in rendered
+    assert resource.read_text(encoding="utf-8") == "保留此文件\n"
+
+
+def test_managed_skill_editor_rejects_external_and_symlink_directories(tmp_path) -> None:
+    """在线编辑不能越过受管目录边界或跟随目录符号链接。"""
+
+    config_path = _write_minimal_config(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "SKILL.md").write_text(SKILL_MD, encoding="utf-8")
+    with pytest.raises(ValueError, match="目录名非法"):
+        read_managed_skill_document(config_path, "../external")
+
+    managed = tmp_path / "skills"
+    managed.mkdir()
+    (managed / "linked").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="不存在或不可编辑"):
+        read_managed_skill_document(config_path, "linked")
+
+    linked_manifest = managed / "linked-manifest"
+    linked_manifest.mkdir()
+    (linked_manifest / "SKILL.md").symlink_to(external / "SKILL.md")
+    with pytest.raises(ValueError, match="不存在或不可编辑"):
+        read_managed_skill_document(config_path, "linked-manifest")
 
 
 def test_config_validates_agent_skill_references(tmp_path) -> None:
@@ -206,3 +275,39 @@ def test_skill_directory_web_api_imports_whole_folder(tmp_path) -> None:
         )
         assert inspected.status_code == 200
         assert inspected.json()["description"] == "根据代码变化按需更新项目文档。"
+
+
+def test_skill_directory_web_api_creates_and_updates_managed_skill(tmp_path) -> None:
+    """管理 API 应支持创建、读取和更新受管 SKILL.md。"""
+
+    app = create_app(_write_minimal_config(tmp_path), start_scheduler=False)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/skill-directories",
+            json={
+                "name": "ui-created-skill",
+                "description": "由管理界面创建。",
+                "body": "# UI Skill\n\n执行指定流程。",
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["path"] == "./skills/ui-created-skill"
+
+        loaded = client.get(
+            "/api/skill-directories/ui-created-skill/document"
+        )
+        assert loaded.status_code == 200
+        assert loaded.json()["managed"] is True
+        assert loaded.json()["body"].startswith("# UI Skill")
+
+        updated = client.put(
+            "/api/skill-directories/ui-created-skill/document",
+            json={
+                "name": "ui-created-skill",
+                "description": "已经更新描述。",
+                "body": "# 更新\n\n执行更新后的流程。",
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["description"] == "已经更新描述。"
+        assert "执行更新后的流程" in updated.json()["body"]

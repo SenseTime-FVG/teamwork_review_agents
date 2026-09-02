@@ -62,8 +62,9 @@ teamwork-review-agents start
 2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
 3. 在“全局配置与环境”中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`，并确认全局默认模型。
 4. 在“Provider”页检查不可删除的内置 Codex CLI；新增 API Provider 时填写 Base URL 和 API Key，点击“检测模型”后选择默认模型，也可以跳过检测手工维护模型目录。
-5. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
-6. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
+5. 如需项目专属能力，在“SKILL”页直接新建 `SKILL.md`、导入完整 Skill 文件夹或配置服务端已有目录，再为对应 Agent 选择允许装载的 Skill。`description` 会供 Codex 发现和匹配，Markdown 正文会在 Skill 被使用时作为完整指令读取。
+6. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
+7. 确认仓库、事件和日志正常，再启用触发规则；需要在 Agent 前执行本地 CI 的规则，同时选择“执行仓库 CI（如已启用）”。
 
 平台连接与仓库配置：
 

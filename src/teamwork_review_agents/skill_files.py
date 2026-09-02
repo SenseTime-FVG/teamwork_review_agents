@@ -34,6 +34,16 @@ class SkillMetadata:
     description: str
 
 
+@dataclass(frozen=True)
+class SkillDocument:
+    """从 SKILL.md 读取的完整可编辑文档。"""
+
+    name: str
+    description: str
+    body: str
+    frontmatter: dict[str, Any]
+
+
 def skill_directory(config_path: str | Path) -> Path:
     """返回配置文件旁由管理 UI 导入 Skill 的目录。"""
 
@@ -48,8 +58,8 @@ def _display_path(config_path: str | Path, path: Path) -> str:
     return f"./{relative.as_posix()}"
 
 
-def read_skill_metadata(path: str | Path) -> SkillMetadata:
-    """校验 Skill 目录并读取 SKILL.md 的 name 与 description。"""
+def _read_skill_document(path: str | Path) -> SkillDocument:
+    """校验 Skill 目录并读取完整 SKILL.md 文档。"""
 
     directory = Path(path).expanduser().resolve()
     if not directory.is_dir():
@@ -63,7 +73,8 @@ def read_skill_metadata(path: str | Path) -> SkillMetadata:
         content = manifest.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("SKILL.md 必须使用 UTF-8 编码") from exc
-    match = _FRONTMATTER_PATTERN.match(content.lstrip("\ufeff"))
+    normalized = content.lstrip("\ufeff")
+    match = _FRONTMATTER_PATTERN.match(normalized)
     if match is None:
         raise ValueError("SKILL.md 必须以 YAML frontmatter 开头")
     try:
@@ -82,7 +93,212 @@ def read_skill_metadata(path: str | Path) -> SkillMetadata:
         raise ValueError("SKILL.md 的 name 非法或超过 128 个字符")
     if len(description) > 4096 or "\0" in description:
         raise ValueError("SKILL.md 的 description 非法或超过 4096 个字符")
-    return SkillMetadata(name=name, description=description)
+    return SkillDocument(
+        name=name,
+        description=description,
+        body=normalized[match.end() :],
+        frontmatter=dict(header),
+    )
+
+
+def read_skill_metadata(path: str | Path) -> SkillMetadata:
+    """校验 Skill 目录并读取 SKILL.md 的 name 与 description。"""
+
+    document = _read_skill_document(path)
+    return SkillMetadata(name=document.name, description=document.description)
+
+
+def _serialize_skill_document(
+    *,
+    name: str,
+    description: str,
+    body: str,
+    frontmatter: Mapping[str, Any] | None = None,
+) -> str:
+    """生成规范的 SKILL.md，并保留已有扩展 frontmatter。"""
+
+    normalized_name = name.strip()
+    normalized_description = description.strip()
+    normalized_body = body.strip()
+    if not normalized_name:
+        raise ValueError("Skill 名称不能为空")
+    if not normalized_description:
+        raise ValueError("Skill 描述不能为空")
+    if not normalized_body:
+        raise ValueError("Skill 操作说明不能为空")
+    if len(normalized_name) > 128 or any(
+        character in normalized_name for character in "\r\n\0"
+    ):
+        raise ValueError("Skill 名称非法或超过 128 个字符")
+    if len(normalized_description) > 4096 or "\0" in normalized_description:
+        raise ValueError("Skill 描述非法或超过 4096 个字符")
+    if "\0" in normalized_body:
+        raise ValueError("Skill 操作说明包含非法字符")
+
+    header = dict(frontmatter or {})
+    header["name"] = normalized_name
+    header["description"] = normalized_description
+    rendered_header = yaml.safe_dump(
+        header,
+        allow_unicode=True,
+        sort_keys=False,
+    ).strip()
+    content = f"---\n{rendered_header}\n---\n\n{normalized_body}\n"
+    if len(content.encode("utf-8")) > MAX_SKILL_MD_BYTES:
+        raise ValueError("SKILL.md 不能超过 1 MiB")
+    return content
+
+
+def _is_managed_skill_path(config_path: str | Path, path: Path) -> bool:
+    """判断路径是否为受管 skills 根目录下的直接、安全子目录。"""
+
+    managed_root = skill_directory(config_path).resolve()
+    return (
+        path.parent.resolve() == managed_root
+        and path.is_dir()
+        and not path.is_symlink()
+        and path.resolve().parent == managed_root
+    )
+
+
+def _managed_skill_path(config_path: str | Path, directory: str) -> Path:
+    """解析受管 Skill 目录名并拒绝目录穿越和符号链接。"""
+
+    normalized = directory.strip()
+    if (
+        not normalized
+        or normalized.startswith(".")
+        or Path(normalized).name != normalized
+        or "/" in normalized
+        or "\\" in normalized
+    ):
+        raise ValueError("受管 Skill 目录名非法")
+    path = skill_directory(config_path) / normalized
+    if not _is_managed_skill_path(config_path, path) or (path / "SKILL.md").is_symlink():
+        raise ValueError(f"受管 Skill 目录不存在或不可编辑：{normalized}")
+    return path
+
+
+def _managed_skill_response(
+    config_path: str | Path,
+    path: Path,
+    document: SkillDocument,
+    *,
+    include_body: bool = False,
+) -> dict[str, Any]:
+    """构造受管 Skill 的统一 API 响应。"""
+
+    result: dict[str, Any] = {
+        "directory": path.name,
+        "path": _display_path(config_path, path),
+        "resolved_path": str(path.resolve()),
+        "name": document.name,
+        "description": document.description,
+        "valid": True,
+        "managed": True,
+        "editable": True,
+        "error": None,
+    }
+    if include_body:
+        result["body"] = document.body.strip()
+    return result
+
+
+def create_managed_skill(
+    config_path: str | Path,
+    *,
+    name: str,
+    description: str,
+    body: str,
+) -> dict[str, Any]:
+    """在配置旁原子创建一个只含 SKILL.md 的受管 Skill。"""
+
+    content = _serialize_skill_document(
+        name=name,
+        description=description,
+        body=body,
+    )
+    managed_root = skill_directory(config_path)
+    managed_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".skill-create-", dir=managed_root))
+    target = managed_root / _safe_directory_name(name.strip())
+    try:
+        (staging / "SKILL.md").write_text(content, encoding="utf-8")
+        document = _read_skill_document(staging)
+        if target.exists():
+            raise ValueError(f"受管 Skill 目录已存在：{target.name}")
+        os.replace(staging, target)
+        return _managed_skill_response(
+            config_path,
+            target,
+            document,
+            include_body=True,
+        )
+    finally:
+        if staging.exists():
+            remove_tree(staging)
+
+
+def read_managed_skill_document(
+    config_path: str | Path,
+    directory: str,
+) -> dict[str, Any]:
+    """读取一个受管 Skill 的可编辑根文档。"""
+
+    path = _managed_skill_path(config_path, directory)
+    document = _read_skill_document(path)
+    return _managed_skill_response(
+        config_path,
+        path,
+        document,
+        include_body=True,
+    )
+
+
+def update_managed_skill(
+    config_path: str | Path,
+    directory: str,
+    *,
+    name: str,
+    description: str,
+    body: str,
+) -> dict[str, Any]:
+    """原子更新受管 Skill 的 SKILL.md，并保留其他资源和扩展元数据。"""
+
+    path = _managed_skill_path(config_path, directory)
+    manifest = path / "SKILL.md"
+    if manifest.is_symlink():
+        raise ValueError("受管 Skill 的 SKILL.md 不能是符号链接")
+    current = _read_skill_document(path)
+    content = _serialize_skill_document(
+        name=name,
+        description=description,
+        body=body,
+        frontmatter=current.frontmatter,
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".SKILL.",
+        suffix=".tmp",
+        dir=path,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, manifest.stat().st_mode & 0o777)
+        os.replace(temporary, manifest)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    document = _read_skill_document(path)
+    return _managed_skill_response(
+        config_path,
+        path,
+        document,
+        include_body=True,
+    )
 
 
 def list_skill_directories(config_path: str | Path) -> list[dict[str, Any]]:
@@ -104,6 +320,8 @@ def list_skill_directories(config_path: str | Path) -> list[dict[str, Any]]:
                     "name": metadata.name,
                     "description": metadata.description,
                     "valid": True,
+                    "managed": True,
+                    "editable": not (path / "SKILL.md").is_symlink(),
                     "error": None,
                 }
             )
@@ -115,6 +333,8 @@ def list_skill_directories(config_path: str | Path) -> list[dict[str, Any]]:
                     "name": path.name,
                     "description": "",
                     "valid": False,
+                    "managed": True,
+                    "editable": False,
                     "error": str(exc),
                 }
             )
@@ -130,12 +350,17 @@ def inspect_skill_path(config_path: str | Path, value: str | Path) -> dict[str, 
         expanded = config_directory / expanded
     resolved = expanded.resolve()
     metadata = read_skill_metadata(resolved)
+    managed = _is_managed_skill_path(config_path, expanded)
+    editable = managed and not (expanded / "SKILL.md").is_symlink()
     return {
+        "directory": resolved.name if managed else None,
         "path": str(value),
         "resolved_path": str(resolved),
         "name": metadata.name,
         "description": metadata.description,
         "valid": True,
+        "managed": managed,
+        "editable": editable,
         "error": None,
     }
 
@@ -218,9 +443,12 @@ def import_skill_directory(
         return {
             "directory": target.name,
             "path": _display_path(config_path, target),
+            "resolved_path": str(target.resolve()),
             "name": metadata.name,
             "description": metadata.description,
             "valid": True,
+            "managed": True,
+            "editable": True,
             "error": None,
         }
     finally:

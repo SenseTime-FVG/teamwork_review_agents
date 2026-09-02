@@ -3,14 +3,17 @@ import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   api,
+  createManagedSkill,
   getToken,
+  loadManagedSkill,
   setToken as persistToken,
   streamPreflightLogs,
   streamRunLogs,
   uploadPromptFile,
   uploadSkillDirectory,
+  updateManagedSkill,
 } from "./api";
-import type { ManagedPromptFile, ManagedSkillDirectory } from "./api";
+import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { presentRunLogs } from "./runLogPresentation";
 import type {
@@ -5644,6 +5647,114 @@ function RepositoriesView(props: {
   );
 }
 
+type SkillDocumentEditorState = {
+  mode: "create" | "edit";
+  configId: string;
+  directory?: string;
+  name: string;
+  description: string;
+  body: string;
+};
+
+function SkillDocumentDrawer(props: {
+  state: SkillDocumentEditorState;
+  loading: boolean;
+  saving: boolean;
+  error: string;
+  onChange: (state: SkillDocumentEditorState) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  const editing = props.state.mode === "edit";
+  return createPortal(
+    <div className="run-drawer-layer">
+      <button
+        className="run-drawer-backdrop"
+        type="button"
+        aria-label="关闭 Skill 编辑器"
+        disabled={props.saving}
+        onClick={props.onClose}
+      />
+      <aside className="run-drawer skill-document-drawer" role="dialog" aria-modal="true" aria-label={editing ? "编辑 Skill" : "新建 Skill"}>
+        <header className="run-drawer-head">
+          <div>
+            <span className="eyebrow">CODEX SKILL</span>
+            <h2>{editing ? props.state.name || "编辑 Skill" : "新建 Skill"}</h2>
+            <p>{editing ? `./skills/${props.state.directory ?? ""}/SKILL.md` : "创建受 Teamwork 管理的 SKILL.md"}</p>
+          </div>
+          <div className="run-drawer-actions">
+            <button className="button secondary" type="button" disabled={props.saving} onClick={props.onClose}>取消</button>
+            <button className="button primary" type="button" disabled={props.loading || props.saving} onClick={props.onSave}>
+              {props.saving ? "保存中…" : editing ? "保存 Skill" : "创建 Skill"}
+            </button>
+            <button className="run-drawer-close" type="button" aria-label="关闭" disabled={props.saving} onClick={props.onClose}>×</button>
+          </div>
+        </header>
+        <div className="run-drawer-body skill-document-body">
+          {props.error && <div className="alert error skill-editor-alert"><span>{props.error}</span></div>}
+          {props.loading ? (
+            <div className="loading-screen skill-editor-loading"><span className="spinner" />正在读取 SKILL.md…</div>
+          ) : (
+            <section className="section-card skill-document-form">
+              <div className="section-title-row">
+                <div>
+                  <h2>技能说明</h2>
+                  <p>描述用于 Codex 发现和匹配 Skill；操作说明会在 Skill 被使用时作为完整指令读取。</p>
+                </div>
+              </div>
+              {!editing && (
+                <Field
+                  label="配置 ID"
+                  value={props.state.configId}
+                  onChange={(configId) => props.onChange({ ...props.state, configId })}
+                  placeholder="例如 dependency-review"
+                  help="Teamwork 配置和 Agent 引用使用的稳定标识；创建后仍需保存页面配置。"
+                />
+              )}
+              {editing && props.state.configId && (
+                <div className="skill-editor-context">
+                  <span>配置 ID</span>
+                  <code>{props.state.configId}</code>
+                  <small>这里直接保存 SKILL.md 内容，不会修改配置 ID，也不会被页面右上角“取消”回滚。</small>
+                </div>
+              )}
+              <Field
+                label="Skill 名称"
+                value={props.state.name}
+                onChange={(name) => props.onChange({ ...props.state, name })}
+                placeholder="例如 dependency-review"
+                help="写入 frontmatter 的 name，供 Codex 识别技能。"
+              />
+              <label className="field">
+                <span>描述</span>
+                <textarea
+                  rows={4}
+                  value={props.state.description}
+                  placeholder="简要说明何时应使用这个 Skill，以及它能完成什么。"
+                  onChange={(event) => props.onChange({ ...props.state, description: event.target.value })}
+                />
+                <small>这不是只给人看的备注；Codex 会根据它发现和匹配 Skill。</small>
+              </label>
+              <label className="field skill-body-field">
+                <span>操作说明（Markdown 正文）</span>
+                <textarea
+                  className="mono"
+                  rows={22}
+                  value={props.state.body}
+                  placeholder={"# 技能说明\n\n写清执行步骤、输入输出和边界。"}
+                  onChange={(event) => props.onChange({ ...props.state, body: event.target.value })}
+                />
+                <small>保存时会保留已有的其他 frontmatter 字段，以及 scripts、references、assets 等目录资源。</small>
+              </label>
+            </section>
+          )}
+        </div>
+      </aside>
+    </div>,
+    document.body,
+  );
+}
+
 function SkillsEditor(props: {
   document: ConfigDocument;
   onChange: (document: ConfigDocument) => void;
@@ -5653,6 +5764,10 @@ function SkillsEditor(props: {
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [skillEditor, setSkillEditor] = useState<SkillDocumentEditorState | null>(null);
+  const [skillEditorLoading, setSkillEditorLoading] = useState(false);
+  const [skillEditorSaving, setSkillEditorSaving] = useState(false);
+  const [skillEditorError, setSkillEditorError] = useState("");
   const skillEntries = Object.entries(props.document.skills);
   const skillSignature = JSON.stringify(skillEntries.map(([id, skill]) => [id, skill.path]));
 
@@ -5681,6 +5796,8 @@ function SkillsEditor(props: {
             name: id,
             description: "",
             valid: false,
+            managed: false,
+            editable: false,
             error: reason instanceof Error ? reason.message : "Skill 路径检查失败",
           }] as const;
         }
@@ -5709,6 +5826,100 @@ function SkillsEditor(props: {
       ...props.document,
       skills: { ...props.document.skills, [id]: value },
     });
+  }
+
+  function startCreatingSkill() {
+    setSkillEditorError("");
+    setSkillEditorLoading(false);
+    setSkillEditor({
+      mode: "create",
+      configId: uniqueId(`skill-${skillEntries.length + 1}`),
+      name: "",
+      description: "",
+      body: "",
+    });
+  }
+
+  async function startEditingSkill(configId: string, metadata: ManagedSkillDirectory) {
+    if (!metadata.directory || !metadata.editable) return;
+    const directory = metadata.directory;
+    setSkillEditorError("");
+    setSkillEditorLoading(true);
+    setSkillEditor({
+      mode: "edit",
+      configId,
+      directory,
+      name: metadata.name,
+      description: metadata.description,
+      body: "",
+    });
+    try {
+      const loaded = await loadManagedSkill(directory);
+      setSkillEditor((current) => (
+        current?.mode === "edit" && current.directory === directory
+          ? {
+              ...current,
+              name: loaded.name,
+              description: loaded.description,
+              body: loaded.body,
+            }
+          : current
+      ));
+    } catch (reason) {
+      setSkillEditorError(reason instanceof Error ? reason.message : "读取 SKILL.md 失败");
+    } finally {
+      setSkillEditorLoading(false);
+    }
+  }
+
+  async function saveSkillDocument() {
+    if (!skillEditor) return;
+    const configId = skillEditor.configId.trim();
+    const name = skillEditor.name.trim();
+    const description = skillEditor.description.trim();
+    const body = skillEditor.body.trim();
+    if (skillEditor.mode === "create" && !configId) {
+      setSkillEditorError("配置 ID 不能为空");
+      return;
+    }
+    if (skillEditor.mode === "create" && props.document.skills[configId]) {
+      setSkillEditorError(`配置 ID 已存在：${configId}`);
+      return;
+    }
+    if (!name || !description || !body) {
+      setSkillEditorError("Skill 名称、描述和操作说明都不能为空");
+      return;
+    }
+    setSkillEditorSaving(true);
+    setSkillEditorError("");
+    setMessage("");
+    setError("");
+    try {
+      let saved: ManagedSkillDocument;
+      if (skillEditor.mode === "create") {
+        saved = await createManagedSkill({ name, description, body });
+        props.onChange({
+          ...props.document,
+          skills: {
+            ...props.document.skills,
+            [configId]: { path: saved.path },
+          },
+        });
+        setMessage(`已创建 ${saved.name} 并加入配置草稿，请点击右上角“保存配置”完成注册。`);
+      } else {
+        saved = await updateManagedSkill(skillEditor.directory!, { name, description, body });
+        if (configId) {
+          setInspected((current) => ({ ...current, [configId]: saved }));
+        }
+        setMessage(`已保存 Skill 内容：${saved.name}`);
+      }
+      setSkillEditor(null);
+      await loadDirectories();
+    } catch (reason) {
+      setSkillEditorError(reason instanceof Error ? reason.message : "保存 SKILL.md 失败");
+    } finally {
+      setSkillEditorSaving(false);
+    }
   }
 
   function renameSkill(id: string, nextId: string): boolean {
@@ -5761,8 +5972,9 @@ function SkillsEditor(props: {
             <p>注册包含 SKILL.md 的技能目录；每个 Agent 再独立选择允许装载的 Skill。</p>
           </div>
           <div className="button-group">
-            <button className="button secondary" type="button" onClick={() => addSkill()}>+ 配置服务端目录</button>
-            <label className={`button primary file-button ${uploading ? "disabled" : ""}`}>
+            <button className="button primary" type="button" onClick={startCreatingSkill}>+ 新建 Skill</button>
+            <button className="button secondary" type="button" onClick={() => addSkill()}>配置已有目录</button>
+            <label className={`button secondary file-button ${uploading ? "disabled" : ""}`}>
               {uploading ? "正在导入…" : "从电脑导入文件夹"}
               <input
                 type="file"
@@ -5784,7 +5996,7 @@ function SkillsEditor(props: {
         </div>
         <div className="agent-workspace-note">
           <strong>原生 Skill 装载</strong>
-          <span>目录根部必须有带 name 和 description 的 SKILL.md；scripts、references、assets 等子目录会完整保留。选择 Skill 只是让 Codex 可以按描述匹配或通过 $skill-name 显式使用，不代表每次都强制执行。</span>
+          <span>Codex 会看见 SKILL.md 中的 name 和 description，并据此发现、匹配 Skill；命中后再读取 Markdown 正文和配套资源。scripts、references、assets 等子目录会完整保留。</span>
         </div>
         {message && <p className="inline-message success-text skill-message">{message}</p>}
         {error && <p className="inline-message error-text skill-message">{error}</p>}
@@ -5803,17 +6015,25 @@ function SkillsEditor(props: {
                       </div>
                     )}
                   </div>
-                  <button className="icon-button danger" type="button" onClick={() => {
-                    const skills = { ...props.document.skills };
-                    delete skills[id];
-                    const agents = Object.fromEntries(
-                      Object.entries(props.document.agents).map(([name, agent]) => [
-                        name,
-                        { ...agent, skills: agent.skills?.filter((skillId) => skillId !== id) },
-                      ]),
-                    );
-                    props.onChange({ ...props.document, skills, agents });
-                  }}>×</button>
+                  <div className="button-group skill-card-actions">
+                    {metadata?.editable && metadata.directory && (
+                      <button className="button secondary compact" type="button" onClick={() => { void startEditingSkill(id, metadata); }}>编辑内容</button>
+                    )}
+                    {metadata?.valid && !metadata.editable && (
+                      <span className="skill-readonly-badge">外部目录只读</span>
+                    )}
+                    <button className="icon-button danger" type="button" onClick={() => {
+                      const skills = { ...props.document.skills };
+                      delete skills[id];
+                      const agents = Object.fromEntries(
+                        Object.entries(props.document.agents).map(([name, agent]) => [
+                          name,
+                          { ...agent, skills: agent.skills?.filter((skillId) => skillId !== id) },
+                        ]),
+                      );
+                      props.onChange({ ...props.document, skills, agents });
+                    }}>×</button>
+                  </div>
                 </div>
                 <Field
                   label="Skill 文件夹路径"
@@ -5831,7 +6051,7 @@ function SkillsEditor(props: {
           {skillEntries.length === 0 && (
             <div className="empty-config-state">
               <strong>还没有配置 Skill</strong>
-              <p>可以从电脑选择整个 Skill 文件夹，或填写服务端已经存在的目录。导入文件会保存到 `./skills/`，但只有加入配置并被 Agent 选中后才会装载。</p>
+              <p>可以直接新建 SKILL.md、从电脑导入完整 Skill 文件夹，或配置服务端已有目录。只有加入配置并被 Agent 选中后才会装载。</p>
             </div>
           )}
         </div>
@@ -5843,11 +6063,27 @@ function SkillsEditor(props: {
             {availableDirectories.map((skill) => (
               <div className={`managed-skill ${skill.valid ? "" : "invalid"}`} key={skill.path}>
                 <div><strong>{skill.name}</strong><span>{skill.valid ? skill.description : skill.error}</span><code>{skill.path}</code></div>
-                <button className="button secondary compact" type="button" disabled={!skill.valid} onClick={() => addSkill(skill)}>加入配置</button>
+                <div className="button-group">
+                  {skill.valid && skill.editable && skill.directory && (
+                    <button className="button secondary compact" type="button" onClick={() => { void startEditingSkill("", skill); }}>编辑内容</button>
+                  )}
+                  <button className="button secondary compact" type="button" disabled={!skill.valid} onClick={() => addSkill(skill)}>加入配置</button>
+                </div>
               </div>
             ))}
           </div>
         </section>
+      )}
+      {skillEditor && (
+        <SkillDocumentDrawer
+          state={skillEditor}
+          loading={skillEditorLoading}
+          saving={skillEditorSaving}
+          error={skillEditorError}
+          onChange={setSkillEditor}
+          onClose={() => { if (!skillEditorSaving) setSkillEditor(null); }}
+          onSave={() => { void saveSkillDocument(); }}
+        />
       )}
     </div>
   );
