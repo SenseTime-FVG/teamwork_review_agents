@@ -74,10 +74,10 @@ teamwork-review-agents start
 > 第一次使用建议直接按[首次配置图文指南](docs/first-time-setup.md)操作；下面只保留最短配置路径。
 
 1. 添加 GitHub / GitLab 连接，填写 API 地址和 Token 变量名。
-2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
+2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。仓库可配置“不额外限制”“仅允许所选”或“禁止所有 Skill”三态策略，默认不额外限制。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
 3. 在“全局配置与环境”中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`，并确认全局默认模型。
 4. 在“Provider”页检查不可删除的内置 Codex CLI；新增 API Provider 时填写 Base URL 和 API Key，点击“检测模型”后选择默认模型，也可以跳过检测手工维护模型目录。
-5. 如需项目专属能力，在“SKILL”页直接新建 `SKILL.md`、导入完整 Skill 文件夹或配置服务端已有目录，再为对应 Agent 选择允许装载的 Skill。`description` 会供 Codex 发现和匹配，Markdown 正文会在 Skill 被使用时作为完整指令读取。
+5. 如需项目专属能力，在“SKILL”页直接新建 `SKILL.md`、导入完整 Skill 文件夹或配置服务端已有目录，再为对应 Agent 选择允许装载的 Skill；仓库策略会在运行时进一步收窄该列表。`description` 会供 Codex 发现和匹配，Markdown 正文会在 Skill 被使用时作为完整指令读取。
 6. 检查 Agent 的模型继承、权限和 Prompt，保存后执行“立即扫描”。
 7. 确认仓库、事件和日志正常，再启用 MR / PR 事件规则或新建定时规则；需要在 Agent 前执行本地 CI 的事件规则，同时选择“执行仓库 CI（如已启用）”。
 
@@ -199,8 +199,11 @@ Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` �
 | `write_scopes: [change_request]` | 声明评论、标签、审批或合并等平台写操作，并为对应 PR / MR 申请串行锁 |
 | `allowed_sub_agents` | 限定 `invoke_agent` 可以调用的 Agent 名称；sub-agent 仍使用自己的模型、权限和 Skill |
 | `skills` | 只为当前 Agent 装载指定 Skill，不自动继承给 sub-agent |
+| 仓库 `allowed_skills` | 省略或 `[]` 表示不额外限制，非空列表与当前 Agent 的 `skills` 取交集，`null` 表示禁止所有 Skill |
 
 “SKILL”页支持三种来源：直接新建受管 `SKILL.md`、从电脑导入完整 Skill 文件夹，以及注册服务端已有目录。受管 Skill 可以在线编辑名称、用于发现和匹配的 `description` 及 Markdown 操作说明；更新根 `SKILL.md` 时会保留扩展 frontmatter 和同目录的 `scripts/`、`references/`、`assets/` 等资源。外部目录保持只读，移除配置引用也不会删除磁盘上的 Skill 文件。
+
+仓库详情通过三张单选卡片明确配置 Skill 策略。“不额外限制”是默认状态；“仅允许所选”要求至少选择一个全局 Skill；“禁止所有 Skill”会让该仓库触发的根 Agent 和 sub-agent 都不装载 Skill。每次运行都会用当前 Agent 自身的 `skills` 与仓库策略重新计算有效列表。
 
 ## 触发规则与定时调度
 
@@ -491,6 +494,7 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 | [`docs/design-managed-comment-model-signature.md`](docs/design-managed-comment-model-signature.md) | 托管评论模型签名设计 |
 | [`docs/design-model-runtime-log-normalization.md`](docs/design-model-runtime-log-normalization.md) | 模型运行消息与日志归一化设计 |
 | [`docs/design-managed-skill-authoring.md`](docs/design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 |
+| [`docs/design-repository-skill-policy.md`](docs/design-repository-skill-policy.md) | 仓库级 Skill 三态策略与运行时交集设计 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 本地开发、测试和前端联调 |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | 历史实施阶段和验收记录 |
 | [`deploy/`](deploy/) | systemd / launchd 模板 |

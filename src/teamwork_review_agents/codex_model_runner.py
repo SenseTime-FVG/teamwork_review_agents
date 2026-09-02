@@ -26,7 +26,7 @@ from .codex_settings import (
     read_user_model,
     validate_codex_version,
 )
-from .config import AgentConfig, AppConfig, RepositoryConfig
+from .config import AgentConfig, AppConfig, RepositoryConfig, effective_skill_ids
 from .environment import SecretRedactor
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
 from .model_provider_credentials import ModelProviderCredentialStore
@@ -750,7 +750,7 @@ class CodexModelRunner:
                 "reasoning_effort": reasoning_effort,
                 "reasoning_effort_source": reasoning_effort_source,
                 "tool_count": len(tools),
-                "skill_count": len(agent.skills),
+                "skill_count": len(effective_skill_ids(current_agent, repository)),
             },
         )
 
@@ -1238,7 +1238,7 @@ def _instructions(
     ]
     if personality and personality != "none":
         sections.append(f"交互风格：{personality}。")
-    selected = set(agent.skills)
+    selected = set(effective_skill_ids(agent, repository))
     for skill_id, path in sorted(skill_files.items()):
         if skill_id not in selected:
             continue

@@ -45,6 +45,7 @@ export type Repository = {
   workspace: string;
   clone_url?: string;
   enabled?: boolean;
+  allowed_skills?: string[] | null;
   environment?: EnvironmentMap;
   agent_workspace?: RepositoryAgentWorkspace;
   preflight?: RepositoryPreflight;

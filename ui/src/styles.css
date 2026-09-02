@@ -454,6 +454,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .choice-card { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid #263243; border-radius: 8px; background: #090f18; cursor: pointer; transition: .15s ease; }
 .choice-card:hover { border-color: #3b4a5e; }
 .choice-card.selected { border-color: #3d7757; background: #102118; }
+.choice-card.disabled { cursor: not-allowed; opacity: .45; }
+.choice-card.disabled:hover { border-color: #263243; }
 .choice-card input { width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--accent); }
 .choice-card span, .choice-card strong, .choice-card small { display: block; }
 .choice-card strong { color: #cbd6e3; font-size: 11px; }

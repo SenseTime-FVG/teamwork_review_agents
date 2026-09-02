@@ -17,7 +17,7 @@ from .agent_home import (
     TemporaryCodexHome,
     cleanup_stale_agent_homes_once,
 )
-from .config import AgentConfig, AppConfig, RepositoryConfig
+from .config import AgentConfig, AppConfig, RepositoryConfig, effective_skill_ids
 from .codex_settings import (
     agent_network_overrides,
     agent_overrides,
@@ -271,7 +271,12 @@ class CodexRunner:
             ]
             overrides = [*disabled_overrides, *overrides]
         if skill_files:
-            overrides.append(_skills_config_override(skill_files, agent.skills))
+            overrides.append(
+                _skills_config_override(
+                    skill_files,
+                    effective_skill_ids(agent, repository),
+                )
+            )
         for override in overrides:
             command.extend(["--config", override])
         command.extend(agent.extra_codex_args)
