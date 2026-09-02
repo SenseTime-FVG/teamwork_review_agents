@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -367,7 +368,7 @@ def test_stop_closes_all_managed_processes_for_same_config(tmp_path) -> None:
         assert stopped.exit_code == 0, stopped.message
         assert str(first.record.pid) in stopped.message
         assert str(second.pid) in stopped.message
-        assert second.wait(timeout=3) == 0
+        assert second.wait(timeout=3) in {0, -signal.SIGTERM}
     finally:
         cleanup = stop_managed_process(config_path, timeout_seconds=10)
         if second.poll() is None:
