@@ -478,6 +478,11 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
                     "provider": "github-main",
                     "project": "owner/demo",
                     "workspace": str(tmp_path / "workspace"),
+                    "environment": {
+                        "GITHUB_TOKEN": {
+                            "value": "repository-provider-token",
+                        }
+                    },
                     "preflight": {
                         "enabled": True,
                         "steps": [
@@ -508,6 +513,7 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
         yield tmp_path
 
     statuses: list[str] = []
+    provider_tokens: list[str] = []
 
     class FakeProvider:
         async def __aenter__(self):
@@ -520,9 +526,14 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
             statuses.append(state)
 
     monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
+
+    def fake_create_provider(*_args, token: str, **_kwargs):
+        provider_tokens.append(token)
+        return FakeProvider()
+
     monkeypatch.setattr(
         "teamwork_review_agents.preflight.create_provider",
-        lambda *_args, **_kwargs: FakeProvider(),
+        fake_create_provider,
     )
 
     monkeypatch.setattr(
@@ -543,6 +554,10 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
     assert statuses == ["pending", "success"]
+    assert provider_tokens == [
+        "repository-provider-token",
+        "repository-provider-token",
+    ]
 
 
 async def test_preflight_superseded_head_is_terminal_and_not_published(

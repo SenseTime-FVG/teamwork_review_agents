@@ -21,7 +21,7 @@
 | `gh` / `glab` 登录 | 评论、推送、创建或合并 PR / MR | CLI 自行读取 |
 | 管理员 Token | 保护管理 API | 否 |
 
-Provider Token 优先从全局环境中的同名变量读取，否则读取宿主机环境。推荐使用 `from_system`，避免把真实值写入 `config.yaml`。
+Provider Token 按仓库环境、全局环境、服务进程宿主机环境的顺序读取同名变量。仓库层和全局层推荐使用 `from_system`，避免把真实值写入 `config.yaml`；某层已经配置但解析为空时不会向更宽权限层静默降级。
 
 写平台操作使用单独的最小权限身份，不要把 Provider Token 重新注入 Agent 环境。
 

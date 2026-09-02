@@ -144,7 +144,7 @@ class ManagedCommentService:
             )
             content_hash = stable_hash(normalized_body)
             provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
+            token = resolve_provider_token(self.config, provider_config, repository)
             async with create_provider(
                 repository.provider,
                 provider_config,
@@ -235,7 +235,7 @@ class ManagedCommentService:
             if record is None:
                 return False
             provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
+            token = resolve_provider_token(self.config, provider_config, repository)
             async with create_provider(
                 repository.provider,
                 provider_config,
@@ -308,7 +308,7 @@ class ManagedCommentService:
                 }
 
             provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
+            token = resolve_provider_token(self.config, provider_config, repository)
             async with create_provider(
                 repository.provider,
                 provider_config,
@@ -385,7 +385,7 @@ class ManagedCommentService:
             if not records:
                 return 0
             provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
+            token = resolve_provider_token(self.config, provider_config, repository)
             async with create_provider(
                 repository.provider,
                 provider_config,

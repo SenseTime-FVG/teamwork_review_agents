@@ -564,7 +564,7 @@ class PreflightExecutor:
             repository.provider,
             provider_config,
             self.config.scanner,
-            token=resolve_provider_token(self.config, provider_config),
+            token=resolve_provider_token(self.config, provider_config, repository),
         ) as remote:
             await remote.set_commit_status(
                 repository,
@@ -618,7 +618,7 @@ class PreflightExecutor:
             return
 
         provider_config = self.config.providers[repository.provider]
-        token = resolve_provider_token(self.config, provider_config)
+        token = resolve_provider_token(self.config, provider_config, repository)
         body = _failure_comment_body(
             repository,
             result,
@@ -663,7 +663,7 @@ class PreflightExecutor:
             )
         except Exception as exc:
             provider_config = self.config.providers[repository.provider]
-            token = resolve_provider_token(self.config, provider_config)
+            token = resolve_provider_token(self.config, provider_config, repository)
             error = SecretRedactor((token,)).text(str(exc))
             await self._append_log(
                 result.run_id,

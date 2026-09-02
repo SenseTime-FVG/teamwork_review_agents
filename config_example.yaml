@@ -185,8 +185,8 @@ web:
 #     kind: github
 #     # GitHub Enterprise 可替换成企业 API 地址。
 #     base_url: https://api.github.com
-#     # Provider Token 变量名。系统优先读取 environment.global 中的同名变量，
-#     # 未配置时再从启动服务的宿主机环境读取。
+#     # Provider Token 变量名。每个仓库优先读取自身 environment 中的同名变量，
+#     # 未配置时依次读取 environment.global 和启动服务的宿主机环境。
 #     token_env: GITHUB_TOKEN
 #     # 单次 Provider API 请求超时秒数。
 #     request_timeout_seconds: 30
@@ -210,9 +210,12 @@ web:
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true
-#     # 可选：只覆盖当前仓库的环境变量。
+#     # 可选：只覆盖当前仓库的环境变量。Provider Token 可按相同变量名覆盖，
+#     # 推荐引用每个仓库独立的宿主机变量；它仍不会进入 Prompt 或 Agent 进程。
 #     environment:
 #       REPOSITORY_TIER: production
+#       GITHUB_TOKEN:
+#         from_system: GITHUB_TOKEN_EXAMPLE_REPOSITORY
 #     # 可选：声明此仓库具备确定性本地 CI 能力。只有同时在触发规则中选择
 #     # run_preflight 的 Agent 才会等待门禁；具体命令和 CI 脚本由目标仓库维护。
 #     preflight:

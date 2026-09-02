@@ -1330,6 +1330,7 @@ function protectProviderVariable(
 
 function EnvironmentEditor(props: {
   title: string;
+  description?: string;
   value: EnvironmentMap;
   onChange: (value: EnvironmentMap) => void;
   compact?: boolean;
@@ -1352,7 +1353,7 @@ function EnvironmentEditor(props: {
       <div className="section-title-row">
         <div>
           <h2>{props.title}</h2>
-          <p>优先级由全局到仓库再到 Agent；同名变量由更具体的一层覆盖。</p>
+          <p>{props.description ?? "优先级由全局到仓库再到 Agent；同名变量由更具体的一层覆盖。"}</p>
         </div>
         <button
           type="button"
@@ -2329,6 +2330,7 @@ function GlobalEnvironment(props: {
       </section>
       <EnvironmentEditor
         title="全局环境变量"
+        description="普通变量可由仓库和 Agent 覆盖；Provider Token 作为默认值，可由仓库同名变量覆盖，但不会进入 Prompt 或 Agent 进程。"
         value={props.document.environment.global}
         protectedNames={protectedNames}
         onChange={(global) => props.onChange({ ...props.document, environment: { global } })}
@@ -4119,8 +4121,8 @@ function RepositoryConnectionsEditor(props: {
             const tokenHelp = !tokenEnvironment
               ? "填写 Provider Token 的变量名"
               : hasGlobalToken
-                ? "已由“全局环境”配置；只供后台扫描器使用，不会进入 Prompt 或 Codex 进程"
-                : `全局环境未配置；将从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
+                ? "默认已由“全局环境”配置；仓库可用同名变量覆盖，只供服务侧平台 API 使用"
+                : `仓库可配置同名变量；否则从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
               <article className={`sub-card provider-card ${isEditing ? "editing" : ""}`} key={name}>
@@ -4523,6 +4525,9 @@ function RepositoryDetailEditor(props: {
   const providerNames = Object.keys(props.document.providers);
   const protectedNames = providerCredentialNames(props.document);
   if (!repository) return <div className="empty tall">仓库配置不存在</div>;
+  const providerTokenName = String(
+    props.document.providers[repository.provider]?.token_env ?? "",
+  ).trim();
 
   const preflight: Required<Omit<RepositoryPreflight, "steps">> & {
     steps: RepositoryPreflightStep[];
@@ -4892,6 +4897,9 @@ function RepositoryDetailEditor(props: {
           <EnvironmentEditor
             compact
             title="仓库环境变量"
+            description={providerTokenName
+              ? `普通变量会覆盖全局配置；Provider Token 变量 ${providerTokenName} 配置在这里时，扫描、状态和评论优先使用此仓库的值。`
+              : "普通变量会覆盖全局配置；同名变量由更具体的一层覆盖。"}
             value={repository.environment ?? {}}
             protectedNames={protectedNames}
             onChange={(environment) => update({ environment })}
@@ -6247,7 +6255,14 @@ function AgentsEditor(props: {
               <div className="toggle-grid">
                 <Toggle label="跳过 Git 仓库检查" checked={agent.skip_git_repo_check ?? false} onChange={(skip_git_repo_check) => update(name, { skip_git_repo_check })} />
               </div>
-              <EnvironmentEditor compact title="Agent 环境变量" value={agent.environment ?? {}} protectedNames={protectedNames} onChange={(environment) => update(name, { environment })} />
+              <EnvironmentEditor
+                compact
+                title="Agent 环境变量"
+                description="普通变量会覆盖全局和仓库配置；Provider Token 变量始终受保护，不会改变服务侧平台凭据，也不会进入 Prompt 或 Agent 进程。"
+                value={agent.environment ?? {}}
+                protectedNames={protectedNames}
+                onChange={(environment) => update(name, { environment })}
+              />
               <p className="network-credential-note">
                 临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接，Provider Token 仍不会进入 Agent。
               </p>
