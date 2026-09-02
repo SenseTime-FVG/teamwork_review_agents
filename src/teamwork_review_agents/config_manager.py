@@ -28,6 +28,51 @@ class ConfigRevisionConflict(ValueError):
     """配置版本已经变化，当前局部修改不能安全合并。"""
 
 
+def _disable_new_provider_credential_exposure(
+    document: dict[str, Any],
+    token_names: set[str],
+) -> None:
+    """新成为 Provider Token 的同名变量先恢复为安全默认值。"""
+
+    if not token_names:
+        return
+    environment_maps: list[Any] = []
+    environment = document.get("environment", {})
+    if isinstance(environment, dict):
+        environment_maps.append(environment.get("global", {}))
+    repositories = document.get("repositories", [])
+    if isinstance(repositories, list):
+        environment_maps.extend(
+            repository.get("environment", {})
+            for repository in repositories
+            if isinstance(repository, dict)
+        )
+    agents = document.get("agents", {})
+    if isinstance(agents, dict):
+        environment_maps.extend(
+            agent.get("environment", {})
+            for agent in agents.values()
+            if isinstance(agent, dict)
+        )
+
+    for environment_map in environment_maps:
+        if not isinstance(environment_map, dict):
+            continue
+        for name in token_names & environment_map.keys():
+            definition = environment_map[name]
+            if isinstance(definition, dict):
+                definition = dict(definition)
+            elif isinstance(definition, (str, int, float, bool)) or definition is None:
+                definition = {"value": "" if definition is None else str(definition)}
+            else:
+                # 非法结构仍交给配置校验报告，不在保存过程中静默修正。
+                continue
+            definition["secret"] = True
+            definition["expose_to_prompt"] = False
+            definition["expose_to_process"] = False
+            environment_map[name] = definition
+
+
 class ConfigManager:
     """维护最后一版有效配置，并允许 UI 与手工编辑安全共存。"""
 
@@ -447,6 +492,11 @@ class ConfigManager:
                 raise ValueError("providers 配置必须是对象")
             if not all(isinstance(item, dict) for item in providers.values()):
                 raise ValueError("providers 中的每一项都必须是对象")
+            previous_token_names = {
+                str(item.get("token_env"))
+                for item in providers.values()
+                if item.get("token_env")
+            }
 
             current_name = original_name.strip() if original_name is not None else None
             if current_name is None:
@@ -469,6 +519,15 @@ class ConfigManager:
 
             document = copy.deepcopy(current_raw)
             document["providers"] = next_providers
+            next_token_names = {
+                str(item.get("token_env"))
+                for item in next_providers.values()
+                if isinstance(item, dict) and item.get("token_env")
+            }
+            _disable_new_provider_credential_exposure(
+                document,
+                next_token_names - previous_token_names,
+            )
             if current_name is not None and current_name != next_name:
                 for repository in document.get("repositories", []):
                     if (

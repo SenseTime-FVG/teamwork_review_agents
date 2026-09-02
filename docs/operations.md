@@ -16,14 +16,14 @@
 
 | 凭据 | 用途 | 是否传给 Codex |
 | --- | --- | --- |
-| Provider Token | 扫描 GitHub / GitLab API | 否 |
+| Provider Token | 扫描 GitHub / GitLab API | 默认否；可显式开启 Prompt 或进程暴露 |
 | Codex 登录 | 运行 `codex exec` | 由 Codex Home 管理 |
 | `gh` / `glab` 登录 | 评论、推送、创建或合并 PR / MR | CLI 自行读取 |
 | 管理员 Token | 保护管理 API | 否 |
 
 Provider Token 按仓库环境、全局环境、服务进程宿主机环境的顺序读取同名变量。仓库层和全局层推荐使用 `from_system`，避免把真实值写入 `config.yaml`；某层已经配置但解析为空时不会向更宽权限层静默降级。
 
-写平台操作使用单独的最小权限身份，不要把 Provider Token 重新注入 Agent 环境。
+Provider Token 始终按 Secret 脱敏，Prompt 和进程暴露开关默认关闭。管理界面从关闭切换为开启时会要求确认风险；直接编辑 YAML 时也应仅在确有需要时显式设为 `true`。开启 Prompt 暴露后模型可读取明文，开启进程暴露后 Agent、工具命令和仓库 CI 都可读取该变量。写平台操作仍推荐使用单独的最小权限身份和 `gh` / `glab` 登录态。
 
 ## 3. Codex 运行时
 

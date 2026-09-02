@@ -38,7 +38,6 @@ from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
-    remove_environment_names,
     resolve_executable,
     selected_environment,
 )
@@ -318,11 +317,6 @@ class CodexRunner:
             )
         if temporary_codex_home is not None:
             temporary_codex_home.apply_environment(environment)
-        # 即使 Agent 环境显式同名，也不能重新注入扫描器的 Provider 凭据。
-        remove_environment_names(
-            environment,
-            (provider.token_env for provider in self.config.providers.values()),
-        )
         environment["PYTHONUNBUFFERED"] = "1"
         return environment
 

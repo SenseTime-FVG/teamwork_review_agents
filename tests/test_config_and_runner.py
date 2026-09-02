@@ -379,7 +379,12 @@ def test_enabled_repository_preflight_rejects_unsupported_provider(tmp_path) -> 
         )
 
 
-def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> None:
+def test_runner_only_accepts_explicit_provider_token_environment(
+    monkeypatch,
+    configured_app_factory,
+) -> None:
+    """宿主机 Token 不应隐式继承，但解析器明确传入的 Token 应保留。"""
+
     config = configured_app_factory()
     monkeypatch.setenv("GITHUB_TOKEN", "不应进入 Codex")
     monkeypatch.setenv("GITLAB_TOKEN", "也不应进入 Codex")
@@ -389,13 +394,13 @@ def test_runner_scrubs_provider_tokens(monkeypatch, configured_app_factory) -> N
     monkeypatch.setenv("ComSpec", "C:/Windows/System32/cmd.exe")
     environment = CodexRunner(config).child_environment(
         {
-            "Github_Token": "Agent 环境也不能重新注入",
+            "Github_Token": "用户明确允许进入",
             "VISIBLE_AGENT_VALUE": "允许进入 Codex",
         }
     )
     assert "GITHUB_TOKEN" not in environment
-    assert "Github_Token" not in environment
     assert "GITLAB_TOKEN" not in environment
+    assert environment["Github_Token"] == "用户明确允许进入"
     assert environment["CODEX_API_KEY"] == "Codex 自身凭据"
     assert environment["HOME"] == "/tmp/gh-keychain-home"
     assert environment["SYSTEMROOT"] == "C:/Windows"
@@ -1410,7 +1415,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
         repository=repository,
         context=context,
         prompt="执行临时 HOME 测试",
-        process_environment={"GITHUB_TOKEN": "不能进入 Codex"},
+        process_environment={"GITHUB_TOKEN": "用户明确允许进入 Codex"},
         log_callback=capture_log,
     )
 
@@ -1425,7 +1430,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert message == {
         "home": str(home_path),
         "codex_home": str(codex_home),
-        "provider_token_present": False,
+        "provider_token_present": True,
     }
     assert not home_path.exists()
     assert any(event_type == "run.home_cleaned" for event_type, _ in emitted)

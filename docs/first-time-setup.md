@@ -12,7 +12,7 @@
 - GitHub 仓库使用已登录的 `gh`；GitLab 仓库使用已登录的 `glab`。
 - 扫描器使用的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN` 已存在于启动服务的宿主机环境中。
 
-Provider Token 只供后台扫描器访问平台 API，不会传给 Codex，也不能代替 `gh` / `glab` 登录态。具体登录与验证命令见[配置 `gh` / `glab`](platform-cli-auth.md)。
+Provider Token 始终按 Secret 脱敏，默认只供后台扫描器访问平台 API，不会传给 Codex。管理员可以在环境变量中分别显式开启 Prompt 或进程暴露，但这会让模型、Agent 命令或 CI 获得 Token，管理界面会先要求确认风险。它默认不能代替 `gh` / `glab` 登录态。具体登录与验证命令见[配置 `gh` / `glab`](platform-cli-auth.md)。
 
 首次启动前，从示例生成本地配置。
 
@@ -111,7 +111,7 @@ API Key 与 YAML 配置历史分开保存，不会进入 Prompt、Agent 工具�
 - Skill 和允许调用的 sub-agent 是否符合最小权限原则。
 - 总超时和无进展超时是否适合任务时长。
 
-命令联网权限与 Codex 的联网搜索是两项独立配置。Provider Token 不会进入 Agent；`gh` / `glab` 使用本机钥匙串或各自配置目录中的登录态。
+命令联网权限与 Codex 的联网搜索是两项独立配置。Provider Token 默认不进入 Agent；只有管理员确认风险并开启该变量的“进入进程”后才会传入。`gh` / `glab` 默认使用本机钥匙串或各自配置目录中的登录态。
 
 Codex CLI 的命令、账号环境与驱动专属参数在“Provider”页配置；后台并发、Git 超时、无进展超时和外层沙盒在“全局配置与环境”页配置。
 

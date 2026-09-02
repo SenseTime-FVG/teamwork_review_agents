@@ -275,11 +275,11 @@
 - 将 `workspace-write` 联网状态转换为 `sandbox_workspace_write.network_access`；白名单为空时关闭网络代理，非空时启用 `features.network_proxy` 并生成域名允许映射。
 - 将联网参数纳入应用托管配置，禁止运行时高级配置覆盖命令联网和网络代理安全边界。
 - 在 Agent 页面把“本地文件权限”与“命令联网权限”分区展示，按 `read-only`、`workspace-write` 和 `danger-full-access` 说明能力差异，并提供可选域名白名单编辑。
-- 保持 Provider Token 从 Codex 子进程环境移除，同时保留 `HOME`，让 `gh` / `glab` 仅使用各自的系统钥匙串或 CLI 登录态。
+- 保持 Provider Token 默认从 Codex 子进程环境移除，同时保留 `HOME`，让 `gh` / `glab` 默认使用各自的系统钥匙串或 CLI 登录态；阶段 123 的显式进程暴露除外。
 - 将三个内置 Agent 默认设置为允许命令联网且白名单为空，不为其施加域名限制。
 - 更新完整配置示例、README、前后端类型、回归测试和静态构建产物。
 
-验收：`workspace-write` 默认不能联网；开启且无白名单时 `gh` 可通过自身登录态访问公开网络；配置白名单时非允许域名由 Codex 网络代理阻止；`read-only` 不能误开启联网，`danger-full-access` 不把白名单显示为有效隔离；Provider Token 在所有组合下都不会进入 Codex 环境；三个内置 Agent 默认联网且不受域名白名单约束。
+验收：`workspace-write` 默认不能联网；开启且无白名单时 `gh` 可通过自身登录态访问公开网络；配置白名单时非允许域名由 Codex 网络代理阻止；`read-only` 不能误开启联网，`danger-full-access` 不把白名单显示为有效隔离；Provider Token 默认不会进入 Codex 环境，阶段 123 的显式进程暴露除外；三个内置 Agent 默认联网且不受域名白名单约束。
 
 ## 阶段二十八：独立 Codex Home 账户登录与额度诊断
 
@@ -378,7 +378,7 @@
 
 - 在 README 快速开始中强调 GitHub Agent 需要本机 `gh` 登录、GitLab Agent 需要本机 `glab` 登录，并要求使用启动服务的同一系统用户。
 - 新增简短的 CLI 配置文档，只覆盖登录、平台主机选择、状态检查和 API 身份验证命令。
-- 明确 Provider Token 只供扫描器访问平台 API，不能代替 Codex 子进程使用的 `gh` / `glab` 登录态。
+- 明确 Provider Token 默认只供扫描器访问平台 API，不能自动代替 Codex 子进程使用的 `gh` / `glab` 登录态；阶段 123 可在确认风险后显式暴露。
 - 在 README 快速开始和文档导航中加入配置文档链接。
 
 验收：新用户可以从 README 直接识别本地 CLI 登录前置条件，并能通过链接文档完成 GitHub 或 GitLab CLI 登录及验证；文档范围不扩展到其他部署和排障内容。
@@ -518,12 +518,12 @@
 - 为每次根 Agent 和 sub-agent 创建独立的系统临时目录，预建 HOME、XDG 和 Windows 用户目录骨架，并在 Codex 及后代进程收尾后清理。
 - 在服务进程首次创建 Runner 时清理所属 PID 已经不存在的遗留临时 HOME，不删除仍由存活进程持有的目录。
 - 临时 HOME 模式显式固定原 `CODEX_HOME`，桥接已有 `GH_CONFIG_DIR`、`GLAB_CONFIG_DIR`、`GIT_CONFIG_GLOBAL` 和 SSH Agent 连接；不复制用户目录、私钥或凭据。
-- 保持 Provider Token 最终移除规则，Agent 环境变量不能覆盖临时 HOME 的托管目录或重新注入 Provider Token。
+- 保持 Provider Token 默认不进入进程，Agent 环境变量不能覆盖临时 HOME 的托管目录；阶段 123 允许管理员显式确认后注入 Provider Token。
 - 运行日志增加 HOME 准备和清理事件，只记录临时路径、模式与桥接项，不读取桥接文件内容。
 - Agent 详情在本地文件权限附近增加 HOME 模式配置，列表摘要显示系统或临时 HOME；配置示例和 README 说明与 worktree、Codex Home、CLI 登录态的区别。
 - 补充配置组合、环境桥接、独立运行目录、正常/失败清理、遗留目录回收和 UI 类型回归测试，并执行全量 Python 测试、前端生产构建与编译检查。
 
-验收：不同仓库和不同 Agent 不需要声明仓库专用 HOME 变量即可把 `~/.cache`、`~/.config` 等写入本次运行临时目录；Codex 与已登录的 gh/glab 仍使用原认证入口；Provider Token 不进入 Agent；所有终态都清理临时 HOME，服务异常退出后的遗留目录可在后续启动安全回收；只读 Agent 不能保存误导性的临时可写 HOME 配置。
+验收：不同仓库和不同 Agent 不需要声明仓库专用 HOME 变量即可把 `~/.cache`、`~/.config` 等写入本次运行临时目录；Codex 与已登录的 gh/glab 仍使用原认证入口；Provider Token 默认不进入 Agent，阶段 123 的显式进程暴露除外；所有终态都清理临时 HOME，服务异常退出后的遗留目录可在后续启动安全回收；只读 Agent 不能保存误导性的临时可写 HOME 配置。
 
 ## 阶段四十九：扫描与 Agent 执行解耦
 
@@ -576,7 +576,7 @@
 
 - 保留每次 Agent 运行独立临时 HOME，不回退为继承整个真实用户目录，也不复制真实 HOME 内容。
 - macOS 下检测宿主用户的 `~/Library/Keychains`；存在时在临时 HOME 中创建同路径符号链接，使 `security` 与 `gh` 能继续使用该系统用户已经建立的 Keychain 登录态。
-- 继续显式桥接 `GH_CONFIG_DIR`，但不读取、复制或记录其中内容；不生成 `GH_TOKEN`，Provider Token 仍从 Codex 子进程环境强制移除。
+- 继续显式桥接 `GH_CONFIG_DIR`，但不读取、复制或记录其中内容；不生成 `GH_TOKEN`，Provider Token 默认从 Codex 子进程环境移除，阶段 123 的显式进程暴露除外。
 - 将 macOS 钥匙串桥接名称加入 HOME 准备日志，日志只描述桥接能力，不包含真实凭据或配置内容。
 - 清理逻辑只删除临时 HOME 和符号链接，不跟随链接删除真实钥匙串目录；异常退出后的遗留 HOME 继续由既有 PID 所有权规则回收。
 - 补充存在与缺失宿主钥匙串目录、符号链接目标、真实目录保留和临时 HOME 清理测试，并执行全量 Python 测试、前端生产构建与编译检查；不自动重启服务。
@@ -661,7 +661,7 @@
 - 增加跨平台能力诊断，识别 macOS、Linux、WSL 和原生 Windows，校验当前配置的 Codex CLI 是否提供独立 `codex sandbox` 执行器，并通过管理 API 与运行时页面展示后端和错误。
 - 由 Teamwork 为每次受限 Agent 生成命名权限档案：只读任务保持仓库只读；工作区可写任务放行本次运行目录、其独立 `.git` 及 Codex 内置档案要求的系统临时目录；网络关闭、域名白名单和普通联网分别映射到外层网络策略，域名白名单额外强制启用网络代理。
 - 将 `CodexRunner` 改为外层 `codex sandbox` 包裹内层 `codex exec --dangerously-bypass-approvals-and-sandbox`；外层建立前完成版本和能力检查，失败时不启动模型。
-- 保留临时 HOME 的 Codex、GitHub CLI、GitLab CLI、Git 和 macOS Keychain 桥接；按具体路径放行必要的 Unix Socket，Provider Token 继续从 Agent 环境移除。
+- 保留临时 HOME 的 Codex、GitHub CLI、GitLab CLI、Git 和 macOS Keychain 桥接；按具体路径放行必要的 Unix Socket，Provider Token 默认从 Agent 环境移除，阶段 123 的显式进程暴露除外。
 - 将完整 MCP Broker 留在外层沙盒之外，沙盒内只启动暴露 `invoke_agent` 的最小代理；两端通过每轮独立、`0700` 权限和随机令牌保护的临时文件通道通信，权限档案只放行该通道目录，不能暴露配置、SQLite、基础仓库或其他工作区。
 - 让可写运行 clone 解除共享对象库依赖，使工作区开始运行后不需要读取或修改基础仓库 Git 元数据；只读 linked worktree 和继承父工作区语义保持不变。
 - 将外层沙盒与外部 MCP Broker 纳入既有跨平台进程树取消、超时、服务停止和重启收尾；Broker 停止前先持久化取消未完成的 sub-agent，宽限期后再强杀残留后代，并记录不含凭据、通道令牌与完整策略的结构化诊断日志。
@@ -1357,4 +1357,16 @@
 - 补充仓库固定值覆盖、仓库宿主机引用、全局回退、宿主机回退、已声明空值不降级、同一 Provider 多仓库 Token 隔离、单仓库失败不阻塞其他仓库、平台状态与评论使用仓库 Token，以及凭据不暴露的回归测试。
 - 执行环境、扫描、Preflight、托管评论定向测试及 Python 全量测试、编译、前端生产构建和 `git diff --check`；不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
 
-验收：绑定同一 GitHub 或 GitLab Provider 的不同仓库可以通过仓库环境变量使用不同 Token；未配置仓库 Token 时兼容使用全局或宿主机 Token；仓库显式空配置不会意外使用更高权限凭据；扫描、状态和评论身份一致，任一仓库凭据故障不会中断其他仓库，Provider Token 始终不进入 Agent 或 CI。
+验收：绑定同一 GitHub 或 GitLab Provider 的不同仓库可以通过仓库环境变量使用不同 Token；未配置仓库 Token 时兼容使用全局或宿主机 Token；仓库显式空配置不会意外使用更高权限凭据；扫描、状态和评论身份一致，任一仓库凭据故障不会中断其他仓库；Provider Token 默认不进入 Agent 或 CI，阶段 123 的显式暴露除外。
+
+## 阶段一百二十三：Provider Token 显式暴露与风险确认
+
+- 调整 `EnvironmentVariable` 的 Provider 凭据归一化：变量名命中任一 `token_env` 时继续强制 `secret=true`，但仅在 `expose_to_prompt` 或 `expose_to_process` 未显式声明时分别补为 `false`；明确配置的布尔值必须保留。
+- 修改 Agent 与仓库任务环境解析，Provider Token 与普通 Secret 一样按 `expose_to_prompt`、`expose_to_process` 生成 Prompt 和进程环境，同时继续加入 Secret 脱敏集合；服务侧 Provider Token 的仓库优先级解析保持不变。
+- 移除 Codex CLI 与模型基座工具子进程对 Provider Token 名称的无条件删除，只允许显式进入 `process_values` 的值传入；Codex/OpenAI 模型凭据仍保持原有隔离，不随本次调整开放。
+- 在全局、仓库和 Agent 环境变量编辑器中保留 Provider 凭据标识与锁定的 Secret 状态，默认关闭两项暴露；从普通变量重命名为 Provider Token 时重置为安全默认值。
+- 复用现有确认弹窗样式，为开启“进入 Prompt”和“进入进程”分别增加风险确认；取消保持关闭，确认后才更新草稿，关闭或保存既有开启状态不重复弹窗，并说明进程暴露同时覆盖 Agent、模型工具和仓库 CI。
+- 更新 README、配置示例、运维文档和界面说明，明确 Secret 负责脱敏，暴露开关负责运行可见性，Provider 服务侧使用与 Prompt/进程暴露互不影响。
+- 补充配置缺省、显式真值、Prompt 注入与快照脱敏、Agent/工具/CI 进程传递、关闭时过滤、变量重命名安全默认、确认/取消交互及 Provider 服务侧解析不回归测试；执行定向与全量测试、Python 编译、前端生产构建和 `git diff --check`，不启动、停止或重启用户服务，验证通过后自动提交并推送当前分支。
+
+验收：Provider Token 默认仍是 Secret 且不进入 Prompt 或任何任务进程；用户在风险确认后可分别开启 Prompt 或进程暴露，运行时实际生效并继续脱敏；关闭或取消时不暴露，旧配置与模型凭据隔离不回归。

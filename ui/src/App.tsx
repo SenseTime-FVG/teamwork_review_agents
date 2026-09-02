@@ -118,6 +118,12 @@ type AgentActionConfirmation = {
   dangerous?: boolean;
 };
 
+type ProviderExposureConfirmation = {
+  name: string;
+  destination: "prompt" | "process";
+  variable: EnvironmentVariable;
+};
+
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
   repositoryId: "",
   number: "",
@@ -1323,8 +1329,6 @@ function protectProviderVariable(
   return {
     ...variable,
     secret: true,
-    expose_to_prompt: false,
-    expose_to_process: false,
   };
 }
 
@@ -1338,140 +1342,207 @@ function EnvironmentEditor(props: {
 }) {
   const entries = Object.entries(props.value);
   const protectedNames = props.protectedNames ?? new Set<string>();
+  const [exposureConfirmation, setExposureConfirmation] = useState<ProviderExposureConfirmation | null>(null);
 
   function update(name: string, nextName: string, variable: EnvironmentVariable) {
     const next = { ...props.value };
     delete next[name];
     if (nextName) {
-      next[nextName] = protectProviderVariable(nextName, variable, protectedNames);
+      const becameProviderCredential = !protectedNames.has(name) && protectedNames.has(nextName);
+      next[nextName] = protectProviderVariable(
+        nextName,
+        becameProviderCredential
+          ? { ...variable, expose_to_prompt: false, expose_to_process: false }
+          : variable,
+        protectedNames,
+      );
     }
     props.onChange(next);
   }
 
+  function changeExposure(
+    name: string,
+    variable: EnvironmentVariable,
+    destination: "prompt" | "process",
+    checked: boolean,
+  ) {
+    if (protectedNames.has(name) && checked) {
+      setExposureConfirmation({ name, destination, variable });
+      return;
+    }
+    update(name, name, {
+      ...variable,
+      [destination === "prompt" ? "expose_to_prompt" : "expose_to_process"]: checked,
+    });
+  }
+
+  const exposureConfirmationModel: AgentActionConfirmation | null = exposureConfirmation
+    ? {
+        eyebrow: "PROVIDER TOKEN EXPOSURE",
+        title: exposureConfirmation.destination === "prompt"
+          ? "允许 Provider Token 进入 Prompt？"
+          : "允许 Provider Token 进入进程？",
+        description: exposureConfirmation.destination === "prompt"
+          ? "开启后，Token 明文会写入渲染后的 Agent Prompt。"
+          : "开启后，Token 会作为环境变量传入相关执行进程。",
+        details: [
+          { label: "变量名", value: exposureConfirmation.name, mono: true },
+          {
+            label: "暴露范围",
+            value: exposureConfirmation.destination === "prompt"
+              ? "Agent Prompt"
+              : "Agent、工具命令与仓库 CI",
+          },
+          { label: "Secret 保护", value: "保持启用，日志与配置历史继续脱敏" },
+        ],
+        impactTitle: "该操作会扩大凭据可见范围",
+        impact: exposureConfirmation.destination === "prompt"
+          ? "模型将能够读取该 Token，并可能在回复、工具参数或其他输出中泄露它。仅在确有需要且已接受风险时开启。"
+          : "Agent 执行的命令、工具和仓库代码将能够读取该 Token，并可能使用或外传它。仅在确有需要且已接受风险时开启。",
+        cancelLabel: "保持关闭",
+        confirmLabel: "确认开启",
+        dangerous: true,
+      }
+    : null;
+
   return (
-    <section className={props.compact ? "nested-section" : "section-card"}>
-      <div className="section-title-row">
-        <div>
-          <h2>{props.title}</h2>
-          <p>{props.description ?? "优先级由全局到仓库再到 Agent；同名变量由更具体的一层覆盖。"}</p>
+    <>
+      <section className={props.compact ? "nested-section" : "section-card"}>
+        <div className="section-title-row">
+          <div>
+            <h2>{props.title}</h2>
+            <p>{props.description ?? "优先级由全局到仓库再到 Agent；同名变量由更具体的一层覆盖。"}</p>
+          </div>
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => props.onChange({ ...props.value, NEW_VARIABLE: "" })}
+          >
+            + 添加变量
+          </button>
         </div>
-        <button
-          type="button"
-          className="button secondary"
-          onClick={() => props.onChange({ ...props.value, NEW_VARIABLE: "" })}
-        >
-          + 添加变量
-        </button>
-      </div>
-      {entries.length === 0 && <div className="empty">还没有配置环境变量</div>}
-      <div className="env-list">
-        {entries.map(([name, raw]) => {
-          const isProviderCredential = protectedNames.has(name);
-          const variable = protectProviderVariable(
-            name,
-            normalizeVariable(raw),
-            protectedNames,
-          );
-          const source = variable.from_system !== undefined ? "system" : "value";
-          return (
-            <div className={`env-row ${isProviderCredential ? "provider-credential" : ""}`} key={name}>
-              <div className="env-name-cell">
-                <CommitField
-                  label=""
-                  value={name}
-                  className="env-name-field"
-                  onCommit={(nextName) => {
-                    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(nextName)) return false;
-                    if (nextName !== name && Object.hasOwn(props.value, nextName)) return false;
-                    update(name, nextName, variable);
-                    return true;
+        {entries.length === 0 && <div className="empty">还没有配置环境变量</div>}
+        <div className="env-list">
+          {entries.map(([name, raw]) => {
+            const isProviderCredential = protectedNames.has(name);
+            const variable = protectProviderVariable(
+              name,
+              normalizeVariable(raw),
+              protectedNames,
+            );
+            const source = variable.from_system !== undefined ? "system" : "value";
+            return (
+              <div className={`env-row ${isProviderCredential ? "provider-credential" : ""}`} key={name}>
+                <div className="env-name-cell">
+                  <CommitField
+                    label=""
+                    value={name}
+                    className="env-name-field"
+                    onCommit={(nextName) => {
+                      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(nextName)) return false;
+                      if (nextName !== name && Object.hasOwn(props.value, nextName)) return false;
+                      update(name, nextName, variable);
+                      return true;
+                    }}
+                  />
+                  {isProviderCredential && <span className="credential-badge">Provider 凭据</span>}
+                </div>
+                <SelectControl
+                  value={source}
+                  ariaLabel="变量来源"
+                  options={[
+                    { value: "value", label: "固定值" },
+                    { value: "system", label: "宿主机环境" },
+                  ]}
+                  onChange={(value) => {
+                    const fromSystem = value === "system";
+                    update(name, name, {
+                      ...variable,
+                      value: fromSystem ? undefined : "",
+                      from_system: fromSystem ? name : undefined,
+                    });
                   }}
                 />
-                {isProviderCredential && <span className="credential-badge">Provider 凭据</span>}
-              </div>
-              <SelectControl
-                value={source}
-                ariaLabel="变量来源"
-                options={[
-                  { value: "value", label: "固定值" },
-                  { value: "system", label: "宿主机环境" },
-                ]}
-                onChange={(value) => {
-                  const fromSystem = value === "system";
-                  update(name, name, {
-                    ...variable,
-                    value: fromSystem ? undefined : "",
-                    from_system: fromSystem ? name : undefined,
-                  });
-                }}
-              />
-              <input
-                type={variable.secret && source === "value" ? "password" : "text"}
-                value={source === "system" ? variable.from_system ?? "" : variable.value ?? ""}
-                placeholder={source === "system" ? "宿主机变量名" : "变量值"}
-                onChange={(event) =>
-                  update(name, name, {
-                    ...variable,
-                    ...(source === "system"
-                      ? { from_system: event.target.value, value: undefined }
-                      : { value: event.target.value, from_system: undefined }),
-                  })
-                }
-              />
-              <label className="mini-check">
                 <input
-                  type="checkbox"
-                  checked={variable.secret ?? false}
-                  disabled={isProviderCredential}
+                  type={variable.secret && source === "value" ? "password" : "text"}
+                  value={source === "system" ? variable.from_system ?? "" : variable.value ?? ""}
+                  placeholder={source === "system" ? "宿主机变量名" : "变量值"}
                   onChange={(event) =>
                     update(name, name, {
                       ...variable,
-                      secret: event.target.checked,
-                      expose_to_prompt: event.target.checked ? false : variable.expose_to_prompt,
+                      ...(source === "system"
+                        ? { from_system: event.target.value, value: undefined }
+                        : { value: event.target.value, from_system: undefined }),
                     })
                   }
                 />
-                Secret
-              </label>
-              <label className="mini-check">
-                <input
-                  type="checkbox"
-                  checked={variable.expose_to_prompt ?? false}
-                  disabled={isProviderCredential}
-                  onChange={(event) => update(name, name, { ...variable, expose_to_prompt: event.target.checked })}
-                />
-                Prompt
-              </label>
-              <label className="mini-check">
-                <input
-                  type="checkbox"
-                  checked={variable.expose_to_process ?? true}
-                  disabled={isProviderCredential}
-                  onChange={(event) => update(name, name, { ...variable, expose_to_process: event.target.checked })}
-                />
-                进程
-              </label>
-              <button
-                type="button"
-                className="icon-button danger"
-                aria-label={`删除 ${name}`}
-                onClick={() => {
-                  const next = { ...props.value };
-                  delete next[name];
-                  props.onChange(next);
-                }}
-              >
-                ×
-              </button>
-            </div>
-          );
-        })}
-      </div>
-      <p className="section-note">Secret 默认不会进入 Prompt，日志与配置历史中会显示为 ********。</p>
-      {entries.some(([name]) => protectedNames.has(name)) && (
-        <p className="section-note credential-note">Provider 凭据只供后台扫描器访问平台 API，始终不会进入 Prompt 或 Codex 进程。</p>
-      )}
-    </section>
+                <label className="mini-check">
+                  <input
+                    type="checkbox"
+                    checked={variable.secret ?? false}
+                    disabled={isProviderCredential}
+                    onChange={(event) =>
+                      update(name, name, {
+                        ...variable,
+                        secret: event.target.checked,
+                        expose_to_prompt: event.target.checked ? false : variable.expose_to_prompt,
+                      })
+                    }
+                  />
+                  Secret
+                </label>
+                <label className="mini-check">
+                  <input
+                    type="checkbox"
+                    checked={variable.expose_to_prompt ?? false}
+                    onChange={(event) => changeExposure(name, variable, "prompt", event.target.checked)}
+                  />
+                  Prompt
+                </label>
+                <label className="mini-check">
+                  <input
+                    type="checkbox"
+                    checked={variable.expose_to_process ?? true}
+                    onChange={(event) => changeExposure(name, variable, "process", event.target.checked)}
+                  />
+                  进程
+                </label>
+                <button
+                  type="button"
+                  className="icon-button danger"
+                  aria-label={`删除 ${name}`}
+                  onClick={() => {
+                    const next = { ...props.value };
+                    delete next[name];
+                    props.onChange(next);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        <p className="section-note">Secret 默认不会进入 Prompt，日志与配置历史中会显示为 ********。</p>
+        {entries.some(([name]) => protectedNames.has(name)) && (
+          <p className="section-note credential-note">Provider Token 始终按 Secret 脱敏，默认不进入 Prompt 或进程；开启任一暴露范围前会要求确认风险。</p>
+        )}
+      </section>
+      <AgentActionConfirmationDialog
+        model={exposureConfirmationModel}
+        onCancel={() => setExposureConfirmation(null)}
+        onConfirm={() => {
+          if (!exposureConfirmation) return;
+          update(exposureConfirmation.name, exposureConfirmation.name, {
+            ...exposureConfirmation.variable,
+            [exposureConfirmation.destination === "prompt"
+              ? "expose_to_prompt"
+              : "expose_to_process"]: true,
+          });
+          setExposureConfirmation(null);
+        }}
+      />
+    </>
   );
 }
 
@@ -2330,7 +2401,7 @@ function GlobalEnvironment(props: {
       </section>
       <EnvironmentEditor
         title="全局环境变量"
-        description="普通变量可由仓库和 Agent 覆盖；Provider Token 作为默认值，可由仓库同名变量覆盖，但不会进入 Prompt 或 Agent 进程。"
+        description="普通变量可由仓库和 Agent 覆盖；Provider Token 作为默认值，可由仓库同名变量覆盖，且默认不进入 Prompt 或进程。"
         value={props.document.environment.global}
         protectedNames={protectedNames}
         onChange={(global) => props.onChange({ ...props.document, environment: { global } })}
@@ -4121,7 +4192,7 @@ function RepositoryConnectionsEditor(props: {
             const tokenHelp = !tokenEnvironment
               ? "填写 Provider Token 的变量名"
               : hasGlobalToken
-                ? "默认已由“全局环境”配置；仓库可用同名变量覆盖，只供服务侧平台 API 使用"
+                ? "默认已由“全局环境”配置；仓库可用同名变量覆盖，默认只供服务侧平台 API 使用"
                 : `仓库可配置同名变量；否则从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
@@ -6148,7 +6219,7 @@ function AgentsEditor(props: {
                   </p>
                 )}
                 <p className="network-credential-note">
-                  Provider Token 始终不会进入 Codex；gh / glab 只使用当前系统钥匙串或各自 CLI 登录态。
+                  Provider Token 默认不进入 Codex；只有在环境变量中确认风险并开启“进程”后才会传入。gh / glab 默认仍使用当前系统钥匙串或各自 CLI 登录态。
                 </p>
               </section>
               <section className="network-permission-section">
@@ -6258,13 +6329,13 @@ function AgentsEditor(props: {
               <EnvironmentEditor
                 compact
                 title="Agent 环境变量"
-                description="普通变量会覆盖全局和仓库配置；Provider Token 变量始终受保护，不会改变服务侧平台凭据，也不会进入 Prompt 或 Agent 进程。"
+                description="普通变量会覆盖全局和仓库配置；Provider Token 始终按 Secret 脱敏，其 Prompt 与进程暴露范围可在确认风险后独立开启，不会改变服务侧平台凭据。"
                 value={agent.environment ?? {}}
                 protectedNames={protectedNames}
                 onChange={(environment) => update(name, { environment })}
               />
               <p className="network-credential-note">
-                临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接，Provider Token 仍不会进入 Agent。
+                临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接；Provider Token 默认不进入 Agent，显式开启“进程”后除外。
               </p>
             </article>
           );

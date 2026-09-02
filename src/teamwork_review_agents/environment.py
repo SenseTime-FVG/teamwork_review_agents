@@ -157,12 +157,8 @@ def resolve_environment(
         is_provider_credential = name in provider_token_names
         is_secret = bool(definition.secret) or is_provider_credential
         all_values[name] = value
-        prompt_values[name] = (
-            value
-            if definition.expose_to_prompt and not is_provider_credential
-            else ""
-        )
-        if definition.expose_to_process and not is_provider_credential:
+        prompt_values[name] = value if definition.expose_to_prompt else ""
+        if definition.expose_to_process:
             process_values[name] = value
         audit_values[name] = MASK if is_secret and value else value
         if is_secret and value:
@@ -212,12 +208,8 @@ def resolve_repository_process_environment(
         is_provider_credential = name in provider_token_names
         is_secret = bool(definition.secret) or is_provider_credential
         all_values[name] = value
-        prompt_values[name] = (
-            value
-            if definition.expose_to_prompt and not is_provider_credential
-            else ""
-        )
-        if definition.expose_to_process and not is_provider_credential:
+        prompt_values[name] = value if definition.expose_to_prompt else ""
+        if definition.expose_to_process:
             process_values[name] = value
         audit_values[name] = MASK if is_secret and value else value
         if is_secret and value:

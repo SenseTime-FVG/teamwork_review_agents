@@ -18,6 +18,7 @@ from teamwork_review_agents.environment import (
     render_prompt,
     resolve_environment,
     resolve_provider_token,
+    resolve_repository_process_environment,
 )
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.models import (
@@ -140,8 +141,8 @@ def test_environment_precedence_template_and_redaction(
     assert resolved.prompt_values["GLOBAL_SECRET"] == ""
     assert resolved.process_values["GLOBAL_SECRET"] == "system-secret"
     assert resolved.audit_values["GLOBAL_SECRET"] == MASK
-    assert resolved.prompt_values["GITHUB_TEST_TOKEN"] == ""
-    assert "GITHUB_TEST_TOKEN" not in resolved.process_values
+    assert resolved.prompt_values["GITHUB_TEST_TOKEN"] == "provider-secret"
+    assert resolved.process_values["GITHUB_TEST_TOKEN"] == "provider-secret"
     assert resolved.audit_values["GITHUB_TEST_TOKEN"] == MASK
     assert render_prompt("${{LEVEL}}/${{MISSING}}", resolved.prompt_values) == "agent/"
     assert SecretRedactor(resolved.secret_values).text(
@@ -180,8 +181,8 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     provider_token = document["environment"]["global"]["GITHUB_TEST_TOKEN"]
     assert provider_token["value"] == MASK
     assert provider_token["secret"] is True
-    assert provider_token["expose_to_prompt"] is False
-    assert provider_token["expose_to_process"] is False
+    assert provider_token["expose_to_prompt"] is True
+    assert provider_token["expose_to_process"] is True
     assert document["repositories"][0]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
     assert document["repositories"][1]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
     repository_provider_token = document["repositories"][0]["environment"][
@@ -189,8 +190,8 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     ]
     assert repository_provider_token["value"] == MASK
     assert repository_provider_token["secret"] is True
-    assert repository_provider_token["expose_to_prompt"] is False
-    assert repository_provider_token["expose_to_process"] is False
+    assert repository_provider_token["expose_to_prompt"] is True
+    assert repository_provider_token["expose_to_process"] is True
 
     document["repositories"].reverse()
     manager.save(document)
@@ -203,20 +204,47 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     saved_provider_token = saved["environment"]["global"]["GITHUB_TEST_TOKEN"]
     assert saved_provider_token["value"] == "provider-secret"
     assert saved_provider_token["secret"] is True
-    assert saved_provider_token["expose_to_prompt"] is False
-    assert saved_provider_token["expose_to_process"] is False
+    assert saved_provider_token["expose_to_prompt"] is True
+    assert saved_provider_token["expose_to_process"] is True
     saved_repository_provider_token = next(
         item for item in saved["repositories"] if item["id"] == "first"
     )["environment"]["GITHUB_TEST_TOKEN"]
     assert saved_repository_provider_token["value"] == "repository-provider-secret"
     assert saved_repository_provider_token["secret"] is True
-    assert saved_repository_provider_token["expose_to_prompt"] is False
-    assert saved_repository_provider_token["expose_to_process"] is False
+    assert saved_repository_provider_token["expose_to_prompt"] is True
+    assert saved_repository_provider_token["expose_to_process"] is True
     versions = manager.store.list_config_versions()
     assert versions
     assert MASK in manager.store.get_config_version(versions[0]["revision"])["content"]
     assert "first-secret" not in manager.store.get_config_version(versions[0]["revision"])["content"]
     assert "provider-secret" not in manager.store.get_config_version(versions[0]["revision"])["content"]
+
+
+def test_provider_token_defaults_to_secret_without_exposure(tmp_path) -> None:
+    """Provider Token 未显式声明暴露选项时必须采用安全默认值。"""
+
+    config_path = write_config(tmp_path)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["environment"]["global"]["GITHUB_TEST_TOKEN"] = {
+        "value": "provider-secret",
+        "secret": False,
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    definition = config.environment.global_variables["GITHUB_TEST_TOKEN"]
+    assert definition.secret is True
+    assert definition.expose_to_prompt is False
+    assert definition.expose_to_process is False
+
+    repository = config.repository_map()["first"]
+    resolved = resolve_repository_process_environment(config, repository, "manual-ci")
+    assert resolved.prompt_values["GITHUB_TEST_TOKEN"] == ""
+    assert "GITHUB_TEST_TOKEN" not in resolved.process_values
+    assert resolved.audit_values["GITHUB_TEST_TOKEN"] == MASK
 
 
 def test_config_manager_saves_one_agent_and_updates_references(tmp_path) -> None:
@@ -882,6 +910,48 @@ def test_web_api_saves_providers_independently_and_updates_references(
         assert list(deleted.json()["document"]["providers"]) == [
             "provider-renamed"
         ]
+
+
+def test_new_provider_token_name_resets_existing_variable_exposure(tmp_path) -> None:
+    """普通变量新成为 Provider Token 时必须先关闭 Prompt 与进程暴露。"""
+
+    config_path = write_config(tmp_path)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["environment"]["global"]["SECONDARY_TOKEN"] = {
+        "value": "secondary-secret",
+        "secret": False,
+        "expose_to_prompt": True,
+        "expose_to_process": True,
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        current = client.get("/api/config").json()
+        created = client.post(
+            "/api/config/providers",
+            json={
+                "revision": current["revision"],
+                "name": "provider-secondary",
+                "provider": {
+                    "kind": "gitlab",
+                    "base_url": "https://gitlab.example/api/v4",
+                    "token_env": "SECONDARY_TOKEN",
+                },
+            },
+        )
+
+    assert created.status_code == 200
+    variable = created.json()["document"]["environment"]["global"][
+        "SECONDARY_TOKEN"
+    ]
+    assert variable["value"] == MASK
+    assert variable["secret"] is True
+    assert variable["expose_to_prompt"] is False
+    assert variable["expose_to_process"] is False
 
 
 def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -> None:
