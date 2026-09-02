@@ -70,9 +70,16 @@ def _resolve_variable(variable: EnvironmentVariable) -> str:
     return variable.value or ""
 
 
-def resolve_provider_token(config: AppConfig, provider: ProviderConfig) -> str:
-    """优先从全局环境配置解析 Provider Token，再回退到宿主机环境。"""
+def resolve_provider_token(
+    config: AppConfig,
+    provider: ProviderConfig,
+    repository: RepositoryConfig,
+) -> str:
+    """按仓库、全局、宿主机顺序解析 Provider Token。"""
 
+    definition = repository.environment.get(provider.token_env)
+    if definition is not None:
+        return _resolve_variable(definition)
     definition = config.environment.global_variables.get(provider.token_env)
     if definition is not None:
         return _resolve_variable(definition)

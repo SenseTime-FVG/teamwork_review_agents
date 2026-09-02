@@ -164,6 +164,17 @@ def test_environment_precedence_template_and_redaction(
 
 def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> None:
     config_path = write_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["repositories"][0]["environment"]["GITHUB_TEST_TOKEN"] = {
+        "value": "repository-provider-secret",
+        "secret": False,
+        "expose_to_prompt": True,
+        "expose_to_process": True,
+    }
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     manager = ConfigManager(config_path)
     document = manager.document()
     provider_token = document["environment"]["global"]["GITHUB_TEST_TOKEN"]
@@ -173,6 +184,13 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     assert provider_token["expose_to_process"] is False
     assert document["repositories"][0]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
     assert document["repositories"][1]["environment"]["REPOSITORY_SECRET"]["value"] == MASK
+    repository_provider_token = document["repositories"][0]["environment"][
+        "GITHUB_TEST_TOKEN"
+    ]
+    assert repository_provider_token["value"] == MASK
+    assert repository_provider_token["secret"] is True
+    assert repository_provider_token["expose_to_prompt"] is False
+    assert repository_provider_token["expose_to_process"] is False
 
     document["repositories"].reverse()
     manager.save(document)
@@ -187,6 +205,13 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     assert saved_provider_token["secret"] is True
     assert saved_provider_token["expose_to_prompt"] is False
     assert saved_provider_token["expose_to_process"] is False
+    saved_repository_provider_token = next(
+        item for item in saved["repositories"] if item["id"] == "first"
+    )["environment"]["GITHUB_TEST_TOKEN"]
+    assert saved_repository_provider_token["value"] == "repository-provider-secret"
+    assert saved_repository_provider_token["secret"] is True
+    assert saved_repository_provider_token["expose_to_prompt"] is False
+    assert saved_repository_provider_token["expose_to_process"] is False
     versions = manager.store.list_config_versions()
     assert versions
     assert MASK in manager.store.get_config_version(versions[0]["revision"])["content"]
@@ -422,16 +447,67 @@ def test_config_manager_saves_and_safely_deletes_one_repository(tmp_path) -> Non
     ]
 
 
-def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypatch) -> None:
-    """Provider Token 应按全局固定值、全局宿主机引用、直接宿主机依次解析。"""
+def test_provider_token_uses_repository_global_and_host_precedence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Provider Token 应按仓库、全局、直接宿主机顺序解析。"""
 
     config_path = write_config(tmp_path)
     monkeypatch.setenv("GITHUB_TEST_TOKEN", "host-fallback-token")
     config = load_config(config_path)
     provider = config.providers["provider-main"]
-    assert resolve_provider_token(config, provider) == "provider-secret"
+    repository = config.repository_map()["first"]
+    assert resolve_provider_token(config, provider, repository) == "provider-secret"
 
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["repositories"][0]["environment"]["GITHUB_TEST_TOKEN"] = {
+        "value": "repository-secret",
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == "repository-secret"
+
+    document["repositories"][0]["environment"]["GITHUB_TEST_TOKEN"] = {
+        "from_system": "TEAMWORK_REPOSITORY_GITHUB_TOKEN",
+    }
+    monkeypatch.setenv(
+        "TEAMWORK_REPOSITORY_GITHUB_TOKEN",
+        "repository-referenced-host-token",
+    )
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == "repository-referenced-host-token"
+
+    document["repositories"][0]["environment"]["GITHUB_TEST_TOKEN"] = {
+        "from_system": "MISSING_REPOSITORY_GITHUB_TOKEN",
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == ""
+
+    del document["repositories"][0]["environment"]["GITHUB_TEST_TOKEN"]
     document["environment"]["global"]["GITHUB_TEST_TOKEN"] = {
         "from_system": "TEAMWORK_GITHUB_TOKEN",
     }
@@ -441,7 +517,25 @@ def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypa
         encoding="utf-8",
     )
     config = load_config(config_path)
-    assert resolve_provider_token(config, config.providers["provider-main"]) == "referenced-host-token"
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == "referenced-host-token"
+
+    document["environment"]["global"]["GITHUB_TEST_TOKEN"] = {
+        "from_system": "MISSING_GLOBAL_GITHUB_TOKEN",
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == ""
 
     del document["environment"]["global"]["GITHUB_TEST_TOKEN"]
     config_path.write_text(
@@ -449,7 +543,11 @@ def test_provider_token_uses_global_config_then_host_fallback(tmp_path, monkeypa
         encoding="utf-8",
     )
     config = load_config(config_path)
-    assert resolve_provider_token(config, config.providers["provider-main"]) == "host-fallback-token"
+    assert resolve_provider_token(
+        config,
+        config.providers["provider-main"],
+        config.repository_map()["first"],
+    ) == "host-fallback-token"
 
 
 def test_web_api_saves_agents_independently_with_revision_guard(tmp_path) -> None:

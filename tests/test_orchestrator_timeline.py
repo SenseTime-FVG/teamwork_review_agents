@@ -4,7 +4,7 @@ import asyncio
 
 from datetime import UTC, datetime, timedelta
 
-from teamwork_review_agents.config import RuleConfig
+from teamwork_review_agents.config import EnvironmentVariable, RuleConfig
 from teamwork_review_agents.events import detect_events, detect_target_branch_event
 from teamwork_review_agents.models import (
     AgentResult,
@@ -16,6 +16,77 @@ from teamwork_review_agents.state import (
     CANCEL_SOURCE_ADMINISTRATOR,
     CANCEL_SOURCE_SERVICE_SHUTDOWN,
 )
+
+
+async def test_scan_uses_repository_tokens_and_isolates_repository_errors(
+    monkeypatch,
+    configured_app_factory,
+) -> None:
+    """同一 Provider 下的仓库应分别解析 Token，且单仓库失败不阻塞后续扫描。"""
+
+    config = configured_app_factory()
+    first = config.repositories[0]
+    first.environment["GITHUB_TOKEN"] = EnvironmentVariable(
+        from_system="FIRST_REPOSITORY_GITHUB_TOKEN",
+    )
+    second = first.model_copy(
+        update={
+            "id": "second",
+            "project": "owner/second",
+            "workspace": first.workspace.parent / "second",
+            "environment": {
+                "GITHUB_TOKEN": EnvironmentVariable(
+                    from_system="SECOND_REPOSITORY_GITHUB_TOKEN",
+                ),
+            },
+        }
+    )
+    config.repositories.append(second)
+    monkeypatch.setenv("FIRST_REPOSITORY_GITHUB_TOKEN", "first-token")
+    monkeypatch.setenv("SECOND_REPOSITORY_GITHUB_TOKEN", "second-token")
+    created_tokens: list[str] = []
+    scanned: list[tuple[str, str]] = []
+
+    class FakeProvider:
+        """记录每个客户端的 Token，并模拟第一个仓库认证失败。"""
+
+        name = "github-main"
+
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def list_change_requests(self, repository, *, updated_since=None):
+            scanned.append((repository.id, self.token))
+            if repository.id == "demo":
+                raise RuntimeError("认证失败")
+            return []
+
+    def fake_create_provider(*_args, token: str, **_kwargs):
+        created_tokens.append(token)
+        return FakeProvider(token)
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.orchestrator.create_provider",
+        fake_create_provider,
+    )
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    summary = CycleSummary()
+
+    await orchestrator.scan(summary)
+
+    assert created_tokens == ["first-token", "second-token"]
+    assert scanned == [
+        ("demo", "first-token"),
+        ("second", "second-token"),
+    ]
+    assert summary.repositories == 2
+    assert summary.errors == ["扫描仓库 demo 失败：认证失败"]
 
 
 async def test_scan_detects_target_head_for_pr_outside_updated_candidates(

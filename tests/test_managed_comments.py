@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from teamwork_review_agents.config import EnvironmentVariable
 from teamwork_review_agents.events import detect_events, detect_target_branch_event
 from teamwork_review_agents.managed_comments import ManagedCommentService
 from teamwork_review_agents.models import InvocationContext
@@ -120,6 +121,9 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     """同代次应更新，下一代应创建，远端删除后下次发布应重建。"""
 
     config = configured_app_factory()
+    config.repositories[0].environment["GITHUB_TOKEN"] = EnvironmentVariable(
+        value="repository-provider-token",
+    )
     agent = config.agents["security-reviewer"]
     agent.managed_comment = True
     agent.managed_comment_slot = "stable-review-slot"
@@ -129,6 +133,7 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     comments: dict[str, str] = {}
     created: list[str] = []
     updated: list[str] = []
+    provider_tokens: list[str] = []
 
     class FakeProvider:
         async def __aenter__(self):
@@ -161,9 +166,13 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
             updated.append(comment_id)
             return True
 
+    def fake_create_provider(*_args, token: str, **_kwargs):
+        provider_tokens.append(token)
+        return FakeProvider()
+
     monkeypatch.setattr(
         "teamwork_review_agents.managed_comments.create_provider",
-        lambda *_args, **_kwargs: FakeProvider(),
+        fake_create_provider,
     )
     monkeypatch.setenv("GITHUB_TOKEN", "provider-token")
     service = ManagedCommentService(config, store)
@@ -201,6 +210,8 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     recreated = await service.publish_agent_comment(next_context, "新提交审核")
     assert recreated["action"] == "recreated"
     assert created == ["1", "2", "3"]
+    assert provider_tokens
+    assert set(provider_tokens) == {"repository-provider-token"}
 
 
 async def test_agent_comment_model_signature_uses_persisted_run_snapshot(

@@ -77,7 +77,7 @@ Agent 权限与能力摘要：
 
 ![运行概览中的服务状态、扫描快照和变化事件](docs/assets/first-time-setup/05-overview.png)
 
-Provider Token 只供扫描器使用，不会传给 Codex，也不能代替 Agent 所需的本机 `gh` / `glab` 登录态。平台操作使用独立的最小权限 CLI 身份。
+Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 只供扫描、Commit Status 和托管评论等服务侧平台 API 使用，不会传给 Codex，也不能代替 Agent 所需的本机 `gh` / `glab` 登录态。
 
 本地 CI 当前仅支持 GitHub。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub 本地 CI 门禁](#github-本地-ci-门禁)。
 

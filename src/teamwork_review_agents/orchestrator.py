@@ -27,7 +27,7 @@ from .models import (
     stable_hash,
 )
 from .preflight import PreflightExecutor
-from .providers import BaseProvider, ProviderError, create_provider
+from .providers import BaseProvider, create_provider
 from .rules import rule_matches
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
@@ -351,190 +351,194 @@ class Orchestrator:
         )
         return dict(zip(branches, heads, strict=True))
 
+    async def _scan_repository(
+        self,
+        provider: BaseProvider,
+        repository: RepositoryConfig,
+        scan_batch_id: str,
+        summary: CycleSummary,
+    ) -> None:
+        """使用已经按仓库解析凭据的 Provider 扫描单个仓库。"""
+
+        scan_started_at = datetime.now(UTC)
+        last_scan_started_at = await asyncio.to_thread(
+            self._last_successful_scan_started_at,
+            repository.id,
+        )
+        event_window_start = last_scan_started_at or (
+            scan_started_at
+            - timedelta(seconds=self.config.scanner.interval_seconds)
+        )
+        await self._initialize_activity_cursors(provider, repository)
+        updated_since = await asyncio.to_thread(
+            self._updated_since,
+            repository.id,
+        )
+        snapshots = await provider.list_change_requests(
+            repository,
+            updated_since=updated_since,
+        )
+        stored_snapshots = await asyncio.to_thread(
+            self.store.repository_snapshots,
+            provider.name,
+            repository.id,
+        )
+        stored_by_key = {item.key: item for item in stored_snapshots}
+        target_heads = await self._target_branch_heads(
+            provider,
+            repository,
+            [*stored_snapshots, *snapshots],
+        )
+        normalized_snapshots: list[ChangeRequestSnapshot] = []
+        for snapshot in snapshots:
+            old = stored_by_key.get(snapshot.key)
+            target_head_sha = target_heads.get(snapshot.target_branch)
+            if target_head_sha:
+                snapshot = snapshot.model_copy(
+                    update={"target_head_sha": target_head_sha}
+                )
+            elif old is not None and old.target_head_sha:
+                snapshot = snapshot.model_copy(
+                    update={"target_head_sha": old.target_head_sha}
+                )
+            normalized_snapshots.append(snapshot)
+        snapshots = normalized_snapshots
+        candidate_keys = {item.key for item in snapshots}
+        for snapshot in snapshots:
+            old = stored_by_key.get(snapshot.key)
+            activity_cursor = await asyncio.to_thread(
+                self.store.load_activity_cursor,
+                snapshot.provider,
+                snapshot.repository_id,
+                snapshot.number,
+            )
+            if old is None:
+                activity_batch = await provider.list_change_request_activities(
+                    repository,
+                    snapshot.number,
+                    cursor=activity_cursor,
+                    since=event_window_start,
+                )
+            else:
+                activity_batch = await provider.list_change_request_activities(
+                    repository,
+                    snapshot.number,
+                    cursor=activity_cursor,
+                )
+            if old is None:
+                events = detect_first_seen_events(
+                    snapshot,
+                    (
+                        activity_batch.activities
+                        if activity_batch is not None and not activity_batch.baseline
+                        else ()
+                    ),
+                    event_window_start=event_window_start,
+                    emit_discovered=(
+                        self.config.scanner.emit_initial_events
+                        or repository.preflight.enabled
+                    ),
+                    batch_id=scan_batch_id,
+                )
+            elif activity_batch is not None and not activity_batch.baseline:
+                events = detect_activity_events(
+                    old,
+                    snapshot,
+                    activity_batch.activities,
+                    batch_id=scan_batch_id,
+                )
+            else:
+                events = detect_events(
+                    old,
+                    snapshot,
+                    emit_initial=self.config.scanner.emit_initial_events,
+                    batch_id=scan_batch_id,
+                )
+            events.extend(
+                detect_target_branch_event(
+                    old,
+                    snapshot,
+                    batch_id=scan_batch_id,
+                    occurred_at=scan_started_at,
+                )
+            )
+            inserted = await asyncio.to_thread(
+                self.store.save_snapshot_and_events,
+                snapshot,
+                events,
+                activity_cursor=(
+                    self._activity_cursor(activity_batch)
+                    if activity_batch is not None
+                    else None
+                ),
+            )
+            summary.snapshots += 1
+            summary.new_events += inserted
+        for old in stored_snapshots:
+            if old.state != "opened" or old.key in candidate_keys:
+                continue
+            target_head_sha = target_heads.get(old.target_branch)
+            if not target_head_sha or target_head_sha == old.target_head_sha:
+                continue
+            current = old.model_copy(update={"target_head_sha": target_head_sha})
+            events = detect_target_branch_event(
+                old,
+                current,
+                batch_id=scan_batch_id,
+                occurred_at=scan_started_at,
+            )
+            inserted = await asyncio.to_thread(
+                self.store.save_snapshot_and_events,
+                current,
+                events,
+            )
+            summary.snapshots += 1
+            summary.new_events += inserted
+        await asyncio.to_thread(
+            self._mark_scan_completed,
+            repository.id,
+            scan_started_at,
+        )
+
     async def scan(self, summary: CycleSummary) -> None:
-        """按 Provider 分组扫描所有启用仓库。"""
+        """按 Provider 分组并使用各仓库自己的凭据执行扫描。"""
 
         scan_batch_id = uuid.uuid4().hex
-        enabled = [repository for repository in self.config.repositories if repository.enabled]
+        enabled = [
+            repository
+            for repository in self.config.repositories
+            if repository.enabled
+        ]
         for provider_name, provider_config in self.config.providers.items():
             repositories = [
-                repository for repository in enabled if repository.provider == provider_name
+                repository
+                for repository in enabled
+                if repository.provider == provider_name
             ]
-            if not repositories:
-                continue
-            try:
-                async with create_provider(
-                    provider_name,
-                    provider_config,
-                    self.config.scanner,
-                    token=resolve_provider_token(self.config, provider_config),
-                ) as provider:
-                    for repository in repositories:
-                        summary.repositories += 1
-                        try:
-                            scan_started_at = datetime.now(UTC)
-                            last_scan_started_at = await asyncio.to_thread(
-                                self._last_successful_scan_started_at,
-                                repository.id,
-                            )
-                            event_window_start = last_scan_started_at or (
-                                scan_started_at
-                                - timedelta(seconds=self.config.scanner.interval_seconds)
-                            )
-                            await self._initialize_activity_cursors(
-                                provider,
-                                repository,
-                            )
-                            updated_since = await asyncio.to_thread(
-                                self._updated_since,
-                                repository.id,
-                            )
-                            snapshots = await provider.list_change_requests(
-                                repository,
-                                updated_since=updated_since,
-                            )
-                            stored_snapshots = await asyncio.to_thread(
-                                self.store.repository_snapshots,
-                                provider.name,
-                                repository.id,
-                            )
-                            stored_by_key = {
-                                item.key: item for item in stored_snapshots
-                            }
-                            target_heads = await self._target_branch_heads(
-                                provider,
-                                repository,
-                                [*stored_snapshots, *snapshots],
-                            )
-                            normalized_snapshots: list[ChangeRequestSnapshot] = []
-                            for snapshot in snapshots:
-                                old = stored_by_key.get(snapshot.key)
-                                target_head_sha = target_heads.get(
-                                    snapshot.target_branch
-                                )
-                                if target_head_sha:
-                                    snapshot = snapshot.model_copy(
-                                        update={"target_head_sha": target_head_sha}
-                                    )
-                                elif old is not None and old.target_head_sha:
-                                    snapshot = snapshot.model_copy(
-                                        update={
-                                            "target_head_sha": old.target_head_sha
-                                        }
-                                    )
-                                normalized_snapshots.append(snapshot)
-                            snapshots = normalized_snapshots
-                            candidate_keys = {item.key for item in snapshots}
-                            for snapshot in snapshots:
-                                old = stored_by_key.get(snapshot.key)
-                                activity_cursor = await asyncio.to_thread(
-                                    self.store.load_activity_cursor,
-                                    snapshot.provider,
-                                    snapshot.repository_id,
-                                    snapshot.number,
-                                )
-                                if old is None:
-                                    activity_batch = (
-                                        await provider.list_change_request_activities(
-                                            repository,
-                                            snapshot.number,
-                                            cursor=activity_cursor,
-                                            since=event_window_start,
-                                        )
-                                    )
-                                else:
-                                    activity_batch = (
-                                        await provider.list_change_request_activities(
-                                            repository,
-                                            snapshot.number,
-                                            cursor=activity_cursor,
-                                        )
-                                    )
-                                if old is None:
-                                    events = detect_first_seen_events(
-                                        snapshot,
-                                        (
-                                            activity_batch.activities
-                                            if activity_batch is not None
-                                            and not activity_batch.baseline
-                                            else ()
-                                        ),
-                                        event_window_start=event_window_start,
-                                        emit_discovered=(
-                                            self.config.scanner.emit_initial_events
-                                            or repository.preflight.enabled
-                                        ),
-                                        batch_id=scan_batch_id,
-                                    )
-                                elif (
-                                    old is not None
-                                    and activity_batch is not None
-                                    and not activity_batch.baseline
-                                ):
-                                    events = detect_activity_events(
-                                        old,
-                                        snapshot,
-                                        activity_batch.activities,
-                                        batch_id=scan_batch_id,
-                                    )
-                                else:
-                                    events = detect_events(
-                                        old,
-                                        snapshot,
-                                        emit_initial=self.config.scanner.emit_initial_events,
-                                        batch_id=scan_batch_id,
-                                    )
-                                events.extend(
-                                    detect_target_branch_event(
-                                        old,
-                                        snapshot,
-                                        batch_id=scan_batch_id,
-                                        occurred_at=scan_started_at,
-                                    )
-                                )
-                                inserted = await asyncio.to_thread(
-                                    self.store.save_snapshot_and_events,
-                                    snapshot,
-                                    events,
-                                    activity_cursor=(
-                                        self._activity_cursor(activity_batch)
-                                        if activity_batch is not None
-                                        else None
-                                    ),
-                                )
-                                summary.snapshots += 1
-                                summary.new_events += inserted
-                            for old in stored_snapshots:
-                                if old.state != "opened" or old.key in candidate_keys:
-                                    continue
-                                target_head_sha = target_heads.get(old.target_branch)
-                                if not target_head_sha or target_head_sha == old.target_head_sha:
-                                    continue
-                                current = old.model_copy(
-                                    update={"target_head_sha": target_head_sha}
-                                )
-                                events = detect_target_branch_event(
-                                    old,
-                                    current,
-                                    batch_id=scan_batch_id,
-                                    occurred_at=scan_started_at,
-                                )
-                                inserted = await asyncio.to_thread(
-                                    self.store.save_snapshot_and_events,
-                                    current,
-                                    events,
-                                )
-                                summary.snapshots += 1
-                                summary.new_events += inserted
-                            await asyncio.to_thread(
-                                self._mark_scan_completed,
-                                repository.id,
-                                scan_started_at,
-                            )
-                        except Exception as exc:
-                            summary.errors.append(f"扫描仓库 {repository.id} 失败：{exc}")
-            except ProviderError as exc:
-                summary.errors.append(str(exc))
+            for repository in repositories:
+                summary.repositories += 1
+                try:
+                    token = resolve_provider_token(
+                        self.config,
+                        provider_config,
+                        repository,
+                    )
+                    async with create_provider(
+                        provider_name,
+                        provider_config,
+                        self.config.scanner,
+                        token=token,
+                    ) as provider:
+                        await self._scan_repository(
+                            provider,
+                            repository,
+                            scan_batch_id,
+                            summary,
+                        )
+                except Exception as exc:
+                    summary.errors.append(
+                        f"扫描仓库 {repository.id} 失败：{exc}"
+                    )
 
     async def _run_agent(
         self,
