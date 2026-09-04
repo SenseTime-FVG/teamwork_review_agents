@@ -36,7 +36,7 @@ Teamwork Review Agents 是一个自托管的 GitHub / GitLab Agent 编排服务�
 | Agent | 职责 | 触发时机 |
 | --- | --- | --- |
 | `general-reviewer` | 审核代码和门禁、发布结论；可按配置自动合并 | PR / MR `opened`、`reopened`、源/目标分支提交变化 |
-| `dependency&incremental-doc-update-runner` | 编排依赖更新与增量文档更新，统一创建、门禁、合并和清理 | GitHub PR / GitLab MR `merged` |
+| `dependency&incremental-doc-update-runner` | 编排依赖更新与增量文档更新；依赖业务失败在完整恢复基线后仍继续文档阶段，统一创建、门禁、合并和清理 | GitHub PR / GitLab MR `merged` |
 | `dependency-reviewer` | 扫描并升级全仓依赖，提交并推送依赖变更 | 组合 Runner 通过 MCP 委托，也可由规则直接运行 |
 | `incremental-doc-updater` | 增量更新受影响文档 | Runner 通过 MCP 委托，也可由规则直接运行 |
 
@@ -495,6 +495,7 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 | [`docs/design-model-runtime-log-normalization.md`](docs/design-model-runtime-log-normalization.md) | 模型运行消息与日志归一化设计 |
 | [`docs/design-managed-skill-authoring.md`](docs/design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 |
 | [`docs/design-repository-skill-policy.md`](docs/design-repository-skill-policy.md) | 仓库级 Skill 三态策略与运行时交集设计 |
+| [`docs/design-combined-update-dependency-failure-continuation.md`](docs/design-combined-update-dependency-failure-continuation.md) | 组合更新中依赖失败后的文档续跑设计 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 本地开发、测试和前端联调 |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | 历史实施阶段和验收记录 |
 | [`deploy/`](deploy/) | systemd / launchd 模板 |

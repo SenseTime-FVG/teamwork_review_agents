@@ -1146,6 +1146,15 @@ def test_combined_update_prompts_support_github_and_gitlab() -> None:
     assert "输入中会提供一条已经合并的 GitLab Merge Request" not in runner_prompt
     assert "{{ DEPENDENCY_AUTO_UPDATE_AGENT_NAME }}" in runner_prompt
     assert "{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}" in runner_prompt
+    assert (
+        "- 返回 `FAILED` 或 `BLOCKED`：判定任务失败并执行清理，"
+        "不调用文档子 Agent"
+    ) not in runner_prompt
+    assert "返回 `FAILED`：保存子 Agent 报告的原始失败原因" in runner_prompt
+    assert "返回 `BLOCKED`：判定整条流程阻塞" in runner_prompt
+    assert "依赖失败恢复 = 成功" in runner_prompt
+    assert "将 `<文档任务起始SHA>` 设为 `<合并后SHA>` 并继续" in runner_prompt
+    assert "必须标记为部分完成" in runner_prompt
     assert "MR 合并前目标分支 SHA" in dependency_prompt
     assert "DEPENDENCY_UPDATE_BRANCH" in dependency_prompt
     assert "ALREADY_UPDATED_AND_PUSHED" not in dependency_prompt
