@@ -25,6 +25,7 @@
 | [`design-managed-comment-model-signature.md`](design-managed-comment-model-signature.md) | 托管评论模型签名设计 | `managed_comments.py`、Agent 配置与评论 UI | 签名开关、模型快照来源、评论格式或生命周期变化 |
 | [`design-managed-skill-authoring.md`](design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 | `skill_files.py`、Skill 管理 API 与 UI | Skill 在线创建、编辑、元数据或受管目录边界变化 |
 | [`design-repository-skill-policy.md`](design-repository-skill-policy.md) | 仓库级 Skill 白名单设计 | 仓库配置、Agent Skill 交集与仓库详情 UI | `allowed_skills` 或运行时 Skill 选择语义变化 |
+| [`design-combined-update-dependency-failure-continuation.md`](design-combined-update-dependency-failure-continuation.md) | 组合更新中依赖失败后的文档续跑设计 | 组合更新 Runner Prompt 与两个子 Agent 的阶段契约 | 依赖失败恢复、文档续跑或部分完成语义变化 |
 
 ## 实施记录
 
@@ -39,3 +40,4 @@
 | [`implementation-plan-managed-comment-model-signature.md`](implementation-plan-managed-comment-model-signature.md) | 托管评论模型签名实施方案 | 托管评论、模型快照和 Agent 配置 | 该实施方案或验收记录更新 |
 | [`implementation-plan-managed-skill-authoring.md`](implementation-plan-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑实施方案 | Skill 文件管理、API 和配置界面 | 该实施方案或验收记录更新 |
 | [`implementation-plan-repository-skill-policy.md`](implementation-plan-repository-skill-policy.md) | 仓库级 Skill 白名单实施方案 | 配置校验、运行器和仓库详情 UI | 该实施方案或验收记录更新 |
+| [`implementation-plan-combined-update-dependency-failure-continuation.md`](implementation-plan-combined-update-dependency-failure-continuation.md) | 组合更新中依赖失败后的文档续跑实施方案 | 组合更新 Runner Prompt 与协议测试 | 该实施方案或验收记录更新 |
