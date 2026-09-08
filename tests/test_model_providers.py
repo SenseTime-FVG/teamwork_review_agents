@@ -427,7 +427,7 @@ async def test_model_runner_falls_back_without_replaying_tools(
     snapshot_factory,
     monkeypatch,
 ) -> None:
-    """Provider 限流时应在同一模型循环切换，不能重新执行已完成工具。"""
+    """收到模型事件后的临时错误仍应切换，且不能重新执行已完成工具。"""
 
     config = configured_app_factory()
     config.model_providers["provider-a"] = ModelProviderConfig.model_validate(
@@ -462,10 +462,19 @@ async def test_model_runner_falls_back_without_replaying_tools(
     credentials.replace("provider-a", "key-a")
     credentials.replace("provider-b", "key-b")
     calls: list[str] = []
+    logs: list[tuple[str, str, Any]] = []
+
+    async def log_callback(stream: str, event_type: str, payload: Any) -> None:
+        logs.append((stream, event_type, payload))
 
     async def fake_create_response(self, payload, *, event_callback=None):
         calls.append(self.provider.display_name)
         if self.provider.display_name == "Provider A":
+            # 模拟模型已经发送 SSE 事件后才发生的临时上游故障。
+            if event_callback is not None:
+                await event_callback(
+                    {"type": "response.created", "response": {"id": "partial"}}
+                )
             raise ModelProviderRequestError(
                 "模型 Provider 请求失败（HTTP 429）",
                 status_code=429,
@@ -502,6 +511,7 @@ async def test_model_runner_falls_back_without_replaying_tools(
         redactor=SecretRedactor(()),
         model_plan=plan.selections,
         model_snapshot_callback=save_snapshot,
+        log_callback=log_callback,
     )
 
     assert result.status == "completed"
@@ -509,6 +519,13 @@ async def test_model_runner_falls_back_without_replaying_tools(
     assert calls == ["Provider A", "Provider B"]
     assert snapshots[-1]["provider_id"] == "provider-b"
     assert snapshots[-1]["fallback_used"] is True
+    assert any(
+        snapshot["fallback_attempts"]
+        and snapshot["fallback_attempts"][-1]["status"] == "failed"
+        and snapshot["fallback_used"] is False
+        for snapshot in snapshots
+    )
+    assert any(event_type == "model.fallback" for _, event_type, _ in logs)
 
 
 def test_credential_store_masks_reveals_replaces_and_deletes(tmp_path) -> None:

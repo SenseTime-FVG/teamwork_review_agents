@@ -526,7 +526,7 @@ class CodexModelRunner:
         current_agent = agent
         current_index = -1
         attempts: list[dict[str, Any]] = []
-        round_had_model_events = False
+        fallback_was_used = False
 
         def fallbackable_error(error: Exception) -> bool:
             """只把 Provider 暂时不可用类错误交给回退链。"""
@@ -757,9 +757,8 @@ class CodexModelRunner:
         async def receive_event(event: dict[str, Any]) -> None:
             """用 SSE 事件续期，并只持久化不含加密思维链的安全摘要。"""
 
-            nonlocal thread_started, round_had_model_events
+            nonlocal thread_started
             progress()
-            round_had_model_events = True
             event_type = str(event.get("type") or "response.event")
             if event_type == "response.created":
                 response = event.get("response")
@@ -823,7 +822,6 @@ class CodexModelRunner:
                     payload["text"] = text_config
                 round_message_keys.clear()
                 round_message_parts.clear()
-                round_had_model_events = False
                 try:
                     provider_semaphore = self._semaphore_for(
                         current_selection.provider_id if current_selection else self.provider_id,
@@ -866,14 +864,14 @@ class CodexModelRunner:
                                 current_selection=failed_selection,
                                 reasoning_effort=reasoning_effort,
                                 reasoning_effort_source=reasoning_effort_source,
-                                fallback_used=bool(attempts),
+                                fallback_used=fallback_was_used,
                             )
                         )
                     if (
-                        not round_had_model_events
-                        and fallbackable_error(exc)
+                        fallbackable_error(exc)
                         and await activate(current_index + 1)
                     ):
+                        fallback_was_used = True
                         next_selection = current_selection
                         await emit(
                             "system",
@@ -920,9 +918,7 @@ class CodexModelRunner:
                             current_selection=current_selection,
                             reasoning_effort=reasoning_effort,
                             reasoning_effort_source=reasoning_effort_source,
-                            fallback_used=any(
-                                item.get("status") == "failed" for item in attempts
-                            ),
+                            fallback_used=fallback_was_used,
                         )
                     )
                 break
