@@ -22,6 +22,11 @@ from .config import (
 )
 from .environment import MASK
 from .state import StateStore
+from .repository_migration import (
+    has_pending_repository_migration,
+    migrate_repository,
+    recover_repository_migration,
+)
 
 
 class ConfigRevisionConflict(ValueError):
@@ -79,6 +84,7 @@ class ConfigManager:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self._lock = threading.RLock()
+        recover_repository_migration(self.path)
         self._config = load_config(self.path)
         self._mtime_ns = self.path.stat().st_mtime_ns
         self.last_error: str | None = None
@@ -182,6 +188,21 @@ class ConfigManager:
             merged = protect_provider_credentials(
                 self._merge_masked(incoming, current_raw)
             )
+            # 全量保存没有原仓库身份和维护窗口，目录变更必须走单仓库迁移入口。
+            previous = parse_config_data(current_raw, self.path).repository_map()
+            following = parse_config_data(merged, self.path).repository_map()
+            if any(
+                previous[key].workspace != following[key].workspace
+                for key in previous.keys() & following.keys()
+            ):
+                raise ValueError(
+                    "修改仓库目录请进入仓库详情单独保存，以便安全迁移已有文件"
+                )
+            if (
+                previous.keys() - following.keys()
+                and following.keys() - previous.keys()
+            ):
+                raise ValueError("修改仓库 ID 请进入仓库详情单独保存，以便迁移历史关联")
             return self._persist_locked(merged, source=source)
 
     def save_agent(
@@ -733,12 +754,33 @@ class ConfigManager:
             else:
                 if current_id not in repository_ids:
                     raise ValueError(f"仓库不存在：{current_id}")
-                if next_id != current_id:
-                    raise ValueError("已有仓库的 ID 不允许修改，请新建仓库")
+                if next_id != current_id and next_id in repository_ids:
+                    raise ValueError(f"仓库已存在：{next_id}")
                 target_index = repository_ids.index(current_id)
 
-            next_repository = copy.deepcopy(repository)
+            if current_id != next_id and (
+                next_id in {".", ".."}
+                or re.search(r'[<>:"/\\|?*\x00-\x1f]', next_id)
+                or next_id.endswith(".")
+                or next_id.split(".", 1)[0].upper()
+                in {
+                    "CON",
+                    "PRN",
+                    "AUX",
+                    "NUL",
+                    *[f"COM{i}" for i in range(1, 10)],
+                    *[f"LPT{i}" for i in range(1, 10)],
+                }
+            ):
+                raise ValueError("仓库 ID 不能包含路径分隔符或文件名非法字符")
+            # 先按原仓库还原 Secret，再变更身份，防止脱敏占位失去匹配对象。
+            next_repository = self._merge_masked(
+                repository,
+                repositories[target_index] if current_id is not None else {},
+            )
             next_repository["id"] = next_id
+            name = str(next_repository.get("display_name") or "").strip()
+            next_repository["display_name"] = name or None
             next_repositories = [copy.deepcopy(item) for item in repositories]
             if current_id is None:
                 next_repositories.append(next_repository)
@@ -748,9 +790,95 @@ class ConfigManager:
 
             document = copy.deepcopy(current_raw)
             document["repositories"] = next_repositories
+            old_config = parse_config_data(current_raw, self.path)
+            if current_id is not None and current_id != next_id:
+                old_repository = old_config.repository_map()[current_id]
+                requested = Path(str(next_repository.get("workspace", ""))).expanduser()
+                absolute = (
+                    requested
+                    if requested.is_absolute()
+                    else self.path.parent / requested
+                )
+                if absolute.resolve() == old_repository.workspace:
+                    next_repository["workspace"] = str(requested.parent / next_id)
+                for rule in [
+                    *document.get("rules", []),
+                    *document.get("scheduled_rules", []),
+                ]:
+                    if isinstance(rule.get("repositories"), list):
+                        rule["repositories"] = [
+                            next_id if item == current_id else item
+                            for item in rule["repositories"]
+                        ]
+                    # 精确仓库条件也是引用，不能仅更新可视化仓库列表。
+                    for key, value in rule.get("conditions", {}).items():
+                        field, _, operator = key.partition("__")
+                        if operator in {"", "ne", "in", "not_in"} and field in {
+                            "repository_id",
+                            "old.repository_id",
+                            "new.repository_id",
+                            "current.repository_id",
+                        }:
+                            rule["conditions"][key] = (
+                                [
+                                    next_id if item == current_id else item
+                                    for item in value
+                                ]
+                                if isinstance(value, list)
+                                else next_id
+                                if value == current_id
+                                else value
+                            )
             merged = protect_provider_credentials(
                 self._merge_masked(document, current_raw)
             )
+            next_config = parse_config_data(merged, self.path)
+            if current_id is not None:
+                old_repository = old_config.repository_map()[current_id]
+                new_repository = next_config.repository_map()[next_id]
+                if (
+                    old_repository.id != new_repository.id
+                    or old_repository.workspace != new_repository.workspace
+                ):
+                    if (
+                        old_repository.provider != new_repository.provider
+                        or old_repository.project != new_repository.project
+                    ):
+                        raise ValueError(
+                            "迁移 ID 或目录时请保持平台连接和远端项目不变，分开保存"
+                        )
+                    if next_config.database.path != self._config.database.path:
+                        raise ValueError("后台运行期间不允许修改 database.path")
+                    for item in (repositories[target_index], next_repository):
+                        raw_path = Path(str(item["workspace"])).expanduser()
+                        raw_path = (
+                            raw_path
+                            if raw_path.is_absolute()
+                            else self.path.parent / raw_path
+                        )
+                        if raw_path.is_symlink():
+                            raise ValueError("迁移的基础目录不能是符号链接")
+                    migrate_repository(
+                        config_path=self.path,
+                        store=self.store,
+                        config=old_config,
+                        old=old_repository,
+                        new=new_repository,
+                        content=yaml.safe_dump(
+                            merged, allow_unicode=True, sort_keys=False
+                        ).encode(),
+                        revision=next_config.revision,
+                        masked_content=yaml.safe_dump(
+                            self._mask_secrets(merged),
+                            allow_unicode=True,
+                            sort_keys=False,
+                        ),
+                        source=source,
+                    )
+                    self._config = next_config
+                    self._mtime_ns = self.path.stat().st_mtime_ns
+                    self.last_error = None
+                    return next_config
             return self._persist_locked(merged, source=source)
 
     def delete_repository(
@@ -824,6 +952,8 @@ class ConfigManager:
     ) -> AppConfig:
         """在已经持有配置锁时校验并原子写入配置。"""
 
+        if has_pending_repository_migration(self.path):
+            raise ValueError("仓库迁移尚未恢复，请重启服务完成恢复后再保存配置")
         config = parse_config_data(document, self.path)
         if config.database.path != self._config.database.path:
             raise ValueError("后台运行期间不允许通过 UI 修改 database.path")

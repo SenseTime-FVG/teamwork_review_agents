@@ -32,6 +32,11 @@ from .workspace import (
 class ManualPreflightManager:
     """管理不绑定 MR / PR、不会触发 Agent 的仓库手动 CI。"""
 
+    def has_active_operations(self) -> bool:
+        """迁移前确认手动 CI 及其清理流程已经结束。"""
+
+        return any(not task.done() for task in self._tasks.values())
+
     def __init__(self, config_manager: ConfigManager) -> None:
         self.config_manager = config_manager
         self._tasks: dict[str, asyncio.Task[None]] = {}

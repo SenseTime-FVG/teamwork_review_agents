@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -59,6 +59,19 @@ import type {
 } from "./types";
 
 type Tab = "overview" | "repositories" | "environment" | "model-providers" | "skills" | "agents" | "rules" | "runs";
+
+// 展示名称独立于内部 ID，历史记录也按当前配置展示，未配置时兼容回退。
+const RepositoryNamesContext = createContext<Record<string, string>>({});
+
+function repositoryLabel(repository: Repository, includeId = false): string {
+  const name = repository.display_name?.trim() || repository.id;
+  return includeId && name !== repository.id ? `${name}（${repository.id}）` : name;
+}
+
+function RepositoryName({ id }: { id: string }) {
+  const names = useContext(RepositoryNamesContext);
+  return <span title={id}>{names[id] || id}</span>;
+}
 
 type OverviewLimit = number | null;
 
@@ -1142,6 +1155,7 @@ function MultiSelect(props: {
   label: string;
   values: string[];
   options: string[];
+  optionLabels?: Record<string, string>;
   onChange: (values: string[]) => void;
   emptySummary?: string;
   help?: string;
@@ -1173,7 +1187,7 @@ function MultiSelect(props: {
                   checked={checked}
                   onChange={() => toggle(option)}
                 />
-                <span>{option}</span>
+                <span>{props.optionLabels?.[option] ?? option}</span>
               </label>
             );
           })}
@@ -1644,7 +1658,7 @@ function OverviewListControls(props: {
           { value: "", label: "全部仓库" },
           ...props.repositories.map((repository) => ({
             value: repository.id,
-            label: `${repository.id} · ${repository.project}`,
+            label: `${repositoryLabel(repository, true)} · ${repository.project}`,
           })),
         ]}
       />
@@ -2099,7 +2113,7 @@ function Overview(props: {
                       <small>{item.source_branch} → {item.target_branch}</small>
                     </a>
                   </td>
-                  <td>{item.repository_id}</td>
+                  <td><RepositoryName id={item.repository_id} /></td>
                   <td><StatusPill value={item.state} /></td>
                   <td>{dateTimeText(item.updated_at)}</td>
                   <td>{timeText(item.scanned_at)}</td>
@@ -2254,7 +2268,7 @@ function Overview(props: {
                       {event.origin === "manual" && <small>手动</small>}
                     </span>
                   </td>
-                  <td>{event.repository_id}</td>
+                  <td><RepositoryName id={event.repository_id} /></td>
                   <td>#{event.number}</td>
                   <td>
                     <EventStatusPill event={event} />
@@ -4564,7 +4578,7 @@ function RepositoryWorkspaceManager(props: {
                   onClick={() => openDetail(repository.id)}
                 >
                   <div className="repository-workspace-title">
-                    <strong>{repository.id}</strong>
+                    <strong>{repositoryLabel(repository)}</strong>
                     {item && <span className={`repository-workspace-status status-${item.status}`}>{statusLabels[item.status]}</span>}
                     {item?.detail_source === "agent" && <span className="repository-workspace-source">Agent</span>}
                   </div>
@@ -4629,12 +4643,15 @@ function RepositoryDetailEditor(props: {
   repositoryIndex: number;
   creating: boolean;
   disabled: boolean;
+  originalWorkspace?: string;
   preflightAction?: ReactNode;
   agentWorkspaceAction?: ReactNode;
   agentWorkspaceWarmup?: RepositoryWorkspaceWarmupStatus | null;
   onIdChange: (repositoryId: string) => void;
   onChange: (document: ConfigDocument) => void;
 }) {
+  const autoWorkspace = useRef<string | undefined>(undefined);
+  const directoryEdited = useRef(false);
   const repository = props.document.repositories[props.repositoryIndex];
   const providerNames = Object.keys(props.document.providers);
   const protectedNames = providerCredentialNames(props.document);
@@ -4680,12 +4697,20 @@ function RepositoryDetailEditor(props: {
   }
 
   function updateId(repositoryId: string) {
-    const oldDefaultWorkspace = `./workspaces/${repository.id}`;
+    // 目录末段仍跟随旧 ID 时自动预览新路径，用户自定义路径优先保留。
+    const path = repository.workspace.replace(/[\\/]+$/, "");
+    const boundary = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    const followId = !directoryEdited.current && (path.slice(boundary + 1) === repository.id
+      || repository.workspace === props.originalWorkspace
+      || repository.workspace === autoWorkspace.current);
+    // 清空 ID 再输入时保持父目录，不把空 ID 当成一次目录层级变更。
+    const workspace = followId && repositoryId.trim()
+      ? `${path.slice(0, boundary + 1)}${repositoryId.trim()}`
+      : repository.workspace;
+    autoWorkspace.current = followId ? workspace : undefined;
     update({
       id: repositoryId,
-      workspace: repository.workspace === oldDefaultWorkspace
-        ? `./workspaces/${repositoryId}`
-        : repository.workspace,
+      workspace,
     });
     props.onIdChange(repositoryId);
   }
@@ -4761,19 +4786,12 @@ function RepositoryDetailEditor(props: {
       <article className="sub-card repository-detail-card">
         <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
           <div className="sub-card-head">
-            <div><h3>{repository.id || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
+            <div><h3>{repositoryLabel(repository) || "未命名仓库"}</h3><p>{repository.clone_url ?? repository.project}</p></div>
             <Toggle label="启用" checked={repository.enabled ?? true} onChange={(enabled) => update({ enabled })} />
           </div>
           <div className="form-grid two">
-            {props.creating ? (
-              <Field label="仓库 ID" value={repository.id} onChange={updateId} help="保存后作为持久身份，不允许直接修改" />
-            ) : (
-              <label className="field">
-                <span>仓库 ID</span>
-                <input value={repository.id} disabled />
-                <small>关联历史事件、运行记录和临时 Git 工作区，已有仓库不可修改 ID</small>
-              </label>
-            )}
+            <Field label="仓库名称" value={repository.display_name ?? ""} onChange={(display_name) => update({ display_name })} placeholder={repository.id} help="用于界面展示；留空显示 ID，修改名称不会迁移目录" />
+            <Field label="仓库 ID" value={repository.id} onChange={updateId} help="唯一标识；修改后同步迁移规则、历史关联和本地目录" />
             <SelectField
               label="所属 GitHub / GitLab 连接"
               value={repository.provider}
@@ -4791,8 +4809,8 @@ function RepositoryDetailEditor(props: {
             <Field
               label="基础 Git 仓库目录（自动管理）"
               value={repository.workspace}
-              onChange={(workspace) => update({ workspace })}
-              help="只负责克隆、校验、fetch 和运行工作区管理；Codex 不会直接在基础仓库中工作"
+              onChange={(workspace) => { directoryEdited.current = true; update({ workspace }); }}
+              help="修改目录并保存后，会搬移已有仓库并修复工作区引用；成功后不保留旧目录"
             />
           </div>
         </fieldset>
@@ -5217,6 +5235,7 @@ function RepositoriesView(props: {
     if (!keyword) return repositories;
     return repositories.filter((repository) => [
       repository.id,
+      repository.display_name ?? "",
       repository.provider,
       repository.project,
       repository.clone_url ?? "",
@@ -5237,6 +5256,9 @@ function RepositoriesView(props: {
   const dirty = editing && Boolean(
     creating || JSON.stringify(draftRepository) !== JSON.stringify(originalRepository),
   );
+  const migratingRepository = Boolean(editing && !creating && originalRepository && draftRepository && (
+    draftId.trim() !== originalRepository.id || draftRepository.workspace !== originalRepository.workspace
+  ));
   const workspaceById = useMemo(
     () => new Map(workspaceItems.map((item) => [item.repository_id, item])),
     [workspaceItems],
@@ -5358,10 +5380,12 @@ function RepositoriesView(props: {
       });
       const normalized = normalizeDocument(result.document);
       props.onSaved(normalized, result.revision);
-      setDetailId(draftId);
+      setDetailId(draftId.trim());
       clearDraft();
       await refreshWorkspaceItems();
-      props.onNotice(creating ? `仓库 ${draftId} 已创建并热加载` : `仓库 ${draftId} 已保存并热加载`);
+      props.onNotice(creating ? `仓库 ${draftId} 已创建并热加载` : migratingRepository
+        ? `仓库 ${draftId.trim()} 已迁移并热加载，旧目录不再保留`
+        : `仓库 ${draftId} 已保存并热加载`);
     } catch (reason) {
       props.onError(reason instanceof Error ? reason.message : "保存仓库失败");
     } finally {
@@ -5565,7 +5589,7 @@ function RepositoriesView(props: {
                   key={repository.id}
                   onClick={() => openDetail(repository.id)}
                 >
-                  <span className="agent-config-identity"><span className="repository-config-avatar" aria-hidden="true">G</span><span><strong>{repository.id}</strong><small>{repository.environment && Object.keys(repository.environment).length > 0 ? `${Object.keys(repository.environment).length} 个环境变量` : "无仓库环境变量"}</small></span></span>
+                  <span className="agent-config-identity"><span className="repository-config-avatar" aria-hidden="true">G</span><span><strong>{repositoryLabel(repository)}</strong><small>{repository.id}</small></span></span>
                   <span className={`repository-config-status ${enabled ? "enabled" : ""}`} onClick={(event) => event.stopPropagation()}>
                     <Toggle
                       label={toggling ? "保存中…" : enabled ? "已启用" : "已停用"}
@@ -5615,7 +5639,7 @@ function RepositoriesView(props: {
         <div className="agent-detail-heading">
           <div>
             <span className="eyebrow">REPOSITORY</span>
-            <h2>{activeId}</h2>
+            <h2>{activeRepository ? repositoryLabel(activeRepository) : activeId}</h2>
             <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新仓库" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
           </div>
           <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
@@ -5624,7 +5648,7 @@ function RepositoriesView(props: {
           {editing ? (
             <>
               <button type="button" className="button secondary" disabled={saving} onClick={cancelEdit}>取消</button>
-              <button type="button" className="button primary" disabled={!dirty || !draftId.trim() || saving || gitActive} onClick={() => { void saveRepository(); }}>{saving ? "保存中…" : "保存仓库"}</button>
+              <button type="button" className="button primary" disabled={!dirty || !draftId.trim() || saving || gitActive} onClick={() => { void saveRepository(); }}>{saving ? migratingRepository ? "迁移中…" : "保存中…" : migratingRepository ? "保存并迁移" : "保存仓库"}</button>
             </>
           ) : (
             <>
@@ -5640,6 +5664,14 @@ function RepositoriesView(props: {
           )}
         </div>
       </header>
+      {migratingRepository && originalRepository && draftRepository && (
+        <div className="repository-reference-warning" role="status">
+          <strong>保存时迁移仓库</strong>
+          {draftId.trim() !== originalRepository.id && <span>ID：{originalRepository.id} → {draftId.trim() || "待填写"}，同步更新规则与历史关联。</span>}
+          <span>目录：{originalRepository.workspace} → {draftRepository.workspace}</span>
+          <span>后台空闲时执行；保留提交和未提交文件，目标已存在时拒绝覆盖。成功后不保留旧目录。</span>
+        </div>
+      )}
       {referencingRuleNames.length > 0 && !creating && (
         <div className="repository-reference-warning">
           <strong>当前仓库不能删除</strong>
@@ -5648,9 +5680,11 @@ function RepositoriesView(props: {
       )}
       {activeRepository && (
         <RepositoryDetailEditor
+          key={`${creating ? "new" : detailId}:${editing ? "edit" : "read"}`}
           document={activeDocument}
           repositoryIndex={detailIndex}
           creating={creating}
+          originalWorkspace={originalRepository?.workspace}
           disabled={!editing || saving || gitActive}
           agentWorkspaceWarmup={!editing ? workspaceWarmup : null}
           agentWorkspaceAction={!editing ? (
@@ -7152,7 +7186,7 @@ function RulesEditor(props: {
               <Field label="规则名称" value={rule.name} onChange={(name) => update(index, { name })} />
               <MultiSelect label="触发事件" values={rule.events} options={props.events} onChange={(events) => update(index, { events })} />
               <MultiSelect label="触发 Agent" values={rule.agents} options={agentNames} onChange={(agents) => update(index, { agents })} />
-              <MultiSelect label="限制仓库（留空为全部）" values={rule.repositories ?? []} options={repositoryNames} onChange={(repositories) => update(index, { repositories: repositories.length ? repositories : undefined })} />
+              <MultiSelect label="限制仓库（留空为全部）" values={rule.repositories ?? []} options={repositoryNames} optionLabels={Object.fromEntries(props.document.repositories.map((item) => [item.id, repositoryLabel(item, true)]))} onChange={(repositories) => update(index, { repositories: repositories.length ? repositories : undefined })} />
             </div>
             <div className="rule-options">
               <div className="rule-option">
@@ -7978,6 +8012,7 @@ function ScheduledRulesView(props: {
               label="执行仓库"
               values={activeRule.repositories}
               options={props.document.repositories.map((repository) => repository.id)}
+              optionLabels={Object.fromEntries(props.document.repositories.map((item) => [item.id, repositoryLabel(item, true)]))}
               emptySummary="全部已启用仓库"
               help="不选择时，每次触发动态执行全部已启用仓库；选择后只执行指定仓库。"
               onChange={(repositories) => updateDraft({ repositories })}
@@ -8528,7 +8563,7 @@ function ChangeRequestDetailDrawer(props: {
         <header className="run-drawer-head">
           <div>
             <span className="eyebrow">
-              {current.repository_id} · {current.web_url ? (
+              <RepositoryName id={current.repository_id} /> · {current.web_url ? (
                 <a
                   className="event-change-request-link"
                   href={current.web_url}
@@ -8567,7 +8602,7 @@ function ChangeRequestDetailDrawer(props: {
               <section className="event-detail-section">
                 <div className="event-detail-section-title"><div><span className="eyebrow">CHANGE REQUEST</span><h3>当前快照</h3></div></div>
                 <dl className="run-metadata">
-                  <div><dt>仓库</dt><dd>{detail.repository_id}</dd></div>
+                  <div><dt>仓库</dt><dd><RepositoryName id={detail.repository_id} /></dd></div>
                   <div><dt>编号</dt><dd>#{detail.number}</dd></div>
                   <div><dt>Head SHA</dt><dd>{detail.head_sha}</dd></div>
                   <div><dt>远端更新</dt><dd>{dateTimeText(detail.updated_at)}</dd></div>
@@ -8761,7 +8796,7 @@ function EventDetailDrawer(props: {
             <span className="eyebrow">{current.event_id}</span>
             <h2>{current.event_type}</h2>
             <p>
-              {current.repository_id} · {detail?.change_request_url ? (
+              <RepositoryName id={current.repository_id} /> · {detail?.change_request_url ? (
                 <a
                   className="event-change-request-link"
                   href={detail.change_request_url}
@@ -8999,7 +9034,7 @@ function PreflightRunDetailDrawer(props: {
             <h2>本地 Preflight / CI</h2>
             {detail && (
               <p>
-                {detail.repository_id} · {detail.number ? (
+                <RepositoryName id={detail.repository_id} /> · {detail.number ? (
                   <ChangeRequestNumberLink
                     repositoryId={detail.repository_id}
                     number={detail.number}
@@ -9197,7 +9232,7 @@ function RunTargetLabel({ run }: { run: RunSummary }) {
   ) {
     return (
       <>
-        {run.repository_id} · <ChangeRequestNumberLink
+        <RepositoryName id={run.repository_id} /> · <ChangeRequestNumberLink
           repositoryId={run.repository_id}
           number={run.change_request_number}
           url={run.change_request_url}
@@ -9206,7 +9241,7 @@ function RunTargetLabel({ run }: { run: RunSummary }) {
     );
   }
   if (run.trigger_source === "schedule" && run.repository_id) {
-    return <>{run.repository_id} · {run.trigger_context?.branch || "默认分支"}</>;
+    return <><RepositoryName id={run.repository_id} /> · {run.trigger_context?.branch || "默认分支"}</>;
   }
   return <>{run.resource_key}</>;
 }
@@ -9600,7 +9635,7 @@ function RunsView(props: {
                 { value: "", label: "全部仓库" },
                 ...props.repositories.map((repository) => ({
                   value: repository.id,
-                  label: `${repository.id} · ${repository.project}`,
+                  label: `${repositoryLabel(repository, true)} · ${repository.project}`,
                 })),
               ]}
             />
@@ -9716,7 +9751,7 @@ function RunsView(props: {
               return (
                 <button key={`preflight:${preflight.run_id}`} className={`run-row ${selected?.kind === "preflight" && selected.id === preflight.run_id ? "selected" : ""}`} onClick={() => setSelected({ kind: "preflight", id: preflight.run_id })}>
                   <span className="run-agent-cell"><span className="run-status-dot" data-status={preflight.status} /><span><strong>本地 Preflight / CI</strong><small>CI · {preflight.run_id.slice(0, 8)}</small></span></span>
-                  <span className="run-target-cell"><strong>{preflight.repository_id} · {preflight.number ? `#${preflight.number}` : preflight.branch ?? "默认分支"}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
+                  <span className="run-target-cell"><strong><RepositoryName id={preflight.repository_id} /> · {preflight.number ? `#${preflight.number}` : preflight.branch ?? "默认分支"}</strong><small>{preflight.change_request_title ?? preflight.head_sha}</small></span>
                   <span className="run-source-cell"><strong>{preflight.trigger_source === "manual" ? "仓库手动执行" : preflight.event_type ?? "事件检查"}</strong><small>{preflight.trigger_source === "manual" ? "不触发 Agent、不回写 PR 状态" : preflight.reused_event_count > 0 ? `被 ${preflight.reused_event_count} 个事件复用` : "本批次新执行"}</small></span>
                   <span className="run-status-cell"><span className={`status-pill status-${preflightStatusClass(preflight.status)}`}>{preflightStatusLabel(preflight.status)}</span>{preflight.failed_step && <small>{preflight.failed_step}</small>}</span>
                   <span className="run-time-cell"><strong>{timeText(preflight.started_at)}</strong></span>
@@ -10379,6 +10414,7 @@ export default function App() {
   }, [tab]);
 
   return (
+    <RepositoryNamesContext.Provider value={Object.fromEntries((document?.repositories ?? []).map((item) => [item.id, repositoryLabel(item)]))}>
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">TR</div><div><strong>Teamwork</strong><span>Review Agents</span></div></div>
@@ -10620,5 +10656,6 @@ export default function App() {
         }}
       />
     </div>
+    </RepositoryNamesContext.Provider>
   );
 }

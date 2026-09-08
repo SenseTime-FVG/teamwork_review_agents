@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from .config import ScheduledRuleConfig
+from .repository_migration import has_pending_repository_migration
 from .config_manager import ConfigManager
 from .orchestrator import CycleSummary, Orchestrator
 from .scheduler import next_scheduled_at, schedule_signature, schedule_summary
@@ -34,6 +36,9 @@ class BackgroundRuntime:
         )
         self._active_orchestrators: set[Orchestrator] = set()
         self._revision = manager.config.revision
+        self.repository_migrating = False
+        self._repository_ready = asyncio.Event()
+        self._repository_ready.set()
         self.paused = False
         self.running_cycle = False
         self.dispatching_events = False
@@ -107,6 +112,33 @@ class BackgroundRuntime:
         """请求尽快执行一次扫描，不与正在运行的周期重叠。"""
 
         self._scan_wake_event.set()
+
+    @contextmanager
+    def repository_maintenance(self):
+        """空闲时封闭后台入口，直到配置和目录迁移完成。"""
+
+        if (
+            self.repository_migrating
+            or self.running_cycle
+            or self.dispatching_events
+            or self._active_orchestrators
+            or any(not task.done() for task in self._scheduled_occurrence_tasks)
+        ):
+            raise ValueError("后台正在扫描或执行任务，请等待当前工作完成后再迁移仓库")
+        self.repository_migrating = True
+        self._repository_ready.clear()
+        try:
+            yield
+        finally:
+            # 恢复分发前更换编排器，避免旧配置继续写入旧仓库身份。
+            if has_pending_repository_migration(self.manager.path):
+                self.last_error = "仓库迁移尚未恢复，后台已暂停，请重启服务完成恢复"
+            else:
+                self._reload_config()
+                self.repository_migrating = False
+                self._repository_ready.set()
+                self.notify_config_changed()
+                self._dispatch_event.set()
 
     def dispatch_events_now(self) -> None:
         """请求尽快只处理待处理事件，不额外访问 Provider。"""
@@ -209,6 +241,7 @@ class BackgroundRuntime:
     async def _run_scan_cycle(self) -> None:
         """执行一次扫描并持久化事件，不等待 Agent 执行。"""
 
+        await self._repository_ready.wait()
         self.running_cycle = True
         self.last_started_at = time.time()
         self.last_error = None
@@ -237,6 +270,7 @@ class BackgroundRuntime:
     async def _run_dispatch_cycle(self) -> None:
         """独立领取并执行持久化事件，不占用扫描循环。"""
 
+        await self._repository_ready.wait()
         self.dispatching_events = True
         self.last_dispatch_started_at = time.time()
         self.last_dispatch_error = None
@@ -272,6 +306,7 @@ class BackgroundRuntime:
 
         next_scan_at = 0.0
         while not self._stop_event.is_set():
+            await self._repository_ready.wait()
             self._reload_config()
             if self._stop_event.is_set():
                 break
@@ -360,6 +395,7 @@ class BackgroundRuntime:
         """计算固定间隔与 Cron 到期点，并为每个周期独立创建任务。"""
 
         while not self._stop_event.is_set():
+            await self._repository_ready.wait()
             self._reload_config()
             if self._stop_event.is_set():
                 break

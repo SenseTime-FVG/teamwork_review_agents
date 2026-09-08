@@ -416,6 +416,7 @@ class RepositoryConfig(BaseModel):
     """被扫描仓库及 Agent 本地工作目录配置。"""
 
     id: str
+    display_name: str | None = None
     provider: str
     project: str
     workspace: Path
@@ -427,6 +428,13 @@ class RepositoryConfig(BaseModel):
         default_factory=AgentWorkspaceConfig,
     )
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value: str | None) -> str | None:
+        """名称只用于展示，空白值统一回退到仓库 ID。"""
+
+        return value.strip() or None if value is not None else None
 
     @model_validator(mode="before")
     @classmethod
