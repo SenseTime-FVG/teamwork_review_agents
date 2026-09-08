@@ -323,12 +323,17 @@ def create_app(
     app.state.manual_preflight_manager = manual_preflight_manager
     app.state.agent_workspace_warmup_manager = agent_workspace_warmup_manager
     app.state.model_provider_credentials = model_provider_credentials
+    active_api_writes = 0
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
         """配置管理员 Token 后保护全部管理 API。"""
 
-        if request.url.path.startswith("/api/") and request.url.path != "/api/health":
+        nonlocal active_api_writes
+        is_api = request.url.path.startswith("/api/") and request.url.path != "/api/health"
+        if is_api:
+            if runtime.repository_migrating:
+                return JSONResponse({"detail": "仓库正在迁移，请稍后重试"}, status_code=409)
             token_env = manager.config.web.admin_token_env
             expected = os.getenv(token_env, "") if token_env else ""
             if token_env:
@@ -337,7 +342,14 @@ def create_app(
                 supplied = request.headers.get("X-Admin-Token", "") or bearer
                 if not expected or supplied != expected:
                     return JSONResponse({"detail": "管理员认证失败"}, status_code=401)
-        return await call_next(request)
+        writing = is_api and request.method not in {"GET", "HEAD", "OPTIONS"}
+        if writing:
+            active_api_writes += 1
+        try:
+            return await call_next(request)
+        finally:
+            if writing:
+                active_api_writes -= 1
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
@@ -1025,18 +1037,58 @@ def create_app(
         repository_id: str,
         body: RepositoryConfigRequest,
     ) -> dict[str, Any]:
-        """基于指定版本更新一个仓库，仓库 ID 保持不变。"""
+        """更新展示名称，或在维护窗口内迁移仓库 ID 和目录。"""
 
         await ensure_repository_idle(repository_id)
         try:
-            config = await asyncio.to_thread(
-                manager.save_repository,
-                expected_revision=body.revision,
-                original_id=repository_id,
-                repository_id=body.repository_id,
-                repository=body.repository,
-                source="ui-repository-update",
+            previous = manager.config.repository_map().get(repository_id)
+            requested = Path(str(body.repository.get("workspace", ""))).expanduser()
+            requested = (
+                requested
+                if requested.is_absolute()
+                else manager.path.parent / requested
             )
+            migrating = previous is not None and (
+                repository_id != body.repository_id.strip()
+                or previous.workspace != requested.resolve()
+            )
+
+            async def save_repository_config():
+                """请求取消后仍等待写入线程结束，防止提前开放后台入口。"""
+
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        manager.save_repository,
+                        expected_revision=body.revision,
+                        original_id=repository_id,
+                        repository_id=body.repository_id,
+                        repository=body.repository,
+                        source="ui-repository-update",
+                    )
+                )
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await task
+                    raise
+
+            if migrating:
+                if active_api_writes > 1:
+                    raise ValueError("还有管理操作正在处理，请稍后再迁移仓库")
+                with runtime.repository_maintenance():
+                    if (
+                        repository_initialization_manager.has_active_operations()
+                        or agent_workspace_warmup_manager.has_active_operations()
+                        or manual_preflight_manager.has_active_operations()
+                    ):
+                        raise ValueError(
+                            "工作区或本地 CI 正在运行，请等待完成后再迁移仓库"
+                        )
+                    config = await save_repository_config()
+                    repository_initialization_manager.forget_finished(repository_id)
+                    agent_workspace_warmup_manager.forget_finished(repository_id)
+            else:
+                config = await save_repository_config()
         except ConfigRevisionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:

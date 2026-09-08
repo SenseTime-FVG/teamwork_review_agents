@@ -87,6 +87,20 @@ def _directory_size(path: Path) -> int:
 class RepositoryInitializationManager:
     """在管理服务进程内编排基础仓库操作。"""
 
+    def has_active_operations(self) -> bool:
+        """迁移前确认没有仍持有旧配置的手动 Git 任务。"""
+
+        return any(
+            item.task is not None and not item.task.done()
+            for item in self._operations.values()
+        )
+
+    def forget_finished(self, repository_id: str) -> None:
+        """迁移后清除旧路径的进程内状态，持久运行记录继续保留。"""
+
+        self._operations.pop(repository_id, None)
+        self._size_cache.clear()
+
     def __init__(self, config_manager: ConfigManager) -> None:
         self.config_manager = config_manager
         self._operations: dict[str, RepositoryInitialization] = {}

@@ -40,6 +40,7 @@ export type RepositoryAgentWorkspace = {
 
 export type Repository = {
   id: string;
+  display_name?: string | null;
   provider: string;
   project: string;
   workspace: string;

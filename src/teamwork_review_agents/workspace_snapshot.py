@@ -227,7 +227,7 @@ def _read_metadata(directory: Path) -> dict[str, Any] | None:
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("invalidated_by_migration"):
         return None
     archive = directory / ARCHIVE_FILE_NAME
     if not archive.is_file() or payload.get("fingerprint") != directory.name:

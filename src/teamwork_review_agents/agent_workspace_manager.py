@@ -99,6 +99,19 @@ class AgentWorkspaceWarmup:
 class AgentWorkspaceWarmupManager:
     """编排默认分支准备步骤，并复用正常 Agent 的快照实现。"""
 
+    def has_active_operations(self) -> bool:
+        """迁移前确认依赖预热任务已经全部收尾。"""
+
+        return any(
+            item.task is not None and not item.task.done()
+            for item in self._operations.values()
+        )
+
+    def forget_finished(self, repository_id: str) -> None:
+        """迁移后重新读取新路径下的持久快照状态。"""
+
+        self._operations.pop(repository_id, None)
+
     def __init__(self, config_manager: ConfigManager) -> None:
         self.config_manager = config_manager
         self._operations: dict[str, AgentWorkspaceWarmup] = {}

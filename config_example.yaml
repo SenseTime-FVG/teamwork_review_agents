@@ -201,14 +201,17 @@ web:
 
 # 可选：需要扫描的仓库列表。
 # repositories:
-#   - # UI 和规则使用的仓库唯一 ID。
+#   - # 规则、事件和运行关联使用的仓库唯一 ID；修改请在仓库详情单独保存。
 #     id: example-github
+#     # 可选展示名称，留空显示 ID；只改名称不会迁移目录或改变身份。
+#     display_name: 示例仓库
 #     # 引用 providers 中的键名，决定扫描时使用哪个平台 API 和 Token。
 #     provider: github-main
 #     # 支持 owner/repository、group/project、SSH 或 HTTPS Git 地址。
 #     project: git@github.com:owner/repository.git
 #     # 基础 Git 仓库目录；不存在时会自动克隆，已存在时只校验并 fetch。
 #     # Codex 不直接在这里运行；可写 Agent 创建独立 clone，只读 Agent 创建 linked worktree。
+#     # UI 修改此目录会迁移已有内容，即使 ID 不变；成功后旧目录不保留。
 #     workspace: ./workspaces/example-github
 #     # false 时不扫描，也不会处理该仓库的待处理事件。
 #     enabled: true

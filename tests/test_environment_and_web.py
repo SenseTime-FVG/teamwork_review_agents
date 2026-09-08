@@ -449,11 +449,11 @@ def test_config_manager_saves_and_safely_deletes_one_repository(tmp_path) -> Non
     ]
     assert document["repositories"][0]["enabled"] is False
 
-    with pytest.raises(ValueError, match="ID 不允许修改"):
+    with pytest.raises(ValueError, match="仓库已存在"):
         manager.save_repository(
             expected_revision=updated.revision,
             original_id="first",
-            repository_id="renamed",
+            repository_id="second",
             repository=repository,
         )
 
@@ -809,8 +809,8 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
             "/api/config/repositories/third",
             json={
                 "revision": updated_body["revision"],
-                "repository_id": "renamed",
-                "repository": {**repository, "id": "renamed"},
+                "repository_id": "second",
+                "repository": {**repository, "id": "second"},
             },
         )
         assert renamed.status_code == 422
