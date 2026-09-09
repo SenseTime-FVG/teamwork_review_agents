@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
 from .filesystem import remove_tree, temporary_directory
+from .git_auth import current_git_environment
 from .models import ChangeRequestSnapshot
 from .process_control import process_group_options, terminate_process
 
@@ -190,20 +191,40 @@ def _run_git(
                 )
             )
 
-    def terminate(process: subprocess.Popen[str]) -> None:
+    def terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
         """终止 Git 进程组或进程树，避免 ssh 与 index-pack 成为遗留进程。"""
 
         if process.poll() is not None:
-            return
+            return "", ""
         with suppress(ProcessLookupError, PermissionError):
             terminate_process(process.pid, force=False, tree=True)
         try:
-            process.communicate(timeout=2)
+            return process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             with suppress(ProcessLookupError, PermissionError):
                 terminate_process(process.pid, force=True, tree=True)
             with suppress(subprocess.TimeoutExpired):
-                process.communicate(timeout=2)
+                return process.communicate(timeout=2)
+        return "", ""
+
+    child_environment = None
+    active_git_environment = current_git_environment()
+    if active_git_environment:
+        child_environment = os.environ.copy()
+        child_environment.update(active_git_environment)
+
+    def safe_error(stderr: str) -> str | None:
+        """返回脱敏且有界的 Git 错误摘要。"""
+
+        detail = (stderr or "").replace("\x1b", "").strip()
+        if active_git_environment:
+            for secret_name in ("TEAMWORK_GIT_TOKEN",):
+                secret = active_git_environment.get(secret_name, "")
+                if secret:
+                    detail = detail.replace(secret, "********")
+        if not detail:
+            return None
+        return detail[-800:]
 
     try:
         process = subprocess.Popen(
@@ -214,6 +235,7 @@ def _run_git(
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=child_environment,
             **process_group_options(),
         )
     except OSError as exc:
@@ -228,14 +250,19 @@ def _run_git(
             raise WorkspaceCancelled("运行已在 Git 工作区准备期间取消")
         elapsed = time.monotonic() - monotonic_started_at
         if elapsed >= timeout_seconds:
-            terminate(process)
+            _, stderr = terminate(process)
+            detail = safe_error(stderr)
             report(
                 "timed_out",
-                error=f"Git 操作超过 {timeout_seconds} 秒",
+                error=(
+                    f"Git 操作超过 {timeout_seconds} 秒"
+                    + (f"：{detail}" if detail else "")
+                ),
             )
-            raise WorkspaceError(
-                f"Git 操作超过 {timeout_seconds} 秒，请检查网络和 SSH 认证"
-            )
+            message = f"Git 操作超过 {timeout_seconds} 秒，请检查网络和 SSH 认证"
+            if detail:
+                message += f"：{detail}"
+            raise WorkspaceError(message)
         try:
             stdout, stderr = process.communicate(
                 timeout=min(0.25, max(0.01, timeout_seconds - elapsed))
@@ -258,10 +285,14 @@ def _run_git(
         report(
             "failed",
             exit_code=result.returncode,
-            error="Git 命令返回非零退出码",
+            error=safe_error(result.stderr) or "Git 命令返回非零退出码",
         )
     if check and result.returncode != 0:
-        raise WorkspaceError("Git 操作失败，请检查仓库地址、网络和 SSH/HTTPS 权限")
+        detail = safe_error(result.stderr)
+        raise WorkspaceError(
+            "Git 操作失败，请检查仓库地址、网络和 SSH/HTTPS 权限"
+            + (f"：{detail}" if detail else "")
+        )
     return result
 
 

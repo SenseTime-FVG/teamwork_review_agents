@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
 from .config import AgentWorkspaceConfig, AppConfig, PreflightConfig
-from .environment import SecretRedactor, resolve_provider_token
+from .environment import (
+    SecretRedactor,
+    resolve_provider_token,
+    resolve_repository_process_environment,
+)
+from .git_auth import GitCredentialContext
 from .filesystem import temporary_directory
 from .managed_comments import ManagedCommentService
 from .models import ChangeEvent, PreflightResult, stable_hash
@@ -113,6 +118,7 @@ def build_preflight_environment(
     home: Path | None = None,
     cache_environment: dict[str, str] | None = None,
     windows: bool | None = None,
+    git_environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """只继承运行工具所需的宿主机变量，不隐式传递平台或模型凭据。"""
 
@@ -142,6 +148,8 @@ def build_preflight_environment(
             environment["TMP"] = str(temporary)
     if cache_environment:
         environment.update(cache_environment)
+    if git_environment:
+        environment.update(git_environment)
     return environment
 
 
@@ -853,6 +861,24 @@ class PreflightExecutor:
                 ),
                 progress_callback=record_git_progress,
             )
+            git_credentials = GitCredentialContext(
+                resolve_provider_token(self.config, provider_config, repository),
+                provider_kind=provider_config.kind,
+            ).start()
+            repository_process_environment = resolve_repository_process_environment(
+                self.config,
+                repository,
+                reservation.run_id,
+            )
+            ci_git_environment = (
+                {
+                    provider_config.token_env: git_credentials.token,
+                    **git_credentials.environment,
+                }
+                if provider_config.token_env
+                in repository_process_environment.process_values
+                else None
+            )
             checkout: Path | None = None
             try:
                 checkout = await asyncio.to_thread(manager.__enter__)
@@ -890,6 +916,7 @@ class PreflightExecutor:
                         environment=build_preflight_environment(
                             home=home,
                             cache_environment=cache_environment,
+                            git_environment=ci_git_environment,
                         ),
                         on_step_update=record_step,
                         on_output=record_output,
@@ -897,6 +924,7 @@ class PreflightExecutor:
             finally:
                 if checkout is not None:
                     await asyncio.to_thread(manager.__exit__, None, None, None)
+                git_credentials.close()
             result = PreflightResult(
                 run_id=reservation.run_id,
                 repository_id=repository.id,

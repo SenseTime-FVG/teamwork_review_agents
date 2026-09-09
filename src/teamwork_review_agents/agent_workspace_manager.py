@@ -15,7 +15,12 @@ from typing import Any
 from .agent_workspace import prepare_agent_workspace
 from .config import AgentConfig, RepositoryConfig
 from .config_manager import ConfigManager
-from .environment import SecretRedactor, resolve_repository_process_environment
+from .environment import (
+    SecretRedactor,
+    resolve_provider_token,
+    resolve_repository_process_environment,
+)
+from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, LockTimeoutError, ResourceLease
 from .preflight import build_preflight_environment
 from .workspace import (
@@ -256,6 +261,10 @@ class AgentWorkspaceWarmupManager:
         )
         manager = None
         checkout: Path | None = None
+        git_credentials = GitCredentialContext(
+            resolve_provider_token(config, provider, repository),
+            provider_kind=provider.kind,
+        ).start()
         try:
             operation.append_log("system", "workspace.warmup.waiting", "正在等待仓库 Git 资源锁")
             async with lease:
@@ -309,6 +318,9 @@ class AgentWorkspaceWarmupManager:
                         redactor.data(payload),
                     )
 
+                warmup_process_environment = dict(resolved.process_values)
+                if provider.token_env in resolved.process_values:
+                    warmup_process_environment.update(git_credentials.environment)
                 result = await prepare_agent_workspace(
                     config=config,
                     repository=checkout_repository,
@@ -318,7 +330,7 @@ class AgentWorkspaceWarmupManager:
                         network_access=True,
                         write_scopes=["workspace"],
                     ),
-                    process_environment=resolved.process_values,
+                    process_environment=warmup_process_environment,
                     redactor=redactor,
                     log_callback=record_log,
                     cancel_check=operation.cancel_event.is_set,
@@ -362,6 +374,7 @@ class AgentWorkspaceWarmupManager:
             if checkout is not None and manager is not None:
                 with suppress(Exception):
                     await asyncio.to_thread(manager.__exit__, None, None, None)
+            git_credentials.close()
             operation.finished_at = time.time()
 
     async def close(self) -> None:

@@ -20,8 +20,10 @@ from .environment import (
     PromptRenderError,
     SecretRedactor,
     render_prompt,
+    resolve_provider_token,
     resolve_environment,
 )
+from .git_auth import GitCredentialContext
 from .locks import ResourceLease
 from .models import (
     AgentResult,
@@ -643,7 +645,13 @@ class AgentExecutor:
                 payload=payload,
             )
 
-        redactor = SecretRedactor(())
+        git_credentials = GitCredentialContext(
+            resolve_provider_token(self.config, provider, configured_repository),
+            provider_kind=provider.kind,
+        ).start()
+        redactor = SecretRedactor(
+            (git_credentials.token,) if git_credentials.token else ()
+        )
         active_workspace: Path | None = None
         owned_workspace = False
         workspace_prepared = False
@@ -845,7 +853,9 @@ class AgentExecutor:
                     include_change_request=task is None and event is not None,
                     schedule=resolved_schedule,
                 )
-                redactor = SecretRedactor(resolved_environment.secret_values)
+                redactor = SecretRedactor(
+                    (*resolved_environment.secret_values, git_credentials.token)
+                )
                 cache_root, cache_environment = agent_repository_cache_environment(
                     self.config,
                     repository,
@@ -854,6 +864,8 @@ class AgentExecutor:
                     **resolved_environment.process_values,
                     **cache_environment,
                 }
+                if provider.token_env in resolved_environment.process_values:
+                    process_environment.update(git_credentials.environment)
                 audit_environment = dict(resolved_environment.audit_values)
                 if cache_root is not None:
                     audit_environment["TEAMWORK_REPOSITORY_CACHE_DIR"] = str(
@@ -1070,6 +1082,8 @@ class AgentExecutor:
                 status="cancelled" if cancelled else "failed",
                 error=error,
             )
+        finally:
+            git_credentials.close()
 
         if result.status == "cancelled":
             source = await cancellation_source()

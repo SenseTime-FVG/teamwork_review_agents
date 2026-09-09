@@ -14,6 +14,8 @@ from typing import Any
 
 from .config import RepositoryConfig
 from .config_manager import ConfigManager
+from .environment import resolve_provider_token
+from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, LockTimeoutError, ResourceLease
 from .workspace import (
     GitProgressEvent,
@@ -427,17 +429,21 @@ class RepositoryInitializationManager:
                     elif git_event.state == "cancelled":
                         operation.phase = f"{git_event.operation}已取消"
 
-                _, actual_operation = await asyncio.to_thread(
-                    initialize_repository_workspace,
-                    provider,
-                    repository,
-                    timeout_seconds=config.runtime.git_timeout_seconds,
-                    initialization_timeout_seconds=(
-                        config.runtime.repository_initialization_timeout_seconds
-                    ),
-                    cancel_check=operation.cancel_event.is_set,
-                    progress_callback=progress,
-                )
+                with GitCredentialContext(
+                    resolve_provider_token(config, provider, repository),
+                    provider_kind=provider.kind,
+                ):
+                    _, actual_operation = await asyncio.to_thread(
+                        initialize_repository_workspace,
+                        provider,
+                        repository,
+                        timeout_seconds=config.runtime.git_timeout_seconds,
+                        initialization_timeout_seconds=(
+                            config.runtime.repository_initialization_timeout_seconds
+                        ),
+                        cancel_check=operation.cancel_event.is_set,
+                        progress_callback=progress,
+                    )
                 operation.operation = actual_operation
                 operation.status = "ready"
                 operation.phase = "基础仓库已就绪"
