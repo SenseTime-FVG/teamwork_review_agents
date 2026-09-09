@@ -6,14 +6,36 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
+import pytest
+
+from teamwork_review_agents import process_control
 from teamwork_review_agents.process_control import (
+    hidden_process_options,
     iter_process_commands,
     pid_exists,
     process_group_options,
     process_started_at,
     terminate_process,
 )
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_hidden_and_detached_process_flags(monkeypatch, platform) -> None:
+    """精确检查窗口与进程组位掩码，防止误用优先级标志或混合互斥标志。"""
+
+    # 只替换模块持有的系统信息，避免改变 pytest 和 pathlib 看到的平台。
+    monkeypatch.setattr(process_control, "os", SimpleNamespace(name=platform))
+    assert process_control._WINDOWS_CREATE_NO_WINDOW == 0x08000000
+    if platform == "nt":
+        assert hidden_process_options() == {"creationflags": 0x08000000}
+        assert process_group_options() == {"creationflags": 0x08000200}
+        assert process_group_options(detached=True) == {"creationflags": 0x00000208}
+    else:
+        assert hidden_process_options() == {}
+        assert process_group_options() == {"start_new_session": True}
+        assert process_group_options(detached=True) == {"start_new_session": True}
 
 
 def test_process_group_options_match_current_platform() -> None:
@@ -24,7 +46,12 @@ def test_process_group_options_match_current_platform() -> None:
     if os.name == "nt":
         assert "creationflags" in foreground
         assert "start_new_session" not in foreground
-        assert detached["creationflags"] != foreground["creationflags"]
+        assert foreground["creationflags"] == (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
+        assert detached["creationflags"] == (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
     else:
         assert foreground == {"start_new_session": True}
         assert detached == foreground

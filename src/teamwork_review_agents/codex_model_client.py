@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from .process_control import hidden_process_options
 from .subprocess_utils import resolve_executable
 
 
@@ -477,6 +478,7 @@ def _codex_client_version(codex_binary: str) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=3,
+            **hidden_process_options(),
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"

@@ -56,6 +56,7 @@ jobs:
           tests/test_agent_home.py
           tests/test_codex_account.py
           tests/test_process_control.py
+          tests/test_hidden_subprocess.py
           tests/test_process_manager.py
           tests/test_preflight.py
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
