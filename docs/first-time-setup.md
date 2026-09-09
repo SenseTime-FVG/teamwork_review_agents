@@ -9,10 +9,10 @@
 启动 Teamwork 服务的系统用户必须具备以下登录态：
 
 - 已安装 Codex CLI；使用默认内置 Provider 时还需要完成 Codex 登录。
-- GitHub 仓库使用已登录的 `gh`；GitLab 仓库使用已登录的 `glab`。
+- 建议为 GitHub 仓库准备已登录的 `gh`、为 GitLab 仓库准备已登录的 `glab`，作为仓库 Token 被关闭或失效时的后备登录态。
 - 扫描器使用的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN` 已存在于启动服务的宿主机环境中。
 
-Provider Token 始终按 Secret 脱敏，默认只供后台扫描器访问平台 API，不会传给 Codex。管理员可以在环境变量中分别显式开启 Prompt 或进程暴露，但这会让模型、Agent 命令或 CI 获得 Token，管理界面会先要求确认风险。它默认不能代替 `gh` / `glab` 登录态。具体登录与验证命令见[配置 `gh` / `glab`](platform-cli-auth.md)。
+Provider Token 始终按 Secret 脱敏，默认供后台扫描器、Agent 命令和仓库 CI 使用，但不会进入 Prompt。`gh` / `glab` 仍是本机程序，运行时会优先使用当前仓库 Token；管理员关闭“进程”后才使用本机保存的 CLI 登录态。具体登录与验证命令见[配置 `gh` / `glab`](platform-cli-auth.md)。
 
 首次启动前，从示例生成本地配置。
 
@@ -75,9 +75,9 @@ teamwork-review-agents start
 - 宿主机变量名：`GITHUB_TOKEN`
 - Secret：开启
 - Prompt：关闭
-- 进程：关闭
+- 进程：开启
 
-Provider 凭据会被系统强制视为 Secret，并禁止进入 Prompt 和 Codex 子进程。如果是在服务启动后才设置宿主机环境变量，需要由你手动重启服务，让新进程继承该变量。
+Provider 凭据会被系统强制视为 Secret，默认不进入 Prompt，但会传给 Agent、工具命令和仓库 CI。如果是在服务启动后才设置宿主机环境变量，需要由你手动重启服务，让新进程继承该变量。
 
 在 Windows 中，`$env:GITHUB_TOKEN` 或 `$env:GITLAB_TOKEN` 只属于当前 PowerShell 会话及其后代进程。使用这种方式时，必须从同一个 PowerShell 会话启动 Teamwork；如果改为用户级环境变量或由 Windows 服务管理器、任务计划程序注入，也只有之后创建的服务进程能够读取。不要在文档、截图或 Git 仓库中填写真实 Token。
 
@@ -111,7 +111,7 @@ API Key 与 YAML 配置历史分开保存，不会进入 Prompt、Agent 工具�
 - Skill 和允许调用的 sub-agent 是否符合最小权限原则。
 - 总超时和无进展超时是否适合任务时长。
 
-命令联网权限与 Codex 的联网搜索是两项独立配置。Provider Token 默认不进入 Agent；只有管理员确认风险并开启该变量的“进入进程”后才会传入。`gh` / `glab` 默认使用本机钥匙串或各自配置目录中的登录态。
+命令联网权限与 Codex 的联网搜索是两项独立配置。Provider Token 默认进入 Agent 进程，`gh` / `glab` 会优先使用当前仓库解析出的 Token；管理员可以关闭“进程”，使 CLI 回退到本机钥匙串或各自配置目录中的登录态。
 
 Codex CLI 的命令、账号环境与驱动专属参数在“Provider”页配置；后台并发、Git 超时、无进展超时和外层沙盒在“全局配置与环境”页配置。
 
@@ -158,7 +158,7 @@ Codex CLI 的命令、账号环境与驱动专属参数在“Provider”页配�
 
 - `teamwork-review-agents validate` 通过。
 - Codex、`gh` / `glab` 使用启动服务的同一系统用户登录。
-- Provider Token 来自宿主机环境，未进入 Prompt 或 Codex 进程。
+- Provider Token 来自宿主机环境，未进入 Prompt，但默认进入 Codex、工具命令和仓库 CI 进程。
 - 仓库基础目录已就绪，扫描结果中能看到目标 PR / MR。
 - 事件符合预期后才启用触发规则。
 - 能在“运行与日志”查看 Agent 的消息、最终结果和运行详情。

@@ -220,8 +220,8 @@ def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> Non
     assert "provider-secret" not in manager.store.get_config_version(versions[0]["revision"])["content"]
 
 
-def test_provider_token_defaults_to_secret_without_exposure(tmp_path) -> None:
-    """Provider Token 未显式声明暴露选项时必须采用安全默认值。"""
+def test_provider_token_defaults_to_secret_with_process_exposure(tmp_path) -> None:
+    """Provider Token 未显式声明时应脱敏、避开 Prompt 并进入进程。"""
 
     config_path = write_config(tmp_path)
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -238,11 +238,39 @@ def test_provider_token_defaults_to_secret_without_exposure(tmp_path) -> None:
     definition = config.environment.global_variables["GITHUB_TEST_TOKEN"]
     assert definition.secret is True
     assert definition.expose_to_prompt is False
-    assert definition.expose_to_process is False
+    assert definition.expose_to_process is True
 
     repository = config.repository_map()["first"]
     resolved = resolve_repository_process_environment(config, repository, "manual-ci")
     assert resolved.prompt_values["GITHUB_TEST_TOKEN"] == ""
+    assert resolved.process_values["GITHUB_TEST_TOKEN"] == "provider-secret"
+    assert resolved.audit_values["GITHUB_TEST_TOKEN"] == MASK
+
+
+def test_provider_token_preserves_explicit_process_opt_out(tmp_path) -> None:
+    """已有 Provider Token 明确关闭进程暴露时必须继续保持关闭。"""
+
+    config_path = write_config(tmp_path)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["environment"]["global"]["GITHUB_TEST_TOKEN"] = {
+        "value": "provider-secret",
+        "secret": False,
+        "expose_to_prompt": False,
+        "expose_to_process": False,
+    }
+    config_path.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    definition = config.environment.global_variables["GITHUB_TEST_TOKEN"]
+    assert definition.secret is True
+    assert definition.expose_to_prompt is False
+    assert definition.expose_to_process is False
+
+    repository = config.repository_map()["first"]
+    resolved = resolve_repository_process_environment(config, repository, "manual-ci")
     assert "GITHUB_TEST_TOKEN" not in resolved.process_values
     assert resolved.audit_values["GITHUB_TEST_TOKEN"] == MASK
 
@@ -916,7 +944,7 @@ def test_web_api_saves_providers_independently_and_updates_references(
 
 
 def test_new_provider_token_name_resets_existing_variable_exposure(tmp_path) -> None:
-    """普通变量新成为 Provider Token 时必须先关闭 Prompt 与进程暴露。"""
+    """普通变量新成为 Provider Token 时应关闭 Prompt 并开启进程。"""
 
     config_path = write_config(tmp_path)
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -954,7 +982,7 @@ def test_new_provider_token_name_resets_existing_variable_exposure(tmp_path) -> 
     assert variable["value"] == MASK
     assert variable["secret"] is True
     assert variable["expose_to_prompt"] is False
-    assert variable["expose_to_process"] is False
+    assert variable["expose_to_process"] is True
 
 
 def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -> None:

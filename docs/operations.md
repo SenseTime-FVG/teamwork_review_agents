@@ -16,14 +16,14 @@
 
 | 凭据 | 用途 | 是否传给 Codex |
 | --- | --- | --- |
-| Provider Token | 扫描 GitHub / GitLab API | 默认否；可显式开启 Prompt 或进程暴露 |
+| Provider Token | 扫描 GitHub / GitLab API，并为 Agent、工具命令和仓库 CI 提供平台身份 | 默认进入进程，不进入 Prompt |
 | Codex 登录 | 运行 `codex exec` | 由 Codex Home 管理 |
 | `gh` / `glab` 登录 | 评论、推送、创建或合并 PR / MR | CLI 自行读取 |
 | 管理员 Token | 保护管理 API | 否 |
 
 Provider Token 按仓库环境、全局环境、服务进程宿主机环境的顺序读取同名变量。仓库层和全局层推荐使用 `from_system`，避免把真实值写入 `config.yaml`；某层已经配置但解析为空时不会向更宽权限层静默降级。
 
-Provider Token 始终按 Secret 脱敏，Prompt 和进程暴露开关默认关闭。管理界面从关闭切换为开启时会要求确认风险；直接编辑 YAML 时也应仅在确有需要时显式设为 `true`。开启 Prompt 暴露后模型可读取明文，开启进程暴露后 Agent、工具命令和仓库 CI 都可读取该变量。写平台操作仍推荐使用单独的最小权限身份和 `gh` / `glab` 登录态。
+Provider Token 始终按 Secret 脱敏，Prompt 暴露默认关闭，进程暴露默认开启。Agent、工具命令和仓库 CI 因而可以读取当前仓库解析出的变量，`gh` / `glab` 会优先使用该身份；不需要时可关闭“进程”。开启 Prompt 暴露仍会让模型读取明文并要求额外确认。建议为每个仓库使用满足任务所需权限的独立 Token，并保留最小权限的本机 CLI 登录态作为后备。
 
 ## 3. Codex 运行时
 

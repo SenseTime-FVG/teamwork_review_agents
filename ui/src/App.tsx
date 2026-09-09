@@ -1409,7 +1409,7 @@ function EnvironmentEditor(props: {
       next[nextName] = protectProviderVariable(
         nextName,
         becameProviderCredential
-          ? { ...variable, expose_to_prompt: false, expose_to_process: false }
+          ? { ...variable, expose_to_prompt: false, expose_to_process: true }
           : variable,
         protectedNames,
       );
@@ -1582,7 +1582,7 @@ function EnvironmentEditor(props: {
         </div>
         <p className="section-note">Secret 默认不会进入 Prompt，日志与配置历史中会显示为 ********。</p>
         {entries.some(([name]) => protectedNames.has(name)) && (
-          <p className="section-note credential-note">Provider Token 始终按 Secret 脱敏，默认不进入 Prompt 或进程；开启任一暴露范围前会要求确认风险。</p>
+          <p className="section-note credential-note">Provider Token 始终按 Secret 脱敏，默认进入 Agent、工具命令和仓库 CI 进程，但不进入 Prompt；关闭后可按需再次确认开启。</p>
         )}
       </section>
       <AgentActionConfirmationDialog
@@ -2458,7 +2458,7 @@ function GlobalEnvironment(props: {
       </section>
       <EnvironmentEditor
         title="全局环境变量"
-        description="普通变量可由仓库和 Agent 覆盖；Provider Token 作为默认值，可由仓库同名变量覆盖，且默认不进入 Prompt 或进程。"
+        description="普通变量可由仓库和 Agent 覆盖；Provider Token 可由仓库同名变量覆盖，默认进入运行进程但不进入 Prompt。"
         value={props.document.environment.global}
         protectedNames={protectedNames}
         onChange={(global) => props.onChange({ ...props.document, environment: { global } })}
@@ -4249,7 +4249,7 @@ function RepositoryConnectionsEditor(props: {
             const tokenHelp = !tokenEnvironment
               ? "填写 Provider Token 的变量名"
               : hasGlobalToken
-                ? "默认已由“全局环境”配置；仓库可用同名变量覆盖，默认只供服务侧平台 API 使用"
+                ? "默认已由“全局环境”配置；仓库可用同名变量覆盖，并默认传给 Agent、工具命令和仓库 CI"
                 : `仓库可配置同名变量；否则从启动服务的宿主机环境 ${tokenEnvironment} 读取`;
             const referencedRepositories = props.document.repositories.filter((repository) => repository.provider === name).length;
             return (
@@ -5106,7 +5106,7 @@ function RepositoryDetailEditor(props: {
             compact
             title="仓库环境变量"
             description={providerTokenName
-              ? `普通变量会覆盖全局配置；Provider Token 变量 ${providerTokenName} 配置在这里时，扫描、状态和评论优先使用此仓库的值。`
+              ? `普通变量会覆盖全局配置；Provider Token 变量 ${providerTokenName} 配置在这里时，扫描、状态、评论和 Agent 进程优先使用此仓库的值。`
               : "普通变量会覆盖全局配置；同名变量由更具体的一层覆盖。"}
             value={repository.environment ?? {}}
             protectedNames={protectedNames}
@@ -6622,7 +6622,7 @@ function AgentsEditor(props: {
                   </p>
                 )}
                 <p className="network-credential-note">
-                  Provider Token 默认不进入 Codex；只有在环境变量中确认风险并开启“进程”后才会传入。gh / glab 默认仍使用当前系统钥匙串或各自 CLI 登录态。
+                  Provider Token 默认进入 Agent 进程，gh / glab 会优先使用当前仓库解析出的 Token；关闭“进程”后才回退到系统钥匙串或各自 CLI 登录态。
                 </p>
               </section>
               <section className="network-permission-section">
@@ -6732,13 +6732,13 @@ function AgentsEditor(props: {
               <EnvironmentEditor
                 compact
                 title="Agent 环境变量"
-                description="普通变量会覆盖全局和仓库配置；Provider Token 始终按 Secret 脱敏，其 Prompt 与进程暴露范围可在确认风险后独立开启，不会改变服务侧平台凭据。"
+                description="普通变量会覆盖全局和仓库配置；Provider Token 始终按 Secret 脱敏，默认进入进程但不进入 Prompt，两项范围仍可独立调整。"
                 value={agent.environment ?? {}}
                 protectedNames={protectedNames}
                 onChange={(environment) => update(name, { environment })}
               />
               <p className="network-credential-note">
-                临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接；Provider Token 默认不进入 Agent，显式开启“进程”后除外。
+                临时 HOME 与独立 Git 工作区相互独立：运行工作区隔离仓库文件和 Git 元数据，临时 HOME 隔离 <code>~/.cache</code>、<code>~/.config</code> 等用户级写入。Codex Home 与已存在的 gh / glab / Git / SSH 登录入口会单独桥接；Provider Token 默认进入 Agent 进程并优先提供平台认证，也可以显式关闭。
               </p>
             </article>
           );
