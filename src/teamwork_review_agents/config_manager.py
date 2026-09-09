@@ -33,11 +33,11 @@ class ConfigRevisionConflict(ValueError):
     """配置版本已经变化，当前局部修改不能安全合并。"""
 
 
-def _disable_new_provider_credential_exposure(
+def _apply_new_provider_credential_exposure_defaults(
     document: dict[str, Any],
     token_names: set[str],
 ) -> None:
-    """新成为 Provider Token 的同名变量先恢复为安全默认值。"""
+    """让新成为 Provider Token 的同名变量采用凭据暴露默认值。"""
 
     if not token_names:
         return
@@ -74,7 +74,7 @@ def _disable_new_provider_credential_exposure(
                 continue
             definition["secret"] = True
             definition["expose_to_prompt"] = False
-            definition["expose_to_process"] = False
+            definition["expose_to_process"] = True
             environment_map[name] = definition
 
 
@@ -545,7 +545,7 @@ class ConfigManager:
                 for item in next_providers.values()
                 if isinstance(item, dict) and item.get("token_env")
             }
-            _disable_new_provider_credential_exposure(
+            _apply_new_provider_credential_exposure_defaults(
                 document,
                 next_token_names - previous_token_names,
             )

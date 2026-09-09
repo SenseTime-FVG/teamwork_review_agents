@@ -1,6 +1,6 @@
 # 配置 `gh` / `glab`
 
-Teamwork 的 Provider Token 默认只供扫描器访问平台 API，不能自动代替 Agent 使用的 `gh` / `glab` 登录态。即使显式开启 Token 的进程暴露，仍建议为平台写操作使用启动 Teamwork 服务的同一系统用户完成下列 CLI 登录。
+Teamwork 的 Provider Token 默认进入 Agent 进程，`gh` / `glab` 会优先使用当前仓库解析出的 `GITHUB_TOKEN` / `GITLAB_TOKEN`。CLI 可执行文件仍安装在本机；管理员关闭 Token 的“进程”暴露或 Token 不可用时，才依赖启动 Teamwork 服务的同一系统用户保存的 CLI 登录态。建议完成下面的登录检查，把它作为后备认证。
 
 ## GitHub：`gh`
 

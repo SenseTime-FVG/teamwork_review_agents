@@ -699,7 +699,7 @@ class AppConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def default_provider_credential_exposure(cls, value: Any) -> Any:
-        """Provider Token 始终按 Secret 处理，未声明的暴露选项默认关闭。"""
+        """Provider Token 始终脱敏，默认只允许进入运行进程。"""
 
         if isinstance(value, dict):
             return protect_provider_credentials(value)
@@ -909,7 +909,7 @@ def _resolve_path(base_dir: Path, value: str | Path) -> Path:
 
 
 def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
-    """复制配置并为所有 Provider Token 设置安全的默认暴露策略。"""
+    """复制配置并为所有 Provider Token 设置默认暴露策略。"""
 
     data = copy.deepcopy(raw)
     providers = data.get("providers", {})
@@ -958,7 +958,7 @@ def protect_provider_credentials(raw: dict[str, Any]) -> dict[str, Any]:
                 continue
             definition["secret"] = True
             definition.setdefault("expose_to_prompt", False)
-            definition.setdefault("expose_to_process", False)
+            definition.setdefault("expose_to_process", True)
             environment_map[name] = definition
     return data
 
