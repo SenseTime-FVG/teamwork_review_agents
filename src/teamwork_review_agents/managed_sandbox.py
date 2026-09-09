@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .config import AgentConfig
+from .process_control import hidden_process_options
 from .subprocess_utils import resolve_executable
 
 
@@ -99,6 +100,7 @@ def _inspect_cached(
             errors="replace",
             timeout=_INSPECTION_TIMEOUT_SECONDS,
             env=environment,
+            **hidden_process_options(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return ManagedSandboxInspection(

@@ -20,6 +20,7 @@ from .config import AppConfig, RepositoryConfig
 from .filesystem import remove_tree
 from .models import stable_hash
 from .preflight_cache import repository_cache_root
+from .process_control import hidden_process_options
 from .subprocess_utils import resolve_executable
 
 
@@ -323,6 +324,7 @@ def _run_git_paths(workspace: Path, *, ignored: bool) -> set[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **hidden_process_options(),
     )
     if process.returncode != 0:
         raise WorkspaceSnapshotError("无法读取准备步骤产生的未跟踪文件")
@@ -361,6 +363,7 @@ def _workspace_head(workspace: Path) -> str | None:
         stderr=subprocess.DEVNULL,
         text=True,
         check=False,
+        **hidden_process_options(),
     )
     value = process.stdout.strip()
     return value if process.returncode == 0 and value else None

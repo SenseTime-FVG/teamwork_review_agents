@@ -22,6 +22,12 @@ _WINDOWS_DETACHED_PROCESS = getattr(
     "DETACHED_PROCESS",
     0x00000008,
 )
+# 标准库仅在 Windows 暴露此常量；兼容值供跨平台导入和参数测试使用。
+_WINDOWS_CREATE_NO_WINDOW = getattr(
+    subprocess,
+    "CREATE_NO_WINDOW",
+    0x08000000,
+)
 
 
 @dataclass(frozen=True)
@@ -32,13 +38,24 @@ class ProcessIdentity:
     started_at: str
 
 
+def hidden_process_options() -> dict[str, Any]:
+    """隐藏 Windows 非交互命令的控制台，不改变其他平台的会话行为。"""
+
+    if os.name == "nt":
+        return {"creationflags": _WINDOWS_CREATE_NO_WINDOW}
+    return {}
+
+
 def process_group_options(*, detached: bool = False) -> dict[str, Any]:
-    """返回当前平台创建独立进程组所需的 subprocess 参数。"""
+    """创建独立进程组；Windows 普通后台命令不创建控制台窗口。"""
 
     if os.name == "nt":
         creationflags = _WINDOWS_CREATE_NEW_PROCESS_GROUP
         if detached:
+            # 服务保持脱离控制台；该标志会让 CREATE_NO_WINDOW 失效，不混用。
             creationflags |= _WINDOWS_DETACHED_PROCESS
+        else:
+            creationflags |= hidden_process_options()["creationflags"]
         return {"creationflags": creationflags}
     return {"start_new_session": True}
 

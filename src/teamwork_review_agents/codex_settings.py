@@ -19,6 +19,7 @@ from .config import (
     ManagedSandboxConfig,
 )
 from .managed_sandbox import inspect_managed_sandbox
+from .process_control import hidden_process_options
 
 
 def toml_value(value: CodexConfigValue) -> str:
@@ -361,6 +362,7 @@ def inspect_codex_binary(
             errors="replace",
             timeout=5,
             env=environment,
+            **hidden_process_options(),
         )
         output = (result.stdout or result.stderr).strip()
     except (OSError, subprocess.SubprocessError) as exc:
@@ -504,6 +506,7 @@ def read_bundled_models(
             errors="replace",
             timeout=8,
             env=environment,
+            **hidden_process_options(),
         )
         document = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
