@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import teamwork_review_agents.workspace as workspace_module
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.git_auth import GitCredentialContext
@@ -30,6 +31,8 @@ from teamwork_review_agents.workspace import (
     validate_isolated_clone,
     validate_linked_workspace,
     validate_run_workspace,
+    publish_isolated_clone,
+    workspace_publish_lock_key,
     WorkspaceCancelled,
     WorkspaceError,
     WorkspaceSnapshotSuperseded,
@@ -50,6 +53,188 @@ def run_git(*arguments: str, cwd=None) -> str:
         errors="replace",
     )
     return result.stdout.strip()
+
+
+def test_publish_isolated_clone_retries_windows_permission_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """临时文件占用返回 WinError 5 时应退避后继续发布。"""
+
+    source = tmp_path / "source"
+    staged = tmp_path / "staged"
+    target = tmp_path / "target"
+    source.mkdir()
+    staged.mkdir()
+    attempts = 0
+    original_rename = Path.rename
+
+    def flaky_rename(path: Path, destination: Path) -> Path:
+        nonlocal attempts
+        if path == staged and attempts == 0:
+            attempts += 1
+            error = PermissionError("文件暂时被占用")
+            error.winerror = 5
+            raise error
+        attempts += 1
+        return original_rename(path, destination)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
+    monkeypatch.setattr(
+        workspace_module,
+        "validate_isolated_clone",
+        lambda _source, candidate, *, timeout_seconds: candidate,
+    )
+
+    result = publish_isolated_clone(
+        source,
+        staged,
+        target,
+        timeout_seconds=1,
+    )
+
+    assert result == target.resolve()
+    assert target.is_dir()
+    assert not staged.exists()
+    assert attempts == 2
+
+
+def test_publish_isolated_clone_retries_windows_sharing_violation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """临时文件占用返回 WinError 32 时也应退避后继续发布。"""
+
+    source = tmp_path / "source"
+    staged = tmp_path / "staged"
+    target = tmp_path / "target"
+    source.mkdir()
+    staged.mkdir()
+    attempts = 0
+    original_rename = Path.rename
+
+    def flaky_rename(path: Path, destination: Path) -> Path:
+        nonlocal attempts
+        if path == staged and attempts == 0:
+            attempts += 1
+            error = PermissionError("文件共享冲突")
+            error.winerror = 32
+            raise error
+        attempts += 1
+        return original_rename(path, destination)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
+    monkeypatch.setattr(
+        workspace_module,
+        "validate_isolated_clone",
+        lambda _source, candidate, *, timeout_seconds: candidate,
+    )
+
+    assert publish_isolated_clone(source, staged, target, timeout_seconds=1) == (
+        target.resolve()
+    )
+    assert attempts == 2
+
+
+def test_publish_isolated_clone_does_not_retry_unrelated_os_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """非 WinError 5/32 的系统错误不得被吞掉或重复执行。"""
+
+    source = tmp_path / "source"
+    staged = tmp_path / "staged"
+    target = tmp_path / "target"
+    source.mkdir()
+    staged.mkdir()
+    attempts = 0
+
+    def failing_rename(_path: Path, _destination: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError("其他系统错误")
+        error.winerror = 87
+        raise error
+
+    monkeypatch.setattr(Path, "rename", failing_rename)
+
+    with pytest.raises(PermissionError, match="其他系统错误"):
+        publish_isolated_clone(source, staged, target)
+
+    assert attempts == 1
+
+
+def test_publish_isolated_clone_reuses_target_created_during_publish(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """发布竞态中目标目录出现且有效时应复用目标，不覆盖它。"""
+
+    source = tmp_path / "source"
+    staged = tmp_path / "staged"
+    target = tmp_path / "target"
+    source.mkdir()
+    staged.mkdir()
+    target_created = False
+
+    def competing_rename(path: Path, destination: Path) -> Path:
+        nonlocal target_created
+        destination.mkdir()
+        target_created = True
+        error = PermissionError("目标已被其他流程创建")
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr(Path, "rename", competing_rename)
+    monkeypatch.setattr(
+        workspace_module,
+        "validate_isolated_clone",
+        lambda _source, candidate, *, timeout_seconds: candidate,
+    )
+
+    result = publish_isolated_clone(source, staged, target)
+
+    assert target_created
+    assert result == target.resolve()
+    assert target.is_dir()
+    assert staged.is_dir()
+
+
+def test_publish_isolated_clone_does_not_replace_invalid_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """已有目标校验失败时应保留目标并立即报错。"""
+
+    source = tmp_path / "source"
+    staged = tmp_path / "staged"
+    target = tmp_path / "target"
+    source.mkdir()
+    staged.mkdir()
+    target.mkdir()
+    marker = target / "保留现场.txt"
+    marker.write_text("保留", encoding="utf-8")
+
+    def invalid_target(*_args, **_kwargs):
+        raise WorkspaceError("目标不是有效 clone")
+
+    monkeypatch.setattr(workspace_module, "validate_isolated_clone", invalid_target)
+
+    with pytest.raises(WorkspaceError, match="目标不是有效 clone"):
+        publish_isolated_clone(source, staged, target)
+
+    assert marker.read_text(encoding="utf-8") == "保留"
+    assert staged.is_dir()
+
+
+def test_workspace_publish_lock_key_uses_absolute_target(tmp_path) -> None:
+    """发布锁键应稳定绑定到目标目录绝对路径。"""
+
+    target = tmp_path / "worktree"
+
+    assert workspace_publish_lock_key(target) == (
+        f"workspace_publish:{target.resolve()}"
+    )
 
 
 def test_git_command_display_removes_url_credentials_and_query() -> None:

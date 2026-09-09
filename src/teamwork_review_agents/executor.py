@@ -55,6 +55,7 @@ from .workspace import (
     prepare_change_request_workspace,
     prepare_default_branch_workspace,
     repository_git_lock_key,
+    workspace_publish_lock_key,
     run_workspace_kind,
     validate_run_workspace,
     WorkspaceCancelled,
@@ -741,6 +742,28 @@ class AgentExecutor:
                                 event_loop,
                             )
 
+                        def report_workspace_publish(
+                            publish_event: dict[str, object],
+                        ) -> None:
+                            """从 Git 工作线程向运行日志提交发布阶段诊断。"""
+
+                            event_name = str(
+                                publish_event.get("event", "unknown")
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                persist_log(
+                                    "system",
+                                    f"workspace.publish.{event_name}",
+                                    {
+                                        **publish_event,
+                                        "repository_id": configured_repository.id,
+                                        "run_id": reservation.run_id,
+                                        "attempt": reservation.attempts,
+                                    },
+                                ),
+                                event_loop,
+                            )
+
                         git_cancel_check = lambda: self._cancel_requested(
                             reservation.run_id
                         )
@@ -796,16 +819,30 @@ class AgentExecutor:
                         )
                         uses_independent_clone = "workspace" in agent.write_scopes
                         if uses_independent_clone:
-                            active_workspace = await asyncio.to_thread(
-                                ensure_isolated_clone,
-                                configured_repository.workspace,
-                                active_workspace,
-                                change_ref,
-                                change_ref=change_ref,
-                                timeout_seconds=self.config.runtime.git_timeout_seconds,
-                                cancel_check=git_cancel_check,
-                                progress_callback=report_git_progress,
+                            publish_owner = (
+                                f"{reservation.run_id}:attempt:{reservation.attempts}:"
+                                f"{uuid.uuid4()}"
                             )
+                            publish_lease = ResourceLease(
+                                self.store,
+                                [workspace_publish_lock_key(active_workspace)],
+                                publish_owner,
+                                ttl_seconds=self.config.runtime.lock_ttl_seconds,
+                                timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                                cancel_check=git_cancel_check,
+                            )
+                            async with publish_lease:
+                                active_workspace = await asyncio.to_thread(
+                                    ensure_isolated_clone,
+                                    configured_repository.workspace,
+                                    active_workspace,
+                                    change_ref,
+                                    change_ref=change_ref,
+                                    timeout_seconds=self.config.runtime.git_timeout_seconds,
+                                    cancel_check=git_cancel_check,
+                                    progress_callback=report_git_progress,
+                                    publish_callback=report_workspace_publish,
+                                )
                         else:
                             active_workspace = await asyncio.to_thread(
                                 ensure_isolated_worktree,
