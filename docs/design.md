@@ -1123,15 +1123,15 @@ Provider 的 `token_env` 是平台凭据的逻辑变量名。每次对具体仓�
 
 扫描器仍保持一个扫描周期和现有仓库顺序，但 Provider HTTP 客户端改为在每个仓库边界内创建和关闭，创建时使用该仓库解析出的 Token。一个仓库的 Token 缺失、认证失败或权限不足只记录为该仓库扫描错误，不能阻止同一 Provider 下其他仓库继续扫描。Commit Status、Preflight 失败评论、Agent 托管评论及评论删除等所有服务侧平台写操作必须复用相同的仓库级解析规则，避免扫描与写回身份不一致。
 
-Provider Token 无论来自仓库、全局还是宿主机，都继续强制标记为 Secret；默认不进入 Prompt 或 Agent/CI 子进程，是否显式暴露由阶段 123 的独立开关控制。配置历史明文和普通日志始终移除凭据，错误摘要与 Preflight 输出继续使用本仓库实际解析出的 Token 脱敏。管理界面的 Provider Token 说明和仓库环境变量说明应明确该覆盖关系；旧配置没有仓库级 Token 时保持现有“全局 → 宿主机”行为，不新增 Provider 字段或数据库迁移。
+Provider Token 无论来自仓库、全局还是宿主机，都继续强制标记为 Secret；默认不进入 Prompt，默认进入 Agent/CI 子进程。是否进入这些普通进程由阶段 123 的独立开关控制，但 Teamwork 管理的原生 Git 凭证不受该开关影响。基础仓库 clone/fetch、Agent 工作区 Git 和 CI 中的原生 Git 通过本轮临时 askpass 上下文使用解析出的 Token。配置历史明文和普通日志始终移除凭据，错误摘要与 Preflight 输出继续使用本仓库实际解析出的 Token 脱敏。管理界面的 Provider Token 说明和仓库环境变量说明应明确该覆盖关系；旧配置没有仓库级 Token 时保持现有“全局 → 宿主机”行为，不新增 Provider 字段或数据库迁移。
 
 ## 123. Provider Token 显式暴露控制与风险确认
 
-Provider Token 继续强制按 Secret 处理，固定值在配置读取、配置历史、运行快照、日志和错误摘要中保持脱敏；Secret 身份本身不再等同于禁止运行使用。Provider Token 的 `expose_to_prompt` 与 `expose_to_process` 改为独立、显式的用户配置：两项缺省都为 `false`，旧配置未声明时保持不暴露；用户明确配置 `true` 时，运行时不得再按变量名将其静默删除。
+Provider Token 继续强制按 Secret 处理，固定值在配置读取、配置历史、运行快照、日志和错误摘要中保持脱敏；Secret 身份本身不再等同于禁止运行使用。Provider Token 的 `expose_to_prompt` 与 `expose_to_process` 继续独立配置：Prompt 缺省关闭，进程缺省开启；用户明确配置的值保持不变。原生 Git 使用的临时凭证上下文不由 `expose_to_process` 控制。
 
 开启 `expose_to_prompt` 后，本轮按全局、仓库、Agent 优先级解析出的 Token 可以进入 Prompt 模板上下文，模型能够读取该明文，但持久化的 Prompt 快照和普通日志仍必须经 Secret 脱敏。开启 `expose_to_process` 后，Token 可以进入 Agent 的 Codex CLI 环境、模型基座工具命令环境和仓库 Preflight / CI 环境；关闭时上述进程都不得继承。Provider 服务侧扫描、状态和评论继续按阶段 122 的仓库、全局、宿主机优先级解析，不受暴露开关影响。
 
-管理界面识别到名称被任一 Provider 的 `token_env` 使用时，自动将变量设为 Secret，并默认关闭 Prompt 与进程暴露。用户把任一关闭的暴露开关改为开启时，必须先显示风险确认弹窗：Prompt 确认明确说明 Token 会发送给模型并可能被模型输出；进程确认明确说明 Agent、仓库代码和 CI 命令可读取并可能外传 Token。取消不改变开关，关闭开关不需要确认，已开启状态在编辑其他字段或保存时不重复确认。直接编辑 YAML 视为显式配置，不依赖管理界面弹窗。
+管理界面识别到名称被任一 Provider 的 `token_env` 使用时，自动将变量设为 Secret，默认关闭 Prompt 并开启进程暴露。用户把 Prompt 或进程开关改为开启时，按原有风险确认流程处理；取消不改变开关。关闭进程暴露只移除普通 Agent、工具和 CI 环境中的变量，不影响 Teamwork 原生 Git 凭证。
 
 Provider Token 的 Secret 开关保持锁定开启，避免用户允许运行使用后又意外关闭审计脱敏。配置加载器只为未显式声明的暴露字段应用安全默认值，不能覆盖用户明确保存的 `true`；前后端均应覆盖新建变量、变量重命名为 Provider Token、已有配置回读和开关确认。保留 Provider Token 与 Codex/OpenAI 模型凭据变量不可复用的限制，不改变 `gh` / `glab` 独立登录边界。
 

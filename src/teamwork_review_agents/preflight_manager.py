@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .config import AppConfig, RepositoryConfig
 from .config_manager import ConfigManager
+from .environment import resolve_provider_token, resolve_repository_process_environment
 from .filesystem import temporary_directory
+from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, ResourceLease
 from .models import PreflightResult
 from .preflight import (
@@ -153,6 +155,23 @@ class ManualPreflightManager:
         )
         manager = None
         checkout: Path | None = None
+        git_credentials = GitCredentialContext(
+            resolve_provider_token(config, provider, repository),
+            provider_kind=provider.kind,
+        ).start()
+        repository_process_environment = resolve_repository_process_environment(
+            config,
+            repository,
+            run_id,
+        )
+        ci_git_environment = (
+            {
+                provider.token_env: git_credentials.token,
+                **git_credentials.environment,
+            }
+            if provider.token_env in repository_process_environment.process_values
+            else None
+        )
         try:
             await asyncio.to_thread(
                 store.initialize_preflight_steps,
@@ -268,6 +287,7 @@ class ManualPreflightManager:
                         environment=build_preflight_environment(
                             home=home,
                             cache_environment=cache_environment,
+                            git_environment=ci_git_environment,
                         ),
                         on_step_update=record_step,
                         on_output=record_output,
@@ -306,6 +326,7 @@ class ManualPreflightManager:
             if checkout is not None and manager is not None:
                 with suppress(Exception):
                     await asyncio.to_thread(manager.__exit__, None, None, None)
+            git_credentials.close()
             await asyncio.to_thread(store.finish_preflight_run, result)
             await self._append_log(
                 run_id,

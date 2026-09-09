@@ -93,7 +93,7 @@ Agent 权限与能力摘要：
 
 ![运行概览中的服务状态、扫描快照和变化事件](docs/assets/first-time-setup/05-overview.png)
 
-Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 始终按 Secret 脱敏，默认供扫描、Commit Status、托管评论以及 Agent、工具命令和仓库 CI 使用，但不进入 Prompt。`gh` / `glab` 仍使用本机安装的 CLI，认证会优先采用当前仓库解析出的 Token；管理员可以单独关闭“进入进程”，关闭后 CLI 才回退到本机登录态。已有配置中明确关闭该开关的选择保持不变。
+Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 始终按 Secret 脱敏，默认供扫描、Commit Status、托管评论以及 Agent、工具命令和仓库 CI 使用，但不进入 Prompt。基础仓库的原生 Git clone/fetch 会自动使用当前 Provider Token，不受环境变量“进程”选项影响；HTTPS Git 通过本轮临时 askpass 凭证认证，SSH 继续使用 SSH Agent。`gh` / `glab` 仍使用本机安装的 CLI，认证会优先采用当前仓库解析出的 Token；管理员可以单独关闭“进入进程”，关闭后 CLI 才回退到本机登录态。已有配置中明确关闭该开关的选择保持不变。
 
 本地 CI 当前仅支持 GitHub。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub 本地 CI 门禁](#github-本地-ci-门禁)。
 
@@ -464,7 +464,7 @@ Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改
 
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只隐式继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token 默认加入 CI 环境，管理员关闭对应变量的“进入进程”后才移除。Codex/OpenAI 模型凭据始终不会通过该开关进入 CI。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只隐式继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token 默认加入 CI 环境，管理员关闭对应变量的“进入进程”后才移除。CI 中的原生 Git 也会使用本轮临时 askpass 凭证。Codex/OpenAI 模型凭据始终不会通过该开关进入 CI。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 
 Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 

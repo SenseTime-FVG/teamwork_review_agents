@@ -13,6 +13,7 @@ import pytest
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig
 from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.git_auth import GitCredentialContext
 from teamwork_review_agents.executor import AgentExecutor
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.workspace import (
@@ -64,6 +65,34 @@ def test_git_command_display_removes_url_credentials_and_query() -> None:
     assert command == "git clone https://example.com/owner/demo.git /tmp/demo"
     assert "secret" not in command
     assert "hidden" not in command
+
+
+def test_git_credential_context_authenticates_without_exposing_token(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """原生 Git 子进程应能调用临时 askpass，命令参数和 helper 不保存 Token。"""
+
+    fake_git = tmp_path / "fake-git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$GIT_ASKPASS\"\n"
+        "printf '%s\\n' \"$TEAMWORK_GIT_TOKEN\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(
+        "teamwork_review_agents.workspace.shutil.which",
+        lambda _: str(fake_git),
+    )
+
+    with GitCredentialContext("provider-secret", provider_kind="github") as context:
+        result = _run_git(["fetch", "origin"])
+        assert result.stdout.splitlines()[1] == "provider-secret"
+        helper = Path(context.environment["GIT_ASKPASS"].split()[-1])
+        assert helper.exists()
+
+    assert not helper.exists()
 
 
 @pytest.mark.skipif(
