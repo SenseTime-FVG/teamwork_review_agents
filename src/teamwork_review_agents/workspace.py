@@ -79,6 +79,7 @@ class GitProgressEvent:
 
 
 GitProgressCallback = Callable[[GitProgressEvent], None]
+WorkspacePublishCallback = Callable[[dict[str, object]], None]
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,12 @@ def repository_git_lock_key(repository: RepositoryConfig) -> str:
     """返回基础仓库 fetch 与运行工作区管理共用的资源锁键。"""
 
     return f"git_repository:{repository.workspace.resolve()}"
+
+
+def workspace_publish_lock_key(target_workspace: Path) -> str:
+    """返回最终运行工作区发布阶段使用的目标路径锁键。"""
+
+    return f"workspace_publish:{target_workspace.resolve()}"
 
 
 def change_request_ref(provider: ProviderConfig, number: int) -> tuple[str, str]:
@@ -570,6 +577,169 @@ def ensure_isolated_worktree(
     )
 
 
+def publish_isolated_clone(
+    source_workspace: Path,
+    staged_workspace: Path,
+    target_workspace: Path,
+    *,
+    timeout_seconds: int = 600,
+    publish_callback: WorkspacePublishCallback | None = None,
+) -> Path:
+    """安全发布临时 clone，并处理目标竞争与 Windows 短暂占用。"""
+
+    source = source_workspace.resolve()
+    staged = staged_workspace.resolve()
+    target = target_workspace.resolve()
+    retry_delays = (0.1, 0.3, 1.0, 2.0, 5.0)
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    last_error: OSError | None = None
+
+    def report(
+        event: str,
+        *,
+        retry_index: int = 0,
+        winerror: int | None = None,
+        target_exists_before: bool | None = None,
+        target_exists_after: bool | None = None,
+    ) -> None:
+        """向上层报告发布阶段的可审计诊断信息。"""
+
+        if publish_callback is None:
+            return
+        payload: dict[str, object] = {
+            "event": event,
+            "source": str(source),
+            "staged": str(staged),
+            "target": str(target),
+            "retry_index": retry_index,
+        }
+        if winerror is not None:
+            payload["winerror"] = winerror
+        if target_exists_before is not None:
+            payload["target_exists_before"] = target_exists_before
+        if target_exists_after is not None:
+            payload["target_exists_after"] = target_exists_after
+        publish_callback(payload)
+
+    report("started", target_exists_before=target.exists())
+    for retry_index in range(len(retry_delays) + 1):
+        target_exists_before = target.exists()
+        if target_exists_before:
+            try:
+                result = validate_isolated_clone(
+                    source,
+                    target,
+                    timeout_seconds=timeout_seconds,
+                )
+            except WorkspaceError:
+                report(
+                    "failed",
+                    retry_index=retry_index,
+                    target_exists_before=True,
+                    target_exists_after=True,
+                )
+                raise
+            report(
+                "reused",
+                retry_index=retry_index,
+                target_exists_before=True,
+                target_exists_after=True,
+            )
+            return result
+
+        try:
+            # 使用 rename 而不是 replace，避免并发时静默覆盖已有工作区。
+            staged.rename(target)
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            target_exists_after = target.exists()
+            if target_exists_after:
+                try:
+                    result = validate_isolated_clone(
+                        source,
+                        target,
+                        timeout_seconds=timeout_seconds,
+                    )
+                except WorkspaceError as validation_error:
+                    report(
+                        "failed",
+                        retry_index=retry_index,
+                        winerror=winerror,
+                        target_exists_before=False,
+                        target_exists_after=True,
+                    )
+                    raise WorkspaceError(
+                        f"目标运行工作区已被其他流程创建但校验失败：{target}"
+                    ) from validation_error
+                report(
+                    "reused",
+                    retry_index=retry_index,
+                    winerror=winerror,
+                    target_exists_before=False,
+                    target_exists_after=True,
+                )
+                return result
+            if winerror not in {5, 32}:
+                report(
+                    "failed",
+                    retry_index=retry_index,
+                    winerror=winerror,
+                    target_exists_before=False,
+                    target_exists_after=False,
+                )
+                raise
+            last_error = exc
+            if retry_index >= len(retry_delays):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            delay = min(retry_delays[retry_index], remaining)
+            report(
+                "retry",
+                retry_index=retry_index + 1,
+                winerror=winerror,
+                target_exists_before=False,
+                target_exists_after=False,
+            )
+            time.sleep(delay)
+            continue
+
+        try:
+            result = validate_isolated_clone(
+                source,
+                target,
+                timeout_seconds=timeout_seconds,
+            )
+        except WorkspaceError:
+            report(
+                "failed",
+                retry_index=retry_index,
+                target_exists_before=False,
+                target_exists_after=True,
+            )
+            raise
+        report(
+            "completed",
+            retry_index=retry_index,
+            target_exists_before=False,
+            target_exists_after=True,
+        )
+        return result
+
+    report(
+        "failed",
+        retry_index=len(retry_delays),
+        winerror=getattr(last_error, "winerror", None),
+        target_exists_before=False,
+        target_exists_after=target.exists(),
+    )
+    raise WorkspaceError(
+        "多次重试后仍无法发布运行工作区："
+        f"{target}（临时目录：{staged}）"
+    ) from last_error
+
+
 def ensure_isolated_clone(
     source_workspace: Path,
     target_workspace: Path,
@@ -579,6 +749,7 @@ def ensure_isolated_clone(
     timeout_seconds: int = 600,
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
+    publish_callback: WorkspacePublishCallback | None = None,
 ) -> Path:
     """从基础仓库快速创建拥有独立 `.git` 的运行 clone。"""
 
@@ -666,18 +837,13 @@ def ensure_isolated_clone(
             cancel_check=cancel_check,
             progress_callback=progress_callback,
         )
-        if target.exists():
-            return validate_isolated_clone(
-                source,
-                target,
-                timeout_seconds=timeout_seconds,
-            )
-        staged.replace(target)
-    return validate_isolated_clone(
-        source,
-        target,
-        timeout_seconds=timeout_seconds,
-    )
+        return publish_isolated_clone(
+            source,
+            staged,
+            target,
+            timeout_seconds=timeout_seconds,
+            publish_callback=publish_callback,
+        )
 
 
 def retained_marker_path(workspace: Path) -> Path:
