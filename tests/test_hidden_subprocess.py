@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ from teamwork_review_agents import (
     process_control,
     workspace_snapshot,
 )
-from teamwork_review_agents.process_control import process_group_options
+from teamwork_review_agents.process_control import process_group_options, terminate_process
 
 
 @pytest.mark.parametrize("platform", ["nt", "posix"])
@@ -176,7 +177,7 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
         import subprocess
         import sys
         import time
-        from teamwork_review_agents.process_control import hidden_process_options, process_group_options
+        from teamwork_review_agents.process_control import hidden_process_options, process_group_options, terminate_process
 
         started_at = time.monotonic()
         mode, command = sys.argv[1], json.loads(sys.argv[2])
@@ -225,10 +226,18 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
             code, stdout, stderr = asyncio.run(execute())
         else:
             options = hidden_process_options() if mode == "sync" else process_group_options()
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, **options)
             try:
-                completed = subprocess.run(command, input="pipe input", capture_output=True,
-                                           text=True, timeout=child_timeout, **options)
+                stdout, stderr = process.communicate("pipe input", timeout=child_timeout)
             except subprocess.TimeoutExpired as exc:
+                report("terminate_child_tree", pid=process.pid)
+                # 先清理后代，避免编译器等进程继续持有输出管道，导致读取无法结束。
+                terminate_process(process.pid, force=True, tree=True)
+                try:
+                    exc.stdout, exc.stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    report("child_pipe_cleanup_timeout")
                 # TimeoutExpired 即使在文本模式下也可能携带字节串。
                 stdout = exc.stdout or ""
                 stderr = exc.stderr or ""
@@ -236,7 +245,11 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
                        stdout=stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
                        stderr=stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr)
                 raise
-            code, stdout, stderr = completed.returncode, completed.stdout, completed.stderr
+            finally:
+                if process.poll() is None:
+                    terminate_process(process.pid, force=True, tree=True)
+                    process.wait(timeout=5)
+            code = process.returncode
         report("child_completed", returncode=code)
         # 原始输出交给 pytest 解析，解析失败时仍能看到 PowerShell 的真正错误。
         print(json.dumps({"code": code, "stdout": stdout, "stderr": stderr.strip()}))
@@ -246,30 +259,45 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
         f"模式：{mode}；程序：{command[0]}；"
         f"子进程超时：{child_timeout} 秒；父进程超时：{parent_timeout} 秒"
     )
-    try:
-        result = subprocess.run(
+    timed_out = False
+    cleanup_error = None
+    # 外层仅收集诊断，使用临时文件避免后代持有管道时 communicate 在超时后仍阻塞。
+    # 真正需要验证的子进程标准输入输出仍使用上方的 PIPE。
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
             [sys.executable, "-u", "-c", parent_code, mode, json.dumps(command), str(child_timeout)],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=parent_timeout,
-            check=False,
+            stdout=stdout_file,
+            stderr=stderr_file,
             **process_group_options(detached=True),
         )
-    except subprocess.TimeoutExpired as exc:
-        pytest.fail(
-            f"测试父进程等待超时；{context}；耗时：{time.monotonic() - started_at:.3f} 秒\n"
-            f"原始 stdout：{exc.stdout!r}\n原始 stderr / 阶段日志：{exc.stderr!r}",
-            pytrace=False,
+        try:
+            process.wait(timeout=parent_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            if process.poll() is None:
+                try:
+                    terminate_process(process.pid, force=True, tree=True)
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    cleanup_error = str(exc)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        result = subprocess.CompletedProcess(
+            process.args, process.returncode,
+            stdout_file.read().decode("utf-8", errors="replace"),
+            stderr_file.read().decode("utf-8", errors="replace"),
         )
     diagnostic = (
         f"{context}；耗时：{time.monotonic() - started_at:.3f} 秒；"
         f"父进程退出码：{result.returncode}\n"
         f"原始 stdout：\n{result.stdout}\n原始 stderr / 阶段日志：\n{result.stderr}"
     )
+    if cleanup_error:
+        diagnostic += f"\n进程树清理失败：{cleanup_error}"
+    if timed_out:
+        pytest.fail(f"测试父进程等待超时\n{diagnostic}", pytrace=False)
     assert result.returncode == 0, f"测试父进程执行失败\n{diagnostic}"
     try:
         report = json.loads(result.stdout)
