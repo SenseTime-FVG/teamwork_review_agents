@@ -15,6 +15,9 @@ from .agent_workspace import (
 )
 from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
+from .codex_executable import CodexRuntimeError, active_codex_executable
+from .runtime_readiness import check_runtime_readiness
+from .subprocess_utils import selected_environment, WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
     PromptRenderError,
@@ -67,6 +70,11 @@ from .workspace import (
 
 class AgentExecutionError(RuntimeError):
     """表示 Agent 配置、限额、资源或 Codex 执行失败。"""
+
+    def __init__(self, message: str, *, retryable: bool = True, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.error_code = error_code
 
 
 class AgentWorkspacePreparationError(RuntimeError):
@@ -572,6 +580,12 @@ class AgentExecutor:
             ),
         )
         if reservation is None:
+            failure = await asyncio.to_thread(self.store.agent_run_failure, idempotency_key)
+            if failure is not None and not failure["retryable"]:
+                raise AgentExecutionError(
+                    failure["error"] or "当前运行需要修正配置后手动重新触发",
+                    retryable=False, error_code=failure["error_code"],
+                )
             status = await asyncio.to_thread(
                 self.store.agent_run_status,
                 idempotency_key,
@@ -662,8 +676,32 @@ class AgentExecutor:
         )
         target_head_sha: str | None = None
         result: AgentResult
+        executable_token = active_codex_executable.set(None)
         try:
             async with lease:
+                if isinstance(runner, (CodexRunner, CodexModelRunner)):
+                    readiness_environment = resolve_environment(
+                        self.config, configured_repository, agent, event, reservation.run_id,
+                        include_change_request=task is None and event is not None,
+                        schedule=resolved_schedule,
+                    )
+                    redactor = SecretRedactor(
+                        (*readiness_environment.secret_values, git_credentials.token)
+                    )
+                    host_environment = selected_environment(
+                        WINDOWS_REQUIRED_ENVIRONMENT_NAMES | {"PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL"}
+                    )
+                    host_environment.update(readiness_environment.process_values)
+                    resolution = await asyncio.to_thread(
+                        check_runtime_readiness, self.config, agent, configured_repository,
+                        host_environment, cli_execution=isinstance(runner, CodexRunner),
+                    )
+                    active_codex_executable.set(resolution)
+                    await persist_log("system", "run.runtime_ready", redactor.data({
+                        "stage": "before_workspace", "run_id": reservation.run_id,
+                        "attempt": reservation.attempts,
+                        **(resolution.as_dict() if resolution else {"codex_required": False}),
+                    }))
                 if task is not None and inherit_workspace:
                     preparing = await asyncio.to_thread(
                         self.store.mark_agent_run_preparing,
@@ -1068,6 +1106,18 @@ class AgentExecutor:
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
+        except CodexRuntimeError as exc:
+            await persist_log("system", "run.runtime_unavailable", redactor.data({
+                **exc.details, "stage": "before_workspace" if active_workspace is None else "execution",
+                "run_id": reservation.run_id, "attempt": reservation.attempts,
+                "error": str(exc), "error_code": exc.error_code, "retryable": exc.retryable,
+            }))
+            result = AgentResult(
+                run_id=reservation.run_id, root_run_id=reservation.root_run_id,
+                parent_run_id=reservation.parent_run_id, agent_name=agent_name,
+                status="failed", error=redactor.text(str(exc)),
+                error_code=exc.error_code, retryable=exc.retryable,
+            )
         except AgentWorkspacePreparationError as exc:
             mapped_status = (
                 "cancelled"
@@ -1120,6 +1170,7 @@ class AgentExecutor:
                 error=error,
             )
         finally:
+            active_codex_executable.reset(executable_token)
             git_credentials.close()
 
         if result.status == "cancelled":
@@ -1188,12 +1239,17 @@ class AgentExecutor:
             {
                 "status": result.status,
                 "error": result.error,
+                "error_code": result.error_code,
+                "retryable": result.retryable,
                 "usage": result.usage,
             },
         )
         await asyncio.to_thread(self.store.finish_agent_run, result)
         if result.status != "completed":
-            raise AgentExecutionError(result.error or f"Agent {agent_name} 执行失败")
+            raise AgentExecutionError(
+                result.error or f"Agent {agent_name} 执行失败",
+                retryable=result.retryable, error_code=result.error_code,
+            )
         return result
 
 

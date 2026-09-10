@@ -51,7 +51,7 @@ def test_synchronous_background_commands_apply_window_policy(
 
     monkeypatch.setattr(process_control, "os", SimpleNamespace(name=platform))
     monkeypatch.setattr(subprocess, "run", run)
-    for module in (codex_settings, codex_model_client, managed_sandbox):
+    for module in (codex_settings, codex_model_client):
         monkeypatch.setattr(
             module, "resolve_executable", lambda command, *args: command
         )

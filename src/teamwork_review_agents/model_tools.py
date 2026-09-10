@@ -19,6 +19,7 @@ from .models import InvocationContext
 from .process_control import process_group_options, terminate_process
 from .state import StateStore
 from .subprocess_utils import resolve_executable
+from .codex_executable import resolve_codex_executable
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -339,7 +340,7 @@ class ModelToolExecutor:
         if not self.managed_sandbox:
             return inner_command
         return wrap_managed_sandbox_command(
-            codex_binary=resolve_executable(
+            codex_binary=resolve_codex_executable(
                 self.config.runtime.codex_binary,
                 self.environment,
             ),

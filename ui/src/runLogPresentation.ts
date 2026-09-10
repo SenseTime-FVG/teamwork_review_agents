@@ -38,6 +38,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.home_cleaned": "临时 HOME 已清理",
   "run.home_cleanup_failed": "临时 HOME 清理失败",
   "run.started": "Agent 开始运行",
+  "run.runtime_ready": "运行环境检查通过",
+  "run.runtime_unavailable": "运行环境检查失败",
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
   "turn.completed": "本轮处理完成",
@@ -157,10 +159,19 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   const object = asObject(payload);
   const title = SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
-    || /(?:error|failed|timed_out|mismatch|cancelled)/.test(log.event_type);
+    || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   let body = "";
   let detail = "";
-  if (log.event_type.startsWith("workspace.git.") && object) {
+  if (log.event_type.startsWith("run.runtime_") && object) {
+    body = object.error ? textValue(object.error) : "已在创建工作区前完成运行环境检查。";
+    detail = [
+      object.configured_command ? `配置命令：${textValue(object.configured_command)}` : "",
+      object.resolved_path ? `实际路径：${textValue(object.resolved_path)}` : "",
+      object.discovery_source ? `发现来源：${textValue(object.discovery_source)}` : "",
+      object.error_code ? `错误码：${textValue(object.error_code)}` : "",
+      object.retryable === false ? "自动重试已停止，修正后可手动触发。" : "",
+    ].filter(Boolean).join("\n");
+  } else if (log.event_type.startsWith("workspace.git.") && object) {
     body = textValue(object.operation);
     detail = [
       object.command ? textValue(object.command) : "",

@@ -386,6 +386,10 @@ class StateStore:
             self._ensure_column(connection, "agent_runs", "trigger_context", "TEXT")
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             self._ensure_column(connection, "event_inbox", "unmatched_reason", "TEXT")
+            for table in ("agent_runs", "event_inbox"):
+                # 历史记录默认仍可重试；迁移不改变旧任务的调度语义。
+                self._ensure_column(connection, table, "retryable", "INTEGER NOT NULL DEFAULT 1")
+                self._ensure_column(connection, table, "error_code", "TEXT")
             cancel_source_added = self._ensure_column(
                 connection,
                 "agent_runs",
@@ -1229,7 +1233,7 @@ class StateStore:
             rows = connection.execute(
                 """
                 SELECT payload FROM event_inbox
-                WHERE status IN ('pending', 'failed')
+                WHERE status = 'pending' OR (status = 'failed' AND retryable = 1)
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
@@ -1254,7 +1258,7 @@ class StateStore:
                 f"""
                 SELECT payload FROM event_inbox
                 WHERE status = 'pending'
-                   OR (status = 'failed' AND attempts < ?)
+                   OR (status = 'failed' AND attempts < ? AND retryable = 1)
                 ORDER BY created_at ASC, event_id ASC
                 {limit_clause}
                 """,
@@ -1275,7 +1279,7 @@ class StateStore:
                 SELECT repository_id, number, MIN(created_at) AS first_created_at
                 FROM event_inbox
                 WHERE status = 'pending'
-                   OR (status = 'failed' AND attempts < ?)
+                   OR (status = 'failed' AND attempts < ? AND retryable = 1)
                 GROUP BY repository_id, number
                 ORDER BY first_created_at ASC, repository_id ASC, number ASC
                 LIMIT ?
@@ -1301,7 +1305,7 @@ class StateStore:
                 WHERE repository_id = ? AND number = ?
                   AND (
                       status = 'pending'
-                      OR (status = 'failed' AND attempts < ?)
+                      OR (status = 'failed' AND attempts < ? AND retryable = 1)
                   )
                 ORDER BY created_at ASC, event_id ASC
                 LIMIT ?
@@ -1324,7 +1328,7 @@ class StateStore:
                 """
                 SELECT 1 FROM event_inbox
                 WHERE repository_id = ? AND number = ?
-                  AND status = 'failed' AND attempts < ?
+                  AND status = 'failed' AND attempts < ? AND retryable = 1
                 LIMIT 1
                 """,
                 (repository_id, number, max_attempts),
@@ -1408,7 +1412,7 @@ class StateStore:
                 WHERE event_id IN ({placeholders})
                   AND (
                       status = 'pending'
-                      OR (status = 'failed' AND attempts < ?)
+                      OR (status = 'failed' AND attempts < ? AND retryable = 1)
                   )
                 """,
                 (*ids, max_attempts),
@@ -1424,7 +1428,7 @@ class StateStore:
                     WHERE event_id IN ({matched_placeholders})
                       AND (
                           status = 'pending'
-                          OR (status = 'failed' AND attempts < ?)
+                          OR (status = 'failed' AND attempts < ? AND retryable = 1)
                       )
                     """,
                     (reason, time.time(), *matched_ids, max_attempts),
@@ -1439,12 +1443,13 @@ class StateStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT status, attempts FROM event_inbox WHERE event_id = ?",
+                "SELECT status, attempts, retryable FROM event_inbox WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
             if (
                 row is None
                 or row["status"] not in {"pending", "failed"}
+                or (row["status"] == "failed" and not row["retryable"])
                 or row["attempts"] >= max_attempts
             ):
                 connection.rollback()
@@ -1454,6 +1459,7 @@ class StateStore:
                 UPDATE event_inbox
                 SET status = 'processing', attempts = attempts + 1,
                     error = NULL, queue_reason = NULL, unmatched_reason = NULL,
+                    error_code = NULL, retryable = 1,
                     updated_at = ?
                 WHERE event_id = ?
                 """,
@@ -1505,6 +1511,8 @@ class StateStore:
         *,
         error: str | None = None,
         status: str | None = None,
+        retryable: bool = True,
+        error_code: str | None = None,
     ) -> None:
         """将事件标记为指定的终态，默认根据错误选择完成或失败。"""
 
@@ -1514,11 +1522,11 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE event_inbox
-                SET status = ?, error = ?, queue_reason = NULL,
+                SET status = ?, error = ?, retryable = ?, error_code = ?, queue_reason = NULL,
                     unmatched_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                 """,
-                (final_status, error, time.time(), event_id),
+                (final_status, error, int(retryable), error_code, time.time(), event_id),
             )
 
     def release_event_after_service_shutdown(self, event_id: str) -> bool:
@@ -1531,6 +1539,7 @@ class StateStore:
                 SET status = 'pending',
                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                     error = '服务停止中断，事件已重新入队',
+                    error_code = NULL, retryable = 1,
                     queue_reason = NULL, unmatched_reason = NULL, updated_at = ?
                 WHERE event_id = ?
                   AND status IN ('processing', 'triggered', 'failed')
@@ -2264,7 +2273,7 @@ class StateStore:
             row = connection.execute(
                 """
                 SELECT run_id, root_run_id, parent_run_id, status, attempts,
-                       cancel_source
+                       cancel_source, retryable
                 FROM agent_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -2317,6 +2326,7 @@ class StateStore:
             )
             retryable_failure = (
                 row["status"] in {"failed", "timed_out"}
+                and row["retryable"]
                 and row["attempts"] < max_attempts
             )
             if not service_interrupted and not retryable_failure:
@@ -2334,6 +2344,7 @@ class StateStore:
                     config_revision = ?, model_snapshot = ?,
                     repository_id = COALESCE(?, repository_id),
                     trigger_source = ?, trigger_context = ?, error = NULL,
+                    error_code = NULL, retryable = 1,
                     final_message = NULL, events = NULL, usage = NULL,
                     workspace_path = NULL, workspace_status = NULL,
                     workspace_reason = NULL, cancel_requested = 0,
@@ -2795,6 +2806,17 @@ class StateStore:
                 (path, status, reason, run_id),
             )
 
+    def agent_run_failure(self, idempotency_key: str) -> dict[str, Any] | None:
+        """供同一事件的其他分支重试时复用不可重试的失败分类。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT error, error_code, retryable FROM agent_runs "
+                "WHERE idempotency_key = ? AND status IN ('failed', 'timed_out')",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def finish_agent_run(self, result: AgentResult) -> None:
         """保存 Codex CLI 最终结果与截断后的 JSONL 事件。"""
 
@@ -2803,7 +2825,7 @@ class StateStore:
                 """
                 UPDATE agent_runs
                 SET status = ?, final_message = ?, thread_id = ?, usage = ?,
-                    events = ?, error = ?, concurrency_acquired = 0,
+                    events = ?, error = ?, error_code = ?, retryable = ?, concurrency_acquired = 0,
                     queue_reason = NULL, finished_at = ?
                 WHERE run_id = ?
                 """,
@@ -2814,6 +2836,8 @@ class StateStore:
                     json.dumps(result.usage, ensure_ascii=False),
                     json.dumps(result.events, ensure_ascii=False),
                     result.error,
+                    result.error_code,
+                    int(result.retryable),
                     time.time(),
                     result.run_id,
                 ),
@@ -3049,7 +3073,7 @@ class StateStore:
                 """
                 SELECT run_id, agent_name, status, started_at, finished_at,
                        queue_reason, workspace_path, workspace_status,
-                       workspace_reason
+                       workspace_reason, error, error_code, retryable
                 FROM agent_runs WHERE parent_run_id = ? ORDER BY started_at ASC
                 """,
                 (run_id,),
@@ -3149,6 +3173,7 @@ class StateStore:
                        agent_runs.rule_name, agent_runs.agent_name,
                        agent_runs.resource_key, agent_runs.status,
                        agent_runs.attempts, agent_runs.error,
+                       agent_runs.error_code, agent_runs.retryable,
                        agent_runs.queue_reason,
                        agent_runs.cancel_requested, agent_runs.cancel_source,
                        agent_runs.workspace_path, agent_runs.workspace_status,
@@ -3238,7 +3263,8 @@ class StateStore:
                 SELECT event_inbox.event_id, event_inbox.event_type,
                        event_inbox.repository_id, event_inbox.number,
                        event_inbox.status, event_inbox.attempts,
-                       event_inbox.error, event_inbox.queue_reason,
+                       event_inbox.error, event_inbox.error_code,
+                       event_inbox.retryable, event_inbox.queue_reason,
                        event_inbox.unmatched_reason,
                        event_inbox.created_at,
                        event_inbox.updated_at,
@@ -3406,7 +3432,8 @@ class StateStore:
                        dispatch.agent_name, dispatch.created_at,
                        run.run_id, run.root_run_id, run.parent_run_id,
                        run.status AS run_status,
-                       run.error AS run_error, run.started_at,
+                       run.error AS run_error, run.error_code AS run_error_code,
+                       run.retryable AS run_retryable, run.started_at,
                        run.finished_at
                 FROM event_agent_dispatches AS dispatch
                 LEFT JOIN agent_runs AS run
@@ -3423,7 +3450,9 @@ class StateStore:
                        family.parent_run_id, family.idempotency_key,
                        family.rule_name, family.agent_name,
                        family.status AS run_status,
-                       family.error AS run_error, family.started_at,
+                       family.error AS run_error,
+                       family.error_code AS run_error_code,
+                       family.retryable AS run_retryable, family.started_at,
                        family.finished_at
                 FROM event_agent_dispatches AS dispatch
                 JOIN agent_runs AS root_run
@@ -3721,7 +3750,7 @@ class StateStore:
                 WHERE event_type = ?
                   AND (
                       status IN ('completed', 'unmatched', 'cancelled')
-                      OR (status = 'failed' AND attempts >= ?)
+                      OR (status = 'failed' AND (attempts >= ? OR retryable = 0))
                   )
                   AND updated_at < ?
                 """,

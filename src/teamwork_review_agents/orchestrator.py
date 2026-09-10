@@ -801,6 +801,13 @@ class Orchestrator:
             errors_by_event: dict[str, list[str]] = {
                 event.id: [] for event in claimed_events
             }
+            # None 表示尚未收到可分类的错误；普通异常沿用可重试语义。
+            retryable_by_event: dict[str, bool | None] = {
+                event.id: None for event in claimed_events
+            }
+            error_codes_by_event: dict[str, list[str]] = {
+                event.id: [] for event in claimed_events
+            }
             service_interrupted_event_ids: set[str] = set()
             administrator_cancelled_event_ids: set[str] = set()
             matched_event_ids: set[str] = set()
@@ -889,6 +896,7 @@ class Orchestrator:
                             for event in invocation.events:
                                 matched_event_ids.add(event.id)
                                 errors_by_event[event.id].append(str(exc))
+                                retryable_by_event[event.id] = True
                     else:
                         await asyncio.to_thread(
                             self.store.link_events_to_preflight,
@@ -920,6 +928,7 @@ class Orchestrator:
                                 for event in invocation.events:
                                     matched_event_ids.add(event.id)
                                     errors_by_event[event.id].append(error)
+                                    retryable_by_event[event.id] = True
 
                 if ready_preflight_invocations:
                     preflight_dispatches = [
@@ -946,6 +955,7 @@ class Orchestrator:
                             for event in invocation.events:
                                 matched_event_ids.add(event.id)
                                 errors_by_event[event.id].append(str(exc))
+                                retryable_by_event[event.id] = True
                     else:
                         matched_event_ids.update(item[0] for item in preflight_dispatches)
                         task_items.extend(
@@ -955,6 +965,7 @@ class Orchestrator:
             except Exception as exc:
                 for event in claimed_events:
                     errors_by_event[event.id].append(str(exc))
+                    retryable_by_event[event.id] = True
 
             if task_items:
                 results = await asyncio.gather(
@@ -990,12 +1001,26 @@ class Orchestrator:
                         continue
                     if isinstance(result, BaseException):
                         error = str(result)
+                        failure_retryable = bool(getattr(result, "retryable", True))
+                        failure_error_code = getattr(result, "error_code", None)
                     elif isinstance(result, AgentResult) and result.status != "completed":
                         error = result.error or f"Agent 运行状态为 {result.status}"
+                        failure_retryable = result.retryable
+                        failure_error_code = result.error_code
                     else:
                         continue
                     for event in invocation.events:
                         errors_by_event[event.id].append(error)
+                        previous_retryable = retryable_by_event[event.id]
+                        retryable_by_event[event.id] = (
+                            failure_retryable
+                            if previous_retryable is None
+                            else previous_retryable or failure_retryable
+                        )
+                        if failure_error_code:
+                            error_codes_by_event[event.id].append(
+                                str(failure_error_code)
+                            )
 
             for event in claimed_events:
                 if event.id in settled_unmatched_event_ids:
@@ -1035,8 +1060,25 @@ class Orchestrator:
                     continue
                 if error:
                     summary.errors.append(f"处理事件 {event.id} 失败：{error}")
-                    retry_deferred = True
-                await asyncio.to_thread(self.store.finish_event, event.id, error=error)
+                    retryable = (
+                        True
+                        if retryable_by_event[event.id] is None
+                        else bool(retryable_by_event[event.id])
+                    )
+                    retry_deferred = retry_deferred or retryable
+                else:
+                    retryable = True
+                error_code = (
+                    "; ".join(dict.fromkeys(error_codes_by_event[event.id]))
+                    or None
+                )
+                await asyncio.to_thread(
+                    self.store.finish_event,
+                    event.id,
+                    error=error,
+                    retryable=retryable,
+                    error_code=error_code,
+                )
                 await asyncio.to_thread(
                     self.store.finalize_terminal_target_event_context,
                     event.id,

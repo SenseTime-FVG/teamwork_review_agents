@@ -115,6 +115,10 @@ class AgentResult(BaseModel):
     events: list[dict[str, Any]] = Field(default_factory=list)
     error: str | None = None
 
+    # 默认沿用历史重试行为，只有显式分类的确定性错误才停止自动调度。
+    error_code: str | None = None
+    retryable: bool = True
+
 
 class PreflightResult(BaseModel):
     """一次确定性 CI 前置检查的最终结果。"""

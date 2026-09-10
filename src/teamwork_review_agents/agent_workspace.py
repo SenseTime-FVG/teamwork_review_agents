@@ -21,7 +21,7 @@ from .preflight_cache import (
     build_repository_cache_environment,
     repository_cache_root,
 )
-from .subprocess_utils import resolve_executable
+from .codex_executable import resolve_codex_executable
 from .workspace_snapshot import (
     WorkspaceSnapshotCancelled,
     WorkspaceSnapshotError,
@@ -299,7 +299,7 @@ async def prepare_agent_workspace(
             if not restricted:
                 return command
             return wrap_managed_sandbox_command(
-                codex_binary=resolve_executable(
+                codex_binary=resolve_codex_executable(
                     config.runtime.codex_binary,
                     environment,
                 ),

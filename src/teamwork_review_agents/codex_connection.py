@@ -23,7 +23,7 @@ from .config import AppConfig
 from .codex_runner import CodexRunner
 from .environment import SecretRedactor
 from .process_control import process_group_options, terminate_process
-from .subprocess_utils import resolve_executable
+from .codex_executable import resolve_codex_executable as resolve_executable
 
 
 CONNECTION_TEST_TIMEOUT_SECONDS = 30.0
@@ -125,7 +125,9 @@ async def _test_cli_connection(config: AppConfig) -> tuple[str | None, str]:
     """在空临时目录中通过当前 Codex CLI 验证真实命令链路。"""
 
     environment = CodexRunner(config).child_environment()
-    binary = resolve_executable(config.runtime.codex_binary, environment)
+    binary = await asyncio.to_thread(
+        resolve_executable, config.runtime.codex_binary, environment,
+    )
     with tempfile.TemporaryDirectory(prefix="teamwork-codex-connection-") as directory:
         command = _cli_connection_command(config, binary, Path(directory))
         process = await asyncio.create_subprocess_exec(

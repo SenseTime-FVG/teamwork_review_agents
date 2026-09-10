@@ -21,7 +21,8 @@ from typing import Any
 import httpx
 
 from .process_control import hidden_process_options
-from .subprocess_utils import resolve_executable
+from .codex_executable import resolve_codex_executable as resolve_executable
+from .codex_executable import CodexRuntimeError
 
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -480,7 +481,7 @@ def _codex_client_version(codex_binary: str) -> str:
             timeout=3,
             **hidden_process_options(),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (CodexRuntimeError, OSError, subprocess.SubprocessError):
         return "unknown"
     match = re.search(r"\b(\d+\.\d+\.\d+)\b", f"{completed.stdout}\n{completed.stderr}")
     return match.group(1) if match else "unknown"

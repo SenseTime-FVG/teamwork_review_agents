@@ -10,7 +10,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .subprocess_utils import resolve_executable
+from .codex_executable import resolve_codex_executable as resolve_executable
+from .codex_executable import CodexRuntimeError
 
 from .config import (
     AgentConfig,
@@ -350,9 +351,10 @@ def inspect_codex_binary(
     """解析 Codex CLI 路径和版本，不执行任何 Agent 任务。"""
 
     environment = _codex_environment(home)
-    command = resolve_executable(codex_binary, environment)
-    resolved = command if Path(command).is_file() else None
+    resolved = None
     try:
+        command = resolve_executable(codex_binary, environment)
+        resolved = command
         result = subprocess.run(
             [command, "--version"],
             check=True,
@@ -365,12 +367,13 @@ def inspect_codex_binary(
             **hidden_process_options(),
         )
         output = (result.stdout or result.stderr).strip()
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (CodexRuntimeError, OSError, subprocess.SubprocessError) as exc:
         return {
             "resolved_path": resolved,
             "version": None,
             "version_output": None,
             "error": str(exc),
+            "error_code": exc.error_code if isinstance(exc, CodexRuntimeError) else "codex_version_probe_failed",
         }
     match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)", output)
     return {
@@ -378,6 +381,7 @@ def inspect_codex_binary(
         "version": match.group(1) if match else None,
         "version_output": output,
         "error": None,
+        "error_code": None,
     }
 
 
@@ -495,8 +499,8 @@ def read_bundled_models(
     """从本机 Codex CLI 读取模型目录；失败时保留手工填写能力。"""
 
     environment = _codex_environment(home)
-    command = resolve_executable(codex_binary, environment)
     try:
+        command = resolve_executable(codex_binary, environment)
         result = subprocess.run(
             [command, "debug", "models", "--bundled"],
             check=True,
@@ -509,7 +513,7 @@ def read_bundled_models(
             **hidden_process_options(),
         )
         document = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+    except (CodexRuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         return [], str(exc)
 
     raw_models = document.get("models", []) if isinstance(document, dict) else []
