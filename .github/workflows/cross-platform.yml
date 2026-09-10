@@ -50,7 +50,7 @@ jobs:
           teamwork-review-agents validate -c config.windows-ci.yaml
       - name: 验证 Windows CLI 与进程树
         run: >-
-          python -m pytest
+          python -m pytest -vv -o faulthandler_timeout=120
           tests/test_filesystem.py
           tests/test_subprocess_utils.py
           tests/test_agent_home.py
