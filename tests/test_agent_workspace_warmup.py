@@ -55,6 +55,8 @@ def _write_config(tmp_path: Path, origin: Path) -> Path:
     document = {
         "database": {"path": str(tmp_path / "state.db")},
         "runtime": {
+            # 沙盒调用已由用例替换，使用存在的占位程序，避免依赖宿主安装 Codex。
+            "codex_binary": sys.executable,
             "git_timeout_seconds": 10,
             "repository_initialization_timeout_seconds": 10,
             "lock_timeout_seconds": 5,
