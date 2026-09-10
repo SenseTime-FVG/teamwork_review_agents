@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -128,6 +129,9 @@ def test_all_direct_process_launches_declare_window_policy():
 def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
     """模拟后台服务，真实检查子进程无控制台且标准输入输出、退出码正常。"""
 
+    # PowerShell 启动与 Add-Type 可能较慢，外层另留诊断和清理时间。
+    child_timeout = 60 if mode == "powershell" else 10 if mode == "async" else 15
+    parent_timeout = 90 if mode == "powershell" else 25
     python_probe = textwrap.dedent("""
         import ctypes
         import json
@@ -171,13 +175,27 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
         import json
         import subprocess
         import sys
+        import time
         from teamwork_review_agents.process_control import hidden_process_options, process_group_options
 
+        started_at = time.monotonic()
+        mode, command = sys.argv[1], json.loads(sys.argv[2])
+        child_timeout = float(sys.argv[3])
+
+        def report(stage, **details):
+            # 阶段日志走父进程 stderr，不改变子进程的管道验证内容。
+            print(json.dumps({
+                "stage": stage, "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                **details,
+            }), file=sys.stderr, flush=True)
+
         # 父进程以 DETACHED_PROCESS 启动，复现实际后台服务没有控制台的条件。
+        report("check_parent_console")
         get_window = ctypes.windll.kernel32.GetConsoleWindow
         get_window.restype = ctypes.c_void_p
-        assert not get_window()
-        mode, command = sys.argv[1], json.loads(sys.argv[2])
+        parent_window = get_window() or 0
+        assert not parent_window, f"后台父进程仍有控制台窗口：{parent_window}"
+        report("run_child", executable=command[0], timeout_seconds=child_timeout)
         if mode == "async":
             async def execute():
                 # 使用与工具命令、CI 和 MCP 相同的异步进程启动方式。
@@ -185,9 +203,21 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
                     *command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, **process_group_options(),
                 )
+                # 等待超时不取消管道读取，终止后仍可收集已产生的输出。
+                communication = asyncio.create_task(process.communicate(b"pipe input"))
                 try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(b"pipe input"), 10)
+                    stdout, stderr = await asyncio.wait_for(
+                        asyncio.shield(communication), child_timeout,
+                    )
                     return process.returncode, stdout.decode(), stderr.decode()
+                except asyncio.TimeoutError:
+                    if process.returncode is None:
+                        process.kill()
+                    stdout, stderr = await communication
+                    report("child_timeout", timeout_seconds=child_timeout,
+                           stdout=stdout.decode(errors="replace"),
+                           stderr=stderr.decode(errors="replace"))
+                    raise
                 finally:
                     if process.returncode is None:
                         process.kill()
@@ -195,23 +225,71 @@ def test_windows_detached_parent_starts_windowless_child_with_pipes(mode):
             code, stdout, stderr = asyncio.run(execute())
         else:
             options = hidden_process_options() if mode == "sync" else process_group_options()
-            completed = subprocess.run(command, input="pipe input", capture_output=True,
-                                       text=True, timeout=15, **options)
+            try:
+                completed = subprocess.run(command, input="pipe input", capture_output=True,
+                                           text=True, timeout=child_timeout, **options)
+            except subprocess.TimeoutExpired as exc:
+                # TimeoutExpired 即使在文本模式下也可能携带字节串。
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                report("child_timeout", timeout_seconds=child_timeout,
+                       stdout=stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
+                       stderr=stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr)
+                raise
             code, stdout, stderr = completed.returncode, completed.stdout, completed.stderr
-        print(json.dumps({"code": code, "stdout": json.loads(stdout), "stderr": stderr.strip()}))
+        report("child_completed", returncode=code)
+        # 原始输出交给 pytest 解析，解析失败时仍能看到 PowerShell 的真正错误。
+        print(json.dumps({"code": code, "stdout": stdout, "stderr": stderr.strip()}))
     """)
-    result = subprocess.run(
-        [sys.executable, "-c", parent_code, mode, json.dumps(command)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=25,
-        check=True,
-        **process_group_options(detached=True),
+    started_at = time.monotonic()
+    context = (
+        f"模式：{mode}；程序：{command[0]}；"
+        f"子进程超时：{child_timeout} 秒；父进程超时：{parent_timeout} 秒"
     )
-    assert json.loads(result.stdout) == {
+    try:
+        result = subprocess.run(
+            [sys.executable, "-u", "-c", parent_code, mode, json.dumps(command), str(child_timeout)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=parent_timeout,
+            check=False,
+            **process_group_options(detached=True),
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"测试父进程等待超时；{context}；耗时：{time.monotonic() - started_at:.3f} 秒\n"
+            f"原始 stdout：{exc.stdout!r}\n原始 stderr / 阶段日志：{exc.stderr!r}",
+            pytrace=False,
+        )
+    diagnostic = (
+        f"{context}；耗时：{time.monotonic() - started_at:.3f} 秒；"
+        f"父进程退出码：{result.returncode}\n"
+        f"原始 stdout：\n{result.stdout}\n原始 stderr / 阶段日志：\n{result.stderr}"
+    )
+    assert result.returncode == 0, f"测试父进程执行失败\n{diagnostic}"
+    try:
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict):
+            raise ValueError("父进程输出必须为 JSON 对象")
+    except ValueError as exc:
+        pytest.fail(f"父进程输出解析失败：{exc}\n{diagnostic}", pytrace=False)
+    # 解开父进程的 JSON 包装，让子进程错误中的中文和换行可直接阅读。
+    diagnostic += (
+        f"\n子进程退出码：{report.get('code')}\n"
+        f"子进程原始 stdout：\n{report.get('stdout')}\n"
+        f"子进程原始 stderr：\n{report.get('stderr')}"
+    )
+    assert report.get("code") == 7, f"子进程未按探测脚本约定退出（预期 7）\n{diagnostic}"
+    try:
+        report["stdout"] = json.loads(report["stdout"])
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        pytest.fail(f"子进程输出解析失败：{exc}\n{diagnostic}", pytrace=False)
+    assert report == {
         "code": 7,
         "stdout": {"console_window": 0, "input": "pipe input"},
         "stderr": "probe stderr",
-    }
+    }, f"窗口或管道探测结果不符合预期\n{diagnostic}"
