@@ -18,6 +18,7 @@ from .agent_home import (
     cleanup_stale_agent_homes_once,
 )
 from .config import AgentConfig, AppConfig, RepositoryConfig, effective_skill_ids
+from .codex_executable import resolve_codex_executable
 from .codex_settings import (
     agent_network_overrides,
     agent_overrides,
@@ -38,7 +39,6 @@ from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
-    resolve_executable,
     selected_environment,
 )
 
@@ -183,9 +183,10 @@ class CodexRunner:
             else managed_sandbox
         )
         active_environment = environment if environment is not None else os.environ
-        codex_binary = resolve_executable(
+        codex_binary = resolve_codex_executable(
             self.config.runtime.codex_binary,
             active_environment,
+            allow_unresolved=True,
         )
         command = [
             codex_binary,

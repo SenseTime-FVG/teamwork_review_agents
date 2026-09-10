@@ -6,14 +6,19 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
 from .config import AgentConfig
+from .codex_executable import CodexRuntimeError, locate_codex_executable
 from .process_control import hidden_process_options
-from .subprocess_utils import resolve_executable
+from .subprocess_utils import (
+    WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
+    selected_environment,
+)
 
 
 _PROFILE_NAME = "teamwork_managed"
@@ -28,16 +33,16 @@ class ManagedSandboxInspection:
     platform: str
     backend: str | None
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool = True
+    configured_command: str | None = None
+    resolved_path: str | None = None
+    discovery_source: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """转换为可由管理 API 返回的脱敏结构。"""
 
-        return {
-            "available": self.available,
-            "platform": self.platform,
-            "backend": self.backend,
-            "error": self.error,
-        }
+        return asdict(self)
 
 
 def _platform_backend() -> tuple[str, str | None]:
@@ -62,10 +67,15 @@ def _platform_backend() -> tuple[str, str | None]:
     return sys.platform, None
 
 
-def _inspection_environment(codex_home: Path | None) -> dict[str, str]:
+def _inspection_environment(
+    codex_home: Path | None, source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """构造不读取业务凭据的 Codex 能力诊断环境。"""
 
-    environment = os.environ.copy()
+    environment = selected_environment(
+        WINDOWS_REQUIRED_ENVIRONMENT_NAMES | {"PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL"},
+        source,
+    )
     if codex_home is not None:
         environment["CODEX_HOME"] = str(codex_home.expanduser().resolve())
     return environment
@@ -77,22 +87,21 @@ def _inspect_cached(
     codex_home_text: str | None,
     platform_name: str,
     backend: str | None,
+    environment_items: tuple[tuple[str, str], ...] = (),
+    binary_fingerprint: tuple[int, int, int] = (0, 0, 0),
+    cache_period: int = 0,
 ) -> ManagedSandboxInspection:
-    """按二进制和配置目录缓存沙盒执行器能力。"""
+    """仅缓存成功结果；环境、文件变化或短期到期后重新探测。"""
 
     if backend is None:
-        return ManagedSandboxInspection(
-            available=False,
-            platform=platform_name,
-            backend=None,
-            error=f"当前平台 {platform_name} 不在 Teamwork 外层沙盒支持范围内",
+        raise CodexRuntimeError(
+            f"当前平台 {platform_name} 不在 Teamwork 外层沙盒支持范围内",
+            error_code="sandbox_platform_unsupported",
         )
-    configured_home = Path(codex_home_text) if codex_home_text else None
-    environment = _inspection_environment(configured_home)
-    command = resolve_executable(codex_binary, environment)
+    environment = dict(environment_items)
     try:
         completed = subprocess.run(
-            [command, "sandbox", "--help"],
+            [codex_binary, "sandbox", "--help"],
             check=False,
             capture_output=True,
             text=True,
@@ -103,12 +112,10 @@ def _inspect_cached(
             **hidden_process_options(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return ManagedSandboxInspection(
-            available=False,
-            platform=platform_name,
-            backend=backend,
-            error=f"无法检查 Codex 外层沙盒执行器：{exc}",
-        )
+        raise CodexRuntimeError(
+            f"无法检查 Codex 外层沙盒执行器：{exc}",
+            error_code="sandbox_probe_failed", retryable=True,
+        ) from exc
     output = f"{completed.stdout}\n{completed.stderr}".lower()
     if completed.returncode == 0 and "permission-profile" in output:
         return ManagedSandboxInspection(
@@ -119,26 +126,49 @@ def _inspect_cached(
     detail = (completed.stderr or completed.stdout).strip()
     if len(detail) > 300:
         detail = f"{detail[:300]}…"
-    return ManagedSandboxInspection(
-        available=False,
-        platform=platform_name,
-        backend=backend,
-        error=(
+    # 成功返回帮助但缺少参数才是确定性能力缺失；非零退出可能是暂时启动异常。
+    unsupported = completed.returncode == 0
+    raise CodexRuntimeError(
+        (
             "当前 Codex CLI 未提供可用的 `codex sandbox --permission-profile`"
             + (f"：{detail}" if detail else "")
         ),
+        error_code="sandbox_capability_missing" if unsupported else "sandbox_probe_failed",
+        retryable=not unsupported,
     )
 
 
 def inspect_managed_sandbox(
     codex_binary: str,
     codex_home: Path | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> ManagedSandboxInspection:
     """检查当前 Codex CLI 是否能作为受托的原生沙盒执行器。"""
 
     platform_name, backend = _platform_backend()
     home_text = str(codex_home.expanduser().resolve()) if codex_home else None
-    return _inspect_cached(codex_binary, home_text, platform_name, backend)
+    diagnostic_environment = _inspection_environment(codex_home, environment)
+    resolution = None
+    try:
+        resolution = locate_codex_executable(codex_binary, diagnostic_environment)
+        info = Path(resolution.resolved_path).stat()
+        result = _inspect_cached(
+            resolution.resolved_path, home_text, platform_name, backend,
+            tuple(sorted(diagnostic_environment.items())),
+            (info.st_mtime_ns, info.st_size, info.st_ino), int(time.monotonic() // 30),
+        )
+    except (CodexRuntimeError, OSError) as exc:
+        result = ManagedSandboxInspection(
+            available=False, platform=platform_name, backend=backend, error=str(exc),
+            error_code=exc.error_code if isinstance(exc, CodexRuntimeError) else "sandbox_probe_failed",
+            retryable=exc.retryable if isinstance(exc, CodexRuntimeError) else True,
+        )
+    return replace(
+        result, configured_command=codex_binary,
+        resolved_path=resolution.resolved_path if resolution else None,
+        discovery_source=resolution.discovery_source if resolution else None,
+    )
 
 
 def _toml_string(value: str) -> str:

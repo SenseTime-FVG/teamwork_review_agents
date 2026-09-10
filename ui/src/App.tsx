@@ -8399,7 +8399,11 @@ function eventStatusExplanation(event: EventRecord): string {
     return reason ? `事件未触发：${reason}。` : "没有启用的触发规则匹配这个事件。";
   }
   if (event.status === "triggered") return "规则已匹配，Agent 正在排队或运行。";
-  if (event.status === "failed") return "事件处理发生异常，详情见错误信息。";
+  if (event.status === "failed") {
+    return event.retryable === false || event.retryable === 0
+      ? "配置或运行环境需要修正，已停止自动重试；修正后可手动重新触发。"
+      : "事件处理发生异常，详情见错误信息。";
+  }
   if (event.status === "cancelled") return "事件关联的运行已被取消。";
   if (event.trigger_count > 0) return "事件已完成规则匹配，关联的 Agent 调度已经结束。";
   return "事件处理流程已结束，本次没有产生 Agent 调度或本地 CI 记录。";
@@ -8829,6 +8833,8 @@ function EventDetailDrawer(props: {
                   <div><dt>来源</dt><dd>{detail.origin === "manual" ? "手动触发" : "扫描器"}</dd></div>
                   <div><dt>事件状态</dt><dd>{detail.status}</dd></div>
                   <div><dt>尝试次数</dt><dd>{detail.attempts}</dd></div>
+                  {detail.error_code && <div><dt>错误码</dt><dd className="mono">{detail.error_code}</dd></div>}
+                  {detail.status === "failed" && <div><dt>自动重试</dt><dd>{detail.retryable === false || detail.retryable === 0 ? "已停止，需修正后手动触发" : "按配置的重试次数执行"}</dd></div>}
                   <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>
                   {detail.unmatched_reason && (
                     <div><dt>未触发原因</dt><dd>{unmatchedReasonLabel(detail.unmatched_reason) ?? detail.unmatched_reason}</dd></div>
@@ -9429,6 +9435,8 @@ function AgentRunDetailDrawer(props: {
                     <summary>运行信息</summary>
                     <dl className="run-metadata">
                       <div><dt>运行 ID</dt><dd>{detail.run_id}</dd></div>
+                      {detail.error_code && <div><dt>错误码</dt><dd className="mono">{detail.error_code}</dd></div>}
+                      {["failed", "timed_out"].includes(detail.status) && <div><dt>自动重试</dt><dd>{detail.retryable === false || detail.retryable === 0 ? "已停止，需修正后手动触发" : "按配置的重试次数执行"}</dd></div>}
                       <div><dt>触发规则</dt><dd>{detail.rule_name ?? "Sub-agent 调用"}</dd></div>
                       <div><dt>触发来源</dt><dd>{detail.trigger_source === "schedule" ? "定时触发" : "MR / PR 事件"}</dd></div>
                       <div><dt>排队原因</dt><dd>{queueReasonLabel(detail.queue_reason) ?? "—"}</dd></div>

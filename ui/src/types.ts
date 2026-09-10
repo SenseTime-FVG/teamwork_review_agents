@@ -537,6 +537,8 @@ export type RunSummary = {
   queue_reason?: string | null;
   attempts: number;
   error?: string | null;
+  error_code?: string | null;
+  retryable?: number | boolean | null;
   workspace_path?: string | null;
   workspace_status?: "active" | "removed" | "retained" | "inherited" | "not-created" | null;
   workspace_reason?: string | null;
@@ -603,6 +605,8 @@ export type EventRecord = {
   status: string;
   attempts: number;
   error?: string | null;
+  error_code?: string | null;
+  retryable?: number | boolean | null;
   queue_reason?: string | null;
   unmatched_reason?: string | null;
   trigger_count: number;
@@ -642,6 +646,8 @@ export type EventDispatchDetail = {
   parent_run_id?: string | null;
   run_status?: string | null;
   run_error?: string | null;
+  run_error_code?: string | null;
+  run_retryable?: number | boolean | null;
   started_at?: number | null;
   finished_at?: number | null;
 };
@@ -655,6 +661,8 @@ export type EventAgentRunSummary = {
   agent_name: string;
   run_status: string;
   run_error?: string | null;
+  run_error_code?: string | null;
+  run_retryable?: number | boolean | null;
   started_at: number;
   finished_at?: number | null;
 };

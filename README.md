@@ -69,6 +69,8 @@ teamwork-review-agents start
 
 原生 Windows 支持 `run`、`start`、`stop`、`restart`、`scan-once` 等 CLI 命令。需要长期托管时，可以让 Windows 服务管理器或任务计划程序执行前台命令 `teamwork-review-agents run -c C:\path\to\config.yaml`；需要 Bash 工具链的仓库 CI 脚本可以继续使用 Git Bash 或 WSL2。
 
+后台服务按自身的 PATH 查找 `runtime.codex_binary`。Windows 使用默认 `codex` 且 PATH 中没有该命令时，会自动查找当前服务账号 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，按文件更新时间优先探测并选择可用安装；也可以配置明确的可执行文件路径。显式路径错误不会改用其他安装。需要 Codex 的任务会在创建工作区前检查程序与所需沙盒能力，并在运行日志记录配置命令、实际路径和发现来源。找不到程序、固定版本不匹配或确定缺少必需沙盒能力时会停止自动重试，修正后可手动重新触发；暂时性的探测超时仍按重试配置处理。
+
 打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)，点击“编辑配置”：
 
 > 第一次使用建议直接按[首次配置图文指南](docs/first-time-setup.md)操作；下面只保留最短配置路径。

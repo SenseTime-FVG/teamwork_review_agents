@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .process_control import process_group_options, terminate_process
-from .subprocess_utils import resolve_executable
+from .codex_executable import CodexRuntimeError, resolve_codex_executable
 
 
 APP_SERVER_TIMEOUT_SECONDS = 10.0
@@ -31,10 +31,10 @@ def _resolve_binary(
 ) -> str:
     """解析 Codex 命令，避免 App Server 启动时依赖不确定的工作目录。"""
 
-    resolved = resolve_executable(codex_binary, environment)
-    if resolved != codex_binary or Path(resolved).expanduser().is_file():
-        return resolved
-    raise CodexAccountError(f"找不到 Codex CLI：{codex_binary}")
+    try:
+        return resolve_codex_executable(codex_binary, environment)
+    except CodexRuntimeError as exc:
+        raise CodexAccountError(str(exc)) from exc
 
 
 def _codex_environment(home: Path) -> dict[str, str]:
