@@ -15,6 +15,7 @@ from typing import Mapping
 from .config import AgentConfig
 from .codex_executable import CodexRuntimeError, locate_codex_executable
 from .process_control import hidden_process_options
+from .sandbox_git import current_sandbox_git
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
     selected_environment,
@@ -205,6 +206,13 @@ def permission_profile_override(
         for path in (ipc_directory, codex_runtime_directory, *writable_directories)
         if path is not None
     ]
+    git_context = current_sandbox_git()
+    if git_context is not None:
+        # 只读例外来自宿主创建的运行上下文，不能由工具环境自行声明。
+        extra_filesystem_entries.extend(
+            f"{_toml_string(str(path))}=\"read\""
+            for path in git_context.readable_directories
+        )
     if agent.sandbox == "read-only":
         fields = [
             'description="Teamwork 托管的只读 Agent 外层沙盒"',

@@ -357,6 +357,16 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 `fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时，Codex CLI 驱动才回退到自己的同级内层沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“全局配置与环境”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
 
+### Windows 沙盒内 Git HTTPS
+
+Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`、`http.sslVerify=true`，避开受限账户下可能无法初始化的 Schannel TLS 上下文；不修改宿主 Git 配置，不关闭证书校验，不取消网络代理或域名白名单。需要 Git for Windows 提供 OpenSSL 后端；使用企业自签证书时，需配置可被沙盒读取的可信 CA，例如 `GIT_SSL_CAINFO`。
+
+仓库 Token 只有在原有“进入进程”权限允许时才交给工具；沙盒使用独立的无密钥 askpass 文件，并在权限档案中增加该文件目录及 Python 运行依赖的只读访问，运行结束清理。不会把 Token 写入 URL、命令参数或 helper 文件，也不会借此放开整个宿主临时目录。
+
+模型启动前使用相同沙盒、实际工具环境执行无密钥 helper 自检及 `git ls-remote origin HEAD`，时间线显示配置的 TLS 后端、Git 路径、远端主机、HEAD SHA 和脱敏错误。禁网、SSH 或无 origin 的运行跳过联网探测。探测通过仅说明远端读取可用，不保证 push 权限或之后的网络始终可用。
+
+明确的 Schannel、OpenSSL、证书、helper 和认证错误使用 `sandbox_git_*` 错误码阻断运行，停止确定性错误的整体重试，修正后可手动触发；临时探测超时仍保留重试资格。模型工具运行中识别到同类错误时也会中止，内嵌调用的子 Agent 会向父 Agent 传播该故障，不进入后续工具阶段。完整 CLI 模式在启动前做相同探测，并在收到已完成命令的错误事件后终止进程树；普通冲突、分支不存在等 Git 结果仍交给 Agent 处理。
+
 ## GitHub 本地 CI 门禁
 
 通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。

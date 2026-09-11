@@ -30,6 +30,8 @@ from .codex_settings import (
 from .environment import SecretRedactor
 from .mcp_bridge import ManagedMcpBroker, McpBridgeChannel
 from .models import AgentResult, InvocationContext
+from .model_tools import ModelToolExecutor
+from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git
 from .managed_sandbox import (
     ManagedSandboxInspection,
     inspect_managed_sandbox,
@@ -642,6 +644,27 @@ class CodexRunner:
                     "network_domain_count": 0,
                 },
             )
+        if use_managed_sandbox and current_sandbox_git() is not None:
+            probe_executor = ModelToolExecutor(
+                config=self.config, agent=agent, repository=repository, context=context,
+                environment=child_environment, managed_sandbox=True, cancel_check=cancel_check,
+                progress_callback=lambda: None, invoke_agent_callback=None,
+                codex_runtime_directory=temporary_codex_home.path if temporary_codex_home else None,
+            )
+            await emit("system", "run.git_https_started", {"ssl_backend": "openssl"})
+            try:
+                diagnostic = await probe_executor.check_git_https()
+            except SandboxGitError as exc:
+                error = active_redactor.text(str(exc))
+                await emit("system", "run.git_https_failed", {
+                    "error": error, "error_code": exc.error_code, "retryable": exc.retryable,
+                })
+                return AgentResult(
+                    run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                    agent_name=agent_name, status="failed", error=error,
+                    error_code=exc.error_code, retryable=exc.retryable,
+                )
+            await emit("system", f"run.git_https_{diagnostic['status']}", diagnostic)
         command = self.build_command(
             agent,
             repository,
@@ -696,6 +719,7 @@ class CodexRunner:
         thread_id: str | None = None
         usage: dict[str, Any] = {}
         stream_error: str | None = None
+        git_failure: SandboxGitError | None = None
         started_at = time.monotonic()
         last_progress_at = started_at
         stream_failure_event = asyncio.Event()
@@ -727,6 +751,7 @@ class CodexRunner:
             """逐行解析并持久化 Codex JSONL。"""
 
             nonlocal final_message, thread_id, usage, stream_error, last_progress_at
+            nonlocal git_failure
             try:
                 while raw_line := await process.stdout.readline():
                     # 只有 stdout / JSONL 代表 Agent 有实际语义进展；重复诊断 stderr 不续期。
@@ -748,6 +773,20 @@ class CodexRunner:
                         thread_id = str(event.get("thread_id") or "") or None
                     if event_type == "item.completed":
                         item = event.get("item") or {}
+                        if (
+                            use_managed_sandbox and current_sandbox_git() is not None
+                            and isinstance(item, dict) and item.get("type") == "command_execution"
+                            and item.get("exit_code") not in {None, 0}
+                        ):
+                            failure = classify_git_failure(str(item.get("aggregated_output") or item.get("output") or ""))
+                            if failure is not None:
+                                git_failure = failure
+                                stream_error = active_redactor.text(str(failure))
+                                stream_failure_event.set()
+                                await emit("system", "run.git_https_failed", {
+                                    "error": stream_error, "error_code": failure.error_code,
+                                    "retryable": failure.retryable,
+                                })
                         if isinstance(item, dict) and item.get("type") == "agent_message":
                             final_message = str(item.get("text") or "")
                     if event_type == "turn.completed" and isinstance(
@@ -931,4 +970,6 @@ class CodexRunner:
             usage=usage,
             events=events,
             error=error,
+            error_code=git_failure.error_code if git_failure else None,
+            retryable=git_failure.retryable if git_failure else True,
         )

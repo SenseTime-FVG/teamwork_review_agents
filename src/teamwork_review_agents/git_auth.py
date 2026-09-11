@@ -21,6 +21,26 @@ _ACTIVE_ENVIRONMENT: ContextVar[Mapping[str, str] | None] = ContextVar(
 )
 
 
+def write_askpass_helper(helper: Path) -> list[str]:
+    """生成不含凭据的 helper；隔离导入环境并提供无密钥自检入口。"""
+
+    helper.write_text(
+        "# Git 凭据只从已授权的进程环境读取，不写入文件。\n"
+        "import os, sys\n"
+        "prompt = (sys.argv[1] if len(sys.argv) > 1 else '').lower()\n"
+        "if prompt == 'teamwork-helper-probe':\n"
+        "    print('teamwork-askpass-ready')\n"
+        "elif 'username' in prompt:\n"
+        "    print(os.environ.get('TEAMWORK_GIT_USERNAME', 'x-access-token'))\n"
+        "elif 'password' in prompt:\n"
+        "    print(os.environ.get('TEAMWORK_GIT_TOKEN', ''))\n"
+        "else:\n"
+        "    print('')\n",
+        encoding="utf-8",
+    )
+    return [sys.executable, "-I", str(helper)]
+
+
 def current_git_environment() -> Mapping[str, str] | None:
     """返回当前异步任务和工作线程共享的 Git 环境补丁。"""
 

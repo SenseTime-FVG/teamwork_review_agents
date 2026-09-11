@@ -40,6 +40,11 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.started": "Agent 开始运行",
   "run.runtime_ready": "运行环境检查通过",
   "run.runtime_unavailable": "运行环境检查失败",
+  "run.git_https_started": "检查 Windows 沙盒 Git HTTPS",
+  "run.git_https_ready": "沙盒 Git HTTPS 检查通过",
+  "run.git_https_skipped": "已跳过沙盒 Git HTTPS 检查",
+  "run.git_https_failed": "沙盒 Git HTTPS 不可用，已阻断运行",
+  "run.git_helper_cleanup_failed": "Git 临时 helper 清理失败",
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
   "turn.completed": "本轮处理完成",
@@ -172,6 +177,16 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   } else if (log.event_type === "model.attempt_failed" && object) {
     body = textValue(object.reason);
     detail = `${textValue(object.provider_id)} / ${textValue(object.model)}`;
+  } else if (log.event_type.startsWith("run.git_") && object) {
+    body = textValue(object.error ?? object.reason);
+    detail = [
+      object.ssl_backend ? `TLS 后端：${textValue(object.ssl_backend)}` : "",
+      object.git_binary ? `Git 路径：${textValue(object.git_binary)}` : "",
+      object.host ? `远端主机：${textValue(object.host)}` : "",
+      object.sha ? `远端 HEAD：${textValue(object.sha)}` : "",
+      object.error_code ? `错误码：${textValue(object.error_code)}` : "",
+      object.retryable === false ? "确定性错误已停止自动重试，修正后可手动触发。" : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type.startsWith("run.runtime_") && object) {
     body = object.error ? textValue(object.error) : "已在创建工作区前完成运行环境检查。";
     detail = [

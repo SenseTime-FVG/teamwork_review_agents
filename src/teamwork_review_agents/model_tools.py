@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .managed_comments import ManagedCommentService
@@ -20,6 +22,7 @@ from .process_control import process_group_options, terminate_process
 from .state import StateStore
 from .subprocess_utils import resolve_executable
 from .codex_executable import resolve_codex_executable
+from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -253,6 +256,10 @@ class ModelToolExecutor:
             cwd=workdir,
             timeout_seconds=timeout_seconds,
         )
+        if self.managed_sandbox and current_sandbox_git() is not None and result["exit_code"] != 0:
+            failure = classify_git_failure(f"{result['stderr']}\n{result['stdout']}")
+            if failure is not None:
+                raise failure
         return {
             "exit_code": result["exit_code"],
             "stdout": result["stdout"],
@@ -261,6 +268,86 @@ class ModelToolExecutor:
             "truncated": result["truncated"],
             "workdir": str(workdir.relative_to(self.repository.workspace.resolve()) or "."),
         }
+
+    async def check_git_https(self) -> dict[str, Any]:
+        """在真实工具沙盒内只读探测 HTTPS；不触碰远端引用，不输出任何凭据。"""
+
+        git_context = current_sandbox_git()
+        if not self.managed_sandbox or git_context is None:
+            return {"status": "skipped", "reason": "当前不是 Windows 托管沙盒"}
+        if not self.agent.network_access:
+            return {"status": "skipped", "reason": "Agent 禁止联网，未执行 HTTPS 探测"}
+        if not (self.repository.workspace / ".git").exists():
+            return {"status": "skipped", "reason": "当前不是 Git 工作区"}
+        timeout = min(30, self.config.runtime.mcp_tool_timeout_seconds)
+
+        async def probe(command: list[str], stage: str) -> dict[str, Any]:
+            """沿用有界输出、进程树取消和相同权限档案，绝不回退到宿主执行。"""
+
+            try:
+                process_task = asyncio.create_task(self._run_process(
+                    self._wrap(command), cwd=self.repository.workspace, timeout_seconds=timeout,
+                ))
+                try:
+                    # 完整 CLI 模式尚未启动自身看门狗，自检也必须响应管理员取消。
+                    while not process_task.done():
+                        await asyncio.wait({process_task}, timeout=0.25)
+                        if self.cancel_check is not None and await self.cancel_check():
+                            raise asyncio.CancelledError
+                    result = await process_task
+                finally:
+                    if not process_task.done():
+                        process_task.cancel()
+                    await asyncio.gather(process_task, return_exceptions=True)
+            except OSError as exc:
+                raise SandboxGitError(
+                    f"Git HTTPS 自检无法启动（{stage}）：{exc}",
+                    error_code="sandbox_git_probe_launch_failed",
+                ) from exc
+            if result["timed_out"]:
+                raise SandboxGitError(
+                    f"Git HTTPS 自检超时（{stage}，{timeout} 秒）",
+                    error_code="sandbox_git_probe_timeout", retryable=True,
+                )
+            return result
+
+        git = resolve_executable("git", self.environment)
+        remote = await probe([git, "remote", "get-url", "origin"], "读取远端")
+        if remote["exit_code"] != 0:
+            output = f"{remote['stderr']}\n{remote['stdout']}"
+            if "no such remote" in output.lower():
+                return {"status": "skipped", "reason": "当前工作区没有 origin"}
+            raise classify_git_failure(output) or SandboxGitError(
+                f"无法读取 Git origin：{output[-1200:]}", error_code="sandbox_git_remote_probe_failed",
+                retryable=True,
+            )
+        try:
+            remote_url = urlsplit(remote["stdout"].strip())
+            is_https = remote_url.scheme.lower() == "https" and remote_url.hostname
+        except ValueError:
+            is_https = False
+        if not is_https:
+            return {"status": "skipped", "reason": "origin 不是 HTTPS 远端"}
+        if git_context.probe_command is not None:
+            helper = await probe(git_context.probe_command, "askpass helper")
+            if helper["exit_code"] != 0 or helper["stdout"].strip() != "teamwork-askpass-ready":
+                # 不回显 helper stdout，避免错误 helper 意外打印 Token。
+                raise SandboxGitError(
+                    f"沙盒内 askpass helper 自检失败：{helper['stderr'][-1200:]}",
+                    error_code="sandbox_git_askpass_unavailable",
+                )
+        result = await probe([git, "ls-remote", "--exit-code", "origin", "HEAD"], "HTTPS 远端")
+        if result["exit_code"] != 0:
+            output = f"{result['stderr']}\n{result['stdout']}"
+            raise classify_git_failure(output) or SandboxGitError(
+                f"Git HTTPS 远端探测失败：{output[-1200:]}",
+                error_code="sandbox_git_remote_probe_failed", retryable=True,
+            )
+        match = re.search(r"^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\s+HEAD\s*$", result["stdout"], re.MULTILINE)
+        if match is None:
+            raise SandboxGitError("Git HTTPS 探测未返回有效 HEAD SHA", error_code="sandbox_git_invalid_remote_head")
+        return {"status": "ready", "ssl_backend": "openssl", "git_binary": git,
+                "remote": "origin", "host": remote_url.hostname, "sha": match.group(1)}
 
     async def _apply_patch(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """先校验路径和补丁，再通过 git apply 原子落盘。"""
