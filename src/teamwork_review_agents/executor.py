@@ -27,7 +27,7 @@ from .environment import (
     resolve_environment,
 )
 from .git_auth import GitCredentialContext
-from .sandbox_git import SandboxGitContext, SandboxGitError, windows_sandbox_git_enabled
+from .sandbox_git import SandboxGitContext, SandboxGitError, classify_git_failure, windows_sandbox_git_enabled
 from .locks import ResourceLease
 from .models import (
     AgentResult,
@@ -952,8 +952,14 @@ class AgentExecutor:
                     self.config.runtime.managed_sandbox.enabled
                     and agent.sandbox != "danger-full-access"
                 )):
-                    sandbox_git_context = SandboxGitContext(process_environment).start()
+                    sandbox_git_context = SandboxGitContext(
+                        process_environment, verified_workspace=active_workspace,
+                    ).start()
                     process_environment = sandbox_git_context.environment
+                    await persist_log("system", "run.git_workspace_trusted", {
+                        "trusted_workspace": sandbox_git_context.verified_workspace.as_posix(),
+                        "reason": "只信任本轮已校验的 Git 工作区，不修改全局配置或目录权限",
+                    })
                 audit_environment = dict(resolved_environment.audit_values)
                 if cache_root is not None:
                     audit_environment["TEAMWORK_REPOSITORY_CACHE_DIR"] = str(
@@ -1008,6 +1014,13 @@ class AgentExecutor:
                     inherited_workspace=task is not None and inherit_workspace,
                 )
                 if preparation.outcome.status != "success":
+                    # 准备步骤也可能先执行 Git；所有权故障不能退化为可重试的普通步骤失败。
+                    if sandbox_git_context is not None and preparation.outcome.status in {"failure", "error"}:
+                        git_failure = classify_git_failure(
+                            f"{preparation.outcome.error or ''}\n{preparation.outcome.output}"
+                        )
+                        if git_failure is not None and git_failure.error_code == "sandbox_git_ownership_mismatch":
+                            raise git_failure
                     detail = preparation.outcome.error or (
                         f"步骤 {preparation.outcome.failed_step or 'unknown'} 失败"
                     )

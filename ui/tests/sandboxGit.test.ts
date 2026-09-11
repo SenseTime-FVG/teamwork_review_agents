@@ -29,3 +29,18 @@ test("探测成功展示主机和 SHA，跳过探测不显示错误", () => {
   assert.equal(messages[1].kind, "system");
   assert.match(messages[1].body, /禁止联网/);
 });
+
+test("目录信任记录精确路径，所有权错误不误报 HTTPS 故障", () => {
+  const messages = presentRunLogs([
+    {id: 1, run_id: "run", created_at: 1, stream: "system", event_type: "run.git_workspace_trusted",
+      payload: JSON.stringify({trusted_workspace: "D:/worktrees/run-id", reason: "只信任本轮已校验的 Git 工作区"})},
+    {id: 2, run_id: "run", created_at: 2, stream: "system", event_type: "run.git_https_failed",
+      payload: JSON.stringify({error_code: "sandbox_git_ownership_mismatch", retryable: false, error: "工作区所有权校验失败"})},
+  ]);
+  assert.equal(messages[0].kind, "system");
+  assert.match(messages[0].detail, /D:\/worktrees\/run-id/);
+  assert.equal(messages[1].kind, "error");
+  assert.match(messages[1].title, /工作区所有权校验失败/);
+  assert.doesNotMatch(messages[1].title, /HTTPS/);
+  assert.match(messages[1].detail, /停止自动重试/);
+});

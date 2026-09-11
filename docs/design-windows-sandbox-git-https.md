@@ -12,6 +12,16 @@
 
 目录权限通过宿主内存中的运行上下文传递，不从 Agent 可控的环境变量解析授权路径。嵌套调用和并发运行分别保存、恢复上下文；运行结束清理目录。
 
+## 工作区所有权信任
+
+Windows 上工作区创建者与沙盒运行用户可能不同，因此 TLS 自检前还需要通过 Git 的所有权校验。执行器在工作区创建或父工作区继承校验完成后，将实际运行目录作为必需参数传给 `SandboxGitContext`，不使用报错中的路径或模型声明的路径。
+
+上下文规范化该目录的绝对路径，并在命令作用域依次追加 `safe.directory=` 与 `safe.directory=<本轮目录>`。空值重置来自系统、全局或已注入环境的信任列表，包括 `*`；重复键必须保留顺序。只清空本轮进程的信任列表，不改任何 Git 配置文件、owner 或 ACL，也不改变操作系统沙盒权限。OpenSSL、证书、凭据、excludes 与代理等原有配置继续合并。
+
+准备步骤、两种模型运行器和工具进程共用该环境。子 Agent 创建新目录时重新生成单目录信任，继承父工作区时使用同一已校验目录；并发上下文不共享可变环境。日志记录本轮信任目录。若仍出现 `detected dubious ownership`，分类为 `sandbox_git_ownership_mismatch`，展示本地工作区所有权错误并停止确定性重试，不能误判为 HTTPS 或 Token 故障。
+
+回归使用 Git 的异主测试模式，在不修改操作系统账户和目录 owner 的情况下验证：当前 clone 与 linked worktree 可读 origin/HEAD、其他异主仓库仍被拒绝、临时 HOME 与继承的通配信任不影响单目录限制。该设置不是额外的操作系统安全边界；拥有命令执行能力的 Agent 仍受原有沙盒文件权限约束。
+
 ## 诊断和失败语义
 
 在模型启动前用实际工具环境和同一沙盒执行 helper 无密钥自检、读取 origin，再对 HTTPS origin 执行有界的 `git ls-remote --exit-code origin HEAD`。禁网、SSH 或没有 origin 的运行不发起 HTTPS 探测。不得打印完整 URL、Token 或环境。
@@ -25,3 +35,5 @@
 单测覆盖配置合并、只读授权、Token 隔离、临时目录清理、禁网/SSH 跳过、故障分类、模型与 CLI 启动前阻断、子 Agent 传播和普通错误不误伤。Windows CI 执行不依赖宿主 Codex 登录的回归；实际 Windows 托管沙盒和企业 CA 仍需部署环境验收。
 
 参考：[Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)、[Git SSL 配置](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpsslBackend)。
+
+目录信任语义参考：[Git safe.directory](https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory)。

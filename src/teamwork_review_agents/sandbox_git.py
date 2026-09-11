@@ -7,9 +7,9 @@ import re
 import shlex
 import sys
 import tempfile
+from collections.abc import Iterable, Mapping
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import urlsplit
 
 from .filesystem import remove_tree
@@ -48,8 +48,10 @@ def windows_sandbox_git_enabled(*, managed: bool) -> bool:
     return managed and (os.name == "nt" or sys.platform == "win32")
 
 
-def append_git_config(environment: dict[str, str], entries: Mapping[str, str]) -> None:
-    """追加命令作用域配置并验证现有索引，避免覆盖凭据或 excludes 设置。"""
+def append_git_config(
+    environment: dict[str, str], entries: Mapping[str, str] | Iterable[tuple[str, str]],
+) -> None:
+    """追加命令作用域配置，保留多值键顺序且不覆盖已有凭据或 excludes。"""
 
     try:
         count = int(environment.get("GIT_CONFIG_COUNT", "0") or "0")
@@ -60,7 +62,7 @@ def append_git_config(environment: dict[str, str], entries: Mapping[str, str]) -
                 raise ValueError
     except ValueError as exc:
         raise SandboxGitError("运行环境的 Git 配置索引无效", error_code="sandbox_git_config_invalid") from exc
-    for key, value in entries.items():
+    for key, value in entries.items() if isinstance(entries, Mapping) else entries:
         environment[f"GIT_CONFIG_KEY_{count}"] = key
         environment[f"GIT_CONFIG_VALUE_{count}"] = value
         count += 1
@@ -70,7 +72,9 @@ def append_git_config(environment: dict[str, str], entries: Mapping[str, str]) -
 class SandboxGitContext:
     """为一个运行准备环境和只读 helper，绝不复用宿主可执行凭据文件。"""
 
-    def __init__(self, environment: Mapping[str, str]) -> None:
+    def __init__(self, environment: Mapping[str, str], *, verified_workspace: Path) -> None:
+        # 路径必须由执行器在创建/继承校验后提供，不能从环境或命令错误中推断。
+        self.verified_workspace = verified_workspace
         self.environment = {
             key.upper() if key.upper().startswith(("GIT_", "TEAMWORK_GIT_")) else key: value
             for key, value in environment.items()
@@ -81,9 +85,27 @@ class SandboxGitContext:
         self._context_token: Token | None = None
 
     def start(self) -> SandboxGitContext:
-        """只消费已经获准传入工具进程的 Token，不读取宿主凭据存储。"""
+        """只信任本轮已校验工作区，并消费已获准传入工具进程的 Token。"""
 
-        append_git_config(self.environment, {"http.sslBackend": "openssl", "http.sslVerify": "true"})
+        try:
+            workspace = self.verified_workspace.resolve(strict=True)
+            if (
+                not workspace.is_dir() or workspace.parent == workspace
+                or "*" in workspace.as_posix()
+                or not ((workspace / ".git").is_dir() or (workspace / ".git").is_file())
+            ):
+                raise ValueError("工作区必须是存在的非根 Git 目录，且不含通配符")
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise SandboxGitError(
+                f"本轮已校验工作区不可用：{self.verified_workspace}：{exc}",
+                error_code="sandbox_git_workspace_invalid",
+            ) from exc
+        self.verified_workspace = workspace
+        # 空值清除本轮继承的信任列表，再仅信任精确目录；不修改全局配置或 ACL。
+        append_git_config(self.environment, [
+            ("http.sslBackend", "openssl"), ("http.sslVerify", "true"),
+            ("safe.directory", ""), ("safe.directory", workspace.as_posix()),
+        ])
         self.environment.pop("GIT_SSL_NO_VERIFY", None)
         self.environment["GIT_TERMINAL_PROMPT"] = "0"
         self.environment["GCM_INTERACTIVE"] = "never"
@@ -124,10 +146,11 @@ class SandboxGitContext:
 
 
 def classify_git_failure(output: str) -> SandboxGitError | None:
-    """仅识别 Git 明确的 TLS/认证基础设施错误，普通冲突等交回模型处理。"""
+    """识别所有权、TLS 和认证基础设施错误，普通冲突等交回模型处理。"""
 
     lowered = output.lower()
     categories = (
+        ("sandbox_git_ownership_mismatch", "工作区所有权校验失败，Git 尚未进入远端网络认证", ("fatal: detected dubious ownership in repository",)),
         ("sandbox_git_schannel_credentials", "Windows 沙盒无法初始化 Schannel TLS 凭据", ("schannel: acquirecredentialshandle failed", "sec_e_no_credentials")),
         ("sandbox_git_openssl_unavailable", "当前 Git 不支持所需 OpenSSL 后端", ("fatal: unsupported ssl backend",)),
         ("sandbox_git_certificate_invalid", "Git HTTPS 证书校验失败，请检查可信 CA 配置", ("ssl certificate problem:", "error setting certificate file:", "error setting certificate verify locations:")),

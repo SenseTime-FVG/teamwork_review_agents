@@ -44,6 +44,7 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.git_https_ready": "沙盒 Git HTTPS 检查通过",
   "run.git_https_skipped": "已跳过沙盒 Git HTTPS 检查",
   "run.git_https_failed": "沙盒 Git HTTPS 不可用，已阻断运行",
+  "run.git_workspace_trusted": "本轮 Git 工作区信任已配置",
   "run.git_helper_cleanup_failed": "Git 临时 helper 清理失败",
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
@@ -165,7 +166,9 @@ function itemMessage(log: RunLog, item: JsonObject): RunMessage {
 
 function systemMessage(log: RunLog, payload: unknown): RunMessage {
   const object = asObject(payload);
-  const title = SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
+  const title = object?.error_code === "sandbox_git_ownership_mismatch"
+    ? "工作区所有权校验失败，已阻断运行"
+    : SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   let body = "";
@@ -180,6 +183,7 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   } else if (log.event_type.startsWith("run.git_") && object) {
     body = textValue(object.error ?? object.reason);
     detail = [
+      object.trusted_workspace ? `Git 信任目录：${textValue(object.trusted_workspace)}` : "",
       object.ssl_backend ? `TLS 后端：${textValue(object.ssl_backend)}` : "",
       object.git_binary ? `Git 路径：${textValue(object.git_binary)}` : "",
       object.host ? `远端主机：${textValue(object.host)}` : "",
