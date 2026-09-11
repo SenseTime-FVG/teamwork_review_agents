@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat
 import sys
-import tempfile
 from collections.abc import Iterable, Mapping
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -70,19 +70,25 @@ def append_git_config(
 
 
 class SandboxGitContext:
-    """为一个运行准备环境和只读 helper，绝不复用宿主可执行凭据文件。"""
+    """为一个运行准备环境和沙盒专用 helper，绝不复用宿主凭据文件。"""
 
-    def __init__(self, environment: Mapping[str, str], *, verified_workspace: Path) -> None:
+    def __init__(
+        self, environment: Mapping[str, str], *, verified_workspace: Path,
+        helper_root: Path | None,
+    ) -> None:
         # 路径必须由执行器在创建/继承校验后提供，不能从环境或命令错误中推断。
         self.verified_workspace = verified_workspace
+        self.helper_root = helper_root
         self.environment = {
             key.upper() if key.upper().startswith(("GIT_", "TEAMWORK_GIT_")) else key: value
             for key, value in environment.items()
         }
         self.directory: Path | None = None
         self.readable_directories: tuple[Path, ...] = ()
+        self.writable_directories: tuple[Path, ...] = ()
         self.probe_command: list[str] | None = None
         self._context_token: Token | None = None
+        self._directory_identity: tuple[int, int] | None = None
 
     def start(self) -> SandboxGitContext:
         """只信任本轮已校验工作区，并消费已获准传入工具进程的 Token。"""
@@ -111,7 +117,21 @@ class SandboxGitContext:
         self.environment["GCM_INTERACTIVE"] = "never"
         try:
             if self.environment.get("TEAMWORK_GIT_TOKEN"):
-                self.directory = Path(tempfile.mkdtemp(prefix="teamwork-sandbox-git-"))
+                try:
+                    root = self.helper_root.resolve(strict=True) if self.helper_root is not None else None
+                    if root is None or not root.is_dir() or root.parent == root or root.is_relative_to(workspace):
+                        raise ValueError("helper 根目录必须是工作区外、本轮独立的运行目录")
+                    directory = root / "git-askpass"
+                    # 不复用已有目录；只有成功创建后才归本上下文清理。
+                    directory.mkdir(mode=0o700)
+                    self.directory = directory
+                    info = directory.stat(follow_symlinks=False)
+                    self._directory_identity = (info.st_dev, info.st_ino)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise SandboxGitError(
+                        f"无法创建本轮 Git askpass 目录：{exc}",
+                        error_code="sandbox_git_helper_root_invalid",
+                    ) from exc
                 command = write_askpass_helper(self.directory / "askpass.py")
                 # GIT_ASKPASS 是文件名而不是 shell 命令。Git for Windows 支持带
                 # shebang 的脚本，由随 Git 提供的 sh 执行；参数只在脚本内转义。
@@ -124,8 +144,10 @@ class SandboxGitContext:
                 launcher.chmod(0o700)
                 self.environment["GIT_ASKPASS"] = str(launcher)
                 self.probe_command = [*command, "teamwork-helper-probe"]
+                # Windows 部署实测中只读授权不足，精确可写根可触发新目录 ACL 初始化。
+                self.writable_directories = (self.directory,)
                 self.readable_directories = tuple(dict.fromkeys((
-                    self.directory.resolve(), Path(sys.executable).resolve().parent,
+                    Path(sys.executable).resolve().parent,
                     Path(sys.base_prefix).resolve(),
                 )))
             self._context_token = _ACTIVE.set(self)
@@ -134,6 +156,25 @@ class SandboxGitContext:
             self.close()
             raise
 
+    def validate_helper_directory(self) -> None:
+        """重新生成权限档案前验证入口未被替换，不能把可写授权解析到外部目录。"""
+
+        if self.directory is None:
+            return
+        try:
+            info = self.directory.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                or (info.st_dev, info.st_ino) != self._directory_identity
+            ):
+                raise ValueError("helper 目录入口已被替换")
+        except (OSError, ValueError) as exc:
+            raise SandboxGitError(
+                f"本轮 Git askpass 目录不再可信：{exc}",
+                error_code="sandbox_git_helper_root_invalid",
+            ) from exc
+
     def close(self) -> None:
         """恢复父运行上下文并清理当前 helper，不删除宿主或其他运行目录。"""
 
@@ -141,8 +182,11 @@ class SandboxGitContext:
             _ACTIVE.reset(self._context_token)
             self._context_token = None
         if self.directory is not None:
+            # 保留创建时的入口，不 resolve 已被 Agent 改写的符号链接或 junction。
             remove_tree(self.directory)
             self.directory = None
+        self.readable_directories = ()
+        self.writable_directories = ()
 
 
 def classify_git_failure(output: str) -> SandboxGitError | None:

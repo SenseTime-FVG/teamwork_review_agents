@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .filesystem import remove_tree
+from .git_auth import current_git_environment
 from .process_control import process_group_options, terminate_process
+from .sandbox_git import current_sandbox_git
 
 
 CHANNEL_VERSION = 1
@@ -280,7 +282,13 @@ class ManagedMcpBroker:
             response_timeout_seconds=response_timeout_seconds,
         )
         broker = cls(channel)
-        environment = dict(base_environment)
+        if current_sandbox_git() is not None:
+            # Broker 在沙盒外执行，不能继承可写 helper 或工具 HOME/PATH/Git 配置。
+            # 无 Token 时也从宿主重建，防止子 Agent 的匿名 Git 回退到沙盒脚本。
+            environment = dict(os.environ)
+            environment.update(current_git_environment() or {})
+        else:
+            environment = dict(base_environment)
         environment.update(channel.environment_overrides())
         environment["TEAMWORK_CONFIG_PATH"] = str(config_path)
         environment["TEAMWORK_INVOCATION_CONTEXT"] = encoded_context
