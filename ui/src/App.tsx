@@ -16,6 +16,7 @@ import {
 import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { presentRunLogs } from "./runLogPresentation";
+import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -280,7 +281,7 @@ async function loadCodexRuntimeOptions(): Promise<{
   }
 }
 
-const REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
   const scannerInput = { ...(value.scanner ?? {}) };
@@ -3160,7 +3161,8 @@ function ModelProvidersEditor(props: {
                         options={modelSupportsReasoningEffort(selected, selectedResolved?.model)
                           ? [
                               { value: "", label: "不向上游显式传递" },
-                              ...GPT_REASONING_LEVELS.map((value) => ({ value, label: value })),
+                              ...reasoningEffortOptions(EXTERNAL_REASONING_LEVELS, selected.model_reasoning_effort)
+                                .map((value) => ({ value, label: value })),
                             ]
                           : [{ value: "", label: "不适用（非 GPT 模型）" }]}
                       />
@@ -3336,8 +3338,6 @@ function resolvedProviderModel(
   };
 }
 
-const GPT_REASONING_LEVELS = ["minimal", "low", "medium", "high"];
-
 function modelSupportsReasoningEffort(
   provider?: ModelProviderConfig,
   model?: string | null,
@@ -3360,10 +3360,7 @@ function reasoningLevelsForProvider(
   if (provider?.driver === "codex_cli") {
     return reasoningLevels(options, model, current ?? undefined);
   }
-  return Array.from(new Set([
-    ...GPT_REASONING_LEVELS,
-    ...(current && GPT_REASONING_LEVELS.includes(current) ? [current] : []),
-  ]));
+  return reasoningEffortOptions(EXTERNAL_REASONING_LEVELS, current);
 }
 
 function agentModelDisplay(
@@ -3522,7 +3519,6 @@ type InheritedSettingKey = keyof CodexRuntimeOptions["inherited_settings"];
 
 const SETTING_VALUE_LABELS: Record<InheritedSettingKey, Record<string, string>> = {
   model_reasoning_effort: {
-    minimal: "最小",
     low: "低",
     medium: "中",
     high: "高",
@@ -3651,10 +3647,7 @@ function reasoningLevels(
   current?: string,
 ): string[] {
   const modelEntry = options.models.find((item) => item.slug === model);
-  return Array.from(new Set([
-    ...(modelEntry?.supported_reasoning_levels ?? REASONING_LEVELS),
-    ...(current ? [current] : []),
-  ]));
+  return reasoningEffortOptions(modelEntry?.supported_reasoning_levels ?? REASONING_LEVELS, current);
 }
 
 function CodexRuntimeEditor(props: {
@@ -9171,6 +9164,7 @@ function modelSettingSourceLabel(source?: string | null): string {
     codex_user: "Codex 用户配置",
     codex_default: "Codex / 账号默认",
     unsupported: "模型不支持",
+    compatibility_downgrade: "上游兼容降级",
   };
   return source ? labels[source] ?? source : "来源未记录";
 }
@@ -9423,6 +9417,11 @@ function AgentRunDetailDrawer(props: {
                     <div><span>配置版本</span><strong>{shortRevision(detail.config_revision)}</strong></div>
                   </div>
                   <h3>Agent 最终消息</h3>
+                  {detail.model_snapshot?.reasoning_effort_source === "compatibility_downgrade" && (
+                    <div className="alert" role="status">
+                      推理参数已兼容降级：配置 {detail.model_snapshot.configured_reasoning_effort} → 实际请求 {detail.model_snapshot.reasoning_effort ?? "不传 effort（上游默认）"}。可在消息或运行详情中查看原始错误和降级轨迹。
+                    </div>
+                  )}
                   {detail.final_message
                     ? <div className="run-result-message"><MarkdownMessage>{detail.final_message}</MarkdownMessage></div>
                     : <pre className={`detail-pre ${detail.error ? "detail-error" : ""}`}>{detail.error ?? "暂无最终消息"}</pre>}
@@ -9461,8 +9460,12 @@ function AgentRunDetailDrawer(props: {
                       <div><dt>模型来源</dt><dd>{detail.model_snapshot
                         ? modelSettingSourceLabel(detail.model_snapshot.model_source)
                         : "—"}</dd></div>
-                      <div><dt>推理强度</dt><dd>{detail.model_snapshot
-                        ? modelSettingText(detail.model_snapshot.reasoning_effort, detail.model_snapshot.reasoning_effort_source)
+                      {detail.model_snapshot && "configured_reasoning_effort" in detail.model_snapshot && (
+                        <div><dt>配置推理强度</dt><dd>{detail.model_snapshot.configured_reasoning_effort ?? "未显式配置"}</dd></div>
+                      )}
+                      <div><dt>实际请求推理强度</dt><dd>{detail.model_snapshot
+                        ? modelSettingText(detail.model_snapshot.reasoning_effort, detail.model_snapshot.reasoning_effort_source,
+                          detail.model_snapshot.reasoning_effort_source === "compatibility_downgrade" ? "不传 effort（上游默认）" : "模型默认")
                         : "—"}</dd></div>
                       <div><dt>快速模式</dt><dd>{detail.model_snapshot
                         ? modelSettingText(modelFastModeLabel(detail.model_snapshot.fast_mode), detail.model_snapshot.fast_mode_source)
@@ -9471,6 +9474,17 @@ function AgentRunDetailDrawer(props: {
                         ? modelSettingText(modelVerbosityLabel(detail.model_snapshot.verbosity), detail.model_snapshot.verbosity_source)
                         : "—"}</dd></div>
                     </dl>
+                    {!!detail.model_snapshot?.reasoning_downgrades?.length && (
+                      <details className="run-fallback-attempts" open>
+                        <summary>推理强度降级轨迹 <span>{detail.model_snapshot.reasoning_downgrades.length}</span></summary>
+                        {detail.model_snapshot.reasoning_downgrades.map((item, index) => (
+                          <div key={index}>
+                            <strong>{item.provider_id} / {item.model}：{item.from} → {item.to ?? "不传 effort（上游默认）"}</strong>
+                            <pre className="detail-pre">{item.reason}</pre>
+                          </div>
+                        ))}
+                      </details>
+                    )}
                     {detail.model_snapshot?.fallback_plan && detail.model_snapshot.fallback_plan.length > 0 && (
                       <div className="run-fallback-trace">
                         <strong>模型回退链</strong>
