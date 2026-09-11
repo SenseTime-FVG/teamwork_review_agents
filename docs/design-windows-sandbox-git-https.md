@@ -16,6 +16,10 @@ Windows 部署实测发现只读授权的新建 helper 目录仍被 ACL 拒绝�
 
 目录权限通过宿主内存中的运行上下文传递，不从 Agent 可控的环境变量解析授权路径。嵌套调用和并发运行分别保存、恢复上下文；成功、失败、取消后均先结束工具/Broker，再清理 helper 和本轮 Git 运行目录。清理使用原始目录入口、不 resolve 可被修改的链接，不跟随符号链接或 Windows junction 删除其他目录。
 
+Windows junction 不是 `Path.is_symlink()` 识别的普通符号链接，Python 3.12 的 `rmtree()` 会拒绝把 junction 当作顶层待删目录。清理器在每次重试前通过 `lstat` 的 reparse 属性和 mount-point tag 识别 junction，调用 `rmdir` 仅删除联接入口；普通符号链接使用 `unlink`，实际目录才使用 `rmtree`。使用 Python 3.11 已支持的元数据，不依赖 3.12 新增的 `Path.is_junction()`。目标缺失的失效联接也能识别；权限错误处理不对链接目标回退执行 chmod。新增原生 Windows 顶层、嵌套和失效 junction 回归，不跳过原有失败用例。
+
+删除语义参考：[Windows RemoveDirectory](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw)。
+
 ## 工作区所有权信任
 
 Windows 上工作区创建者与沙盒运行用户可能不同，因此 TLS 自检前还需要通过 Git 的所有权校验。执行器在工作区创建或父工作区继承校验完成后，将实际运行目录作为必需参数传给 `SandboxGitContext`，不使用报错中的路径或模型声明的路径。

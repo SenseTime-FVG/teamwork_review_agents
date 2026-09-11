@@ -22,3 +22,10 @@
 3. MCP Broker 在该上下文下使用宿主环境及宿主凭据上下文，不再复用 Agent 工具环境；覆盖有/无 Token、被修改 helper、嵌套子 Agent 的隔离回归。
 4. 在 finally 清理 helper 及其运行目录，补充成功、准备失败、取消、创建失败和目录链接清理测试。
 5. 更新 README，执行定向及全量回归，提交推送；明确实际 Windows 沙盒仍需部署验收。
+
+## Windows CI junction 清理修正
+
+1. 在公共清理器中用 lstat 区分实际目录、符号链接和 junction；每次重试重新判断入口，仅对 junction 执行 rmdir。
+2. 保留缺失路径处理和有界重试，嵌套链接的权限错误回调不能修改链接目标的权限。
+3. 添加跨平台模拟测试及原生 Windows 顶层、嵌套、失效 junction 测试，保留原有 helper 安全清理用例。
+4. 定向与全量测试通过后提交推送，检查本次提交的 Windows push/PR CI 结果；不修改沙盒授权或凭据方案。
