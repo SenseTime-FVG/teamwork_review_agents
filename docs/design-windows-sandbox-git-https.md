@@ -8,9 +8,13 @@
 
 为单次运行复制进程环境，追加 `http.sslBackend=openssl` 和 `http.sslVerify=true`，合并已有 `GIT_CONFIG_COUNT` 和 excludes/凭据设置。用户显式提供的 CA 路径保持有效；没有可用 OpenSSL 或可信 CA 时明确阻断，不降为不验证证书。
 
-仅当已有进程环境包含获准暴露的 Teamwork Git Token 时创建新的 askpass helper。该文件不含 Token，独立于宿主同步使用的 helper，位于独立随机运行目录。权限档案只添加 helper 与 Python 运行依赖的只读目录，不放行整个临时目录，不为业务工作区增加写权限。采用隔离 Python 启动，避免导入工作区同名模块。
+仅当已有进程环境包含获准暴露的 Teamwork Git Token 时创建新的 askpass helper。执行器在准备步骤前创建本轮独立的 Git 运行目录，在其 `git-askpass/` 子目录写入不含 Token 的 helper。只将该子目录作为精确可写根，Python 运行依赖仍为只读；不放行整个临时目录，不为业务工作区增加写权限。采用隔离 Python 启动，避免导入工作区同名模块。
 
-目录权限通过宿主内存中的运行上下文传递，不从 Agent 可控的环境变量解析授权路径。嵌套调用和并发运行分别保存、恢复上下文；运行结束清理目录。
+Windows 部署实测发现只读授权的新建 helper 目录仍被 ACL 拒绝，而可写根授权能使同沙盒自检通过；这不是官方保证所有版本均有的行为。现有 Codex 运行目录由 Runner 稍后创建，晚于工作区准备，因此本次使用独立 Git 运行目录，不迁移两个 Runner 的生命周期或混入 Codex 登录文件。
+
+可写 helper 只能在沙盒内执行。Windows Git 上下文启用时，沙盒外 MCP Broker 从宿主进程环境及独立 `GitCredentialContext` 构造环境，绝不继承工具环境的 askpass、Git 配置、HOME、PATH 或 Python 导入路径；子 Agent 的宿主 Git 仍使用受保护的凭据文件。无 Token 时也必须隔离，防止匿名 Git 通过环境回退执行父 Agent 改写的 helper。
+
+目录权限通过宿主内存中的运行上下文传递，不从 Agent 可控的环境变量解析授权路径。嵌套调用和并发运行分别保存、恢复上下文；成功、失败、取消后均先结束工具/Broker，再清理 helper 和本轮 Git 运行目录。清理使用原始目录入口、不 resolve 可被修改的链接，不跟随符号链接或 Windows junction 删除其他目录。
 
 ## 工作区所有权信任
 
@@ -32,7 +36,7 @@ Windows 上工作区创建者与沙盒运行用户可能不同，因此 TLS 自�
 
 ## 验证
 
-单测覆盖配置合并、只读授权、Token 隔离、临时目录清理、禁网/SSH 跳过、故障分类、模型与 CLI 启动前阻断、子 Agent 传播和普通错误不误伤。Windows CI 执行不依赖宿主 Codex 登录的回归；实际 Windows 托管沙盒和企业 CA 仍需部署环境验收。
+单测覆盖配置合并、精确可写授权、Python 只读依赖、Token 隔离、宿主 Broker 隔离、真实 Git credential fill 链路、临时目录清理、禁网/SSH 跳过、故障分类、模型与 CLI 启动前阻断、子 Agent 传播和普通错误不误伤。Windows CI 执行不依赖宿主 Codex 登录的回归；实际 Windows 托管沙盒和企业 CA 仍需部署环境验收。
 
 参考：[Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)、[Git SSL 配置](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpsslBackend)。
 

@@ -18,13 +18,14 @@ import pytest
 from teamwork_review_agents.agent_workspace import AgentWorkspacePreparationResult, prepare_agent_workspace
 from teamwork_review_agents.codex_model_runner import CodexModelRunner
 from teamwork_review_agents.codex_runner import CodexRunner
-from teamwork_review_agents.config import AgentWorkspaceConfig, AgentWorkspacePrepareStepConfig
+from teamwork_review_agents.config import AgentWorkspaceConfig, AgentWorkspacePrepareStepConfig, EnvironmentVariable
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
 from teamwork_review_agents.git_auth import GitCredentialContext
+from teamwork_review_agents.filesystem import remove_tree
 from teamwork_review_agents.managed_sandbox import ManagedSandboxInspection, permission_profile_override
-from teamwork_review_agents.mcp_bridge import McpBridgeChannel
+from teamwork_review_agents.mcp_bridge import ManagedMcpBroker, McpBridgeChannel
 from teamwork_review_agents.model_tools import ModelToolExecutor
 from teamwork_review_agents.models import AgentResult, InvocationContext
 from teamwork_review_agents.preflight import StepExecutionOutcome
@@ -36,18 +37,21 @@ from teamwork_review_agents.state import StateStore
 
 
 @contextmanager
-def active_git(environment=None, *, workspace=None):
+def active_git(environment=None, *, workspace=None, helper_root=None):
     """在当前任务中成对建立和释放上下文，避免测试间残留。"""
 
     with nullcontext(workspace) if workspace is not None else TemporaryDirectory(prefix="test-git-workspace-") as directory:
         if workspace is None:
             workspace = Path(directory)
             (workspace / ".git").mkdir()
-        context = SandboxGitContext(environment or {}, verified_workspace=workspace).start()
-        try:
-            yield context
-        finally:
-            context.close()
+        with nullcontext(helper_root) if helper_root is not None else TemporaryDirectory(prefix="test-git-runtime-") as runtime:
+            context = SandboxGitContext(
+                environment or {}, verified_workspace=workspace, helper_root=Path(runtime),
+            ).start()
+            try:
+                yield context
+            finally:
+                context.close()
 
 
 def process_result(stdout="", stderr="", code=0, timed_out=False):
@@ -191,7 +195,7 @@ def test_workspace_trust_requires_existing_precise_git_directory(tmp_path, inval
         workspace.write_text("不是目录", encoding="utf-8")
     elif invalid == "root":
         workspace = Path(tmp_path.anchor)
-    context = SandboxGitContext({"TEAMWORK_GIT_TOKEN": "test"}, verified_workspace=workspace)
+    context = SandboxGitContext({"TEAMWORK_GIT_TOKEN": "test"}, verified_workspace=workspace, helper_root=None)
     with pytest.raises(SandboxGitError) as failure:
         context.start()
     assert failure.value.error_code == "sandbox_git_workspace_invalid"
@@ -249,9 +253,13 @@ async def test_ownership_failure_blocks_before_https_probe(tool, monkeypatch):
     assert run.await_count == 1
 
 
-@pytest.mark.parametrize("inherit,preparation_fails", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("inherit,outcome", [
+    (False, "completed"), (True, "completed"), (True, "prepare_failed"),
+    (False, "cancelled"), (False, "failed"), (False, "task_cancelled"),
+])
+@pytest.mark.parametrize("expose_token", [True, False])
 async def test_executor_injects_validated_workspace_before_preparation(
-    git_repositories, configured_app_factory, snapshot_factory, monkeypatch, inherit, preparation_fails,
+    git_repositories, configured_app_factory, snapshot_factory, monkeypatch, inherit, outcome, expose_token,
 ):
     """实际执行器向准备步骤和 Runner 传递校验结果，准备失败时也保存不可重试状态。"""
 
@@ -262,15 +270,20 @@ async def test_executor_injects_validated_workspace_before_preparation(
     config.repositories[0].workspace = source
     config.agents["code-reviewer"].sandbox = "workspace-write"
     config.agents["code-reviewer"].write_scopes = ["workspace"]
+    config.repositories[0].environment["GITHUB_TOKEN"] = EnvironmentVariable(
+        value="executor-test-token", secret=True, expose_to_process=expose_token,
+    )
     store = StateStore(config.database.path)
     store.initialize()
     executor = AgentExecutor(config, store)
     monkeypatch.setattr("teamwork_review_agents.executor.windows_sandbox_git_enabled", lambda **kwargs: True)
-    monkeypatch.setattr("teamwork_review_agents.executor.resolve_provider_token", lambda *args: "")
+    monkeypatch.setattr("teamwork_review_agents.executor.resolve_provider_token", lambda *args: "executor-test-token")
     monkeypatch.setattr("teamwork_review_agents.executor.resolve_model_snapshot", lambda *args: {"model": "gpt-test"})
     monkeypatch.setattr("teamwork_review_agents.executor.prepare_change_request_workspace", lambda *args, **kwargs: "HEAD")
     # 创建分支使用已准备的真实 clone；继承分支仍执行真实 validate_run_workspace。
     monkeypatch.setattr("teamwork_review_agents.executor.ensure_isolated_clone", lambda *args, **kwargs: workspace)
+
+    runtime_paths = []
 
     def assert_trust(environment):
         count = int(environment["GIT_CONFIG_COUNT"])
@@ -278,11 +291,21 @@ async def test_executor_injects_validated_workspace_before_preparation(
         assert environment[f"GIT_CONFIG_KEY_{count - 1}"] == "safe.directory"
         assert environment[f"GIT_CONFIG_VALUE_{count - 1}"] == workspace.resolve().as_posix()
         assert current_sandbox_git().verified_workspace == workspace.resolve()
+        if not expose_token:
+            assert "TEAMWORK_GIT_TOKEN" not in environment
+            assert "GIT_ASKPASS" not in environment
+            assert current_sandbox_git().directory is None
+            return
+        helper = Path(environment["GIT_ASKPASS"])
+        assert helper.is_file()
+        assert helper.parent == current_sandbox_git().directory
+        assert not helper.is_relative_to(workspace)
+        runtime_paths.append(helper.parent.parent)
 
     async def prepare(**kwargs):
         assert kwargs["repository"].workspace == workspace.resolve()
         assert_trust(kwargs["process_environment"])
-        if preparation_fails:
+        if outcome == "prepare_failed":
             return AgentWorkspacePreparationResult(
                 outcome=StepExecutionOutcome(status="failure", exit_code=128,
                                              output="fatal: detected dubious ownership in repository at 'D:/run'"),
@@ -292,8 +315,10 @@ async def test_executor_injects_validated_workspace_before_preparation(
 
     async def run(**kwargs):
         assert_trust(kwargs["process_environment"])
+        if outcome == "task_cancelled":
+            raise asyncio.CancelledError
         return AgentResult(run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
-                           parent_run_id=kwargs["parent_run_id"], agent_name=kwargs["agent_name"], status="completed")
+                           parent_run_id=kwargs["parent_run_id"], agent_name=kwargs["agent_name"], status=outcome)
 
     preparation = AsyncMock(side_effect=prepare)
     runner = SimpleNamespace(run=AsyncMock(side_effect=run))
@@ -304,7 +329,7 @@ async def test_executor_injects_validated_workspace_before_preparation(
     if inherit:
         arguments.update(task="继承工作区测试", root_run_id="parent", parent_run_id="parent",
                          depth=1, inherit_workspace=True, parent_workspace=workspace)
-    if preparation_fails:
+    if outcome == "prepare_failed":
         for _ in range(2):
             with pytest.raises(AgentExecutionError) as error:
                 await executor.execute(**arguments)
@@ -312,6 +337,12 @@ async def test_executor_injects_validated_workspace_before_preparation(
             assert error.value.retryable is False
         assert preparation.await_count == 1
         runner.run.assert_not_called()
+    elif outcome == "task_cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await executor.execute(**arguments)
+    elif outcome in {"failed", "cancelled"}:
+        with pytest.raises(AgentExecutionError):
+            await executor.execute(**arguments)
     else:
         result = await executor.execute(**arguments)
         assert result.status == "completed"
@@ -321,6 +352,8 @@ async def test_executor_injects_validated_workspace_before_preparation(
     trusted = next(json.loads(log["payload"]) for log in logs if log["event_type"] == "run.git_workspace_trusted")
     assert trusted["trusted_workspace"] == workspace.resolve().as_posix()
     assert current_sandbox_git() is None
+    assert bool(runtime_paths) is expose_token
+    assert all(not path.exists() for path in runtime_paths)
 
 
 @pytest.fixture
@@ -375,6 +408,7 @@ def test_git_environment_is_additive_and_scoped(monkeypatch):
         assert "TEAMWORK_GIT_TOKEN" not in environment
         assert context.directory is None
         assert context.readable_directories == ()
+        assert context.writable_directories == ()
     assert original["GIT_CONFIG_COUNT"] == "2"
     assert original["GIT_SSL_NO_VERIFY"] == "1"
     assert current_sandbox_git() is None
@@ -403,9 +437,11 @@ def test_windows_compatibility_gate(monkeypatch, platform, managed, expected):
     assert windows_sandbox_git_enabled(managed=managed) is expected
 
 
-def test_helper_is_separate_read_only_and_contains_no_token(tool):
+@pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
+def test_helper_is_separate_writable_and_contains_no_token(tool, sandbox):
     """沙盒 helper 不与宿主共用；真实执行无密钥自检。"""
 
+    tool.agent.sandbox = sandbox
     with GitCredentialContext("test-private-token", provider_kind="github") as host:
         original_helper = host.environment["GIT_ASKPASS"]
         with active_git(host.environment) as context:
@@ -413,6 +449,7 @@ def test_helper_is_separate_read_only_and_contains_no_token(tool):
             directory = context.directory
             contents = (directory / "askpass.py").read_text(encoding="utf-8")
             assert "test-private-token" not in contents
+            assert "test-private-token" not in (directory / "askpass.sh").read_text(encoding="utf-8")
             assert original_helper != context.environment["GIT_ASKPASS"]
             assert host.environment["GIT_ASKPASS"] == original_helper
             assert context.probe_command[1] == "-I"
@@ -422,9 +459,15 @@ def test_helper_is_separate_read_only_and_contains_no_token(tool):
             assert result.stdout.strip() == "teamwork-askpass-ready"
             assert "test-private-token" not in result.stdout + result.stderr
             profile = permission_profile_override(tool.agent)
-            assert f'{json.dumps(str(directory.resolve()))}="read"' in profile
-            assert f'{json.dumps(str(directory.resolve()))}="write"' not in profile
-            assert str(directory.parent) + '\"=\"read\"' not in profile
+            assert directory.name == "git-askpass"
+            assert directory == directory.resolve()
+            assert f'{json.dumps(str(directory))}="write"' in profile
+            assert f'{json.dumps(str(directory))}="read"' not in profile
+            assert f'{json.dumps(str(directory.parent))}=' not in profile
+            assert f'{json.dumps(str(directory.parent.parent))}=' not in profile
+            for dependency in context.readable_directories:
+                assert f'{json.dumps(str(dependency))}="read"' in profile
+                assert f'{json.dumps(str(dependency))}="write"' not in profile
             assert 'mode="limited"' in profile
             assert '"github.com"="allow"' in profile
         assert not directory.exists()
@@ -432,14 +475,13 @@ def test_helper_is_separate_read_only_and_contains_no_token(tool):
         assert host.environment["GIT_ASKPASS"] == original_helper
 
 
-def test_git_can_execute_quoted_helper_with_spaces(tmp_path, monkeypatch):
+def test_git_can_execute_quoted_helper_with_spaces(tmp_path):
     """直接让原生 Git 解析 askpass 命令，覆盖 Windows 路径空格而不访问网络。"""
 
-    directory = tmp_path / "helper with spaces"
-    directory.mkdir()
-    (tmp_path / ".git").mkdir()
-    monkeypatch.setattr("teamwork_review_agents.sandbox_git.tempfile.mkdtemp", lambda **kwargs: str(directory))
-    with active_git({"TEAMWORK_GIT_TOKEN": "dummy-credential"}, workspace=tmp_path) as context:
+    runtime = tmp_path / "helper with spaces"
+    runtime.mkdir()
+    with active_git({"TEAMWORK_GIT_TOKEN": "dummy-credential"}, helper_root=runtime) as context:
+        directory = context.directory
         result = subprocess.run(
             ["git", "-c", "credential.helper=", "credential", "fill"],
             input="protocol=https\nhost=example.test\n\n", text=True,
@@ -449,6 +491,132 @@ def test_git_can_execute_quoted_helper_with_spaces(tmp_path, monkeypatch):
         assert "username=x-access-token" in result.stdout
         assert "password=dummy-credential" in result.stdout
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("case", ["missing", "none", "workspace", "existing"])
+def test_helper_root_invalid_never_deletes_existing_directory(tmp_path, case):
+    """拒绝无效/已占用根路径，不能把别人的目录当作本轮失败残留删除。"""
+
+    workspace = tmp_path / "repo"
+    (workspace / ".git").mkdir(parents=True)
+    root = tmp_path / "runtime"
+    if case == "none":
+        root = None
+    elif case == "workspace":
+        root = workspace
+    elif case == "existing":
+        (root / "git-askpass").mkdir(parents=True)
+        (root / "git-askpass/keep").write_text("保留现场", encoding="utf-8")
+    context = SandboxGitContext({"TEAMWORK_GIT_TOKEN": "test"}, verified_workspace=workspace, helper_root=root)
+    with pytest.raises(SandboxGitError) as error:
+        context.start()
+    assert error.value.error_code == "sandbox_git_helper_root_invalid"
+    assert error.value.retryable is False
+    assert context.directory is None
+    if case == "existing":
+        assert (root / "git-askpass/keep").read_text(encoding="utf-8") == "保留现场"
+
+
+def test_helper_creation_failure_cleans_only_owned_directory(tmp_path, monkeypatch):
+    """helper 写入中断时仍回收自己创建的子目录，保留父运行目录及父上下文。"""
+
+    def fail(helper):
+        helper.write_text("部分文件", encoding="utf-8")
+        raise PermissionError("模拟写入失败")
+
+    monkeypatch.setattr("teamwork_review_agents.sandbox_git.write_askpass_helper", fail)
+    with active_git() as parent:
+        with pytest.raises(PermissionError):
+            with active_git({"TEAMWORK_GIT_TOKEN": "test"}, helper_root=tmp_path):
+                pytest.fail("不应成功启动")
+        assert current_sandbox_git() is parent
+    assert tmp_path.is_dir()
+    assert not (tmp_path / "git-askpass").exists()
+
+
+def test_writable_helper_cleanup_does_not_follow_directory_links(tmp_path):
+    """模拟 Agent 替换 helper 入口：POSIX 符号链接和 Windows junction 都不能越界清理。"""
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep"
+    keep.write_text("不能删除", encoding="utf-8")
+    with active_git({"TEAMWORK_GIT_TOKEN": "test"}) as context:
+        directory = context.directory
+        remove_tree(directory)
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(directory), str(outside)],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+        else:
+            directory.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(SandboxGitError) as error:
+            context.validate_helper_directory()
+        assert error.value.error_code == "sandbox_git_helper_root_invalid"
+    assert not os.path.lexists(directory)
+    assert keep.read_text(encoding="utf-8") == "不能删除"
+
+
+@pytest.mark.parametrize("host_token", ["", "host-test-token"])
+async def test_broker_never_executes_mutable_sandbox_helper(tmp_path, monkeypatch, host_token):
+    """即使 helper 被改写，沙盒外 Broker 和无凭据子运行的 Git 也不能回退使用它。"""
+
+    for name in list(os.environ):
+        if name.upper().startswith(("GIT_", "TEAMWORK_GIT_")):
+            monkeypatch.delenv(name)
+    empty_config = tmp_path / "empty-git-config"
+    empty_config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty_config))
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+    launch = AsyncMock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr("teamwork_review_agents.mcp_bridge.asyncio.create_subprocess_exec", launch)
+    monkeypatch.setattr(ManagedMcpBroker, "_wait_until_ready", AsyncMock())
+    marker = tmp_path / "unexpected-host-execution"
+    with GitCredentialContext(host_token, provider_kind="github") as host:
+        with active_git({**host.environment, "TEAMWORK_GIT_TOKEN": "sandbox-test-token"}) as context:
+            helper = context.directory / "askpass.py"
+            helper.write_text(
+                f"# 模拟 Agent 改写的脚本，用标记文件识别越界执行。\n"
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\nprint('tampered')\n",
+                encoding="utf-8",
+            )
+            # 先确认脚本实际可执行，避免阴性结果只是测试 helper 没有生效。
+            proof = subprocess.run(context.probe_command, capture_output=True, text=True, timeout=10)
+            assert proof.returncode == 0 and marker.exists()
+            marker.unlink()
+            tool_environment = {**os.environ, **context.environment,
+                                "HOME": str(context.directory), "USERPROFILE": str(context.directory),
+                                "PATH": str(context.directory), "PYTHONPATH": str(context.directory),
+                                "GIT_CONFIG_PARAMETERS": "工具专属 Git 覆盖"}
+            broker = await ManagedMcpBroker.start(
+                run_id="test-host-git-boundary", config_path=tmp_path / "config.yaml",
+                encoded_context="test-context", base_environment=tool_environment,
+                response_timeout_seconds=5,
+            )
+            try:
+                environment = launch.call_args.kwargs["env"]
+                for name in ("HOME", "USERPROFILE", "PATH", "PYTHONPATH"):
+                    assert environment.get(name) == os.environ.get(name)
+                assert "GIT_CONFIG_PARAMETERS" not in environment
+                assert environment.get("GIT_ASKPASS") == host.environment.get("GIT_ASKPASS")
+                assert environment.get("TEAMWORK_GIT_TOKEN") == (host_token or None)
+                assert str(context.directory) not in json.dumps(environment)
+                assert environment["TEAMWORK_CONFIG_PATH"] == str(tmp_path / "config.yaml")
+                assert environment["TEAMWORK_INVOCATION_CONTEXT"] == "test-context"
+                # 模拟 Broker 子 Agent 没有新凭据时直接继承进程环境的原生 Git 调用。
+                result = subprocess.run(
+                    ["git", "-c", "credential.helper=", "credential", "fill"],
+                    input="protocol=https\nhost=example.test\n\n", cwd=tmp_path,
+                    env=environment, capture_output=True, text=True, timeout=10,
+                )
+                assert "tampered" not in result.stdout
+                assert not marker.exists()
+            finally:
+                await broker.close()
+            assert current_sandbox_git() is context
 
 
 async def test_nested_and_concurrent_contexts_are_isolated():
@@ -525,7 +693,7 @@ async def test_probe_uses_same_sandbox_and_never_passes_token_in_arguments(tool,
             assert command[:2] == ["codex", "sandbox"]
             assert 'mode="limited"' in " ".join(command)
             assert "probe-secret" not in " ".join(command)
-            assert f'{json.dumps(str(context.directory.resolve()))}="read"' in " ".join(command)
+            assert f'{json.dumps(str(context.directory))}="write"' in " ".join(command)
         assert calls[-1][calls[-1].index("--") + 2:] == ["ls-remote", "--exit-code", "origin", "HEAD"]
 
 

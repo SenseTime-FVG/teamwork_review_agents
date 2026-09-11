@@ -208,10 +208,15 @@ def permission_profile_override(
     ]
     git_context = current_sandbox_git()
     if git_context is not None:
-        # 只读例外来自宿主创建的运行上下文，不能由工具环境自行声明。
+        git_context.validate_helper_directory()
+        # 授权来自宿主内存，不从工具环境推断；helper 可写、Python 依赖只读。
         extra_filesystem_entries.extend(
             f"{_toml_string(str(path))}=\"read\""
             for path in git_context.readable_directories
+        )
+        extra_filesystem_entries.extend(
+            f"{_toml_string(str(path))}=\"write\""
+            for path in git_context.writable_directories
         )
     if agent.sandbox == "read-only":
         fields = [

@@ -363,7 +363,7 @@ Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`�
 
 工作区创建者与沙盒用户不一致时，Git 可能拒绝访问并报告 `detected dubious ownership`。Teamwork 在工作区创建或继承校验完成后，通过本轮进程环境先重置 `safe.directory` 列表，再只信任当前运行目录的规范化绝对路径。准备步骤和后续 Git 命令统一继承，不依赖临时 HOME，不写全局配置，也不修改 owner 或 ACL；不会添加 `*` 或整个工作区根目录的信任。子 Agent 按自己的实际工作区重新生成配置。运行日志记录精确信任目录；仍有所有权错误时显示 `sandbox_git_ownership_mismatch` 并停止确定性重试，不误报为 HTTPS 或 Token 失败。
 
-仓库 Token 只有在原有“进入进程”权限允许时才交给工具；沙盒使用独立的无密钥 askpass 文件，并在权限档案中增加该文件目录及 Python 运行依赖的只读访问，运行结束清理。不会把 Token 写入 URL、命令参数或 helper 文件，也不会借此放开整个宿主临时目录。
+仓库 Token 只有在原有“进入进程”权限允许时才交给工具；执行器在准备步骤前创建本轮独立 Git 运行目录，仅将其中 `git-askpass/` helper 目录作为精确可写根，兼容 Windows 新建目录的沙盒 ACL；Python 运行依赖保持只读。沙盒外 MCP Broker 使用独立宿主环境和凭据文件，不能执行这份可写 helper。成功、失败或取消后均清理本轮目录。不会把 Token 写入 URL、命令参数或 helper 文件，也不会借此放开整个宿主临时目录。
 
 模型启动前使用相同沙盒、实际工具环境执行无密钥 helper 自检及 `git ls-remote origin HEAD`，时间线显示配置的 TLS 后端、Git 路径、远端主机、HEAD SHA 和脱敏错误。禁网、SSH 或无 origin 的运行跳过联网探测。探测通过仅说明远端读取可用，不保证 push 权限或之后的网络始终可用。
 

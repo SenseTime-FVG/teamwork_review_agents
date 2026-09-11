@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
+from .agent_home import TemporaryAgentHome
 from .agent_workspace import (
     agent_repository_cache_environment,
     prepare_agent_workspace,
@@ -675,6 +676,7 @@ class AgentExecutor:
         )
         active_workspace: Path | None = None
         sandbox_git_context: SandboxGitContext | None = None
+        git_runtime_directory: TemporaryAgentHome | None = None
         owned_workspace = False
         workspace_prepared = False
         resolved_schedule = schedule
@@ -952,8 +954,12 @@ class AgentExecutor:
                     self.config.runtime.managed_sandbox.enabled
                     and agent.sandbox != "danger-full-access"
                 )):
+                    if any(key.upper() == "TEAMWORK_GIT_TOKEN" and value for key, value in process_environment.items()):
+                        # 早于准备步骤创建；不应用 HOME 桥接，也不复制 Codex 登录文件。
+                        git_runtime_directory = TemporaryAgentHome.create(f"git-{reservation.run_id}")
                     sandbox_git_context = SandboxGitContext(
                         process_environment, verified_workspace=active_workspace,
+                        helper_root=git_runtime_directory.path if git_runtime_directory is not None else None,
                     ).start()
                     process_environment = sandbox_git_context.environment
                     await persist_log("system", "run.git_workspace_trusted", {
@@ -1216,7 +1222,15 @@ class AgentExecutor:
                             "error": redactor.text(str(exc)),
                         })
             finally:
-                git_credentials.close()
+                try:
+                    if git_runtime_directory is not None:
+                        cleanup_error = git_runtime_directory.cleanup()
+                        if cleanup_error:
+                            await persist_log("system", "run.git_helper_cleanup_failed", {
+                                "error": redactor.text(cleanup_error),
+                            })
+                finally:
+                    git_credentials.close()
 
         if result.status == "cancelled":
             source = await cancellation_source()
