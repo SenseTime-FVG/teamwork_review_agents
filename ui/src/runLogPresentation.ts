@@ -43,6 +43,9 @@ const SYSTEM_TITLES: Record<string, string> = {
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
   "turn.completed": "本轮处理完成",
+  "model.attempt_failed": "模型请求失败",
+  "model.fallback": "切换备用模型",
+  "model.reasoning_downgraded": "推理强度自动降级",
   "run.cancel_requested": "已请求取消运行",
   "run.cancelled": "运行已取消",
   "run.timed_out": "运行超过总时限",
@@ -162,7 +165,14 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   let body = "";
   let detail = "";
-  if (log.event_type.startsWith("run.runtime_") && object) {
+  if (log.event_type === "model.reasoning_downgraded" && object) {
+    const next = object.to ? `改用 ${textValue(object.to)}` : "去掉 effort 参数，使用上游默认";
+    body = `${textValue(object.from)} 不受上游支持，正在${next}重试。`;
+    detail = `${textValue(object.provider_id)} / ${textValue(object.model)}\n${textValue(object.reason)}`;
+  } else if (log.event_type === "model.attempt_failed" && object) {
+    body = textValue(object.reason);
+    detail = `${textValue(object.provider_id)} / ${textValue(object.model)}`;
+  } else if (log.event_type.startsWith("run.runtime_") && object) {
     body = object.error ? textValue(object.error) : "已在创建工作区前完成运行环境检查。";
     detail = [
       object.configured_command ? `配置命令：${textValue(object.configured_command)}` : "",

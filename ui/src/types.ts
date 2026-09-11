@@ -556,6 +556,15 @@ export type AgentModelSnapshot = {
   model_source: "agent" | "runtime" | "codex_user" | "codex_default" | string;
   reasoning_effort?: string | null;
   reasoning_effort_source: string;
+  configured_reasoning_effort?: string | null;
+  reasoning_downgrades?: Array<{
+    provider_id: string;
+    model: string;
+    configured_effort: string | null;
+    from: string;
+    to: string | null;
+    reason: string;
+  }>;
   fast_mode?: string | null;
   fast_mode_source: string;
   verbosity?: string | null;

@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import ModelProviderConfig
+from .reasoning_effort import is_reasoning_effort_rejection
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -65,10 +66,12 @@ class ModelProviderRequestError(RuntimeError):
         *,
         status_code: int | None = None,
         fallbackable: bool | None = None,
+        reasoning_effort_rejected: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
+        self.reasoning_effort_rejected = reasoning_effort_rejected
 
 
 class ExternalModelClient:
@@ -333,6 +336,10 @@ class ExternalModelClient:
                 fallbackable=response.status_code
                 in {401, 402, 403, 404, 408, 409, 429}
                 or response.status_code >= 500,
+                reasoning_effort_rejected=is_reasoning_effort_rejection(
+                    _extract_provider_error_fields(_decode_provider_error_body(response.content)),
+                    status_code=response.status_code,
+                ),
             )
         try:
             document = response.json()

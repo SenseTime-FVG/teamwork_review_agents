@@ -44,6 +44,7 @@ from .model_tools import (
     teamwork_function_tools,
 )
 from .models import AgentResult, InvocationContext
+from .reasoning_effort import next_reasoning_effort
 from .skill_files import SkillProjection
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -516,6 +517,8 @@ class CodexModelRunner:
         text_config: dict[str, Any] = {}
         model = ""
         reasoning_effort: str | None = None
+        configured_reasoning_effort: str | None = None
+        reasoning_downgrades: list[dict[str, Any]] = []
         reasoning_effort_source = "provider_default"
         fast_mode = False
         verbosity: str | None = None
@@ -565,6 +568,7 @@ class CodexModelRunner:
             nonlocal client, current_selection, current_index
             nonlocal current_agent, model, reasoning_effort, reasoning_effort_source, fast_mode
             nonlocal verbosity, personality, instructions, text_config, schema
+            nonlocal configured_reasoning_effort
             while index < len(model_plan):
                 selection = model_plan[index]
                 if not selection.provider.enabled:
@@ -622,6 +626,7 @@ class CodexModelRunner:
                     )
                 )
                 if reasoning_effort:
+                    configured_reasoning_effort = reasoning_effort
                     reasoning_effort_source = (
                         "model_selection"
                         if selection.reasoning_effort
@@ -634,6 +639,7 @@ class CodexModelRunner:
                         else "provider_default"
                     )
                 else:
+                    configured_reasoning_effort = None
                     reasoning_effort_source = (
                         "unsupported"
                         if selection.model and not supports_reasoning_effort(
@@ -865,8 +871,43 @@ class CodexModelRunner:
                                 reasoning_effort=reasoning_effort,
                                 reasoning_effort_source=reasoning_effort_source,
                                 fallback_used=fallback_was_used,
+                                configured_reasoning_effort=configured_reasoning_effort,
+                                reasoning_downgrades=reasoning_downgrades,
                             )
                         )
+                    if (
+                        reasoning_effort
+                        and isinstance(exc, (ModelProviderRequestError, CodexUpstreamError))
+                        and exc.reasoning_effort_rejected
+                    ):
+                        # 只重试当前模型请求，不重放已提交的历史和工具副作用。
+                        lowered_effort = next_reasoning_effort(reasoning_effort)
+                        downgrade = {
+                            "provider_id": failure_payload["provider_id"],
+                            "model": model,
+                            "configured_effort": configured_reasoning_effort,
+                            "from": reasoning_effort,
+                            "to": lowered_effort,
+                            "reason": redactor.text(str(exc)),
+                        }
+                        reasoning_downgrades.append(downgrade)
+                        reasoning_effort = lowered_effort
+                        reasoning_effort_source = "compatibility_downgrade"
+                        await emit("system", "model.reasoning_downgraded", downgrade)
+                        if model_snapshot_callback is not None:
+                            await model_snapshot_callback(
+                                _model_snapshot_update(
+                                    model_plan,
+                                    attempts,
+                                    current_selection=current_selection,
+                                    reasoning_effort=reasoning_effort,
+                                    reasoning_effort_source=reasoning_effort_source,
+                                    fallback_used=fallback_was_used,
+                                    configured_reasoning_effort=configured_reasoning_effort,
+                                    reasoning_downgrades=reasoning_downgrades,
+                                )
+                            )
+                        continue
                     if (
                         fallbackable_error(exc)
                         and await activate(current_index + 1)
@@ -895,6 +936,8 @@ class CodexModelRunner:
                                     reasoning_effort=reasoning_effort,
                                     reasoning_effort_source=reasoning_effort_source,
                                     fallback_used=True,
+                                    configured_reasoning_effort=configured_reasoning_effort,
+                                    reasoning_downgrades=reasoning_downgrades,
                                 )
                             )
                         continue
@@ -919,6 +962,8 @@ class CodexModelRunner:
                             reasoning_effort=reasoning_effort,
                             reasoning_effort_source=reasoning_effort_source,
                             fallback_used=fallback_was_used,
+                            configured_reasoning_effort=configured_reasoning_effort,
+                            reasoning_downgrades=reasoning_downgrades,
                         )
                     )
                 break
@@ -1135,6 +1180,8 @@ def _model_snapshot_update(
     reasoning_effort: str | None,
     reasoning_effort_source: str,
     fallback_used: bool,
+    configured_reasoning_effort: str | None = None,
+    reasoning_downgrades: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """生成回退过程中的有界模型快照，不包含任何凭据。"""
 
@@ -1159,6 +1206,8 @@ def _model_snapshot_update(
         else None,
         "reasoning_effort": reasoning_effort,
         "reasoning_effort_source": reasoning_effort_source,
+        "configured_reasoning_effort": configured_reasoning_effort,
+        "reasoning_downgrades": list(reasoning_downgrades[-32:]),
         "fallback_plan": [
             {
                 "provider_id": item.provider_id,

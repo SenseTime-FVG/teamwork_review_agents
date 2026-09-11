@@ -23,6 +23,7 @@ import httpx
 from .process_control import hidden_process_options
 from .codex_executable import resolve_codex_executable as resolve_executable
 from .codex_executable import CodexRuntimeError
+from .reasoning_effort import is_reasoning_effort_rejection
 
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -54,10 +55,12 @@ class CodexUpstreamError(CodexModelError):
         *,
         status_code: int | None = None,
         fallbackable: bool | None = None,
+        reasoning_effort_rejected: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
+        self.reasoning_effort_rejected = reasoning_effort_rejected
 
 
 @dataclass(frozen=True)
@@ -310,6 +313,9 @@ class CodexResponsesClient:
                                 payload=event,
                             ),
                             fallbackable=_upstream_error_fallbackable(event),
+                            reasoning_effort_rejected=is_reasoning_effort_rejection(
+                                _extract_upstream_error_fields(event),
+                            ),
                         )
                 if response is None:
                     raise CodexUpstreamError("Codex SSE 在 completed 事件前结束")
@@ -378,6 +384,10 @@ class CodexResponsesClient:
                                 fallbackable=response.status_code
                                 in {401, 402, 403, 404, 408, 409, 429}
                                 or response.status_code >= 500,
+                                reasoning_effort_rejected=is_reasoning_effort_rejection(
+                                    _extract_upstream_error_fields(_decode_error_body(body)),
+                                    status_code=response.status_code,
+                                ),
                             )
                         content_type = response.headers.get("content-type", "")
                         if "text/event-stream" not in content_type:
@@ -405,6 +415,9 @@ class CodexResponsesClient:
                                 raise CodexUpstreamError(
                                     _format_upstream_error(payload=document),
                                     fallbackable=_upstream_error_fallbackable(document),
+                                    reasoning_effort_rejected=is_reasoning_effort_rejection(
+                                        _extract_upstream_error_fields(document),
+                                    ),
                                 )
                             yield {"type": "response.completed", "response": document}
                             return
