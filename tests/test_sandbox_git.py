@@ -7,14 +7,18 @@ import json
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from teamwork_review_agents.agent_workspace import AgentWorkspacePreparationResult, prepare_agent_workspace
 from teamwork_review_agents.codex_model_runner import CodexModelRunner
 from teamwork_review_agents.codex_runner import CodexRunner
+from teamwork_review_agents.config import AgentWorkspaceConfig, AgentWorkspacePrepareStepConfig
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
@@ -22,7 +26,8 @@ from teamwork_review_agents.git_auth import GitCredentialContext
 from teamwork_review_agents.managed_sandbox import ManagedSandboxInspection, permission_profile_override
 from teamwork_review_agents.mcp_bridge import McpBridgeChannel
 from teamwork_review_agents.model_tools import ModelToolExecutor
-from teamwork_review_agents.models import InvocationContext
+from teamwork_review_agents.models import AgentResult, InvocationContext
+from teamwork_review_agents.preflight import StepExecutionOutcome
 from teamwork_review_agents.sandbox_git import (
     SandboxGitContext, SandboxGitError, append_git_config, classify_git_failure,
     current_sandbox_git, windows_sandbox_git_enabled,
@@ -31,14 +36,18 @@ from teamwork_review_agents.state import StateStore
 
 
 @contextmanager
-def active_git(environment=None):
+def active_git(environment=None, *, workspace=None):
     """在当前任务中成对建立和释放上下文，避免测试间残留。"""
 
-    context = SandboxGitContext(environment or {}).start()
-    try:
-        yield context
-    finally:
-        context.close()
+    with nullcontext(workspace) if workspace is not None else TemporaryDirectory(prefix="test-git-workspace-") as directory:
+        if workspace is None:
+            workspace = Path(directory)
+            (workspace / ".git").mkdir()
+        context = SandboxGitContext(environment or {}, verified_workspace=workspace).start()
+        try:
+            yield context
+        finally:
+            context.close()
 
 
 def process_result(stdout="", stderr="", code=0, timed_out=False):
@@ -46,6 +55,272 @@ def process_result(stdout="", stderr="", code=0, timed_out=False):
 
     return {"stdout": stdout, "stderr": stderr, "exit_code": code,
             "timed_out": timed_out, "truncated": False}
+
+
+def git_process(workspace, arguments, environment):
+    """在测试临时仓库执行原生 Git，既不改开发仓库也不访问外部服务。"""
+
+    return subprocess.run(
+        ["git", "-C", str(workspace), *arguments], env=environment,
+        text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=20,
+    )
+
+
+@pytest.fixture
+def git_repositories(tmp_path):
+    """隔离系统/用户 Git 配置，准备 clone、linked worktree 和未授权仓库。"""
+
+    global_config = tmp_path / "git-global"
+    global_config.write_text("[safe]\n\tdirectory = *\n", encoding="utf-8")
+    home = tmp_path / "temporary-home"
+    home.mkdir()
+    environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(global_config),
+                        "HOME": str(home), "USERPROFILE": str(home)})
+    source = tmp_path / "source"
+    source.mkdir()
+    commands = [
+        ["init", "--initial-branch=main"],
+        ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "测试基准"],
+        ["remote", "add", "origin", "https://example.invalid/owner/repo.git"],
+        ["clone", "--no-hardlinks", str(source), str(tmp_path / "clone with spaces")],
+        ["worktree", "add", "--detach", str(tmp_path / "linked worktree"), "HEAD"],
+    ]
+    for arguments in commands:
+        result = git_process(source, arguments, environment)
+        assert result.returncode == 0, result.stderr
+    clone = tmp_path / "clone with spaces"
+    result = git_process(clone, ["remote", "set-url", "origin", "https://example.invalid/owner/repo.git"], environment)
+    assert result.returncode == 0, result.stderr
+    environment["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+    return source, clone, tmp_path / "linked worktree", environment
+
+
+@pytest.mark.parametrize("kind", ["clone", "linked"])
+def test_exact_trust_allows_only_current_foreign_owned_workspace(git_repositories, kind):
+    """用 Git 自身的异主模式验证精确信任，并覆盖全局及环境中的通配信任重置。"""
+
+    source, clone, linked, environment = git_repositories
+    workspace = clone if kind == "clone" else linked
+    local_config = (workspace if kind == "clone" else source) / ".git/config"
+    before = local_config.read_bytes()
+    global_before = Path(environment["GIT_CONFIG_GLOBAL"]).read_bytes()
+    rejected_environment = dict(environment)
+    append_git_config(rejected_environment, {"safe.directory": ""})
+    rejected = git_process(workspace, ["remote", "get-url", "origin"], rejected_environment)
+    assert rejected.returncode != 0
+    assert "detected dubious ownership" in rejected.stderr
+
+    # 模拟继承旧运行的环境配置，当前运行必须重置列表而不是只追加新路径。
+    append_git_config(environment, [("safe.directory", "*"), ("credential.helper", ""),
+                                    ("core.excludesFile", str(source / "ignore"))])
+    original = dict(environment)
+    with active_git(environment, workspace=workspace) as context:
+        origin = git_process(workspace, ["remote", "get-url", "origin"], context.environment)
+        assert origin.returncode == 0, origin.stderr
+        assert origin.stdout.strip() == "https://example.invalid/owner/repo.git"
+        head = git_process(workspace, ["rev-parse", "HEAD"], context.environment)
+        assert head.returncode == 0, head.stderr
+        assert len(head.stdout.strip()) == 40
+        status = git_process(workspace, ["status", "--porcelain"], context.environment)
+        assert status.returncode == 0, status.stderr
+        outside = git_process(source, ["rev-parse", "HEAD"], context.environment)
+        assert outside.returncode != 0
+        assert "detected dubious ownership" in outside.stderr
+        assert context.environment["GIT_CONFIG_KEY_1"] == "credential.helper"
+        assert context.environment["GIT_CONFIG_KEY_2"] == "core.excludesFile"
+    assert environment == original
+    assert local_config.read_bytes() == before
+    assert Path(environment["GIT_CONFIG_GLOBAL"]).read_bytes() == global_before
+
+
+def test_child_trust_replaces_parent_and_inherited_workspace_reuses_exact_path(git_repositories):
+    """新子工作区不继承父目录信任，复用父工作区则保留同一路径；退出不污染父环境。"""
+
+    _, parent_workspace, child_workspace, environment = git_repositories
+    with active_git(environment, workspace=parent_workspace) as parent:
+        before = dict(parent.environment)
+        with active_git(parent.environment, workspace=child_workspace) as child:
+            assert git_process(child_workspace, ["rev-parse", "HEAD"], child.environment).returncode == 0
+            assert git_process(parent_workspace, ["rev-parse", "HEAD"], child.environment).returncode != 0
+        with active_git(parent.environment, workspace=parent_workspace) as inherited:
+            assert inherited.verified_workspace == parent.verified_workspace
+            assert git_process(parent_workspace, ["rev-parse", "HEAD"], inherited.environment).returncode == 0
+        assert parent.environment == before
+        assert current_sandbox_git() is parent
+
+
+@pytest.mark.parametrize("runner_class", [CodexRunner, CodexModelRunner])
+def test_runner_environment_preserves_trust_after_excludes_injection(
+    git_repositories, configured_app_factory, runner_class,
+):
+    """两种 Runner 合成最终环境并追加 Skill excludes 后，仍只信任本轮仓库。"""
+
+    from teamwork_review_agents.codex_runner import _add_git_excludes_file as cli_excludes
+    from teamwork_review_agents.codex_model_runner import _add_git_excludes_file as model_excludes
+
+    source, workspace, _, environment = git_repositories
+    runner = runner_class(configured_app_factory())
+    with active_git(environment, workspace=workspace) as context:
+        if runner_class is CodexRunner:
+            child_environment = runner.child_environment(context.environment)
+            cli_excludes(child_environment, source / "test-excludes")
+        else:
+            child_environment = runner.child_environment(
+                context.environment, temporary_home=None, tool_codex_home=source / "test-codex-home",
+            )
+            model_excludes(child_environment, source / "test-excludes")
+        result = git_process(workspace, ["rev-parse", "HEAD"], child_environment)
+        assert result.returncode == 0, result.stderr
+        rejected = git_process(source, ["rev-parse", "HEAD"], child_environment)
+        assert rejected.returncode != 0
+        assert "detected dubious ownership" in rejected.stderr
+        assert git_process(workspace, ["config", "--get", "http.sslBackend"], child_environment).stdout.strip() == "openssl"
+        assert git_process(workspace, ["config", "--get", "http.sslVerify"], child_environment).stdout.strip() == "true"
+
+
+@pytest.mark.parametrize("invalid", ["missing", "not-git", "file", "root"])
+def test_workspace_trust_requires_existing_precise_git_directory(tmp_path, invalid):
+    """缺失或宽泛目录不能被静默加入信任列表，也不创建凭据 helper。"""
+
+    workspace = tmp_path / invalid
+    if invalid == "not-git":
+        workspace.mkdir()
+    elif invalid == "file":
+        workspace.write_text("不是目录", encoding="utf-8")
+    elif invalid == "root":
+        workspace = Path(tmp_path.anchor)
+    context = SandboxGitContext({"TEAMWORK_GIT_TOKEN": "test"}, verified_workspace=workspace)
+    with pytest.raises(SandboxGitError) as failure:
+        context.start()
+    assert failure.value.error_code == "sandbox_git_workspace_invalid"
+    assert failure.value.retryable is False
+    assert context.directory is None
+    assert current_sandbox_git() is None
+
+
+async def test_prepare_steps_inherit_precise_trust(git_repositories, configured_app_factory, monkeypatch):
+    """准备步骤的临时 HOME 不能丢失运行级信任；测试只模拟沙盒包装，真实运行 Git。"""
+
+    _, workspace, _, environment = git_repositories
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    repository.workspace = workspace
+    repository.agent_workspace = AgentWorkspaceConfig(prepare_steps=[
+        AgentWorkspacePrepareStepConfig(name="读取远端", command=["git", "remote", "get-url", "origin"]),
+        AgentWorkspacePrepareStepConfig(name="读取提交", command=["git", "rev-parse", "HEAD"]),
+    ])
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace.inspect_managed_sandbox", lambda *args:
+                        ManagedSandboxInspection(available=True, platform="win32", backend="windows"))
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace.resolve_codex_executable", lambda *args: "codex")
+    commands = []
+
+    def wrapper(**kwargs):
+        commands.append(kwargs)
+        return kwargs["inner_command"]
+
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace.wrap_managed_sandbox_command", wrapper)
+    with active_git(environment, workspace=workspace) as context:
+        result = await prepare_agent_workspace(
+            config=config, repository=repository, agent=config.agents["code-reviewer"],
+            process_environment=context.environment, redactor=SecretRedactor(()),
+            log_callback=AsyncMock(), cancel_check=lambda: False,
+        )
+    assert result.outcome.status == "success", result.outcome.error
+    assert len(commands) == 2
+    for command in commands:
+        assert command["environment"]["HOME"] != environment["HOME"]
+        count = int(command["environment"]["GIT_CONFIG_COUNT"])
+        assert command["environment"][f"GIT_CONFIG_KEY_{count - 1}"] == "safe.directory"
+        assert command["environment"][f"GIT_CONFIG_VALUE_{count - 1}"] == workspace.resolve().as_posix()
+
+
+async def test_ownership_failure_blocks_before_https_probe(tool, monkeypatch):
+    """读取本地 origin 被拒绝时只执行一次，不再尝试 HTTPS，也不标为可重试网络错误。"""
+
+    run = AsyncMock(return_value=process_result(stderr="fatal: detected dubious ownership in repository at 'D:/run'", code=128))
+    monkeypatch.setattr(tool, "_run_process", run)
+    with active_git(workspace=tool.repository.workspace), pytest.raises(SandboxGitError) as error:
+        await tool.check_git_https()
+    assert error.value.error_code == "sandbox_git_ownership_mismatch"
+    assert error.value.retryable is False
+    assert "所有权" in str(error.value)
+    assert run.await_count == 1
+
+
+@pytest.mark.parametrize("inherit,preparation_fails", [(False, False), (True, False), (True, True)])
+async def test_executor_injects_validated_workspace_before_preparation(
+    git_repositories, configured_app_factory, snapshot_factory, monkeypatch, inherit, preparation_fails,
+):
+    """实际执行器向准备步骤和 Runner 传递校验结果，准备失败时也保存不可重试状态。"""
+
+    source, workspace, _, _ = git_repositories
+    config = configured_app_factory()
+    config.runtime.codex.execution_mode = "cli"
+    config.runtime.codex.model = "gpt-test"
+    config.repositories[0].workspace = source
+    config.agents["code-reviewer"].sandbox = "workspace-write"
+    config.agents["code-reviewer"].write_scopes = ["workspace"]
+    store = StateStore(config.database.path)
+    store.initialize()
+    executor = AgentExecutor(config, store)
+    monkeypatch.setattr("teamwork_review_agents.executor.windows_sandbox_git_enabled", lambda **kwargs: True)
+    monkeypatch.setattr("teamwork_review_agents.executor.resolve_provider_token", lambda *args: "")
+    monkeypatch.setattr("teamwork_review_agents.executor.resolve_model_snapshot", lambda *args: {"model": "gpt-test"})
+    monkeypatch.setattr("teamwork_review_agents.executor.prepare_change_request_workspace", lambda *args, **kwargs: "HEAD")
+    # 创建分支使用已准备的真实 clone；继承分支仍执行真实 validate_run_workspace。
+    monkeypatch.setattr("teamwork_review_agents.executor.ensure_isolated_clone", lambda *args, **kwargs: workspace)
+
+    def assert_trust(environment):
+        count = int(environment["GIT_CONFIG_COUNT"])
+        assert environment[f"GIT_CONFIG_VALUE_{count - 2}"] == ""
+        assert environment[f"GIT_CONFIG_KEY_{count - 1}"] == "safe.directory"
+        assert environment[f"GIT_CONFIG_VALUE_{count - 1}"] == workspace.resolve().as_posix()
+        assert current_sandbox_git().verified_workspace == workspace.resolve()
+
+    async def prepare(**kwargs):
+        assert kwargs["repository"].workspace == workspace.resolve()
+        assert_trust(kwargs["process_environment"])
+        if preparation_fails:
+            return AgentWorkspacePreparationResult(
+                outcome=StepExecutionOutcome(status="failure", exit_code=128,
+                                             output="fatal: detected dubious ownership in repository at 'D:/run'"),
+                cache_environment={}, cache_root=None,
+            )
+        return await prepare_agent_workspace(**kwargs)
+
+    async def run(**kwargs):
+        assert_trust(kwargs["process_environment"])
+        return AgentResult(run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
+                           parent_run_id=kwargs["parent_run_id"], agent_name=kwargs["agent_name"], status="completed")
+
+    preparation = AsyncMock(side_effect=prepare)
+    runner = SimpleNamespace(run=AsyncMock(side_effect=run))
+    monkeypatch.setattr("teamwork_review_agents.executor.prepare_agent_workspace", preparation)
+    monkeypatch.setattr(executor, "_runner_for_provider", lambda *args: runner)
+    event = detect_events(None, snapshot_factory(provider="github-main"), emit_initial=True)[0]
+    arguments = dict(agent_name="code-reviewer", event=event, idempotency_key="trust-test")
+    if inherit:
+        arguments.update(task="继承工作区测试", root_run_id="parent", parent_run_id="parent",
+                         depth=1, inherit_workspace=True, parent_workspace=workspace)
+    if preparation_fails:
+        for _ in range(2):
+            with pytest.raises(AgentExecutionError) as error:
+                await executor.execute(**arguments)
+            assert error.value.error_code == "sandbox_git_ownership_mismatch"
+            assert error.value.retryable is False
+        assert preparation.await_count == 1
+        runner.run.assert_not_called()
+    else:
+        result = await executor.execute(**arguments)
+        assert result.status == "completed"
+        assert runner.run.await_count == 1
+    record = store.list_runs()[0]
+    logs = store.list_run_logs(record["run_id"])
+    trusted = next(json.loads(log["payload"]) for log in logs if log["event_type"] == "run.git_workspace_trusted")
+    assert trusted["trusted_workspace"] == workspace.resolve().as_posix()
+    assert current_sandbox_git() is None
 
 
 @pytest.fixture
@@ -84,11 +359,15 @@ def test_git_environment_is_additive_and_scoped(monkeypatch):
     monkeypatch.setenv("TEAMWORK_GIT_TOKEN", "host-only-token")
     with active_git(original) as context:
         environment = context.environment
-        assert environment["GIT_CONFIG_COUNT"] == "4"
+        assert environment["GIT_CONFIG_COUNT"] == "6"
         assert environment["GIT_CONFIG_KEY_2"] == "http.sslBackend"
         assert environment["GIT_CONFIG_VALUE_2"] == "openssl"
         assert environment["GIT_CONFIG_KEY_3"] == "http.sslVerify"
         assert environment["GIT_CONFIG_VALUE_3"] == "true"
+        assert environment["GIT_CONFIG_KEY_4"] == "safe.directory"
+        assert environment["GIT_CONFIG_VALUE_4"] == ""
+        assert environment["GIT_CONFIG_KEY_5"] == "safe.directory"
+        assert environment["GIT_CONFIG_VALUE_5"] == context.verified_workspace.as_posix()
         assert environment["GIT_CONFIG_VALUE_1"] == "run-ignore"
         assert environment["GIT_SSL_CAINFO"] == "enterprise.pem"
         assert environment["HTTPS_PROXY"] == "http://proxy"
@@ -158,8 +437,9 @@ def test_git_can_execute_quoted_helper_with_spaces(tmp_path, monkeypatch):
 
     directory = tmp_path / "helper with spaces"
     directory.mkdir()
+    (tmp_path / ".git").mkdir()
     monkeypatch.setattr("teamwork_review_agents.sandbox_git.tempfile.mkdtemp", lambda **kwargs: str(directory))
-    with active_git({"TEAMWORK_GIT_TOKEN": "dummy-credential"}) as context:
+    with active_git({"TEAMWORK_GIT_TOKEN": "dummy-credential"}, workspace=tmp_path) as context:
         result = subprocess.run(
             ["git", "-c", "credential.helper=", "credential", "fill"],
             input="protocol=https\nhost=example.test\n\n", text=True,
@@ -178,6 +458,8 @@ async def test_nested_and_concurrent_contexts_are_isolated():
         with active_git({"TEAMWORK_GIT_TOKEN": token}) as context:
             await asyncio.sleep(0)
             assert current_sandbox_git() is context
+            count = int(context.environment["GIT_CONFIG_COUNT"])
+            assert context.environment[f"GIT_CONFIG_VALUE_{count - 1}"] == context.verified_workspace.as_posix()
             return context.directory
 
     with active_git() as parent:
@@ -189,6 +471,7 @@ async def test_nested_and_concurrent_contexts_are_isolated():
 
 
 @pytest.mark.parametrize("output,code", [
+    ("fatal: detected dubious ownership in repository at 'D:/worktrees/run'", "sandbox_git_ownership_mismatch"),
     ("schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS", "sandbox_git_schannel_credentials"),
     ("fatal: Unsupported SSL backend 'openssl'", "sandbox_git_openssl_unavailable"),
     ("SSL certificate problem: unable to get local issuer certificate", "sandbox_git_certificate_invalid"),
