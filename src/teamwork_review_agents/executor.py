@@ -27,6 +27,7 @@ from .environment import (
     resolve_environment,
 )
 from .git_auth import GitCredentialContext
+from .sandbox_git import SandboxGitContext, SandboxGitError, windows_sandbox_git_enabled
 from .locks import ResourceLease
 from .models import (
     AgentResult,
@@ -284,10 +285,15 @@ class AgentExecutor:
                 }
             )
 
-        result = await self.execute(
-            **execute_arguments,
-            run_started_callback=report_started,
-        )
+        try:
+            result = await self.execute(
+                **execute_arguments,
+                run_started_callback=report_started,
+            )
+        except AgentExecutionError as exc:
+            if exc.error_code and exc.error_code.startswith("sandbox_git_"):
+                raise SandboxGitError(str(exc), error_code=exc.error_code, retryable=exc.retryable) from exc
+            raise
         if result is None:
             return {
                 "status": "deduplicated",
@@ -668,6 +674,7 @@ class AgentExecutor:
             (git_credentials.token,) if git_credentials.token else ()
         )
         active_workspace: Path | None = None
+        sandbox_git_context: SandboxGitContext | None = None
         owned_workspace = False
         workspace_prepared = False
         resolved_schedule = schedule
@@ -941,6 +948,12 @@ class AgentExecutor:
                 }
                 if provider.token_env in resolved_environment.process_values:
                     process_environment.update(git_credentials.environment)
+                if windows_sandbox_git_enabled(managed=(
+                    self.config.runtime.managed_sandbox.enabled
+                    and agent.sandbox != "danger-full-access"
+                )):
+                    sandbox_git_context = SandboxGitContext(process_environment).start()
+                    process_environment = sandbox_git_context.environment
                 audit_environment = dict(resolved_environment.audit_values)
                 if cache_root is not None:
                     audit_environment["TEAMWORK_REPOSITORY_CACHE_DIR"] = str(
@@ -1106,6 +1119,16 @@ class AgentExecutor:
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
+        except SandboxGitError as exc:
+            await persist_log("system", "run.git_https_failed", redactor.data({
+                "error": str(exc), "error_code": exc.error_code, "retryable": exc.retryable,
+            }))
+            result = AgentResult(
+                run_id=reservation.run_id, root_run_id=reservation.root_run_id,
+                parent_run_id=reservation.parent_run_id, agent_name=agent_name,
+                status="failed", error=redactor.text(str(exc)),
+                error_code=exc.error_code, retryable=exc.retryable,
+            )
         except CodexRuntimeError as exc:
             await persist_log("system", "run.runtime_unavailable", redactor.data({
                 **exc.details, "stage": "before_workspace" if active_workspace is None else "execution",
@@ -1171,7 +1194,16 @@ class AgentExecutor:
             )
         finally:
             active_codex_executable.reset(executable_token)
-            git_credentials.close()
+            try:
+                if sandbox_git_context is not None:
+                    try:
+                        sandbox_git_context.close()
+                    except OSError as exc:
+                        await persist_log("system", "run.git_helper_cleanup_failed", {
+                            "error": redactor.text(str(exc)),
+                        })
+            finally:
+                git_credentials.close()
 
         if result.status == "cancelled":
             source = await cancellation_source()

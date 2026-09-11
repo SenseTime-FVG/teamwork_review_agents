@@ -45,6 +45,7 @@ from .model_tools import (
 )
 from .models import AgentResult, InvocationContext
 from .reasoning_effort import next_reasoning_effort
+from .sandbox_git import SandboxGitError, current_sandbox_git
 from .skill_files import SkillProjection
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -475,6 +476,16 @@ class CodexModelRunner:
                 status=status,
                 error=error,
             )
+        except SandboxGitError as exc:
+            error = redactor.text(str(exc))
+            await emit("system", "run.git_https_failed", {
+                "error": error, "error_code": exc.error_code, "retryable": exc.retryable,
+            })
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status="failed", error=error,
+                error_code=exc.error_code, retryable=exc.retryable,
+            )
         except Exception as exc:
             error = redactor.text(str(exc))
             await emit("system", "error", error)
@@ -732,6 +743,10 @@ class CodexModelRunner:
             invoke_agent_callback=self.invoke_agent_callback,
             codex_runtime_directory=codex_runtime_directory,
         )
+        if managed_sandbox and current_sandbox_git() is not None:
+            await emit("system", "run.git_https_started", {"ssl_backend": "openssl"})
+            diagnostic = await tool_executor.check_git_https()
+            await emit("system", f"run.git_https_{diagnostic['status']}", diagnostic)
         history: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -1057,6 +1072,9 @@ class CodexModelRunner:
                         result=redactor.data(tool_result),
                     )
                 except asyncio.CancelledError:
+                    raise
+                except SandboxGitError:
+                    # 基础设施失败必须终止本轮，不能由后续模型或子 Agent 掩盖。
                     raise
                 except Exception as exc:
                     error = redactor.text(str(exc))

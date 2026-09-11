@@ -57,6 +57,7 @@ jobs:
           tests/test_codex_account.py
           tests/test_codex_executable.py
           tests/test_runtime_readiness.py
+          tests/test_sandbox_git.py
           tests/test_process_control.py
           tests/test_hidden_subprocess.py
           tests/test_process_manager.py
