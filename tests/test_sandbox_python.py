@@ -181,7 +181,7 @@ def test_bridge_helper_and_mcp_use_same_selected_python(tmp_path, monkeypatch):
         assert standalone_mcp_command()[0] == selected.executable
         context.start()
         assert context.probe_command[0] == selected.executable
-        assert executable.as_posix() in (context.directory / "askpass.sh").read_text()
+        assert executable.as_posix() in (context.directory / "askpass.sh").read_text(encoding="utf-8")
         profile = managed_sandbox.permission_profile_override(AgentConfig(prompt="测试", sandbox="read-only"))
         assert json.dumps(str(executable.parent)) + '="read"' in profile
         assert json.dumps(str(Path(sys.base_prefix).resolve())) + '="read"' not in profile
