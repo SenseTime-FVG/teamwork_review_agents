@@ -359,6 +359,8 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 ### Windows 沙盒内 Git HTTPS
 
+Windows 外层 `codex sandbox` 使用服务宿主目录环境；`CODEX_HOME` 按 `runtime.codex_home`、服务进程原始 `CODEX_HOME`、宿主 `.codex` 选择。内层通过沙盒内启动桥恢复 Agent 的临时目录，避免临时 `CODEX_HOME` 干扰外层沙盒 ACL。预检、准备步骤、工具和完整 CLI 共用此机制；准备步骤和模型工具使用空临时 Codex home，完整 CLI 保留原有临时登录快照。启动桥只传递目录字段，不复制凭据到脚本或命令参数，不覆盖沙盒注入的网络代理，也不为内层额外授权宿主 `.codex`。
+
 Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`、`http.sslVerify=true`，避开受限账户下可能无法初始化的 Schannel TLS 上下文；不修改宿主 Git 配置，不关闭证书校验，不取消网络代理或域名白名单。需要 Git for Windows 提供 OpenSSL 后端；使用企业自签证书时，需配置可被沙盒读取的可信 CA，例如 `GIT_SSL_CAINFO`。
 
 工作区创建者与沙盒用户不一致时，Git 可能拒绝访问并报告 `detected dubious ownership`。Teamwork 在工作区创建或继承校验完成后，通过本轮进程环境先重置 `safe.directory` 列表，再只信任当前运行目录的规范化绝对路径。准备步骤和后续 Git 命令统一继承，不依赖临时 HOME，不写全局配置，也不修改 owner 或 ACL；不会添加 `*` 或整个工作区根目录的信任。子 Agent 按自己的实际工作区重新生成配置。运行日志记录精确信任目录；仍有所有权错误时显示 `sandbox_git_ownership_mismatch` 并停止确定性重试，不误报为 HTTPS 或 Token 失败。
@@ -368,6 +370,19 @@ Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`�
 模型启动前使用相同沙盒、实际工具环境执行无密钥 helper 自检及 `git ls-remote origin HEAD`，时间线显示配置的 TLS 后端、Git 路径、远端主机、HEAD SHA 和脱敏错误。禁网、SSH 或无 origin 的运行跳过联网探测。探测通过仅说明远端读取可用，不保证 push 权限或之后的网络始终可用。
 
 明确的 Schannel、OpenSSL、证书、helper 和认证错误使用 `sandbox_git_*` 错误码阻断运行，停止确定性错误的整体重试，修正后可手动触发；临时探测超时仍保留重试资格。模型工具运行中识别到同类错误时也会中止，内嵌调用的子 Agent 会向父 Agent 传播该故障，不进入后续工具阶段。完整 CLI 模式在启动前做相同探测，并在收到已完成命令的错误事件后终止进程树；普通冲突、分支不存在等 Git 结果仍交给 Agent 处理。
+
+普通 CI 覆盖环境传递、真实启动桥与进程树回收，不代表真实 Windows 沙盒 ACL 验收。在已安装并初始化 Codex 沙盒的 Windows 部署机，可显式执行以下独立验收；使用虚拟 Token，不调用模型或 GitHub。启用后缺少 Codex 或沙盒能力会失败，不会跳过。它只验证 helper/凭据链路，实际远端 HTTPS 仍以运行日志 `run.git_https_ready` 为准。
+
+```powershell
+$env:TEAMWORK_TEST_WINDOWS_SANDBOX = "1"
+# 可选：指定部署使用的 Codex CLI 绝对路径。
+# $env:TEAMWORK_TEST_CODEX_BINARY = "C:\path\to\codex.exe"
+try {
+    python -m pytest -v tests/test_sandbox_environment.py::test_real_windows_sandbox_askpass_and_credential_fill
+} finally {
+    Remove-Item Env:TEAMWORK_TEST_WINDOWS_SANDBOX
+}
+```
 
 ## GitHub 本地 CI 门禁
 

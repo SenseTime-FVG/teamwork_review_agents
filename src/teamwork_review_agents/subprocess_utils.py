@@ -5,7 +5,16 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Iterable, Mapping, MutableMapping
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ProcessLaunch:
+    """将命令与实际启动环境绑定，防止包装后误用内层环境。"""
+
+    command: list[str]
+    environment: dict[str, str] = field(repr=False)
 
 
 WINDOWS_REQUIRED_ENVIRONMENT_NAMES = frozenset(

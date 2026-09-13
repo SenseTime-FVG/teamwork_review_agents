@@ -698,7 +698,7 @@ def test_model_tool_resolves_managed_sandbox_binary_from_child_path(
         invoke_agent_callback=None,
     )
 
-    command = executor._wrap([sys.executable, "-c", "pass"])
+    command = executor._wrap([sys.executable, "-c", "pass"]).command
 
     assert command[0].lower() == str(executable.resolve()).lower()
 

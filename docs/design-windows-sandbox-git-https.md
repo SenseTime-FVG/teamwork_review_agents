@@ -38,7 +38,19 @@ Windows 上工作区创建者与沙盒运行用户可能不同，因此 TLS 自�
 
 确定性的基础设施错误使用 `sandbox_git_*` 错误码和 `retryable=false`。模型工具执行中若明确检测到这些 Git 基础设施故障，直接结束本轮，不能吞成普通工具反馈或交给模型回退。子 Agent 此类失败向父 Agent 传播。普通 Git 非零退出（例如分支不存在、冲突）仍按原工具结果处理。完整 CLI 模式启动前做相同探测，运行中通过已完成命令的 JSONL 错误识别基础设施失败并终止进程树，不重放 shell。
 
-## 验证
+## Windows 外层与内层目录环境分离
+
+部署方的真实沙盒 A/B 表明：即使 helper 已精确可写，外层继承临时 Agent `CODEX_HOME` 仍可能重新应用隔离 ACL 并拒绝读取 helper。该结论来自部署验证，普通跨平台 CI 不能证明此现象已消失。
+
+统一包装器返回命令与环境的配对启动对象。Windows 外层使用服务原始 HOME、USERPROFILE、APPDATA、LOCALAPPDATA、TEMP、TMP、TMPDIR、HOMEDRIVE/HOMEPATH 和 XDG 目录；外层 CODEX_HOME 按 runtime.codex_home、服务原始 CODEX_HOME、宿主 .codex 的顺序选择，不从 Agent 环境反推。诊断也遵守这一规则。
+
+外层 `--` 后使用固定的隔离 Python 启动桥，仅通过私有环境项携带内层目录变量（包括缺失项），桥在沙盒内恢复这些变量并删除私有项，再启动真正命令。桥不重建全部环境，保留外层注入的网络代理；不把 Token、完整环境写入文件或命令参数。Python 依赖只读授权，不授予宿主 Codex home 额外权限。桥继承标准流、不创建新进程组，保持原有取消及超时进程树管理。
+
+Git 预检、普通工具、apply_patch、准备步骤与完整 CLI 都消费同一启动对象。准备步骤有独立空 Codex home，完整 CLI 仍使用原有临时登录快照，模型工具仍使用空临时 Codex home。Linux/macOS、完全访问模式、宿主 MCP Broker 和 helper 清理机制保持不变。
+
+普通 CI 验证外/内环境、代理保留、凭据不落盘、标准流、退出码及进程树终止。另提供显式启用的真实 Windows Codex sandbox 验收，用虚拟凭据执行 askpass 自检与 credential fill，不调用模型或 GitHub；启用后缺少 Codex/能力必须失败，不能伪装成通过。
+
+## 验证范围
 
 单测覆盖配置合并、精确可写授权、Python 只读依赖、Token 隔离、宿主 Broker 隔离、真实 Git credential fill 链路、临时目录清理、禁网/SSH 跳过、故障分类、模型与 CLI 启动前阻断、子 Agent 传播和普通错误不误伤。Windows CI 执行不依赖宿主 Codex 登录的回归；实际 Windows 托管沙盒和企业 CA 仍需部署环境验收。
 

@@ -11,6 +11,8 @@ from .config import AgentConfig, AppConfig, RepositoryConfig
 from .environment import SecretRedactor
 from .filesystem import temporary_directory
 from .managed_sandbox import inspect_managed_sandbox, wrap_managed_sandbox_command
+from .sandbox_environment import sandbox_executable_environment, windows_environment_separation
+from .subprocess_utils import ProcessLaunch, remove_environment_names
 from .preflight import (
     PreflightStepUpdate,
     StepExecutionOutcome,
@@ -281,7 +283,14 @@ async def prepare_agent_workspace(
         }:
             if name in locked_environment:
                 environment[name] = locked_environment[name]
-        if config.runtime.codex_home is not None:
+        preparation_codex_home = None
+        if restricted and windows_environment_separation():
+            # 准备命令只使用空临时目录，不能因外层使用宿主登录目录而获得宿主凭据。
+            preparation_codex_home = home / "codex-home"
+            preparation_codex_home.mkdir(mode=0o700)
+            remove_environment_names(environment, {"CODEX_HOME"})
+            environment["CODEX_HOME"] = str(preparation_codex_home.resolve())
+        elif config.runtime.codex_home is not None:
             environment["CODEX_HOME"] = str(
                 config.runtime.codex_home.expanduser().resolve()
             )
@@ -293,20 +302,22 @@ async def prepare_agent_workspace(
                 update={"sandbox": "workspace-write"},
             )
 
-        def wrap_command(command: list[str], step_cwd: Path) -> list[str]:
+        def wrap_command(command: list[str], step_cwd: Path) -> ProcessLaunch:
             """为每个步骤按其工作目录生成同一套原生沙盒边界。"""
 
             if not restricted:
-                return command
+                return ProcessLaunch(command, dict(environment))
             return wrap_managed_sandbox_command(
                 codex_binary=resolve_codex_executable(
                     config.runtime.codex_binary,
-                    environment,
+                    sandbox_executable_environment(environment),
                 ),
                 workspace=step_cwd,
                 agent=preparation_agent,
                 inner_command=command,
                 environment=environment,
+                codex_runtime_directory=preparation_codex_home,
+                codex_home=config.runtime.codex_home,
             )
 
         async def on_step_update(update: PreflightStepUpdate) -> None:

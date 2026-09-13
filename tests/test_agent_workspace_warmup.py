@@ -12,6 +12,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from teamwork_review_agents.webapp import create_app
+from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
 
 def _run_git(*arguments: str, cwd: Path | None = None) -> str:
@@ -133,7 +134,7 @@ def test_repository_workspace_warmup_creates_reusable_snapshot(
     )
     monkeypatch.setattr(
         "teamwork_review_agents.agent_workspace.wrap_managed_sandbox_command",
-        lambda *, inner_command, **_kwargs: inner_command,
+        lambda *, inner_command, environment, **_kwargs: ProcessLaunch(inner_command, dict(environment)),
     )
     app = create_app(_write_config(tmp_path, origin), start_scheduler=False)
 

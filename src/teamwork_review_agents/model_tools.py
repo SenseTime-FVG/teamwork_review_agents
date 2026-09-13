@@ -20,7 +20,8 @@ from .managed_sandbox import wrap_managed_sandbox_command
 from .models import InvocationContext
 from .process_control import process_group_options, terminate_process
 from .state import StateStore
-from .subprocess_utils import resolve_executable
+from .subprocess_utils import ProcessLaunch, resolve_executable
+from .sandbox_environment import sandbox_executable_environment
 from .codex_executable import resolve_codex_executable
 from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git
 
@@ -421,26 +422,27 @@ class ModelToolExecutor:
         self.progress_callback()
         return result
 
-    def _wrap(self, inner_command: list[str]) -> list[str]:
+    def _wrap(self, inner_command: list[str]) -> ProcessLaunch:
         """受限 Agent 的每个本地进程都必须进入 Teamwork 托管沙盒。"""
 
         if not self.managed_sandbox:
-            return inner_command
+            return ProcessLaunch(inner_command, dict(self.environment))
         return wrap_managed_sandbox_command(
             codex_binary=resolve_codex_executable(
                 self.config.runtime.codex_binary,
-                self.environment,
+                sandbox_executable_environment(self.environment),
             ),
             workspace=self.repository.workspace,
             agent=self.agent,
             inner_command=inner_command,
             environment=self.environment,
             codex_runtime_directory=self.codex_runtime_directory,
+            codex_home=self.config.runtime.codex_home,
         )
 
     async def _run_process(
         self,
-        command: list[str],
+        launch: ProcessLaunch,
         *,
         cwd: Path,
         timeout_seconds: int,
@@ -450,8 +452,9 @@ class ModelToolExecutor:
 
         if self.cancel_check is not None and await self.cancel_check():
             raise asyncio.CancelledError
+        command = launch.command
         resolved_command = [
-            resolve_executable(command[0], self.environment),
+            resolve_executable(command[0], launch.environment),
             *command[1:],
         ]
         process = await asyncio.create_subprocess_exec(
@@ -460,7 +463,7 @@ class ModelToolExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=self.environment,
+            env=launch.environment,
             **process_group_options(),
         )
         assert process.stdout is not None

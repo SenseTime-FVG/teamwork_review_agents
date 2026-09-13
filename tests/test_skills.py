@@ -317,7 +317,7 @@ def test_runner_enables_only_agent_and_repository_skill_intersection(
     agent = config.agents["code-reviewer"]
     agent.skills = ["docs", "security"]
     repository.allowed_skills = ["security"]
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         agent,
         repository,
         context,
@@ -325,7 +325,7 @@ def test_runner_enables_only_agent_and_repository_skill_intersection(
             "docs": tmp_path / "docs" / "SKILL.md",
             "security": tmp_path / "security" / "SKILL.md",
         },
-    )
+    ).command
     joined = " ".join(command)
     assert "skills.config=[" in joined
     assert f'path = "{tmp_path / "docs" / "SKILL.md"}", enabled = false' in joined
