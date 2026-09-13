@@ -70,6 +70,9 @@ database:
 #     # Windows 沙盒专用 Python；留空检测当前服务账户已有的 Codex runtime / 服务 Python。
 #     # 创建工作区前会在真实沙盒验证，显式路径失败不换用其他解释器；不自动安装或修改 ACL。
 #     python_binary: null
+#     # Windows 沙盒 curl.exe；留空从服务的 Git 安装 / PATH 检测 OpenSSL 版本。
+#     # 只在沙盒验证并调整当前 Agent 环境，找不到时提示，不自动安装或中止无关任务。
+#     curl_binary: null
 #     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
 #     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。
 #   # 未显式配置 model_provider 的 Agent 继承这里的全局默认模型。

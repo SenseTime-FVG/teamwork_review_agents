@@ -188,10 +188,32 @@ class SandboxGitContext:
         self.writable_directories = ()
 
 
-def classify_git_failure(output: str) -> SandboxGitError | None:
-    """识别所有权、TLS 和认证基础设施错误，普通冲突等交回模型处理。"""
+def is_simple_git_command(command: str) -> bool:
+    """只识别单条原生 Git 调用，不猜测复合 shell、包装器或子表达式的错误来源。"""
+
+    command = command.strip()
+    if command.startswith("& "):
+        command = command[2:].lstrip()
+    if re.search(r"[;&|`\r\n<>]", command) or "$" in command:
+        return False
+    try:
+        parts = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    return bool(parts) and parts[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1].lower() in {"git", "git.exe"}
+
+
+def classify_git_failure(output: str, *, git_command: bool = False) -> SandboxGitError | None:
+    """通用 TLS 标记必须有明确 Git 来源；否则只识别 Git 专属的 fatal 行。"""
 
     lowered = output.lower()
+    if not git_command:
+        # curl/urllib 等也会输出 Schannel、CA 或 HTTP 401/403，不能只靠关键字阻断整轮。
+        lowered = "\n".join(line for line in lowered.splitlines() if re.match(
+            r"^fatal: (?:detected dubious ownership in repository|unsupported ssl backend|"
+            r"unable to access |authentication failed|could not read (?:username|password) for 'https://)",
+            line.strip(),
+        ))
     categories = (
         ("sandbox_git_ownership_mismatch", "工作区所有权校验失败，Git 尚未进入远端网络认证", ("fatal: detected dubious ownership in repository",)),
         ("sandbox_git_schannel_credentials", "Windows 沙盒无法初始化 Schannel TLS 凭据", ("schannel: acquirecredentialshandle failed", "sec_e_no_credentials")),

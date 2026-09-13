@@ -16,6 +16,7 @@ from .config import AgentConfig
 from .codex_executable import CodexRuntimeError, locate_codex_executable
 from .process_control import hidden_process_options
 from .sandbox_git import current_sandbox_git
+from .sandbox_curl import current_sandbox_curl
 from .sandbox_python import current_sandbox_python
 from .sandbox_environment import (
     sandbox_host_environment,
@@ -228,6 +229,10 @@ def permission_profile_override(
             f"{_toml_string(str(path))}=\"write\""
             for path in git_context.writable_directories
         )
+    curl_context = current_sandbox_curl()
+    if curl_context is not None and windows_environment_separation():
+        # 候选由服务发现，精确只读授权运行依赖，不根据 Agent 环境扩大权限。
+        readable_directories.extend(curl_context.readable_directories)
     extra_filesystem_entries.extend(
         f"{_toml_string(str(path))}=\"read\""
         for path in dict.fromkeys(readable_directories)

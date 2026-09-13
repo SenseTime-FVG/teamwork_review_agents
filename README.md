@@ -373,7 +373,19 @@ Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`�
 
 模型启动前使用相同沙盒、实际工具环境执行无密钥 helper 自检及 `git ls-remote origin HEAD`，时间线显示配置的 TLS 后端、Git 路径、远端主机、HEAD SHA 和脱敏错误。禁网、SSH 或无 origin 的运行跳过联网探测。探测通过仅说明远端读取可用，不保证 push 权限或之后的网络始终可用。
 
-明确的 Schannel、OpenSSL、证书、helper 和认证错误使用 `sandbox_git_*` 错误码阻断运行，停止确定性错误的整体重试，修正后可手动触发；临时探测超时仍保留重试资格。模型工具运行中识别到同类错误时也会中止，内嵌调用的子 Agent 会向父 Agent 传播该故障，不进入后续工具阶段。完整 CLI 模式在启动前做相同探测，并在收到已完成命令的错误事件后终止进程树；普通冲突、分支不存在等 Git 结果仍交给 Agent 处理。
+有明确 Git 来源的 Schannel、OpenSSL、证书、helper 和认证错误使用 `sandbox_git_*` 错误码阻断运行，停止确定性错误的整体重试，修正后可手动触发；临时探测超时仍保留重试资格。模型工具与完整 CLI 都检查已完成 Git 命令的错误；内嵌子 Agent 向父 Agent 传播此类故障。普通冲突、分支不存在等结果仍交给 Agent 处理。curl 等非 Git 命令的 TLS/HTTP 错误不能仅因关键字相同而触发 Git 专用终止逻辑；来源含混的复合命令保留普通失败语义。
+
+### Windows 沙盒内 curl HTTPS
+
+不需要新增 HTTP 工具。Windows 托管运行会从服务账户的 Git for Windows 安装及绝对 PATH 目录发现真实 `curl.exe`，只在沙盒内验证版本、实际启用的 OpenSSL 后端及 HTTPS 协议支持；启用联网且平台地址是 HTTPS 时，再在相同网络策略下探测平台根地址。探针不附带业务 Token，不扩大域名白名单，也不在宿主补发请求。HTTP 401/403 等响应仍能证明 TLS 连接完成，但不代表业务接口认证通过。
+
+选定后仅在本轮 Agent PATH 中优先使用该版本，并设置 `CURL_SSL_BACKEND=openssl`；这个变量只对编译时包含 OpenSSL 后端的版本有效，不能修复 Schannel-only curl。保留现有代理、`CURL_CA_BUNDLE`、`SSL_CERT_FILE`、`SSL_CERT_DIR`；没有显式 CA 时优先使用 Git 随附的 CA 文件。企业 CA 需要自行配置为沙盒可读取的路径，不能使用 `-k` 绕过校验。不修改系统 curl、全局 PATH、系统 ACL，macOS/Linux 和完全访问 Agent 不变。
+
+可在 UI「全局配置与环境 → Teamwork 外层沙盒」或 YAML `runtime.managed_sandbox.curl_binary` 指定 `curl.exe` 路径；显式路径不可用时不悄悄替换。日志 `run.curl_ready` 记录程序、来源、后端及 HTTPS 探测状态；`run.curl_unavailable` 提供诊断但不阻断不需要 curl 的任务。兼容程序不可用时，Agent 仍可通过现有命令工具使用已验证的 Python 和 `urllib.request`，但仍需遵守 CA、代理与网络权限。
+
+内嵌工具只在本次 PowerShell 进程中将 `curl` 别名指向选定程序；完整 CLI 的运行提示要求使用 `curl.exe` 或选定绝对路径，避开 Windows PowerShell 的 `Invoke-WebRequest` 别名。写死 `System32\\curl.exe` 的命令不会被改写或重放。普通 curl Schannel 失败附带恢复提示或记录 `run.http_tls_unavailable`，不再伪装成 Git HTTPS 失败。
+
+真实 Windows curl 验收需要显式联网授权：设置 `$env:TEAMWORK_TEST_WINDOWS_CURL = "1"`，执行 `python -m pytest -v tests/test_sandbox_curl.py::test_real_windows_sandbox_curl_https`，结束后执行 `Remove-Item Env:TEAMWORK_TEST_WINDOWS_CURL`。可选用 `TEAMWORK_TEST_SANDBOX_CURL` 指定 curl 路径，Codex/Python 路径使用下文同名验收变量。该用例不调用模型、不传业务 Token，只访问 `https://api.github.com/`；自动 CI 默认跳过，启用后缺少兼容运行时必须失败。
 
 普通 CI 覆盖环境传递、真实启动桥与进程树回收，不代表真实 Windows 沙盒 ACL 验收。在已安装并初始化 Codex 沙盒的 Windows 部署机，可显式执行以下独立验收；使用虚拟 Token，不调用模型或 GitHub。启用后缺少 Codex、沙盒能力或可执行 Python 会失败，不会跳过。它验证 Python、helper、虚拟凭据链路和独立 MCP 握手，实际远端 HTTPS 仍以运行日志 `run.git_https_ready` 为准。
 

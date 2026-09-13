@@ -2,6 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { presentRunLogs } from "../src/runLogPresentation.ts";
 
+test("curl 不可用和 HTTP TLS 错误不能展示成 Git 阻断", () => {
+  const messages = presentRunLogs([
+    {id: 1, run_id: "run", created_at: 1, stream: "system", event_type: "run.curl_unavailable",
+      payload: JSON.stringify({message: "请配置兼容 curl", error_code: "sandbox_curl_unavailable"})},
+    {id: 2, run_id: "run", created_at: 2, stream: "system", event_type: "run.http_tls_unavailable",
+      payload: JSON.stringify({message: "HTTP TLS 不可用", error_code: "sandbox_http_tls_unavailable"})},
+  ]);
+  for (const message of messages) {
+    assert.doesNotMatch(message.title, /Git|阻断/);
+    assert.doesNotMatch(message.detail, /停止自动重试/);
+  }
+  assert.match(messages[0].title, /任务可继续/);
+});
+
 test("沙盒 Git 故障展示真实原因、错误码与停止重试提示", () => {
   const messages = presentRunLogs([{
     id: 1, run_id: "run", created_at: 1, stream: "system",

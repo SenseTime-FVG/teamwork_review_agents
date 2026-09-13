@@ -176,10 +176,11 @@ class ManagedSandboxConfig(BaseModel):
     enabled: bool = True
     fail_closed: bool = True
     python_binary: Path | None = None
+    curl_binary: Path | None = None
 
-    @field_validator("python_binary", mode="before")
+    @field_validator("python_binary", "curl_binary", mode="before")
     @classmethod
-    def normalize_python_binary(cls, value: Any) -> Any:
+    def normalize_binary_path(cls, value: Any) -> Any:
         """空路径表示自动发现，不能将空字符串解析为当前目录。"""
 
         return None if isinstance(value, str) and not value.strip() else value
@@ -1104,11 +1105,12 @@ def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]
 
     data["runtime"] = dict(data.get("runtime", {}))
     managed = dict(data["runtime"].get("managed_sandbox") or {})
-    python_binary = managed.get("python_binary")
-    if isinstance(python_binary, str):
-        python_binary = python_binary.strip()
-    if "python_binary" in managed:
-        managed["python_binary"] = _resolve_path(base_dir, python_binary) if python_binary else None
+    for name in ("python_binary", "curl_binary"):
+        binary = managed.get(name)
+        if isinstance(binary, str):
+            binary = binary.strip()
+        if name in managed:
+            managed[name] = _resolve_path(base_dir, binary) if binary else None
     if managed:
         data["runtime"]["managed_sandbox"] = managed
     if data["runtime"].get("codex_home"):
