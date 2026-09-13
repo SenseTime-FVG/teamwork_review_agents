@@ -2488,6 +2488,14 @@ function GlobalEnvironment(props: {
       </section>
       <section className="section-card">
         <div className="section-title-row"><div><h2>Teamwork 外层沙盒</h2><p>供模型基座和受限 Agent 统一使用的跨平台执行边界。</p></div></div>
+        <Field
+          label="Windows 沙盒 Python 路径（可选）"
+          value={props.document.runtime.managed_sandbox?.python_binary ?? ""}
+          onChange={(value) => patchSection("runtime", "managed_sandbox", {
+            ...(props.document.runtime.managed_sandbox ?? {}), python_binary: value.trim() || null,
+          })}
+          help="留空自动检测当前服务账户已有的 Codex runtime / 服务 Python；创建工作区前在真实沙盒中验证。指定路径不可用时明确报错，不会自动换用其他解释器。"
+        />
         <div className="toggle-grid">
           <Toggle
             label="启用 Teamwork 托管外层沙盒"

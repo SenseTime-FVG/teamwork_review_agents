@@ -24,6 +24,8 @@ from teamwork_review_agents.mcp_bridge import McpBridgeChannel
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
+pytestmark = pytest.mark.usefixtures("verified_test_sandbox_python")
+
 
 def test_managed_sandbox_profiles_cover_files_and_network() -> None:
     """权限档案应同时表达文件写边界与三种网络策略。"""
@@ -200,7 +202,7 @@ def test_runner_uses_sandbox_proxy_without_exposing_service_paths(
     ).command
     joined = " ".join(command)
 
-    assert "teamwork_review_agents.mcp_proxy" in joined
+    assert ("teamwork-mcp-proxy" if sys.platform == "win32" else "teamwork_review_agents.mcp_proxy") in joined
     assert "TEAMWORK_MCP_CHANNEL_DIR" in joined
     assert "TEAMWORK_MCP_CHANNEL_TOKEN" in joined
     assert "TEAMWORK_CONFIG_PATH" not in joined
@@ -308,7 +310,7 @@ def test_managed_command_without_bridge_still_never_exposes_service_paths(
     ).command
     joined = " ".join(command)
 
-    assert "teamwork_review_agents.mcp_proxy" in joined
+    assert ("teamwork-mcp-proxy" if sys.platform == "win32" else "teamwork_review_agents.mcp_proxy") in joined
     assert "teamwork_review_agents.mcp_server" not in joined
     assert "TEAMWORK_CONFIG_PATH" not in joined
     assert "TEAMWORK_INVOCATION_CONTEXT" not in joined

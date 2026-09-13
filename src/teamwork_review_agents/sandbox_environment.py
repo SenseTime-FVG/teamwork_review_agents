@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .subprocess_utils import remove_environment_names, selected_environment
+from .sandbox_python import current_sandbox_python
 
 
 DIRECTORY_ENVIRONMENT_NAMES = frozenset({
@@ -86,4 +87,4 @@ def separate_sandbox_environment(
         {name: inner.get(name) for name in sorted(DIRECTORY_ENVIRONMENT_NAMES)},
         ensure_ascii=True,
     )
-    return [sys.executable, "-I", "-c", _INNER_LAUNCHER, *inner_command], outer
+    return [current_sandbox_python().executable, "-I", "-S", "-c", _INNER_LAUNCHER, *inner_command], outer

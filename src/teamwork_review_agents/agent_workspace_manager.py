@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_workspace import prepare_agent_workspace
+from .codex_executable import active_codex_executable
 from .config import AgentConfig, RepositoryConfig
 from .config_manager import ConfigManager
 from .environment import (
@@ -23,6 +24,8 @@ from .environment import (
 from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, LockTimeoutError, ResourceLease
 from .preflight import build_preflight_environment
+from .runtime_readiness import check_runtime_readiness
+from .sandbox_environment import windows_environment_separation
 from .workspace import (
     GitProgressEvent,
     WorkspaceCancelled,
@@ -261,6 +264,7 @@ class AgentWorkspaceWarmupManager:
         )
         manager = None
         checkout: Path | None = None
+        executable_token = active_codex_executable.set(None)
         git_credentials = GitCredentialContext(
             resolve_provider_token(config, provider, repository),
             provider_kind=provider.kind,
@@ -268,6 +272,20 @@ class AgentWorkspaceWarmupManager:
         try:
             operation.append_log("system", "workspace.warmup.waiting", "正在等待仓库 Git 资源锁")
             async with lease:
+                warmup_agent = AgentConfig(
+                    prompt="仓库工作区预热", sandbox="workspace-write",
+                    network_access=True, write_scopes=["workspace"],
+                )
+                if windows_environment_separation():
+                    # 预热是独立入口，也须在创建 checkout 前验证沙盒 Python。
+                    operation.phase = "正在验证沙盒执行环境"
+                    resolution = await asyncio.to_thread(
+                        check_runtime_readiness, config, warmup_agent, repository,
+                        build_preflight_environment(), cli_execution=False,
+                    )
+                    active_codex_executable.set(resolution)
+                    if resolution is not None:
+                        operation.append_log("system", "run.runtime_ready", resolution.as_dict())
                 operation.status = "preparing"
                 operation.phase = "正在更新基础仓库并检出默认分支"
 
@@ -324,12 +342,7 @@ class AgentWorkspaceWarmupManager:
                 result = await prepare_agent_workspace(
                     config=config,
                     repository=checkout_repository,
-                    agent=AgentConfig(
-                        prompt="仓库工作区预热",
-                        sandbox="workspace-write",
-                        network_access=True,
-                        write_scopes=["workspace"],
-                    ),
+                    agent=warmup_agent,
                     process_environment=warmup_process_environment,
                     redactor=redactor,
                     log_callback=record_log,
@@ -371,6 +384,7 @@ class AgentWorkspaceWarmupManager:
             operation.error = str(exc)
             operation.append_log("stderr", "workspace.warmup.failed", str(exc))
         finally:
+            active_codex_executable.reset(executable_token)
             if checkout is not None and manager is not None:
                 with suppress(Exception):
                     await asyncio.to_thread(manager.__exit__, None, None, None)

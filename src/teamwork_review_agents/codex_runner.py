@@ -39,7 +39,8 @@ from .managed_sandbox import (
 )
 from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
-from .sandbox_environment import sandbox_executable_environment
+from .sandbox_environment import sandbox_executable_environment, windows_environment_separation
+from .sandbox_mcp import standalone_mcp_command
 from .subprocess_utils import (
     ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -220,6 +221,10 @@ class CodexRunner:
                 else "teamwork_review_agents.mcp_server"
             ),
         ]
+        mcp_python = sys.executable
+        if use_mcp_bridge and windows_environment_separation():
+            # 沙盒运行时不依赖服务 venv；Broker 仍由服务 Python 在沙盒外运行。
+            mcp_python, *mcp_args = standalone_mcp_command()
         enabled_tools = ["invoke_agent"]
         if agent.managed_comment:
             enabled_tools.append("publish_comment")
@@ -227,7 +232,7 @@ class CodexRunner:
             *runtime_overrides(self.config.runtime.codex),
             *agent_overrides(agent),
             *([] if use_managed_sandbox else agent_network_overrides(agent)),
-            f"mcp_servers.{server_name}.command={_toml_string(sys.executable)}",
+            f"mcp_servers.{server_name}.command={_toml_string(mcp_python)}",
             f"mcp_servers.{server_name}.args={json.dumps(mcp_args)}",
             f"mcp_servers.{server_name}.required=true",
             f"mcp_servers.{server_name}.enabled=true",

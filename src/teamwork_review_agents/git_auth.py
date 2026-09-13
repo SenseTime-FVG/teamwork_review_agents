@@ -21,7 +21,7 @@ _ACTIVE_ENVIRONMENT: ContextVar[Mapping[str, str] | None] = ContextVar(
 )
 
 
-def write_askpass_helper(helper: Path) -> list[str]:
+def write_askpass_helper(helper: Path, *, python_binary: str | None = None) -> list[str]:
     """生成不含凭据的 helper；隔离导入环境并提供无密钥自检入口。"""
 
     helper.write_text(
@@ -38,7 +38,7 @@ def write_askpass_helper(helper: Path) -> list[str]:
         "    print('')\n",
         encoding="utf-8",
     )
-    return [sys.executable, "-I", str(helper)]
+    return [python_binary or sys.executable, "-I", "-S", str(helper)]
 
 
 def current_git_environment() -> Mapping[str, str] | None:
