@@ -152,11 +152,24 @@ async def test_tool_launch_uses_paired_environment_and_transparent_streams(tool,
     assert tool.environment == original
 
 
-@pytest.mark.parametrize("finish", ["timeout", "cancel"])
-async def test_bridge_descendants_stop_with_tool(tool, simulated_outer, finish):
+@pytest.mark.parametrize("finish", ["timeout", "cancel", "cancel-with-read-contention"])
+async def test_bridge_descendants_stop_with_tool(tool, simulated_outer, finish, monkeypatch):
     """新增桥不创建脱离的进程组，超时与取消都必须终止真正命令及其子进程。"""
 
     marker = tool.repository.workspace / "pids.json"
+    denied_reads = 0
+    original_read = Path.read_text
+
+    def read_marker(path, *args, **kwargs):
+        """模拟 Windows 发布标记刚出现时的短暂共享冲突，不跳过进程存活断言。"""
+
+        nonlocal denied_reads
+        if finish == "cancel-with-read-contention" and path == marker and path.exists() and denied_reads < 2:
+            denied_reads += 1
+            raise PermissionError("模拟标记文件暂时不可读")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_marker)
     code = (
         "import os,sys,subprocess,time,json; from pathlib import Path; "
         "options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}; "
@@ -170,10 +183,16 @@ async def test_bridge_descendants_stop_with_tool(tool, simulated_outer, finish):
     ))
     try:
         async with asyncio.timeout(10):
-            while not marker.exists():
-                await asyncio.sleep(0.05)
-        pids = json.loads(marker.read_text())
-        if finish == "cancel":
+            while True:
+                try:
+                    pids = json.loads(marker.read_text(encoding="utf-8"))
+                    break
+                except (FileNotFoundError, PermissionError):
+                    # Windows 上出现目录项不代表文件已可读；仍受原有十秒时限约束。
+                    await asyncio.sleep(0.05)
+        if finish == "cancel-with-read-contention":
+            assert denied_reads == 2
+        if finish != "timeout":
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
