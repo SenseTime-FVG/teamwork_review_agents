@@ -33,6 +33,7 @@ from teamwork_review_agents.sandbox_git import (
     SandboxGitContext, SandboxGitError, append_git_config, classify_git_failure,
     current_sandbox_git, windows_sandbox_git_enabled,
 )
+from teamwork_review_agents.sandbox_curl import current_sandbox_curl
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
@@ -359,6 +360,7 @@ async def test_executor_injects_validated_workspace_before_preparation(
     assert trusted["trusted_workspace"] == workspace.resolve().as_posix()
     assert current_sandbox_git() is None
     assert bool(runtime_paths) is expose_token
+    assert current_sandbox_curl() is None
     assert all(not path.exists() for path in runtime_paths)
 
 
@@ -655,7 +657,7 @@ async def test_nested_and_concurrent_contexts_are_isolated():
 def test_infrastructure_failure_has_specific_code(output, code):
     """提供真实类别并屏蔽 URL 中的凭据，确定性故障不整体重试。"""
 
-    error = classify_git_failure(output)
+    error = classify_git_failure(output, git_command=True)
     assert error.error_code == code
     assert error.retryable is False
     assert "password@" not in str(error)

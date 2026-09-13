@@ -31,7 +31,8 @@ from .environment import SecretRedactor
 from .mcp_bridge import ManagedMcpBroker, McpBridgeChannel
 from .models import AgentResult, InvocationContext
 from .model_tools import ModelToolExecutor
-from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git
+from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
+from .sandbox_curl import current_sandbox_curl, http_tls_hint
 from .managed_sandbox import (
     ManagedSandboxInspection,
     inspect_managed_sandbox,
@@ -673,6 +674,11 @@ class CodexRunner:
                     error_code=exc.error_code, retryable=exc.retryable,
                 )
             await emit("system", f"run.git_https_{diagnostic['status']}", diagnostic)
+            if current_sandbox_curl() is not None:
+                await emit("system", "run.curl_started", {"message": "在相同沙盒中检测兼容 curl，不新增 HTTP 工具"})
+                diagnostic = await probe_executor.prepare_curl()
+                await emit("system", f"run.curl_{diagnostic['status']}", diagnostic)
+                prompt += "\n\n" + current_sandbox_curl().runtime_hint()
         launch = self.build_launch(
             agent,
             repository,
@@ -786,7 +792,8 @@ class CodexRunner:
                             and isinstance(item, dict) and item.get("type") == "command_execution"
                             and item.get("exit_code") not in {None, 0}
                         ):
-                            failure = classify_git_failure(str(item.get("aggregated_output") or item.get("output") or ""))
+                            output = str(item.get("aggregated_output") or item.get("output") or "")
+                            failure = classify_git_failure(output, git_command=is_simple_git_command(str(item.get("command") or "")))
                             if failure is not None:
                                 git_failure = failure
                                 stream_error = active_redactor.text(str(failure))
@@ -794,6 +801,11 @@ class CodexRunner:
                                 await emit("system", "run.git_https_failed", {
                                     "error": stream_error, "error_code": failure.error_code,
                                     "retryable": failure.retryable,
+                                })
+                            elif hint := http_tls_hint(output):
+                                # 普通 HTTP 失败只记录提示；不终止 CLI、不重放有副作用的命令。
+                                await emit("system", "run.http_tls_unavailable", {
+                                    "error_code": "sandbox_http_tls_unavailable", "message": hint,
                                 })
                         if isinstance(item, dict) and item.get("type") == "agent_message":
                             final_message = str(item.get("text") or "")

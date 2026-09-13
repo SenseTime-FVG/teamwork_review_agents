@@ -46,6 +46,7 @@ from .model_tools import (
 from .models import AgentResult, InvocationContext
 from .reasoning_effort import next_reasoning_effort
 from .sandbox_git import SandboxGitError, current_sandbox_git
+from .sandbox_curl import current_sandbox_curl
 from .skill_files import SkillProjection
 from .subprocess_utils import (
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -747,6 +748,11 @@ class CodexModelRunner:
             await emit("system", "run.git_https_started", {"ssl_backend": "openssl"})
             diagnostic = await tool_executor.check_git_https()
             await emit("system", f"run.git_https_{diagnostic['status']}", diagnostic)
+            if current_sandbox_curl() is not None:
+                await emit("system", "run.curl_started", {"message": "在相同沙盒中检测兼容 curl，不新增 HTTP 工具"})
+                diagnostic = await tool_executor.prepare_curl()
+                await emit("system", f"run.curl_{diagnostic['status']}", diagnostic)
+                prompt += "\n\n" + current_sandbox_curl().runtime_hint()
         history: list[dict[str, Any]] = [
             {
                 "role": "user",

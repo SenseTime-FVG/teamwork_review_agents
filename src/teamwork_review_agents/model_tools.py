@@ -23,7 +23,8 @@ from .state import StateStore
 from .subprocess_utils import ProcessLaunch, resolve_executable
 from .sandbox_environment import sandbox_executable_environment
 from .codex_executable import resolve_codex_executable
-from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git
+from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
+from .sandbox_curl import current_sandbox_curl, https_probe_url, http_tls_hint
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -246,10 +247,12 @@ class ModelToolExecutor:
                 self.config.runtime.mcp_tool_timeout_seconds,
             ),
         )
+        curl = current_sandbox_curl() if self.managed_sandbox else None
         inner_command = shell_command(
             command,
             workdir=workdir if self.managed_sandbox else None,
             environment=self.environment,
+            curl_binary=curl.selected.executable if curl is not None and curl.selected is not None else None,
         )
         process_command = self._wrap(inner_command)
         result = await self._run_process(
@@ -258,9 +261,13 @@ class ModelToolExecutor:
             timeout_seconds=timeout_seconds,
         )
         if self.managed_sandbox and current_sandbox_git() is not None and result["exit_code"] != 0:
-            failure = classify_git_failure(f"{result['stderr']}\n{result['stdout']}")
+            failure = classify_git_failure(f"{result['stderr']}\n{result['stdout']}", git_command=is_simple_git_command(command))
             if failure is not None:
                 raise failure
+        if self.managed_sandbox and current_sandbox_curl() is not None and result["exit_code"] != 0:
+            hint = http_tls_hint(f"{result['stderr']}\n{result['stdout']}")
+            if hint:
+                result["stderr"] += f"\n[Teamwork HTTP TLS 提示] {hint}"
         return {
             "exit_code": result["exit_code"],
             "stdout": result["stdout"],
@@ -318,7 +325,7 @@ class ModelToolExecutor:
             output = f"{remote['stderr']}\n{remote['stdout']}"
             if "no such remote" in output.lower():
                 return {"status": "skipped", "reason": "当前工作区没有 origin"}
-            raise classify_git_failure(output) or SandboxGitError(
+            raise classify_git_failure(output, git_command=True) or SandboxGitError(
                 f"无法读取 Git origin：{output[-1200:]}", error_code="sandbox_git_remote_probe_failed",
                 retryable=True,
             )
@@ -340,7 +347,7 @@ class ModelToolExecutor:
         result = await probe([git, "ls-remote", "--exit-code", "origin", "HEAD"], "HTTPS 远端")
         if result["exit_code"] != 0:
             output = f"{result['stderr']}\n{result['stdout']}"
-            raise classify_git_failure(output) or SandboxGitError(
+            raise classify_git_failure(output, git_command=True) or SandboxGitError(
                 f"Git HTTPS 远端探测失败：{output[-1200:]}",
                 error_code="sandbox_git_remote_probe_failed", retryable=True,
             )
@@ -349,6 +356,43 @@ class ModelToolExecutor:
             raise SandboxGitError("Git HTTPS 探测未返回有效 HEAD SHA", error_code="sandbox_git_invalid_remote_head")
         return {"status": "ready", "ssl_backend": "openssl", "git_binary": git,
                 "remote": "origin", "host": remote_url.hostname, "sha": match.group(1)}
+
+    async def prepare_curl(self) -> dict[str, Any]:
+        """只在已绑定的 Windows 托管运行内验证 curl，沿用相同权限和进程树管理。"""
+
+        curl = current_sandbox_curl()
+        if not self.managed_sandbox or curl is None:
+            return {"status": "skipped"}
+
+        async def probe(command: list[str], environment: dict[str, str]) -> dict[str, Any]:
+            """启动前与执行中都响应取消；不把沙盒命令退回宿主执行。"""
+
+            process = asyncio.create_task(self._run_process(
+                self._wrap(command, environment=environment), cwd=self.repository.workspace,
+                timeout_seconds=min(20, self.config.runtime.mcp_tool_timeout_seconds),
+            ))
+            try:
+                while not process.done():
+                    await asyncio.wait({process}, timeout=0.25)
+                    if self.cancel_check is not None and await self.cancel_check():
+                        raise asyncio.CancelledError
+                return await process
+            finally:
+                if not process.done():
+                    process.cancel()
+                await asyncio.gather(process, return_exceptions=True)
+
+        provider = self.config.providers[self.repository.provider]
+        diagnostic = await curl.prepare(probe, self.environment,
+                                        probe_url=https_probe_url(provider.base_url),
+                                        network_access=self.agent.network_access,
+                                        budget_seconds=min(30, self.agent.timeout_seconds / 4,
+                                                           (self.agent.idle_timeout_seconds or self.config.runtime.agent_idle_timeout_seconds) / 4))
+        updated = curl.apply_environment(self.environment)
+        # 原地更新保持 Runner 引用，同时移除 Windows 下大小写重复的旧键。
+        self.environment.clear()
+        self.environment.update(updated)
+        return diagnostic
 
     async def _apply_patch(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """先校验路径和补丁，再通过 git apply 原子落盘。"""
@@ -422,20 +466,21 @@ class ModelToolExecutor:
         self.progress_callback()
         return result
 
-    def _wrap(self, inner_command: list[str]) -> ProcessLaunch:
+    def _wrap(self, inner_command: list[str], *, environment: Mapping[str, str] | None = None) -> ProcessLaunch:
         """受限 Agent 的每个本地进程都必须进入 Teamwork 托管沙盒。"""
 
+        active_environment = self.environment if environment is None else environment
         if not self.managed_sandbox:
-            return ProcessLaunch(inner_command, dict(self.environment))
+            return ProcessLaunch(inner_command, dict(active_environment))
         return wrap_managed_sandbox_command(
             codex_binary=resolve_codex_executable(
                 self.config.runtime.codex_binary,
-                sandbox_executable_environment(self.environment),
+                sandbox_executable_environment(active_environment),
             ),
             workspace=self.repository.workspace,
             agent=self.agent,
             inner_command=inner_command,
-            environment=self.environment,
+            environment=active_environment,
             codex_runtime_directory=self.codex_runtime_directory,
             codex_home=self.config.runtime.codex_home,
         )
@@ -542,6 +587,7 @@ def shell_command(
     environment: Mapping[str, str] | None = None,
     platform_name: str | None = None,
     os_name: str | None = None,
+    curl_binary: Path | None = None,
 ) -> list[str]:
     """按宿主平台构造 shell 参数，外层沙盒时显式恢复子目录 cwd。"""
 
@@ -553,9 +599,13 @@ def shell_command(
             environment,
         )
         script = command
+        if curl_binary is not None:
+            # 只改变本次 PowerShell 进程的别名，不改系统 profile 或用户命令文本。
+            executable = str(curl_binary).replace("'", "''")
+            script = f"Set-Alias -Name curl -Value '{executable}' -Scope Local; {script}"
         if workdir is not None:
             escaped = str(workdir).replace("'", "''")
-            script = f"Set-Location -LiteralPath '{escaped}'; {command}"
+            script = f"Set-Location -LiteralPath '{escaped}'; {script}"
         return [
             shell,
             "-NoLogo",

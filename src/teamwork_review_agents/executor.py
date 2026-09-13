@@ -29,6 +29,7 @@ from .environment import (
 )
 from .git_auth import GitCredentialContext
 from .sandbox_git import SandboxGitContext, SandboxGitError, classify_git_failure, windows_sandbox_git_enabled
+from .sandbox_curl import SandboxCurlContext
 from .locks import ResourceLease
 from .models import (
     AgentResult,
@@ -676,6 +677,7 @@ class AgentExecutor:
         )
         active_workspace: Path | None = None
         sandbox_git_context: SandboxGitContext | None = None
+        sandbox_curl_context: SandboxCurlContext | None = None
         git_runtime_directory: TemporaryAgentHome | None = None
         owned_workspace = False
         workspace_prepared = False
@@ -962,6 +964,7 @@ class AgentExecutor:
                         helper_root=git_runtime_directory.path if git_runtime_directory is not None else None,
                     ).start()
                     process_environment = sandbox_git_context.environment
+                    sandbox_curl_context = SandboxCurlContext(self.config.runtime.managed_sandbox.curl_binary).start()
                     await persist_log("system", "run.git_workspace_trusted", {
                         "trusted_workspace": sandbox_git_context.verified_workspace.as_posix(),
                         "reason": "只信任本轮已校验的 Git 工作区，不修改全局配置或目录权限",
@@ -1213,6 +1216,8 @@ class AgentExecutor:
             )
         finally:
             active_codex_executable.reset(executable_token)
+            if sandbox_curl_context is not None:
+                sandbox_curl_context.close()
             try:
                 if sandbox_git_context is not None:
                     try:

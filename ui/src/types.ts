@@ -176,6 +176,7 @@ export type CodexRuntimeConfig = {
 
 export type ManagedSandboxConfig = {
   python_binary?: string | null;
+  curl_binary?: string | null;
   enabled?: boolean;
   fail_closed?: boolean;
 };
