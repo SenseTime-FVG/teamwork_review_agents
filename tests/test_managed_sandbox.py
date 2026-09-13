@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from teamwork_review_agents.managed_sandbox import (
 )
 from teamwork_review_agents.mcp_bridge import McpBridgeChannel
 from teamwork_review_agents.models import InvocationContext
+from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
 
 def test_managed_sandbox_profiles_cover_files_and_network() -> None:
@@ -380,24 +382,22 @@ def test_managed_sandbox_detects_linux(
 
 def test_managed_sandbox_inspection_checks_codex_capability(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """能力探测应要求当前 Codex 暴露命名权限档案参数。"""
 
-    fake_codex = tmp_path / "fake-codex-sandbox"
-    fake_codex.write_text(
-        f"""#!{sys.executable}
-import sys
-if sys.argv[1:] == ["sandbox", "--help"]:
-    print("--permission-profile PROFILE")
-    raise SystemExit(0)
-raise SystemExit(2)
-""",
-        encoding="utf-8",
-    )
-    fake_codex.chmod(0o755)
-    _inspect_cached.cache_clear()
+    def help_output(command, **kwargs):
+        """仅模拟 CLI 帮助输出，不要求 Windows 执行 POSIX shebang 文件。"""
 
-    inspection = inspect_managed_sandbox(str(fake_codex))
+        assert Path(command[0]).samefile(sys.executable)
+        assert command[1:] == ["sandbox", "--help"]
+        assert kwargs["timeout"] > 0
+        return subprocess.CompletedProcess(command, 0, "--permission-profile PROFILE", "")
+
+    monkeypatch.setattr("teamwork_review_agents.managed_sandbox.subprocess.run", help_output)
+    _inspect_cached.cache_clear()
+    inspection = inspect_managed_sandbox(sys.executable)
+    _inspect_cached.cache_clear()
 
     assert inspection.available is True
     assert inspection.backend is not None
@@ -469,19 +469,14 @@ async def test_runner_can_fall_back_to_codex_internal_sandbox(
 ) -> None:
     """关闭失败即阻断后，只能回退到同等级的 Codex 内层沙盒。"""
 
-    fake_codex = tmp_path / "fake-codex-fallback"
-    fake_codex.write_text(
-        f"""#!{sys.executable}
+    program = """
 import json
 import sys
 sys.stdin.read()
-print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "安全回退"}}}}, ensure_ascii=False), flush=True)
-""",
-        encoding="utf-8",
-    )
-    fake_codex.chmod(0o755)
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "安全回退"}}), flush=True)
+"""
     config = configured_app_factory()
-    config.runtime.codex_binary = str(fake_codex)
+    config.runtime.codex_binary = sys.executable
     config.runtime.managed_sandbox.fail_closed = False
     repository = config.repositories[0]
     agent = config.agents["code-reviewer"]
@@ -500,6 +495,20 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     )
     emitted: list[str] = []
 
+    runner = CodexRunner(config)
+    build_launch = runner.build_launch
+
+    def simulated_cli(*args, **kwargs):
+        """保留真实安全命令断言，仅用跨平台 Python 进程模拟 CLI JSONL 输出。"""
+
+        launch = build_launch(*args, **kwargs)
+        assert "--sandbox" in launch.command
+        assert launch.command[launch.command.index("--sandbox") + 1] == agent.sandbox
+        assert "--dangerously-bypass-approvals-and-sandbox" not in launch.command
+        return ProcessLaunch([sys.executable, "-I", "-c", program], launch.environment)
+
+    monkeypatch.setattr(runner, "build_launch", simulated_cli)
+
     monkeypatch.setattr(
         "teamwork_review_agents.codex_runner.inspect_managed_sandbox",
         lambda *args, **kwargs: ManagedSandboxInspection(
@@ -516,7 +525,7 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
         del stream, payload
         emitted.append(event_type)
 
-    result = await CodexRunner(config).run(
+    result = await runner.run(
         run_id="run-sandbox-fallback",
         root_run_id="run-sandbox-fallback",
         parent_run_id=None,

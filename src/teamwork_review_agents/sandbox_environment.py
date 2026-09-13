@@ -34,7 +34,8 @@ for key, value in payload.items():
     if value is not None:
         os.environ[key] = value
 options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-process = subprocess.Popen(sys.argv[1:], **options)
+# 隐窗模式必须显式传递标准句柄，否则 Windows 可能丢失输出或等待不存在的控制台输入。
+process = subprocess.Popen(sys.argv[1:], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, **options)
 sys.exit(process.wait())
 """ % (tuple(sorted(DIRECTORY_ENVIRONMENT_NAMES)), _INNER_DIRECTORIES_KEY)
 
