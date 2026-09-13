@@ -16,7 +16,13 @@ from .config import AgentConfig
 from .codex_executable import CodexRuntimeError, locate_codex_executable
 from .process_control import hidden_process_options
 from .sandbox_git import current_sandbox_git
+from .sandbox_environment import (
+    sandbox_host_environment,
+    separate_sandbox_environment,
+    windows_environment_separation,
+)
 from .subprocess_utils import (
+    ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
     selected_environment,
 )
@@ -77,7 +83,9 @@ def _inspection_environment(
         WINDOWS_REQUIRED_ENVIRONMENT_NAMES | {"PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL"},
         source,
     )
-    if codex_home is not None:
+    if windows_environment_separation():
+        environment = sandbox_host_environment(environment, codex_home=codex_home)
+    elif codex_home is not None:
         environment["CODEX_HOME"] = str(codex_home.expanduser().resolve())
     return environment
 
@@ -207,17 +215,22 @@ def permission_profile_override(
         if path is not None
     ]
     git_context = current_sandbox_git()
+    readable_directories: list[Path] = []
+    if windows_environment_separation():
+        # 固定启动桥使用宿主 Python，仅授权解释器与标准库读取，不授权宿主 Codex home。
+        readable_directories.extend((Path(sys.executable).resolve().parent, Path(sys.base_prefix).resolve()))
     if git_context is not None:
         git_context.validate_helper_directory()
         # 授权来自宿主内存，不从工具环境推断；helper 可写、Python 依赖只读。
-        extra_filesystem_entries.extend(
-            f"{_toml_string(str(path))}=\"read\""
-            for path in git_context.readable_directories
-        )
+        readable_directories.extend(git_context.readable_directories)
         extra_filesystem_entries.extend(
             f"{_toml_string(str(path))}=\"write\""
             for path in git_context.writable_directories
         )
+    extra_filesystem_entries.extend(
+        f"{_toml_string(str(path))}=\"read\""
+        for path in dict.fromkeys(readable_directories)
+    )
     if agent.sandbox == "read-only":
         fields = [
             'description="Teamwork 托管的只读 Agent 外层沙盒"',
@@ -252,8 +265,9 @@ def wrap_managed_sandbox_command(
     environment: Mapping[str, str],
     ipc_directory: Path | None = None,
     codex_runtime_directory: Path | None = None,
-) -> list[str]:
-    """用 Codex 原生平台沙盒包裹已关闭内层沙盒的执行命令。"""
+    codex_home: Path | None = None,
+) -> ProcessLaunch:
+    """返回不可拆用的沙盒命令与外层环境，内层隔离目录只由沙盒内恢复。"""
 
     repository_cache = environment.get("TEAMWORK_REPOSITORY_CACHE_DIR")
     writable_directories = (
@@ -282,5 +296,10 @@ def wrap_managed_sandbox_command(
         command.extend(["--allow-unix-socket", socket_path])
     # 显式结束外层参数，避免内层 Codex 选项被外层解析器误认。
     command.append("--")
+    outer_environment = dict(environment)
+    if windows_environment_separation():
+        inner_command, outer_environment = separate_sandbox_environment(
+            inner_command, environment, codex_home=codex_home,
+        )
     command.extend(inner_command)
-    return command
+    return ProcessLaunch(command, outer_environment)

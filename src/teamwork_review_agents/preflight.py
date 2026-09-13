@@ -29,6 +29,7 @@ from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
 from .subprocess_utils import (
+    ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
     resolve_executable,
     selected_environment,
@@ -100,7 +101,7 @@ class PreflightStepUpdate:
 StepUpdateCallback = Callable[[PreflightStepUpdate], Awaitable[None]]
 OutputCallback = Callable[[str], Awaitable[None]]
 CancelCheck = Callable[[], bool]
-CommandWrapper = Callable[[list[str], Path], list[str]]
+CommandWrapper = Callable[[list[str], Path], ProcessLaunch]
 
 
 async def _emit_step_update(
@@ -280,12 +281,14 @@ async def execute_preflight_steps(
                 resolve_executable(step.command[0], environment),
                 *step.command[1:],
             ]
-            if command_wrapper is not None:
-                command = command_wrapper(command, step_cwd)
+            launch = (
+                command_wrapper(command, step_cwd)
+                if command_wrapper is not None else ProcessLaunch(command, dict(environment))
+            )
             process = await asyncio.create_subprocess_exec(
-                *command,
+                *launch.command,
                 cwd=step_cwd,
-                env=environment,
+                env=launch.environment,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,

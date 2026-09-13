@@ -39,7 +39,9 @@ from .managed_sandbox import (
 )
 from .process_control import process_group_options, terminate_process
 from .skill_files import SkillProjection
+from .sandbox_environment import sandbox_executable_environment
 from .subprocess_utils import (
+    ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
     selected_environment,
 )
@@ -163,7 +165,7 @@ class CodexRunner:
         self.config = config
         cleanup_stale_agent_homes_once()
 
-    def build_command(
+    def build_launch(
         self,
         agent: AgentConfig,
         repository: RepositoryConfig,
@@ -174,8 +176,8 @@ class CodexRunner:
         environment: Mapping[str, str] | None = None,
         mcp_bridge: McpBridgeChannel | None = None,
         codex_runtime_directory: Path | None = None,
-    ) -> list[str]:
-        """构造显式叠加 Teamwork 默认和 Agent 覆盖的 Codex 命令。"""
+    ) -> ProcessLaunch:
+        """构造命令与环境配对的启动参数，避免内层环境污染外层沙盒。"""
 
         server_name = _TEAMWORK_MCP_SERVER_NAME
         use_managed_sandbox = (
@@ -187,7 +189,7 @@ class CodexRunner:
         active_environment = environment if environment is not None else os.environ
         codex_binary = resolve_codex_executable(
             self.config.runtime.codex_binary,
-            active_environment,
+            sandbox_executable_environment(active_environment) if use_managed_sandbox else active_environment,
             allow_unresolved=True,
         )
         command = [
@@ -302,8 +304,9 @@ class CodexRunner:
                 environment=active_environment,
                 ipc_directory=mcp_bridge.directory if mcp_bridge is not None else None,
                 codex_runtime_directory=codex_runtime_directory,
+                codex_home=self.config.runtime.codex_home,
             )
-        return command
+        return ProcessLaunch(command, dict(active_environment))
 
     def child_environment(
         self,
@@ -665,7 +668,7 @@ class CodexRunner:
                     error_code=exc.error_code, retryable=exc.retryable,
                 )
             await emit("system", f"run.git_https_{diagnostic['status']}", diagnostic)
-        command = self.build_command(
+        launch = self.build_launch(
             agent,
             repository,
             context,
@@ -691,12 +694,12 @@ class CodexRunner:
                 error=error,
             )
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *launch.command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=repository.workspace,
-            env=child_environment,
+            env=launch.environment,
             limit=_CODEX_STREAM_LIMIT_BYTES,
             **process_group_options(),
         )

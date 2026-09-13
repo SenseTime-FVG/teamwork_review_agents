@@ -34,6 +34,7 @@ from teamwork_review_agents.sandbox_git import (
     current_sandbox_git, windows_sandbox_git_enabled,
 )
 from teamwork_review_agents.state import StateStore
+from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
 
 @contextmanager
@@ -222,7 +223,7 @@ async def test_prepare_steps_inherit_precise_trust(git_repositories, configured_
 
     def wrapper(**kwargs):
         commands.append(kwargs)
-        return kwargs["inner_command"]
+        return ProcessLaunch(kwargs["inner_command"], kwargs["environment"])
 
     monkeypatch.setattr("teamwork_review_agents.agent_workspace.wrap_managed_sandbox_command", wrapper)
     with active_git(environment, workspace=workspace) as context:
@@ -677,7 +678,7 @@ async def test_probe_uses_same_sandbox_and_never_passes_token_in_arguments(tool,
     ])
 
     async def run(command, **kwargs):
-        calls.append(command)
+        calls.append(command.command)
         assert kwargs["cwd"] == tool.repository.workspace
         assert kwargs["timeout_seconds"] <= 30
         return next(responses)
@@ -694,7 +695,7 @@ async def test_probe_uses_same_sandbox_and_never_passes_token_in_arguments(tool,
             assert 'mode="limited"' in " ".join(command)
             assert "probe-secret" not in " ".join(command)
             assert f'{json.dumps(str(context.directory))}="write"' in " ".join(command)
-        assert calls[-1][calls[-1].index("--") + 2:] == ["ls-remote", "--exit-code", "origin", "HEAD"]
+        assert calls[-1][-4:] == ["ls-remote", "--exit-code", "origin", "HEAD"]
 
 
 @pytest.mark.parametrize("case", ["no_context", "not_managed", "no_network", "no_git", "ssh", "no_origin"])
@@ -877,7 +878,8 @@ async def test_cli_command_failure_terminates_process(tool, monkeypatch, tmp_pat
     }}
     # 模拟器仅输出协议后等待，不运行模型、网络或用户命令。
     program = f"import sys, time; sys.stdin.read(); print({json.dumps(event)!r}, flush=True); time.sleep(30)"
-    monkeypatch.setattr(runner, "build_command", lambda *args, **kwargs: [sys.executable, "-c", program])
+    monkeypatch.setattr(runner, "build_launch", lambda *args, **kwargs:
+                        ProcessLaunch([sys.executable, "-c", program], dict(kwargs["environment"])))
     with active_git() as context:
         result = await asyncio.wait_for(runner._run_with_projection(
             run_id="run-git", root_run_id="run-git", parent_run_id=None,

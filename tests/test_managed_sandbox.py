@@ -39,7 +39,7 @@ def test_managed_sandbox_profiles_cover_files_and_network() -> None:
     )
     restricted_profile = permission_profile_override(restricted)
     assert 'extends=":workspace"' in restricted_profile
-    assert 'filesystem={":workspace_roots"={".git"="write"}}' in restricted_profile
+    assert '":workspace_roots"={".git"="write"}' in restricted_profile
     assert 'mode="limited"' in restricted_profile
     assert '"api.github.com"="allow"' in restricted_profile
     assert '"*.github.com"="allow"' in restricted_profile
@@ -94,6 +94,7 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
     """外层命令应固定当前工作区，并显式隔开内层 Codex 参数。"""
 
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("teamwork_review_agents.managed_sandbox.windows_environment_separation", lambda: False)
     agent = AgentConfig(
         prompt="测试",
         sandbox="workspace-write",
@@ -111,7 +112,7 @@ def test_managed_sandbox_wrapper_separates_outer_and_inner_arguments(
         inner_command=inner,
         environment={"SSH_AUTH_SOCK": "/tmp/test-ssh-agent.sock"},
         codex_runtime_directory=codex_runtime_directory,
-    )
+    ).command
 
     separator = command.index("--")
     assert command[:2] == ["codex", "sandbox"]
@@ -134,6 +135,7 @@ def test_managed_sandbox_wrapper_allows_only_repository_cache_directory(
     """启用仓库缓存时只应增加当前仓库缓存根目录的写权限。"""
 
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("teamwork_review_agents.managed_sandbox.windows_environment_separation", lambda: False)
     cache_directory = tmp_path / "repository-cache"
     unrelated_directory = tmp_path / "other-cache"
     cache_directory.mkdir()
@@ -148,7 +150,7 @@ def test_managed_sandbox_wrapper_allows_only_repository_cache_directory(
         environment={
             "TEAMWORK_REPOSITORY_CACHE_DIR": str(cache_directory),
         },
-    )
+    ).command
 
     separator = command.index("--")
     outer_command = " ".join(command[:separator])
@@ -187,13 +189,13 @@ def test_runner_uses_sandbox_proxy_without_exposing_service_paths(
         response_timeout_seconds=30,
     )
 
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         agent,
         repository,
         context,
         managed_sandbox=True,
         mcp_bridge=bridge,
-    )
+    ).command
     joined = " ".join(command)
 
     assert "teamwork_review_agents.mcp_proxy" in joined
@@ -249,13 +251,13 @@ def test_managed_runner_exposes_gateway_directly_on_supported_platforms(
         event=event,
     )
 
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         agent,
         repository,
         context,
         managed_sandbox=True,
         environment={},
-    )
+    ).command
     separator = command.index("--")
     inner_command = command[separator + 1 :]
     custom_override = (
@@ -295,13 +297,13 @@ def test_managed_command_without_bridge_still_never_exposes_service_paths(
         event=event,
     )
 
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         agent,
         repository,
         context,
         managed_sandbox=True,
         mcp_bridge=None,
-    )
+    ).command
     joined = " ".join(command)
 
     assert "teamwork_review_agents.mcp_proxy" in joined
@@ -327,7 +329,7 @@ def test_managed_sandbox_only_enables_proxy_for_domain_allowlist(
         agent=agent,
         inner_command=["codex", "exec", "-"],
         environment={},
-    )
+    ).command
     assert "features.network_proxy=true" not in command
 
     agent.network_access = False
@@ -337,7 +339,7 @@ def test_managed_sandbox_only_enables_proxy_for_domain_allowlist(
         agent=agent,
         inner_command=["codex", "exec", "-"],
         environment={},
-    )
+    ).command
     assert "features.network_proxy=true" not in command
 
 

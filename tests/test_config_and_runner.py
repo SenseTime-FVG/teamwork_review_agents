@@ -571,7 +571,7 @@ def test_runner_builds_agent_network_overrides(
         root_run_id="run-network",
         event=event,
     )
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
     profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
@@ -582,7 +582,7 @@ def test_runner_builds_agent_network_overrides(
     assert command[1] == "sandbox"
     assert "--dangerously-bypass-approvals-and-sandbox" in command
     assert 'extends=":workspace"' in profile
-    assert 'filesystem={":workspace_roots"={".git"="write"}}' in profile
+    assert '":workspace_roots"={".git"="write"}' in profile
     assert 'network={enabled=true,mode="limited"' in profile
     assert '"api.github.com"="allow"' in profile
     assert '"*.github.com"="allow"' in profile
@@ -590,7 +590,7 @@ def test_runner_builds_agent_network_overrides(
     assert "sandbox_workspace_write.network_access=true" not in command
 
     agent.network_domains = []
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
     profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
@@ -601,7 +601,7 @@ def test_runner_builds_agent_network_overrides(
     assert "features.network_proxy=true" not in command
 
     agent.network_access = False
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
     profile = next(
         command[index + 1]
         for index, value in enumerate(command[:-1])
@@ -626,11 +626,11 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
         root_run_id="run-1",
         event=event,
     )
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         config.agents["code-reviewer"],
         repository,
         context,
-    )
+    ).command
     joined = " ".join(command)
     assert "--ignore-user-config" not in command
     assert "enabled_tools=[\"invoke_agent\"]" in joined
@@ -667,7 +667,7 @@ def test_runner_enables_managed_comment_tool(
         root_run_id="run-managed-comment",
         event=event,
     )
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
 
     assert (
         'enabled_tools=["invoke_agent", "publish_comment"]'
@@ -740,7 +740,7 @@ def test_runner_forces_project_instruction_isolation_after_extra_args(
         event=event,
     )
 
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
 
     assert command[-3:] == ["--config", "project_doc_max_bytes=0", "-"]
     assert command.index(
@@ -790,11 +790,11 @@ command = "internal-api"
         root_run_id="run-mcp-isolation",
         event=event,
     )
-    command = CodexRunner(config).build_command(
+    command = CodexRunner(config).build_launch(
         config.agents["code-reviewer"],
         repository,
         context,
-    )
+    ).command
     overrides = [
         command[index + 1]
         for index, value in enumerate(command[:-1])
@@ -842,7 +842,7 @@ def test_runner_merges_runtime_and_agent_codex_options(
         root_run_id="run-options",
         event=event,
     )
-    command = CodexRunner(config).build_command(agent, repository, context)
+    command = CodexRunner(config).build_launch(agent, repository, context).command
     overrides = [
         command[index + 1]
         for index, value in enumerate(command[:-1])
