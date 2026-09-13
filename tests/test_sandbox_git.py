@@ -36,6 +36,8 @@ from teamwork_review_agents.sandbox_git import (
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
+pytestmark = pytest.mark.usefixtures("verified_test_sandbox_python")
+
 
 @contextmanager
 def active_git(environment=None, *, workspace=None, helper_root=None):
@@ -261,6 +263,7 @@ async def test_ownership_failure_blocks_before_https_probe(tool, monkeypatch):
 @pytest.mark.parametrize("expose_token", [True, False])
 async def test_executor_injects_validated_workspace_before_preparation(
     git_repositories, configured_app_factory, snapshot_factory, monkeypatch, inherit, outcome, expose_token,
+    verified_test_sandbox_python,
 ):
     """实际执行器向准备步骤和 Runner 传递校验结果，准备失败时也保存不可重试状态。"""
 
@@ -323,6 +326,8 @@ async def test_executor_injects_validated_workspace_before_preparation(
 
     preparation = AsyncMock(side_effect=prepare)
     runner = SimpleNamespace(run=AsyncMock(side_effect=run))
+    # 此用例使用替身 Runner，执行器不会走真实运行时预检；显式提供已模拟的 Python。
+    monkeypatch.setattr("teamwork_review_agents.sandbox_git.current_sandbox_python", lambda: verified_test_sandbox_python)
     monkeypatch.setattr("teamwork_review_agents.executor.prepare_agent_workspace", preparation)
     monkeypatch.setattr(executor, "_runner_for_provider", lambda *args: runner)
     event = detect_events(None, snapshot_factory(provider="github-main"), emit_initial=True)[0]
@@ -521,7 +526,7 @@ def test_helper_root_invalid_never_deletes_existing_directory(tmp_path, case):
 def test_helper_creation_failure_cleans_only_owned_directory(tmp_path, monkeypatch):
     """helper 写入中断时仍回收自己创建的子目录，保留父运行目录及父上下文。"""
 
-    def fail(helper):
+    def fail(helper, **kwargs):
         helper.write_text("部分文件", encoding="utf-8")
         raise PermissionError("模拟写入失败")
 

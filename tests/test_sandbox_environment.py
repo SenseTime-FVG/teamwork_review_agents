@@ -28,6 +28,8 @@ from teamwork_review_agents.sandbox_environment import (
 )
 from teamwork_review_agents.sandbox_git import SandboxGitContext, append_git_config
 
+pytestmark = pytest.mark.usefixtures("verified_test_sandbox_python")
+
 
 @pytest.fixture
 def tool(tmp_path, configured_app_factory, snapshot_factory, monkeypatch):
@@ -300,6 +302,21 @@ async def test_real_windows_sandbox_askpass_and_credential_fill(tool, monkeypatc
     monkeypatch.setattr("teamwork_review_agents.model_tools.resolve_codex_executable", resolve_codex_executable)
     inspection = managed_sandbox.inspect_managed_sandbox(tool.config.runtime.codex_binary)
     assert inspection.available, inspection.error
+    from teamwork_review_agents.codex_executable import CodexExecutable, active_codex_executable
+    from teamwork_review_agents.sandbox_python import inspect_sandbox_python
+    from teamwork_review_agents.sandbox_mcp import standalone_mcp_command
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    # 覆盖模拟测试绑定，真实验收必须重新通过原生沙盒探针，绝不使用模拟结论。
+    python = await asyncio.to_thread(
+        inspect_sandbox_python, inspection.resolved_path,
+        configured=Path(os.environ["TEAMWORK_TEST_SANDBOX_PYTHON"]) if os.environ.get("TEAMWORK_TEST_SANDBOX_PYTHON") else None,
+        codex_home=None, environment=os.environ,
+    )
+    active_codex_executable.set(CodexExecutable(
+        tool.config.runtime.codex_binary, inspection.resolved_path, inspection.discovery_source, python,
+    ))
     git = shutil.which("git")
     assert git, "验收需要安装 Git for Windows"
     tool.config.runtime.codex_binary = inspection.resolved_path
@@ -330,12 +347,20 @@ async def test_real_windows_sandbox_askpass_and_credential_fill(tool, monkeypatc
             "ok=p.returncode==0 and v.get('password')==os.environ['TEAMWORK_GIT_TOKEN'] and v.get('username')=='x-access-token'; "
             "print('credential-ready' if ok else 'credential-failed'); sys.exit(0 if ok else 1)"
         )
-        fill = await tool._run_process(tool._wrap([sys.executable, "-I", "-c", code, git]),
+        fill = await tool._run_process(tool._wrap([python.executable, "-I", "-S", "-c", code, git]),
                                        cwd=tool.repository.workspace, timeout_seconds=60)
         assert fill["exit_code"] == 0, fill["stderr"]
         assert fill["stdout"].strip() == "credential-ready"
         for path in context.directory.iterdir():
             assert b"dummy-not-a-real-token" not in path.read_bytes()
+        # 同一个真实沙盒、同一个 Python 完成标准库独立代理的 MCP 握手。
+        launch = tool._wrap(standalone_mcp_command())
+        parameters = StdioServerParameters(command=launch.command[0], args=launch.command[1:], env=launch.environment)
+        async with asyncio.timeout(60):
+            async with stdio_client(parameters) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment"]
     finally:
         directory = context.directory
         context.close()

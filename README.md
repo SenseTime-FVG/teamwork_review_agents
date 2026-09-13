@@ -359,6 +359,10 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 ### Windows 沙盒内 Git HTTPS
 
+Windows 沙盒账户不一定能执行服务进程的 Python。Teamwork 在创建工作区前检测当前服务账户已有的 `.cache/codex-runtimes/*/dependencies/python/python.exe`（优先主运行时），再尝试服务 Python；只有真实沙盒内的隔离标准库探针通过才会选用。也可在 UI「全局配置与环境 → Teamwork 外层沙盒」或 `runtime.managed_sandbox.python_binary` 指定解释器路径，显式路径不可用时不会悄悄换用其他安装。不自动下载、安装或修改系统 ACL。
+
+选定 Python 供本轮启动桥、askpass 与标准库独立 MCP proxy 使用，代理无需安装本项目或 `mcp`；宿主服务及沙盒外 Broker 仍使用原解释器。就绪日志记录选定路径、来源和依赖目录。若所有候选均不可执行，返回 `sandbox_python_unavailable`，不创建运行工作区，也不重复克隆；探针超时仍允许重试。服务 Python 出现 `CreateProcessAsUserW failed: 5` 不代表 GitHub Token 失效。
+
 Windows 外层 `codex sandbox` 使用服务宿主目录环境；`CODEX_HOME` 按 `runtime.codex_home`、服务进程原始 `CODEX_HOME`、宿主 `.codex` 选择。内层通过沙盒内启动桥恢复 Agent 的临时目录，避免临时 `CODEX_HOME` 干扰外层沙盒 ACL。预检、准备步骤、工具和完整 CLI 共用此机制；准备步骤和模型工具使用空临时 Codex home，完整 CLI 保留原有临时登录快照。启动桥只传递目录字段，不复制凭据到脚本或命令参数，不覆盖沙盒注入的网络代理，也不为内层额外授权宿主 `.codex`。
 
 Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`、`http.sslVerify=true`，避开受限账户下可能无法初始化的 Schannel TLS 上下文；不修改宿主 Git 配置，不关闭证书校验，不取消网络代理或域名白名单。需要 Git for Windows 提供 OpenSSL 后端；使用企业自签证书时，需配置可被沙盒读取的可信 CA，例如 `GIT_SSL_CAINFO`。
@@ -371,12 +375,14 @@ Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`�
 
 明确的 Schannel、OpenSSL、证书、helper 和认证错误使用 `sandbox_git_*` 错误码阻断运行，停止确定性错误的整体重试，修正后可手动触发；临时探测超时仍保留重试资格。模型工具运行中识别到同类错误时也会中止，内嵌调用的子 Agent 会向父 Agent 传播该故障，不进入后续工具阶段。完整 CLI 模式在启动前做相同探测，并在收到已完成命令的错误事件后终止进程树；普通冲突、分支不存在等 Git 结果仍交给 Agent 处理。
 
-普通 CI 覆盖环境传递、真实启动桥与进程树回收，不代表真实 Windows 沙盒 ACL 验收。在已安装并初始化 Codex 沙盒的 Windows 部署机，可显式执行以下独立验收；使用虚拟 Token，不调用模型或 GitHub。启用后缺少 Codex 或沙盒能力会失败，不会跳过。它只验证 helper/凭据链路，实际远端 HTTPS 仍以运行日志 `run.git_https_ready` 为准。
+普通 CI 覆盖环境传递、真实启动桥与进程树回收，不代表真实 Windows 沙盒 ACL 验收。在已安装并初始化 Codex 沙盒的 Windows 部署机，可显式执行以下独立验收；使用虚拟 Token，不调用模型或 GitHub。启用后缺少 Codex、沙盒能力或可执行 Python 会失败，不会跳过。它验证 Python、helper、虚拟凭据链路和独立 MCP 握手，实际远端 HTTPS 仍以运行日志 `run.git_https_ready` 为准。
 
 ```powershell
 $env:TEAMWORK_TEST_WINDOWS_SANDBOX = "1"
 # 可选：指定部署使用的 Codex CLI 绝对路径。
 # $env:TEAMWORK_TEST_CODEX_BINARY = "C:\path\to\codex.exe"
+# 可选：验证指定的沙盒 Python；留空使用自动发现。
+# $env:TEAMWORK_TEST_SANDBOX_PYTHON = "C:\path\to\python.exe"
 try {
     python -m pytest -v tests/test_sandbox_environment.py::test_real_windows_sandbox_askpass_and_credential_fill
 } finally {

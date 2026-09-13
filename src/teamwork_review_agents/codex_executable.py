@@ -10,7 +10,10 @@ import sys
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
+
+if TYPE_CHECKING:
+    from .sandbox_python import SandboxPython
 
 from .process_control import hidden_process_options
 
@@ -35,6 +38,7 @@ class CodexExecutable:
     configured_command: str
     resolved_path: str
     discovery_source: str
+    sandbox_python: SandboxPython | None = None
 
     def as_dict(self) -> dict[str, object]:
         """供运行日志与诊断接口展示实际使用的程序。"""

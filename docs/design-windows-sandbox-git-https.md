@@ -52,6 +52,16 @@ Git 预检、普通工具、apply_patch、准备步骤与完整 CLI 都消费同
 
 普通 CI 验证外/内环境、代理保留、凭据不落盘、标准流、退出码及进程树终止。另提供显式启用的真实 Windows Codex sandbox 验收，用虚拟凭据执行 askpass 自检与 credential fill，不调用模型或 GitHub；启用后缺少 Codex/能力必须失败，不能伪装成通过。
 
+## 沙盒专用 Python
+
+Windows 现场已确认外层/内层目录分离生效，但服务 Python 缺少沙盒账户的执行权限，`CreateProcessAsUserW` 返回 5；同机 Codex runtime Python 可以启动。文件存在与只读目录授权不能代替真实执行验证。
+
+新增可选 `runtime.managed_sandbox.python_binary`，显式路径失败不自动替换。未配置时仅从服务账户已有的 `.cache/codex-runtimes/*/dependencies/python/python.exe` 与服务解释器选择候选，不从 Agent PATH 发现、不安装依赖、不自动修改系统 ACL。创建工作区前在真实 Codex 沙盒中运行隔离的标准库探针；探针使用宿主目录环境、空临时工作目录、禁网权限档案，不经过尚未选定解释器的启动桥，不接触业务凭据。选定路径、标准库根与发现来源绑定本轮执行器，后续环境变化不重新选取。
+
+启动桥、askpass 和 Windows 托管 MCP proxy 共用已验证的解释器，宿主服务及沙盒外 Broker 仍使用服务 Python。MCP proxy 改为可独立执行的标准库脚本，使用隔离模式启动，不导入项目、mcp、pydantic 或服务虚拟环境。脚本由宿主从安装包读取并作为内联源码传入，仅在沙盒中执行，避免宿主执行 Agent 可写脚本；保留原有文件通道鉴权、工具白名单、结构化结果、超时和取消通知。原有非 Windows/非托管 MCP 路径不变。
+
+确定性失败归类为 `sandbox_python_unavailable`，停止事件完整重试；探针超时允许重试。诊断仅记录候选路径、来源、阶段、退出状态，不输出完整环境、凭据或未经筛选的子进程输出。真实 Windows 验收覆盖 Python、askpass、虚拟 credential fill 与 MCP 握手；普通 CI 不冒充 ACL 验收。
+
 ## 验证范围
 
 单测覆盖配置合并、精确可写授权、Python 只读依赖、Token 隔离、宿主 Broker 隔离、真实 Git credential fill 链路、临时目录清理、禁网/SSH 跳过、故障分类、模型与 CLI 启动前阻断、子 Agent 传播和普通错误不误伤。Windows CI 执行不依赖宿主 Codex 登录的回归；实际 Windows 托管沙盒和企业 CA 仍需部署环境验收。

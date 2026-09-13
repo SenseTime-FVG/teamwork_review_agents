@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from .filesystem import remove_tree
 from .git_auth import write_askpass_helper
+from .sandbox_python import current_sandbox_python
 
 
 class SandboxGitError(RuntimeError):
@@ -132,7 +133,8 @@ class SandboxGitContext:
                         f"无法创建本轮 Git askpass 目录：{exc}",
                         error_code="sandbox_git_helper_root_invalid",
                     ) from exc
-                command = write_askpass_helper(self.directory / "askpass.py")
+                python = current_sandbox_python()
+                command = write_askpass_helper(self.directory / "askpass.py", python_binary=python.executable)
                 # GIT_ASKPASS 是文件名而不是 shell 命令。Git for Windows 支持带
                 # shebang 的脚本，由随 Git 提供的 sh 执行；参数只在脚本内转义。
                 launcher = self.directory / "askpass.sh"
@@ -146,10 +148,7 @@ class SandboxGitContext:
                 self.probe_command = [*command, "teamwork-helper-probe"]
                 # Windows 部署实测中只读授权不足，精确可写根可触发新目录 ACL 初始化。
                 self.writable_directories = (self.directory,)
-                self.readable_directories = tuple(dict.fromkeys((
-                    Path(sys.executable).resolve().parent,
-                    Path(sys.base_prefix).resolve(),
-                )))
+                self.readable_directories = tuple(Path(path) for path in python.readable_directories)
             self._context_token = _ACTIVE.set(self)
             return self
         except Exception:

@@ -161,6 +161,41 @@ async def test_missing_codex_stops_before_git_and_manual_replay_rechecks(
     assert orchestrator.store.get_event_detail(event.id)["error_code"] == "codex_not_found"
 
 
+async def test_unavailable_sandbox_python_stops_before_clone_and_retry(
+    configured_app_factory, snapshot_factory, monkeypatch,
+):
+    """原生 Python 启动失败必须早于工作区创建，不能因 fail_closed=false 降低隔离。"""
+
+    config = configured_app_factory()
+    config.runtime.codex_binary = sys.executable
+    config.runtime.codex.execution_mode = "cli"
+    config.runtime.expected_codex_version = None
+    config.runtime.managed_sandbox.fail_closed = False
+    config.runtime.event_retry_count = 2
+    monkeypatch.setattr("teamwork_review_agents.runtime_readiness.windows_environment_separation", lambda: True)
+    monkeypatch.setattr("teamwork_review_agents.runtime_readiness.inspect_managed_sandbox",
+                        lambda *args, **kwargs: managed_sandbox.ManagedSandboxInspection(True, "Windows", "windows"))
+    probe = Mock(side_effect=CodexRuntimeError("沙盒账户无法执行 Python", error_code="sandbox_python_unavailable"))
+    monkeypatch.setattr("teamwork_review_agents.runtime_readiness.inspect_sandbox_python", probe)
+    prepare = Mock(side_effect=AssertionError("不应创建工作区"))
+    monkeypatch.setattr("teamwork_review_agents.executor.prepare_change_request_workspace", prepare)
+    snapshot = snapshot_factory(provider="github-main")
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+    config.rules = [RuleConfig(name="test-review", events=[event.type], agents=["code-reviewer"])]
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    orchestrator.store.save_snapshot_and_events(snapshot, [event])
+    for _ in range(3):
+        await orchestrator.process_events(CycleSummary())
+    prepare.assert_not_called()
+    probe.assert_called_once()
+    record = orchestrator.store.get_event_detail(event.id)
+    assert record["attempts"] == 1
+    assert record["error_code"] == "sandbox_python_unavailable"
+    assert not record["retryable"]
+    run = orchestrator.store.get_run(orchestrator.store.list_runs()[0]["run_id"])
+    assert run["workspace_status"] == "not-created"
+
+
 async def test_runtime_failure_does_not_disable_retry_for_other_event_errors(
     configured_app_factory, snapshot_factory, monkeypatch,
 ):

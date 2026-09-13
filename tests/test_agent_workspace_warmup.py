@@ -15,6 +15,27 @@ from teamwork_review_agents.webapp import create_app
 from teamwork_review_agents.subprocess_utils import ProcessLaunch
 
 
+def test_windows_warmup_checks_python_before_git(tmp_path, monkeypatch):
+    """独立预热入口同样提前阻断不可执行 Python，不克隆仓库。"""
+
+    from unittest.mock import Mock
+    from teamwork_review_agents.codex_executable import CodexRuntimeError
+
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace_manager.windows_environment_separation", lambda: True)
+    probe = Mock(side_effect=CodexRuntimeError("沙盒 Python 不可执行", error_code="sandbox_python_unavailable"))
+    checkout = Mock(side_effect=AssertionError("不应创建 checkout"))
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace_manager.check_runtime_readiness", probe)
+    monkeypatch.setattr("teamwork_review_agents.agent_workspace_manager.temporary_default_branch_worktree", checkout)
+    with TestClient(create_app(_write_config(tmp_path, tmp_path / "remote.git"), start_scheduler=False)) as client:
+        assert client.post("/api/repositories/demo/workspace/warmup/start").status_code == 200
+        result = _wait_for_warmup(client)
+        assert result["status"] == "failed"
+        assert "Python 不可执行" in result["error"]
+        assert result["head_sha"] is None
+    probe.assert_called_once()
+    checkout.assert_not_called()
+
+
 def _run_git(*arguments: str, cwd: Path | None = None) -> str:
     """运行本地预热测试所需的 Git 命令。"""
 

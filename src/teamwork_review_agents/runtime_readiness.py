@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Mapping
 
 from .codex_executable import CodexExecutable, CodexRuntimeError, locate_codex_executable
 from .codex_settings import inspect_codex_binary
 from .config import AgentConfig, AppConfig, RepositoryConfig
 from .managed_sandbox import inspect_managed_sandbox
+from .sandbox_environment import windows_environment_separation
+from .sandbox_python import inspect_sandbox_python
 
 
 def check_runtime_readiness(
@@ -60,4 +63,9 @@ def check_runtime_readiness(
                 retryable=inspection.retryable,
                 details={**inspection.as_dict(), **resolution.as_dict()},
             )
+        if inspection.available and windows_environment_separation():
+            resolution = replace(resolution, sandbox_python=inspect_sandbox_python(
+                resolution.resolved_path, configured=managed.python_binary,
+                codex_home=config.runtime.codex_home, environment=environment,
+            ))
     return resolution

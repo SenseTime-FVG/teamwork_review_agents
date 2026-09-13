@@ -12,6 +12,23 @@ from teamwork_review_agents.models import ChangeRequestSnapshot
 
 
 @pytest.fixture
+def verified_test_sandbox_python():
+    """仅由模拟沙盒测试显式使用；真实 Windows 验收必须重新执行原生探针。"""
+
+    import sys
+    from pathlib import Path
+    from teamwork_review_agents.codex_executable import CodexExecutable, active_codex_executable
+    from teamwork_review_agents.sandbox_python import SandboxPython
+
+    selected = SandboxPython(sys.executable, "test_fixture", (str(Path(sys.executable).resolve().parent), str(Path(sys.base_prefix).resolve())))
+    token = active_codex_executable.set(CodexExecutable("test-codex", "test-codex.exe", "test_fixture", selected))
+    try:
+        yield selected
+    finally:
+        active_codex_executable.reset(token)
+
+
+@pytest.fixture
 def configured_app_factory(tmp_path):
     """创建供运行器与 MCP 边界测试使用的完整配置。"""
 

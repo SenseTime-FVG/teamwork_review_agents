@@ -16,6 +16,7 @@ from .config import AgentConfig
 from .codex_executable import CodexRuntimeError, locate_codex_executable
 from .process_control import hidden_process_options
 from .sandbox_git import current_sandbox_git
+from .sandbox_python import current_sandbox_python
 from .sandbox_environment import (
     sandbox_host_environment,
     separate_sandbox_environment,
@@ -217,8 +218,8 @@ def permission_profile_override(
     git_context = current_sandbox_git()
     readable_directories: list[Path] = []
     if windows_environment_separation():
-        # 固定启动桥使用宿主 Python，仅授权解释器与标准库读取，不授权宿主 Codex home。
-        readable_directories.extend((Path(sys.executable).resolve().parent, Path(sys.base_prefix).resolve()))
+        # 使用已通过沙盒执行验证的解释器与标准库，不授权宿主 Codex home 或服务虚拟环境。
+        readable_directories.extend(Path(path) for path in current_sandbox_python().readable_directories)
     if git_context is not None:
         git_context.validate_helper_directory()
         # 授权来自宿主内存，不从工具环境推断；helper 可写、Python 依赖只读。
