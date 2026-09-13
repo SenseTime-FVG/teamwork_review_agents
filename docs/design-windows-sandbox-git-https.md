@@ -46,6 +46,8 @@ Windows 上工作区创建者与沙盒运行用户可能不同，因此 TLS 自�
 
 外层 `--` 后使用固定的隔离 Python 启动桥，仅通过私有环境项携带内层目录变量（包括缺失项），桥在沙盒内恢复这些变量并删除私有项，再启动真正命令。桥不重建全部环境，保留外层注入的网络代理；不把 Token、完整环境写入文件或命令参数。Python 依赖只读授权，不授予宿主 Codex home 额外权限。桥继承标准流、不创建新进程组，保持原有取消及超时进程树管理。
 
+Windows `CREATE_NO_WINDOW` 启动目标命令时显式传入 stdin/stdout/stderr 句柄，不能依赖默认继承，否则可能没有输出或阻塞读取。真实 Windows CI 覆盖输入、输出、非零退出码及超时回收；CLI 帮助与回退测试也不能依赖 Windows 不支持的 POSIX shebang 启动。
+
 Git 预检、普通工具、apply_patch、准备步骤与完整 CLI 都消费同一启动对象。准备步骤有独立空 Codex home，完整 CLI 仍使用原有临时登录快照，模型工具仍使用空临时 Codex home。Linux/macOS、完全访问模式、宿主 MCP Broker 和 helper 清理机制保持不变。
 
 普通 CI 验证外/内环境、代理保留、凭据不落盘、标准流、退出码及进程树终止。另提供显式启用的真实 Windows Codex sandbox 验收，用虚拟凭据执行 askpass 自检与 credential fill，不调用模型或 GitHub；启用后缺少 Codex/能力必须失败，不能伪装成通过。
