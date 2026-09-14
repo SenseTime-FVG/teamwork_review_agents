@@ -112,7 +112,8 @@ def archive_entries(archive: zipfile.ZipFile, distribution: CurlDistribution) ->
     result: list[tuple[zipfile.ZipInfo, Path]] = []
     seen: set[str] = set()
     for entry in entries:
-        name = entry.filename.rstrip("/")
+        # Windows 的 ZipInfo.filename 会把反斜杠规范化；安全校验必须使用归档原文。
+        name = entry.orig_filename.rstrip("/")
         parts = name.split("/")
         mode = entry.external_attr >> 16
         if (not parts or parts[0] != distribution.package or "\\" in name or entry.flag_bits & 1
