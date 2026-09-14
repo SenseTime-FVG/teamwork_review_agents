@@ -20,6 +20,7 @@
 | --- | --- | --- | --- |
 | [`design.md`](design.md) | 当前系统实现语义的权威设计记录 | `src/teamwork_review_agents/`、`ui/src/` | 已实现的配置、事件、运行时、API 或 UI 语义变化 |
 | [`design-quick-setup.md`](design-quick-setup.md) | 一键配置、规则范围和仓库级 Skill 隔离 | `quick_setup.py`、`QuickSetupWizard.tsx` | 向导步骤、规则适用性、凭据或保存语义变化 |
+| [`design-git-provider-credential-context.md`](design-git-provider-credential-context.md) | 原生 Git 临时凭据程序与错误脱敏 | `git_auth.py`、`workspace.py`、`sandbox_git.py` | Git 凭据传递、跨平台入口或故障展示变化 |
 | [`design-background-startup-confirmation.md`](design-background-startup-confirmation.md) | 后台启动等待与健康检查诊断 | `process_manager.py`、`cli.py` | 启动时限、健康探测或启动确认语义变化 |
 | [`design-model-runtime-log-normalization.md`](design-model-runtime-log-normalization.md) | 模型基座运行日志语义设计 | 模型基座运行时与日志 | 模型基座日志事件或展示语义变化 |
 | [`design-agent-workspace-preparation.md`](design-agent-workspace-preparation.md) | Agent 工作区准备与仓库级依赖缓存设计 | `agent_workspace.py`、缓存与仓库配置 | `agent_workspace`、准备步骤、缓存、沙盒或相关 UI 变化 |
@@ -37,6 +38,7 @@
 | --- | --- | --- | --- |
 | [`implementation-plan.md`](implementation-plan.md) | 项目阶段实施与验收记录 | 全项目历史实施范围 | 新增需要记录的实施阶段或验收结论 |
 | [`implementation-plan-quick-setup.md`](implementation-plan-quick-setup.md) | 一键配置实施与验收 | 向导、配置管理及测试 | 实施范围或验证结果变化 |
+| [`implementation-plan-git-provider-credential-context.md`](implementation-plan-git-provider-credential-context.md) | Git 凭据上下文和启动入口修正记录 | 原生 Git、沙盒与向导检查 | 凭据实现、生命周期或实际 Git 验证结果变化 |
 | [`implementation-plan-background-startup-confirmation.md`](implementation-plan-background-startup-confirmation.md) | 后台启动确认实施与验收范围 | 进程管理与 CLI 测试 | 该实施方案或验收记录更新 |
 | [`implementation-plan-model-runtime-log-normalization.md`](implementation-plan-model-runtime-log-normalization.md) | 模型基座运行日志语义实施方案 | 模型基座运行时与日志 | 该实施方案本身或其验收记录更新 |
 | [`implementation-plan-agent-workspace-preparation.md`](implementation-plan-agent-workspace-preparation.md) | 工作区准备与依赖缓存实施方案 | 工作区准备、缓存和管理界面 | 该实施方案或验收记录更新 |

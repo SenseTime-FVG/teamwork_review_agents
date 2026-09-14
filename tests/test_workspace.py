@@ -274,7 +274,7 @@ def test_git_credential_context_authenticates_without_exposing_token(
     with GitCredentialContext("provider-secret", provider_kind="github") as context:
         result = _run_git(["fetch", "origin"])
         assert result.stdout.splitlines()[1] == "provider-secret"
-        helper = Path(context.environment["GIT_ASKPASS"].split()[-1])
+        helper = Path(context.environment["GIT_ASKPASS"])
         assert helper.exists()
 
     assert not helper.exists()

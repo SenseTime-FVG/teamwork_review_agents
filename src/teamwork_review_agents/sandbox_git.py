@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .filesystem import remove_tree
-from .git_auth import write_askpass_helper
+from .git_auth import write_askpass_helper, write_askpass_launcher
 from .sandbox_python import current_sandbox_python
 
 
@@ -135,15 +135,9 @@ class SandboxGitContext:
                     ) from exc
                 python = current_sandbox_python()
                 command = write_askpass_helper(self.directory / "askpass.py", python_binary=python.executable)
-                # GIT_ASKPASS 是文件名而不是 shell 命令。Git for Windows 支持带
-                # shebang 的脚本，由随 Git 提供的 sh 执行；参数只在脚本内转义。
+                # 宿主和沙盒复用同一入口格式，避免把命令参数误当成文件名。
                 launcher = self.directory / "askpass.sh"
-                python_command = shlex.join([part.replace("\\", "/") for part in command])
-                launcher.write_text(
-                    f'#!/bin/sh\n# 凭据仅由隔离的 Python helper 从环境读取。\nexec {python_command} "$@"\n',
-                    encoding="utf-8", newline="\n",
-                )
-                launcher.chmod(0o700)
+                write_askpass_launcher(launcher, command)
                 self.environment["GIT_ASKPASS"] = str(launcher)
                 self.probe_command = [*command, "teamwork-helper-probe"]
                 # Windows 部署实测中只读授权不足，精确可写根可触发新目录 ACL 初始化。

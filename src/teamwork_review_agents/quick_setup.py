@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field, SecretStr
 
 from .config import AppConfig, RepositoryConfig
 from .environment import resolve_provider_token
-from .git_auth import git_credential_context
-from .workspace import _run_git
+from .git_auth import git_credential_context, safe_git_error_detail
+from .workspace import WorkspaceError, _run_git
 
 
 class SetupRequest(BaseModel):
@@ -270,6 +270,10 @@ async def check_setup_connection(config: AppConfig, repository_id: str) -> list[
     try:
         await asyncio.to_thread(check_git)
         results.append({"name": "Git", "ok": True, "detail": "远端读取成功（未克隆，未验证推送权限）"})
+    except WorkspaceError as exc:
+        # 已知 Git 故障保留排障信息；再次脱敏后才交给界面，禁止返回原始 stderr。
+        detail = safe_git_error_detail(str(exc), secrets=(token,)) or "Git 执行失败，未返回错误详情"
+        results.append({"name": "Git", "ok": False, "detail": detail})
     except Exception:
         results.append({"name": "Git", "ok": False, "detail": "Git 读取失败：请检查服务账号的网络、HTTPS Token 或 SSH 密钥及 known_hosts"})
     return results
