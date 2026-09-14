@@ -331,6 +331,15 @@ def test_runner_enables_only_agent_and_repository_skill_intersection(
     assert f'path = "{tmp_path / "docs" / "SKILL.md"}", enabled = false' in joined
     assert f'path = "{tmp_path / "security" / "SKILL.md"}", enabled = true' in joined
 
+    # 仓库专属列表覆盖共享 Agent，但仍按当前调用的 Agent 名称匹配。
+    agent.skills = []
+    repository.agent_skills = {"code-reviewer": ["security"]}
+    overridden = CodexRunner(config).build_launch(
+        agent, repository, context,
+        {"security": tmp_path / "security" / "SKILL.md"},
+    ).command
+    assert f'path = "{tmp_path / "security" / "SKILL.md"}", enabled = true' in " ".join(overridden)
+
 
 def test_skill_directory_web_api_imports_whole_folder(tmp_path) -> None:
     """管理 API 应接收多文件目录上传并返回可配置相对路径。"""

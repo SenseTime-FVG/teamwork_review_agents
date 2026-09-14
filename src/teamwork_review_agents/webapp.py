@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .agent_workspace_manager import AgentWorkspaceWarmupManager
 from .codex_account import (
@@ -28,6 +30,7 @@ from .codex_connection import (
 )
 from .config import ModelProviderConfig
 from .config_manager import ConfigManager, ConfigRevisionConflict
+from .quick_setup import SetupRequest, check_setup_connection, setup_summary
 from .codex_settings import codex_home, inspect_runtime_options
 from .environment import PromptRenderError, render_prompt
 from .events import (
@@ -353,6 +356,14 @@ def create_app(
             if writing:
                 active_api_writes -= 1
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(request: Request, exc: RequestValidationError):
+        """向导请求包含凭据，结构校验也不得回显完整请求体。"""
+
+        if request.url.path.startswith("/api/setup/"):
+            return JSONResponse(status_code=422, content={"detail": "向导请求格式无效，请检查填写内容或重新打开向导"})
+        return await request_validation_exception_handler(request, exc)
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         return {"status": "ok", "version": app.version, "pid": os.getpid()}
@@ -415,6 +426,46 @@ def create_app(
             "revision": config_revision,
             "document": await asyncio.to_thread(manager.document),
         }
+
+    async def setup_candidate(body: SetupRequest, *, persist: bool = False):
+        """统一配置版本冲突与错误脱敏，禁止校验错误回显 Token。"""
+
+        try:
+            return await asyncio.to_thread(manager.prepare_setup, body, persist=persist)
+        except ConfigRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            if isinstance(exc, ValidationError):
+                errors = [f"{'.'.join(map(str, item['loc']))}：{item['msg']}" for item in exc.errors(include_input=False)]
+                message = "配置校验失败：" + "；".join(errors)
+            else:
+                message = str(exc)
+            secret = body.token.get_secret_value().strip()
+            if secret:
+                message = message.replace(secret, "********")
+            raise HTTPException(status_code=422, detail=message) from exc
+
+    @app.post("/api/setup/preview")
+    async def preview_setup(body: SetupRequest) -> dict[str, Any]:
+        """校验完整草稿并预览最终规则范围，不保存配置。"""
+
+        config, repository_id = await setup_candidate(body)
+        return setup_summary(config, repository_id)
+
+    @app.post("/api/setup/check")
+    async def check_setup(body: SetupRequest) -> dict[str, Any]:
+        """只检测读取能力，不触发扫描、评论或 Agent。"""
+
+        config, repository_id = await setup_candidate(body)
+        return {"checks": await check_setup_connection(config, repository_id)}
+
+    @app.post("/api/setup/complete")
+    async def complete_setup(body: SetupRequest) -> dict[str, Any]:
+        """按规则勾选结果原子保存，后台只按正常触发语义继续运行。"""
+
+        config, _ = await setup_candidate(body, persist=True)
+        runtime.notify_config_changed()
+        return await item_config_response(config.revision)
 
     @app.post("/api/config/agents")
     async def create_agent(body: AgentConfigRequest) -> dict[str, Any]:

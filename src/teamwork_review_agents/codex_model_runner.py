@@ -703,6 +703,7 @@ class CodexModelRunner:
                 instructions = _instructions(
                     repository=repository,
                     agent=current_agent,
+                    agent_name=agent_name,
                     personality=personality,
                     skill_files=skill_files,
                     provider_name=selection.provider.display_name,
@@ -836,7 +837,7 @@ class CodexModelRunner:
                 "reasoning_effort": reasoning_effort,
                 "reasoning_effort_source": reasoning_effort_source,
                 "tool_count": len(tools),
-                "skill_count": len(effective_skill_ids(current_agent, repository)),
+                "skill_count": len(effective_skill_ids(current_agent, repository, agent_name)),
             },
         )
 
@@ -1426,6 +1427,7 @@ def _instructions(
     personality: str | None,
     skill_files: Mapping[str, Path],
     provider_name: str = "Codex",
+    agent_name: str | None = None,
 ) -> str:
     """构造 Teamwork 运行时边界并内联已选 Skill 指令。"""
 
@@ -1444,7 +1446,7 @@ def _instructions(
     ]
     if personality and personality != "none":
         sections.append(f"交互风格：{personality}。")
-    selected = set(effective_skill_ids(agent, repository))
+    selected = set(effective_skill_ids(agent, repository, agent_name))
     for skill_id, path in sorted(skill_files.items()):
         if skill_id not in selected:
             continue

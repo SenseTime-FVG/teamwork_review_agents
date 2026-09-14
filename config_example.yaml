@@ -246,6 +246,10 @@ web:
 #     # 可选：仓库级 Skill 策略。省略或 [] 表示不额外限制，继续使用 Agent 白名单；
 #     # 非空列表表示仅允许所选 Skill，运行时与 Agent skills 取交集；null 表示禁止所有 Skill。
 #     allowed_skills: []
+#     # 可选：仅为本仓库覆盖指定 Agent 的 Skill 列表，不修改共享 Agent。
+#     # 覆盖后仍受 allowed_skills 限制；未列出的 Agent 使用自身 skills。
+#     # agent_skills:
+#     #   general-reviewer: [security-review]
 #     # 可选：只覆盖当前仓库的环境变量。Provider Token 可按相同变量名覆盖，
 #     # 推荐引用每个仓库独立的宿主机变量；默认进入进程但不进入 Prompt，可分别调整开关。
 #     environment:

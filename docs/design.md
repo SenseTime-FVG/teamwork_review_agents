@@ -2,6 +2,8 @@
 
 ## 1. 目标
 
+当前仓库接入支持五步“一键配置”向导：平台、仓库与凭证、动态规则、Skill、检查与完成。规则范围和原子保存语义见 [一键配置设计](design-quick-setup.md)。仓库可通过 `agent_skills` 仅覆盖指定 Agent 在本仓库的 Skill 列表，覆盖后仍受 `allowed_skills` 约束，不修改共享 Agent；未配置时保持原有行为。
+
 系统负责定时扫描 GitHub Pull Request 与 GitLab Merge Request，根据状态变化触发配置好的 Agent。每个 Agent 由独立的 `codex exec` 进程执行，并可通过受控 MCP 工具将任务委托给其他配置好的 Agent。
 
 第一版采用单服务、SQLite 和本地进程模型，优先保证配置清晰、状态可追溯、触发幂等以及写操作不会互相破坏。接口层保留替换 PostgreSQL、消息队列和远程执行器的空间。

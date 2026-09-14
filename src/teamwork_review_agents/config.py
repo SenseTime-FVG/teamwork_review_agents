@@ -462,6 +462,8 @@ class RepositoryConfig(BaseModel):
     clone_url: str | None = None
     enabled: bool = True
     allowed_skills: list[str] | None = Field(default_factory=list)
+    # 仅覆盖本仓库指定 Agent 的 Skill 列表，避免向导修改全局共享 Agent。
+    agent_skills: dict[str, list[str]] = Field(default_factory=dict)
     environment: dict[str, EnvironmentVariable] = Field(default_factory=dict)
     agent_workspace: AgentWorkspaceConfig = Field(
         default_factory=AgentWorkspaceConfig,
@@ -645,15 +647,17 @@ class AgentConfig(BaseModel):
 def effective_skill_ids(
     agent: AgentConfig,
     repository: RepositoryConfig,
+    agent_name: str | None = None,
 ) -> list[str]:
     """按 Agent 白名单顺序计算当前仓库实际装载的 Skill。"""
 
     if repository.allowed_skills is None:
         return []
+    selected = repository.agent_skills.get(agent_name, agent.skills) if agent_name else agent.skills
     if not repository.allowed_skills:
-        return list(agent.skills)
+        return list(selected)
     allowed = set(repository.allowed_skills)
-    return [skill_id for skill_id in agent.skills if skill_id in allowed]
+    return [skill_id for skill_id in selected if skill_id in allowed]
 
 
 class RuleConfig(BaseModel):
@@ -847,6 +851,11 @@ class AppConfig(BaseModel):
             skill_metadata_names[metadata.name] = skill_id
         for repository in self.repositories:
             unknown_skills = set(repository.allowed_skills or ()) - skill_names
+            if set(repository.agent_skills) - agent_names:
+                raise ValueError(f"仓库 {repository.id} 的 Skill 分配引用了不存在的 Agent")
+            unknown_skills |= {
+                skill for selected in repository.agent_skills.values() for skill in selected
+            } - skill_names
             if unknown_skills:
                 raise ValueError(
                     f"仓库 {repository.id} 引用了不存在的 Skill："

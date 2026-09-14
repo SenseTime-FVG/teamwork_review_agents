@@ -1,0 +1,47 @@
+/* 向导使用独立命名空间，避免通用卡片选择器改变字体和对齐。 */
+.quick-setup { width: min(980px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); color: var(--text); box-shadow: 0 24px 100px #0009; }
+.quick-setup[open] { display: flex; flex-direction: column; }
+.quick-setup::backdrop { background: #030711bb; backdrop-filter: blur(3px); }
+.quick-setup-header, .quick-setup-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 20px 24px; flex-shrink: 0; }
+.quick-setup-header h2 { margin: 5px 0; font-size: 22px; }
+.quick-setup-header p, .quick-setup-footer > span { margin: 0; color: var(--muted); font-size: 12px; }
+.quick-setup-steps { display: flex; list-style: none; margin: 0; padding: 12px 24px; gap: 12px; border-block: 1px solid var(--line); flex-shrink: 0; }
+.quick-setup-steps li { flex: 1; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.quick-setup-steps li span { display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--line); border-radius: 50%; flex-shrink: 0; }
+.quick-setup-steps li.active { color: var(--accent); }
+.quick-setup-steps li.active span { border-color: var(--accent); background: #14291e; }
+.quick-setup-body { padding: 24px; overflow: auto; min-height: 240px; }
+.quick-setup-body h3, .quick-setup-body h4 { margin: 0; }
+.quick-setup-body .field input, .quick-setup-body .field select { width: 100%; min-width: 0; box-sizing: border-box; font: inherit; font-size: 13px; color: var(--text); background: #090f18; border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; }
+.quick-setup-body small, .quick-setup-note { display: block; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.quick-setup-platforms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.quick-setup-choice { padding: 24px 16px; border: 1px solid var(--line); border-radius: 10px; background: #0a111b; color: var(--text); cursor: pointer; text-align: left; }
+.quick-setup-choice strong { display: block; font-size: 16px; margin-bottom: 8px; }
+.quick-setup .selected { background: #11241a; border-color: #386e4d; }
+.quick-setup-rule { display: flex; gap: 12px; align-items: flex-start; padding: 13px 15px; border: 1px solid var(--line); border-radius: 9px; background: #0a111b; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.quick-setup-rule input, .quick-setup-skill-options input { width: 16px; height: 16px; accent-color: var(--accent); flex-shrink: 0; margin-top: 3px; }
+.quick-setup-rule > div { min-width: 0; }
+.quick-setup-rule strong { display: block; margin-bottom: 5px; font-size: 13px; }
+.quick-setup-secret { display: flex; align-items: stretch; gap: 8px; }
+.quick-setup-secret input { flex: 1; }
+.quick-setup-secret button { flex-shrink: 0; display: grid; place-items: center; }
+.quick-setup-agent { padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.quick-setup-skill-options { display: flex; gap: 12px 20px; flex-wrap: wrap; margin-top: 12px; }
+.quick-setup-skill-options label { display: flex; align-items: center; gap: 7px; overflow-wrap: anywhere; font-size: 13px; }
+.quick-setup details summary { cursor: pointer; color: var(--blue); margin-bottom: 14px; }
+.quick-setup details .form-grid { margin-bottom: 12px; }
+.quick-setup-summary { display: grid; grid-template-columns: 110px minmax(0, 1fr); margin: 0; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.quick-setup-summary dt, .quick-setup-summary dd { margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); overflow-wrap: anywhere; }
+.quick-setup-summary dt { color: var(--muted); }
+.quick-setup-footer { border-top: 1px solid var(--line); }
+.quick-setup :focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.quick-setup-entry { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+.quick-setup-entry p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+@media (max-width: 650px) {
+  .quick-setup-header, .quick-setup-footer, .quick-setup-body { padding: 16px; }
+  .quick-setup-steps { gap: 6px; padding: 10px; }
+  .quick-setup-steps li { flex-direction: column; font-size: 10px; text-align: center; }
+  .quick-setup-platforms, .quick-setup-body .form-grid { grid-template-columns: 1fr; }
+  .quick-setup-choice { padding: 16px; }
+  .quick-setup-entry { align-items: flex-start; flex-direction: column; }
+}
