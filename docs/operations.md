@@ -48,6 +48,15 @@ Provider Token 始终按 Secret 脱敏，Prompt 暴露默认关闭，进程暴�
 | `teamwork-review-agents scan-once --dry-run` | 保存快照和事件，但不启动 Agent |
 | `teamwork-review-agents runs --limit 20` | 查看最近运行 |
 
+`start` / `restart` 在所有平台默认最多等待 30 秒完成启动确认，检查成功后立即返回。WSL 或较慢磁盘上的首次启动可加长等待：
+
+```bash
+teamwork-review-agents start --startup-timeout 60
+teamwork-review-agents restart --startup-timeout 60
+```
+
+`--startup-timeout` 接受有限正数（单位秒，可带小数），只影响本次启动确认，不改变停止、Git 或 Agent 超时。健康检查绕过环境代理直连服务，不修改其他网络请求的代理设置。
+
 所有命令默认读取当前目录的 `config.yaml`。自定义配置必须始终传入同一路径：
 
 ```bash
@@ -168,6 +177,7 @@ teamwork-review-agents run
 | 现象 | 检查 |
 | --- | --- |
 | `start` 失败 | 查看 `data/teamwork-review-agents.log`；检查端口和配置校验输出 |
+| 启动确认超时 | 查看“最后启动检查”：PID 文件未就绪时检查启动耗时和目录权限；健康接口无法连接时检查监听地址与端口；确认只是启动慢时用 `--startup-timeout 60` |
 | 健康接口不是当前 PID | 执行 `stop` 或 `restart`；不要按端口直接杀进程 |
 | PID 或锁文件丢失 | `stop` / `restart` 会按配置路径发现托管进程 |
 | 仓库没有被扫描 | 检查 Provider Token、仓库 `enabled`、远端项目和 API 地址 |
@@ -178,3 +188,5 @@ teamwork-review-agents run
 | 临时 Git 工作区未删除 | 查看工作区状态和保留原因，不要直接删除仍在使用的目录 |
 
 无法判断时，先保留数据库和临时 Git 工作区，再从管理界面的运行详情、后台日志和健康接口定位问题。
+
+日志先显示 `Uvicorn running`，随后在启动确认超时后显示 `Shutting down`，可能是后台启动器未确认健康接口属于新 PID 而主动收尾。监听成功不等于启动确认成功；应结合“最后启动检查”判断原因。`teamwork-review-agents run` 可用于前台诊断，不经过后台启动确认窗口。

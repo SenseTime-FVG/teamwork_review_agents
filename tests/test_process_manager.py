@@ -11,12 +11,16 @@ import sys
 import threading
 import time
 import urllib.request
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
+from teamwork_review_agents import cli, process_manager
 from teamwork_review_agents.process_control import (
     pid_exists,
     process_group_options,
@@ -24,6 +28,9 @@ from teamwork_review_agents.process_control import (
 )
 from teamwork_review_agents.process_manager import (
     ServiceLease,
+    ProcessActionResult,
+    ProcessRecord,
+    _check_health,
     _effective_startup_timeout_seconds,
     _read_record,
     _write_stop_request,
@@ -202,7 +209,7 @@ def test_read_record_retries_transient_permission_error(tmp_path, monkeypatch) -
 
 
 def test_background_startup_timeout_uses_platform_default(monkeypatch) -> None:
-    """Windows 默认启动预算更长，显式传值始终优先。"""
+    """WSL/POSIX 与 Windows 默认均等待 30 秒，显式值优先。"""
 
     monkeypatch.setattr(
         "teamwork_review_agents.process_manager._is_native_windows",
@@ -213,8 +220,203 @@ def test_background_startup_timeout_uses_platform_default(monkeypatch) -> None:
         "teamwork_review_agents.process_manager._is_native_windows",
         lambda: False,
     )
-    assert _effective_startup_timeout_seconds(None) == 5
+    assert _effective_startup_timeout_seconds(None) == 30
     assert _effective_startup_timeout_seconds(7.5) == 7.5
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_startup_timeout_rejects_invalid_api_value(value) -> None:
+    """直接调用启动器也不允许无期限或无效的等待预算。"""
+
+    with pytest.raises(ValueError, match="有限秒数"):
+        _effective_startup_timeout_seconds(value)
+
+
+@pytest.mark.parametrize("command", ["start", "restart"])
+@pytest.mark.parametrize("timeout", [None, "60", "7.5"])
+def test_cli_passes_startup_timeout(command, timeout, tmp_path, monkeypatch) -> None:
+    """CLI 将默认或显式预算传入后台启动器，重启仍先完成停止。"""
+
+    start = Mock(return_value=ProcessActionResult(0, "已启动"))
+    stop = Mock(return_value=ProcessActionResult(0, "已停止"))
+    monkeypatch.setattr(cli, "start_background", start)
+    monkeypatch.setattr(cli, "stop_managed_process", stop)
+    config = tmp_path / "config.yaml"
+    monkeypatch.setattr(cli, "_server_settings", lambda *args: (config, "127.0.0.1", 8080))
+    arguments = ["teamwork-review-agents", command]
+    if timeout is not None:
+        arguments.extend(["--startup-timeout", timeout])
+    monkeypatch.setattr(sys, "argv", arguments)
+    with pytest.raises(SystemExit) as exit_result:
+        cli.main()
+    assert exit_result.value.code == 0
+    start.assert_called_once_with(
+        config, host="127.0.0.1", port=8080,
+        startup_timeout_seconds=None if timeout is None else float(timeout),
+    )
+    assert stop.call_count == (1 if command == "restart" else 0)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "abc"])
+def test_invalid_cli_timeout_cannot_stop_existing_service(value, monkeypatch) -> None:
+    """非法重启参数必须在任何启停动作之前被拒绝。"""
+
+    start, stop = Mock(), Mock()
+    monkeypatch.setattr(cli, "start_background", start)
+    monkeypatch.setattr(cli, "stop_managed_process", stop)
+    monkeypatch.setattr(sys, "argv", ["teamwork-review-agents", "restart", f"--startup-timeout={value}"])
+    with pytest.raises(SystemExit) as exit_result:
+        cli.main()
+    assert exit_result.value.code == 2
+    start.assert_not_called()
+    stop.assert_not_called()
+
+
+@pytest.fixture
+def simulated_start(tmp_path, monkeypatch):
+    """用虚拟时钟覆盖慢启动及失败收尾，无需真正等待 30 秒。"""
+
+    clock = SimpleNamespace(seconds=0.0)
+
+    def advance(seconds):
+        """只推进当前进程管理测试的时钟。"""
+
+        clock.seconds += seconds
+
+    monkeypatch.setattr(process_manager, "time", SimpleNamespace(
+        monotonic=lambda: clock.seconds, sleep=advance,
+    ))
+    process = Mock(pid=12345)
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    monkeypatch.setattr(process_manager.subprocess, "Popen", Mock(return_value=process))
+    terminate = Mock()
+    monkeypatch.setattr(process_manager, "terminate_process", terminate)
+    monkeypatch.setattr(process_manager, "_running_processes", lambda *args: [])
+    config = tmp_path / "config.yaml"
+    record = ProcessRecord(12345, str(config), "start", "127.0.0.1", 8080, True)
+    monkeypatch.setattr(process_manager, "_read_record", lambda *args: record)
+    monkeypatch.setattr(process_manager, "_record_is_running", lambda *args: True)
+    monkeypatch.setattr(process_manager, "_check_health", lambda *args, **kwargs: (12345, None))
+    return SimpleNamespace(clock=clock, process=process, terminate=terminate, record=record, config=config)
+
+
+def test_default_budget_accepts_service_ready_after_five_seconds(simulated_start, monkeypatch) -> None:
+    """确认耗时 8 秒的正常服务应成功，并在就绪时立即返回。"""
+
+    state = simulated_start
+    monkeypatch.setattr(process_manager, "_check_health", lambda *args, **kwargs:
+        (12345, None) if state.clock.seconds >= 8 else (None, "健康接口无法连接")
+    )
+    result = start_background(state.config, host="127.0.0.1", port=8080)
+    assert result.exit_code == 0
+    assert 8 <= state.clock.seconds < 9
+    state.terminate.assert_not_called()
+
+
+@pytest.mark.parametrize("failure, expected", [
+    ("record", "PID 文件尚未就绪"),
+    ("record_pid", "PID 文件不匹配：期望 12345，实际 23456"),
+    ("identity", "进程身份检查未通过"),
+    ("connection", "健康接口无法连接"),
+    ("health_pid", "健康接口 PID 不匹配：期望 12345，实际 999999"),
+])
+def test_startup_timeout_reports_cause_and_reaps_own_child(
+    simulated_start, monkeypatch, failure, expected,
+) -> None:
+    """超时保留最后未满足条件，并且只终止本次启动的子进程。"""
+
+    state = simulated_start
+    if failure == "record":
+        monkeypatch.setattr(process_manager, "_read_record", lambda *args: None)
+    elif failure == "record_pid":
+        monkeypatch.setattr(process_manager, "_read_record", lambda *args:
+            ProcessRecord(23456, str(state.config), "other", "127.0.0.1", 8080, True))
+    elif failure == "identity":
+        monkeypatch.setattr(process_manager, "_record_is_running", lambda *args: False)
+    else:
+        health = (None, "健康接口无法连接") if failure == "connection" else (999999, None)
+        monkeypatch.setattr(process_manager, "_check_health", lambda *args, **kwargs: health)
+    result = start_background(state.config, host="127.0.0.1", port=8080, startup_timeout_seconds=7.5)
+    assert result.exit_code == 1
+    assert "7.5 秒" in result.message
+    assert expected in result.message
+    assert state.clock.seconds == pytest.approx(7.5)
+    state.terminate.assert_called_once_with(12345, force=False, tree=True)
+    state.process.wait.assert_called_once_with(timeout=3)
+
+
+@pytest.fixture
+def health_server():
+    """提供可指定状态和响应内容的真实本机 HTTP 服务。"""
+
+    class Handler(_OccupiedHealthHandler):
+        def do_GET(self):
+            """返回测试指定的健康响应。"""
+
+            self.send_response(self.server.response_status)
+            self.send_header("Content-Length", str(len(self.server.payload)))
+            self.end_headers()
+            self.wfile.write(self.server.payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.response_status = 200
+    server.payload = json.dumps({"pid": os.getpid()}).encode()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_health_check_bypasses_environment_proxy(health_server, monkeypatch) -> None:
+    """即使 NO_PROXY 未配置且环境代理不可连接，健康接口仍应直连成功。"""
+
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    pid, error = _check_health("0.0.0.0", health_server.server_port)
+    assert (pid, error) == (os.getpid(), None)
+    assert os.environ["http_proxy"] == "http://127.0.0.1:1"
+
+
+@pytest.mark.parametrize("status, payload, expected", [
+    (503, b"busy", "HTTP 503"),
+    (200, b"not-json", "UTF-8 JSON"),
+    (200, b"{}", "有效 PID"),
+    (200, b'{"pid":true}', "有效 PID"),
+    (200, b'{"pid":1.5}', "有效 PID"),
+])
+def test_health_check_explains_invalid_response(health_server, status, payload, expected) -> None:
+    """连接成功但响应不符合健康协议时应给出具体诊断。"""
+
+    health_server.response_status = status
+    health_server.payload = payload
+    pid, error = _check_health("127.0.0.1", health_server.server_port)
+    assert pid is None
+    assert expected in error
+
+
+@pytest.mark.parametrize("failure, expected", [
+    (TimeoutError(), "连接或读取超时"),
+    (urllib.error.URLError(TimeoutError()), "连接或读取超时"),
+    (urllib.error.URLError(ConnectionRefusedError()), "无法连接"),
+    (IncompleteRead(b"partial"), "HTTP 响应不完整"),
+])
+def test_health_probe_failures_remain_diagnostic(failure, expected, monkeypatch) -> None:
+    """网络和协议异常留在启动重试流程内，不抛出导致收尾中断。"""
+
+    opener = Mock()
+    opener.open.side_effect = failure
+    monkeypatch.setattr(urllib.request, "build_opener", Mock(return_value=opener))
+    pid, error = _check_health("::", 8080, timeout_seconds=0.2)
+    assert pid is None
+    assert expected in error
+    opener.open.assert_called_once_with("http://[::1]:8080/api/health", timeout=0.2)
 
 
 def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> None:
