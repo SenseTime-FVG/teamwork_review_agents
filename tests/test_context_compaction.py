@@ -32,7 +32,7 @@ def _settings(**overrides):
 
     return ContextCompactionConfig(**{
         "default_context_window_tokens": 8192, "reserved_output_tokens": 512,
-        "max_summary_tokens": 512, "tool_output_tokens": 4096,
+        "summary_target_bytes": 512, "tool_output_tokens": 4096,
         "trigger_ratio": 0.7, "target_ratio": 0.4, "keep_recent_rounds": 1,
         **overrides,
     })
@@ -95,13 +95,164 @@ async def test_failed_compaction_never_replaces_history(failure):
             raise RuntimeError("模拟上游失败")
         if failure == "cancel":
             raise asyncio.CancelledError()
-        return "" if failure == "empty" else "x" * (513 if failure == "large" else 512)
+        return "" if failure == "empty" else "x" * (10000 if failure == "large" else 512)
 
     expected = asyncio.CancelledError if failure == "cancel" else RuntimeError
     with pytest.raises(expected):
         await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize, force=True)
     assert context.history() == before
     assert context.compaction_count == 0
+
+
+async def test_chinese_summary_above_2048_bytes_is_accepted_when_full_request_fits():
+    """回归现场问题：800 汉字摘要不再因 2400 字节超过软目标而被拒绝。"""
+
+    context = _context(ContextCompactionConfig())
+    context.append_round(_turn(0, 110000))
+    fixed = copy.deepcopy(context.fixed_messages)
+    fields = {"instructions": "SYSTEM 原文；Skill 和权限原样保留", "tools": [{"name": "原始工具"}]}
+    summary = "摘要" * 400
+
+    async def summarize(payload):
+        assert "软目标" in payload["instructions"]
+        assert "不得超过" not in payload["instructions"]
+        return summary
+
+    result = await context.ensure_budget(model="test", request_fields=fields, window=131072, summarize=summarize)
+    assert result["summary_bytes"] == 2400
+    assert result["summary_target_bytes"] == 2048
+    assert result["summary_above_target"] is True
+    assert result["summary_requests"] == 1 and result["summary_rewrites"] == 0
+    assert result["after_estimated_tokens"] < result["before_estimated_tokens"]
+    assert result["after_estimated_tokens"] <= result["input_budget"]
+    assert context.summary == summary and context.fixed_messages == fixed
+
+
+async def test_summary_above_soft_goal_keeps_complete_recent_round():
+    """软目标和目标压缩比例都不应拒绝已经能装下的完整替代上下文。"""
+
+    context = _context(_settings(target_ratio=0.5))
+    for index in range(4):
+        context.append_round(_turn(index))
+
+    async def summarize(payload):
+        return "摘要" * 400
+
+    result = await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
+    assert result["after_estimated_tokens"] > result["input_budget"] * 0.5
+    assert result["summary_above_target"] is True
+    assert context.rounds == [_turn(3)]
+
+
+@pytest.mark.parametrize("recover", [True, False])
+async def test_full_request_overflow_uses_bounded_rewrites(recover):
+    """计算固定指令与 JSON 转义的整体开销，只有真实不合预算时才收短。"""
+
+    context = _context()
+    context.append_round(_turn(0, 2600))
+    original = context.history()
+    requests, diagnostics = [], []
+
+    async def summarize(payload):
+        requests.append(payload)
+        assert estimate_tokens(payload) + 256 <= 7680
+        return "已完成验证，尚未推送" if recover and len(requests) > 1 else "\\" * 2000
+
+    async def report(value):
+        diagnostics.append(value)
+
+    kwargs = dict(model="test", request_fields={"instructions": "x" * 5000}, window=8192,
+                  summarize=summarize, force=True, diagnostic_callback=report)
+    if recover:
+        result = await context.ensure_budget(**kwargs)
+        assert result["summary_rewrites"] == 1 and result["summary_requests"] == 2
+        assert result["after_estimated_tokens"] <= 7680
+    else:
+        with pytest.raises(ContextCompactionError) as caught:
+            await context.ensure_budget(**kwargs)
+        assert caught.value.error_code == "context_summary_context_overflow"
+        assert caught.value.diagnostics["summary_bytes"] == 2000
+        assert caught.value.diagnostics["summary_rewrites"] == 2
+        assert caught.value.diagnostics["after_estimated_tokens"] > 7680
+        assert context.history() == original
+        assert len(requests) == 3
+    assert all(payload["input"] == requests[0]["input"] for payload in requests)
+    assert diagnostics[0]["reason"] == "context_summary_context_overflow"
+    assert "进一步收短" in requests[1]["instructions"]
+
+
+async def test_large_intermediate_draft_is_regenerated_without_truncating_source():
+    """中间草稿太大时不发送超限请求；重用完整上一片段，并保留全部后续材料。"""
+
+    context = _context()
+    context.append_round(_turn(0, 18000))
+    requests = []
+
+    async def summarize(payload):
+        requests.append(payload)
+        assert estimate_tokens(payload) + 256 <= 7680
+        return "z" * 10000 if len(requests) == 1 else "已记录前面的全部关键事实"
+
+    result = await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
+    assert result["summary_rewrites"] == 1
+    assert requests[0]["input"] == requests[1]["input"]
+    assert all("z" * 10000 not in json.dumps(payload) for payload in requests[1:])
+    # 忽略重复归纳的那次请求，按顺序拼回全部源材料，确认没有为控长丢掉片段。
+    sources = [json.loads(payload["input"][0]["content"][0]["text"]) for payload in [requests[0], *requests[2:]]]
+    original = json.loads("".join(item["history_fragment"] for item in sources))
+    assert original["completed_rounds"] == [_turn(0, 18000)]
+    assert context.summary == "已记录前面的全部关键事实"
+
+
+async def test_existing_summary_can_be_split_for_a_smaller_model():
+    """已有摘要超过新模型窗口时，作为完整材料分片处理，不能直接丢弃。"""
+
+    context = _context()
+    context.summary = "旧摘要" * 2000
+    pieces = []
+
+    async def summarize(payload):
+        assert estimate_tokens(payload) + 256 <= 7680
+        pieces.append(json.loads(payload["input"][0]["content"][0]["text"])["history_fragment"])
+        return "已保留旧摘要的关键事实"
+
+    result = await context.ensure_budget(model="smaller", request_fields={}, window=8192, summarize=summarize)
+    assert result["summary_requests"] > 1
+    assert json.loads("".join(pieces))["previous_summary"] == "旧摘要" * 2000
+
+
+@pytest.mark.parametrize("limit", ["rewrites", "requests", "cancel"])
+async def test_rewrite_limits_and_cancellation_preserve_active_history(limit):
+    """收短同时受次数及总请求限制，取消或耗尽后不提交草稿。"""
+
+    settings = _settings(**({"max_summary_rewrites": 0} if limit == "rewrites" else {"max_compaction_requests": 1} if limit == "requests" else {}))
+    context = _context(settings)
+    context.append_round(_turn(0, 2600))
+    original = context.history()
+    requests = []
+
+    async def summarize(payload):
+        requests.append(payload)
+        if len(requests) > 1:
+            raise asyncio.CancelledError()
+        return "\\" * 2000
+
+    with pytest.raises(asyncio.CancelledError if limit == "cancel" else ContextCompactionError) as caught:
+        await context.ensure_budget(model="test", request_fields={"instructions": "x" * 5000}, window=8192, summarize=summarize, force=True)
+    if limit == "requests":
+        assert caught.value.error_code == "context_compaction_request_limit"
+    assert len(requests) == (2 if limit == "cancel" else 1)
+    assert context.history() == original
+
+
+def test_legacy_summary_setting_is_a_soft_goal_and_serializes_new_name():
+    """旧键仍可读取，大软目标不再让有效模型窗口配置被拒绝。"""
+
+    settings = ContextCompactionConfig(max_summary_tokens=1000000)
+    assert settings.summary_target_bytes == 1000000
+    assert "max_summary_tokens" not in settings.model_dump()
+    assert settings.model_dump()["summary_target_bytes"] == 1000000
+    assert ContextCompactionConfig(max_summary_tokens=500, summary_target_bytes=1000).summary_target_bytes == 1000
 
 
 async def test_summary_fragments_fit_budget_and_failure_is_atomic():
@@ -315,6 +466,28 @@ async def test_runner_compacts_without_changing_system_or_replaying_tools(run_co
     assert outcome.snapshots[-1]["context_compactions"][-1]["fixed_content_preserved"] is True
 
 
+async def test_runner_accepts_long_summary_and_does_not_replay_tool(run_context):
+    """真实运行器收到超软目标摘要后继续当前请求，系统和已执行工具不改变。"""
+
+    normal = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+            return _response("摘要" * 400)
+        normal.append(body)
+        return _tool(0) if len(normal) == 1 else _overflow() if len(normal) == 2 else _response("完成")
+
+    outcome = await run_context(handler, output_size=30000, settings=ContextCompactionConfig())
+    assert outcome.result.status == "completed" and outcome.calls == [0]
+    assert len(normal) == 3
+    assert normal[0]["instructions"] == normal[-1]["instructions"]
+    assert normal[0]["input"][0] == normal[-1]["input"][0]
+    compacted = next(payload for event, payload in outcome.logs if event == "context.compacted")
+    assert compacted["summary_bytes"] == 2400 and compacted["summary_above_target"] is True
+    assert compacted["summary_rewrites"] == 0
+
+
 @pytest.mark.parametrize("again", [False, True])
 async def test_context_error_retries_only_current_request_once(run_context, again):
     """超限后压缩一次；仍失败时禁止整轮重跑，已执行工具只执行一次。"""
@@ -368,6 +541,11 @@ async def test_summary_cannot_execute_tools_or_finish_task(run_context, kind):
     if kind != "cancel":
         assert outcome.result.retryable is False
         assert outcome.result.usage["input_tokens"] >= 4
+    if kind == "empty":
+        assert outcome.result.error_code == "context_summary_empty"
+        failure = next(payload for event, payload in outcome.logs if event == "context.compaction_failed")
+        assert failure["summary_bytes"] == 0 and failure["input_budget"] == 7680
+        assert failure["provider_id"] == "a" and failure["request_round"] > 1
 
 
 async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(run_context):

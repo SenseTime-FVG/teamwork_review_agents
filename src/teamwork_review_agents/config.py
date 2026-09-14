@@ -13,7 +13,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 from croniter import croniter
-from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, PositiveInt, field_validator, model_validator
 
 
 CodexConfigPrimitive = str | int | float | bool
@@ -264,9 +264,14 @@ class ContextCompactionConfig(BaseModel):
     trigger_ratio: float = Field(default=0.8, gt=0, lt=1)
     target_ratio: float = Field(default=0.5, gt=0, lt=1)
     keep_recent_rounds: int = Field(default=2, ge=0, le=16)
-    max_summary_tokens: int = Field(default=2048, ge=128)
+    # 旧字段名误用了 token 和 max；兼容读取，但统一输出明确的软目标名称。
+    summary_target_bytes: int = Field(
+        default=2048, ge=128,
+        validation_alias=AliasChoices("summary_target_bytes", "max_summary_tokens"),
+    )
     tool_output_tokens: int = Field(default=4096, ge=256)
     max_compaction_requests: int = Field(default=16, ge=1, le=64)
+    max_summary_rewrites: int = Field(default=2, ge=0, le=4)
     model_context_windows: dict[str, dict[str, PositiveInt]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -278,8 +283,8 @@ class ContextCompactionConfig(BaseModel):
         ]
         if self.target_ratio >= self.trigger_ratio:
             raise ValueError("上下文压缩目标必须低于触发阈值")
-        if min(windows) <= self.reserved_output_tokens + self.max_summary_tokens + 512:
-            raise ValueError("上下文窗口必须大于输出预留、摘要预算及结构余量之和")
+        if min(windows) <= self.reserved_output_tokens + 512:
+            raise ValueError("上下文窗口必须大于输出预留及结构余量之和")
         return self
 
 

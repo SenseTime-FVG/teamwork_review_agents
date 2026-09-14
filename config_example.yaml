@@ -94,10 +94,14 @@ database:
 #     trigger_ratio: 0.8
 #     target_ratio: 0.5
 #     keep_recent_rounds: 2
-#     # 当前以 UTF-8 序列化字节保守估算，以下两项同样按字节约束，不是精确 tokenizer。
-#     max_summary_tokens: 2048
+#     # 摘要软目标，不是失败上限；超过目标但完整请求能装下且已缩小时照常接受。
+#     # 旧键 max_summary_tokens 仍可读取，保存后使用新名称；当前按字节保守估算。
+#     summary_target_bytes: 2048
+#     # 单个工具结果的送模副本字节上限；原始执行日志不裁剪。
 #     tool_output_tokens: 4096
+#     # 收短也计入总请求上限；不重跑已经执行的工具。
 #     max_compaction_requests: 16
+#     max_summary_rewrites: 2
 #     model_context_windows: {}
 #     # 覆盖示例（请填写上游实际窗口，不要照抄示例数值）：
 #     # model_context_windows:

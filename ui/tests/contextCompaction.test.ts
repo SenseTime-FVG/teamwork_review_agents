@@ -38,3 +38,27 @@ test("压缩失败停止整轮重试，恢复尝试和工具截短仅显示告�
   assert.match(messages[2].detail, /call-1.*20000/);
   assert.match(messages[3].detail, /历史压缩请求/);
 });
+
+test("超过软目标的有效摘要正常展示，空摘要与收短记录给出具体长度预算", () => {
+  const messages = presentRunLogs([
+    {id: 1, run_id: "run", created_at: 1, stream: "system", event_type: "context.compacted",
+      payload: JSON.stringify({summary_bytes: 2400, summary_target_bytes: 2048, summary_above_target: true,
+        before_estimated_tokens: 110000, after_estimated_tokens: 4000, input_budget: 126976, summary_rewrites: 0})},
+    {id: 2, run_id: "run", created_at: 2, stream: "system", event_type: "context.compaction_failed",
+      payload: JSON.stringify({error_code: "context_summary_empty", error: "压缩模型返回空摘要", summary_bytes: 0,
+        summary_target_bytes: 2048, input_budget: 126976, summary_rewrites: 0, retryable: false})},
+    {id: 3, run_id: "run", created_at: 3, stream: "system", event_type: "context.summary_rewrite",
+      payload: JSON.stringify({message: "完整请求仍超限，正在收短", summary_bytes: 5000, summary_target_bytes: 1024,
+        after_estimated_tokens: 12000, input_budget: 8000, summary_rewrites: 1})},
+  ]);
+  assert.equal(messages[0].kind, "system");
+  assert.match(messages[0].detail, /2400 字节.*2048 字节（非上限）/);
+  assert.match(messages[0].detail, /已接受/);
+  assert.equal(messages[1].kind, "error");
+  assert.match(messages[1].detail, /摘要长度：0 字节/);
+  assert.match(messages[1].detail, /context_summary_empty/);
+  assert.equal(messages[2].kind, "system");
+  assert.equal(messages[2].title, "正在进一步收短摘要");
+  assert.match(messages[2].detail, /保守估算：12000/);
+  assert.match(messages[2].detail, /额外收短：1 次/);
+});

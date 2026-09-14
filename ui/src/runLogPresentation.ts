@@ -63,6 +63,7 @@ const SYSTEM_TITLES: Record<string, string> = {
   "context.compacted": "上下文已压缩",
   "context.compaction_failed": "上下文无法安全压缩",
   "context.compaction_usage": "历史压缩用量",
+  "context.summary_rewrite": "正在进一步收短摘要",
   "context.retry_after_compaction": "上下文超限，压缩后重试",
   "context.tool_output_truncated": "工具结果已精简，完整日志保留",
   "run.cancel_requested": "已请求取消运行",
@@ -195,7 +196,12 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
       : textValue(object.error ?? object.message);
     detail = [
       object.model ? `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}` : "",
-      object.input_budget ? `输入预算：${textValue(object.input_budget)}；来源：${textValue(object.window_source)}` : "",
+      object.input_budget ? `输入预算：${textValue(object.input_budget)}${object.window_source ? `；来源：${textValue(object.window_source)}` : ""}` : "",
+      object.summary_bytes !== undefined ? `摘要长度：${textValue(object.summary_bytes)} 字节；软目标：${textValue(object.summary_target_bytes)} 字节（非上限）` : "",
+      object.after_estimated_tokens !== undefined ? `${object.summary_material_complete === false ? "当前草稿组装保守估算（历史尚未归纳完）" : "完整请求保守估算"}：${textValue(object.after_estimated_tokens)}` : "",
+      object.next_summary_request_estimated_tokens != null ? `携带下一片段所需摘要请求预算（最小片段）：${textValue(object.next_summary_request_estimated_tokens)}` : "",
+      object.summary_rewrites !== undefined ? `额外收短：${textValue(object.summary_rewrites)} 次` : "",
+      object.summary_above_target === true ? "摘要超过软目标，但完整请求在预算内且已缩小，已接受。" : "",
       object.retained_rounds !== undefined ? `保留最近 ${textValue(object.retained_rounds)} 个完整回合；摘要请求 ${textValue(object.summary_requests)} 次` : "",
       object.estimator === "utf8_bytes_conservative" ? "估算方式：UTF-8 序列化字节数及结构余量，不是精确 Token 计数。" : "",
       object.summary ? `历史交接摘要（非最终结果）：\n${textValue(object.summary)}` : "",

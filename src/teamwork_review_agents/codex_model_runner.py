@@ -485,6 +485,7 @@ class CodexModelRunner:
         except ContextCompactionError as exc:
             error = redactor.text(str(exc))
             await emit("system", "context.compaction_failed", {
+                **redactor.data(exc.diagnostics),
                 "error": error, "error_code": exc.error_code, "retryable": False,
             })
             return AgentResult(
@@ -930,6 +931,15 @@ class CodexModelRunner:
                 raise ContextCompactionError("摘要生成未完整结束；原历史保留")
             return _response_text(summary_response)
 
+        async def report_summary_rewrite(diagnostic: dict[str, Any]) -> None:
+            """收短只调整摘要请求，运行日志记录原因、预算及次数。"""
+
+            await emit("system", "context.summary_rewrite", redactor.data({
+                **diagnostic,
+                "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                "request_round": request_round,
+            }))
+
         for round_index in range(_MAX_TOOL_ROUNDS):
             request_round = round_index + 1
             context_retried: set[tuple[str, str | None]] = set()
@@ -987,6 +997,7 @@ class CodexModelRunner:
                         model=model,
                         request_fields={key: value for key, value in payload.items() if key != "input"},
                         window=window, summarize=summarize, force=force_compaction,
+                        diagnostic_callback=report_summary_rewrite,
                     )
                     force_compaction = False
                     if compacted is not None:
@@ -1011,6 +1022,10 @@ class CodexModelRunner:
                     if isinstance(exc, ContextCompactionError):
                         # 无效摘要同样消耗模型额度，停止时仍保留已收到的用量。
                         exc.usage = redactor.data(usage)
+                        exc.diagnostics.update({
+                            "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                            "model": model, "request_round": request_round,
+                        })
                     failure_payload = {
                         "provider_id": (
                             failed_selection.provider_id
