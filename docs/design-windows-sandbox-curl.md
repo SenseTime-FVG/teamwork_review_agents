@@ -2,7 +2,7 @@
 
 ## 目标与边界
 
-不新增 HTTP 函数或 MCP 工具。Windows 托管 Agent 继续通过现有命令工具使用真实 curl；macOS/Linux、完全访问 Agent 和宿主进程环境不变。不下载程序、不修改系统 PATH/ACL、不关闭证书验证、不在宿主重放失败命令。
+不新增 HTTP 函数或 MCP 工具。Windows 托管 Agent 继续通过现有命令工具使用真实 curl；macOS/Linux、完全访问 Agent 和宿主进程环境不变。Agent 不下载程序；缺少兼容程序时由服务部署阶段的[自动准备管理器](design-managed-curl-runtime.md)准备固定官方分发。不修改系统 PATH/ACL、不关闭证书验证、不在宿主重放失败命令。
 
 ## 运行级选择
 

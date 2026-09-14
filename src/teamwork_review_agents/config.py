@@ -177,6 +177,7 @@ class ManagedSandboxConfig(BaseModel):
     fail_closed: bool = True
     python_binary: Path | None = None
     curl_binary: Path | None = None
+    curl_auto_prepare: bool = True
 
     @field_validator("python_binary", "curl_binary", mode="before")
     @classmethod

@@ -1,6 +1,6 @@
 import type { RunLog } from "./types";
 
-export type RunMessageKind = "agent" | "command" | "tool" | "file" | "system" | "error" | "complete";
+export type RunMessageKind = "agent" | "command" | "tool" | "file" | "system" | "warning" | "error" | "complete";
 
 export type RunMessage = {
   id: number;
@@ -48,7 +48,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.git_helper_cleanup_failed": "Git 临时 helper 清理失败",
   "run.curl_started": "检测 Windows 沙盒兼容 curl",
   "run.curl_ready": "Windows 沙盒 curl 已就绪",
-  "run.curl_unavailable": "未找到兼容 curl，任务可继续",
+  "run.curl_unavailable": "兼容 curl 暂不可用，任务可继续",
+  "run.curl_warning": "curl 程序已就绪，HTTPS 探测未通过",
   "run.http_tls_unavailable": "HTTP 命令 TLS 失败，可换用兼容命令",
   "thread.started": "Codex 会话已创建",
   "turn.started": "开始处理任务",
@@ -175,6 +176,8 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     : SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
+  // 可恢复的 HTTP 能力告警不代表任务终止，也不能冒充 Git 基础设施失败。
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable"].includes(log.event_type);
   let body = "";
   let detail = "";
   if (log.event_type === "model.reasoning_downgraded" && object) {
@@ -184,6 +187,15 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   } else if (log.event_type === "model.attempt_failed" && object) {
     body = textValue(object.reason);
     detail = `${textValue(object.provider_id)} / ${textValue(object.model)}`;
+  } else if ((log.event_type.startsWith("run.curl_") || log.event_type === "run.http_tls_unavailable") && object) {
+    body = textValue(object.message) || "已在当前 Agent 沙盒中检查兼容 curl。";
+    detail = [
+      object.curl_binary ? `程序：${textValue(object.curl_binary)}` : "",
+      object.ssl_backend ? `TLS 后端：${textValue(object.ssl_backend)}` : "",
+      object.https_probe ? `HTTPS 探测：${textValue(object.https_probe)}` : "",
+      object.reason ? `原因：${textValue(object.reason)}` : "",
+      Array.isArray(object.candidates) ? prettyValue(object.candidates) : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type.startsWith("run.git_") && object) {
     body = textValue(object.error ?? object.reason);
     detail = [
@@ -274,7 +286,7 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     createdAt: log.created_at,
     lastCreatedAt: log.created_at,
     eventType: log.event_type,
-    kind: isError ? "error" : log.event_type === "turn.completed" ? "complete" : "system",
+    kind: isWarning ? "warning" : isError ? "error" : log.event_type === "turn.completed" ? "complete" : "system",
     title,
     body,
     detail,

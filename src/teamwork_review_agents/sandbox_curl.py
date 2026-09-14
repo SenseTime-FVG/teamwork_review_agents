@@ -18,7 +18,7 @@ from .subprocess_utils import remove_environment_names, selected_environment
 Probe = Callable[[list[str], dict[str, str]], Awaitable[dict[str, Any]]]
 _ACTIVE: ContextVar[SandboxCurlContext | None] = ContextVar("sandbox_curl_context", default=None)
 _UNAVAILABLE = (
-    "未找到通过沙盒验证的 OpenSSL curl；可配置 runtime.managed_sandbox.curl_binary。"
+    "本轮兼容 curl 暂不可用，请在全局配置的 Windows HTTPS 运行环境查看自动准备状态和具体原因。"
     "需要 HTTPS 时也可通过现有命令工具使用沙盒 Python 的 urllib.request；"
     "不要关闭证书校验或改为沙盒外执行。"
 )
@@ -39,7 +39,7 @@ class CurlCandidate:
         roots = [self.executable.parent]
         if self.ca_bundle is not None:
             roots.append(self.ca_bundle.parent)
-        return tuple(roots)
+        return tuple(dict.fromkeys(roots))
 
 
 def current_sandbox_curl() -> SandboxCurlContext | None:
@@ -48,11 +48,17 @@ def current_sandbox_curl() -> SandboxCurlContext | None:
     return _ACTIVE.get()
 
 
-def curl_candidates(configured: Path | None, host: Mapping[str, str]) -> list[CurlCandidate]:
-    """优先 Git 安装，再枚举宿主 PATH；不搜索当前目录或相对 PATH。"""
+def curl_candidates(configured: Path | None, host: Mapping[str, str], managed_root: Path | None = None) -> list[CurlCandidate]:
+    """优先校验后的项目缓存，再检测 Git 安装和宿主 PATH；不搜索相对路径。"""
 
     if configured is not None:
         return [CurlCandidate(configured.expanduser().resolve(), "configured_path")]
+    managed_candidates: list[CurlCandidate] = []
+    if managed_root is not None:
+        from .curl_distribution import installed_candidate
+
+        if installed := installed_candidate(managed_root):
+            managed_candidates.append(CurlCandidate(installed[0], "managed_cache", installed[1]))
     environment = selected_environment({"PATH", "PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"}, host)
     path_directories = [Path(item.strip('"')) for item in environment.get("PATH", "").split(os.pathsep)
                         if item and Path(item.strip('"')).is_absolute()]
@@ -65,7 +71,7 @@ def curl_candidates(configured: Path | None, host: Mapping[str, str]) -> list[Cu
             root = Path(value)
             if root.is_absolute():
                 git_roots.append(root / ("Programs/Git" if key == "LOCALAPPDATA" else "Git"))
-    candidates: list[CurlCandidate] = []
+    candidates: list[CurlCandidate] = managed_candidates
     for root in dict.fromkeys(git_roots):
         for architecture in ("mingw64", "mingw32", "clangarm64", "ucrt64", "usr"):
             prefix = root / architecture
@@ -120,8 +126,10 @@ def https_probe_url(base_url: str) -> str | None:
 class SandboxCurlContext:
     """绑定本次运行的候选、验证结果与只读根；子运行结束恢复父上下文。"""
 
-    def __init__(self, configured: Path | None, *, host_environment: Mapping[str, str] | None = None) -> None:
+    def __init__(self, configured: Path | None, *, host_environment: Mapping[str, str] | None = None,
+                 managed_root: Path | None = None) -> None:
         self.configured = configured
+        self.managed_root = managed_root
         # 只保存发现所需的宿主字段，不保存宿主凭据或完整环境。
         self.host = selected_environment({"PATH", "PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"},
                                          os.environ if host_environment is None else host_environment)
@@ -178,9 +186,19 @@ class SandboxCurlContext:
             async with asyncio.timeout(budget_seconds):
                 return await self._prepare(probe, environment, probe_url=probe_url, network_access=network_access)
         except TimeoutError:
+            if self.selected is not None:
+                return self._https_warning("https_probe_budget_exhausted")
             self.diagnostic = {"status": "unavailable", "error_code": "sandbox_curl_unavailable",
                                "message": _UNAVAILABLE, "reason": "probe_budget_exhausted"}
             return self.diagnostic
+
+    def _https_warning(self, reason: str, exit_code: int | None = None) -> dict[str, Any]:
+        """网络阶段失败保留已验证程序，包括探针启动错误和总预算超时。"""
+
+        self.diagnostic = {**(self.diagnostic or {}), "status": "warning", "https_probe": "failed",
+                           "reason": reason, "exit_code": exit_code,
+                           "message": "兼容 curl 程序已就绪，但本轮 HTTPS 探测失败；请检查 Agent 网络权限、代理或可信 CA，无需重装 OpenSSL。"}
+        return self.diagnostic
 
     async def _prepare(self, probe: Probe, environment: Mapping[str, str], *, probe_url: str | None, network_access: bool) -> dict[str, Any]:
         """在真实工具沙盒验证；固定失败只提示，不触发 Agent 或模型重试。"""
@@ -189,7 +207,7 @@ class SandboxCurlContext:
             return self.diagnostic
         failures: list[dict[str, Any]] = []
         try:
-            candidates = curl_candidates(self.configured, self.host)
+            candidates = curl_candidates(self.configured, self.host, self.managed_root)
         except (OSError, ValueError, RuntimeError):
             candidates = []
         for candidate in candidates:
@@ -208,7 +226,9 @@ class SandboxCurlContext:
                     failure.update(reason="timeout" if result["timed_out"] else "openssl_curl_unavailable",
                                    exit_code=result["exit_code"])
                     continue
-                network_probe = "skipped"
+                self.selected = candidate
+                self.diagnostic = {"status": "ready", "curl_binary": str(candidate.executable),
+                                   "source": candidate.source, "ssl_backend": backend, "https_probe": "skipped"}
                 if network_access and probe_url:
                     failure["stage"] = "https"
                     result = await probe([
@@ -218,15 +238,13 @@ class SandboxCurlContext:
                     ], child)
                     if (result["exit_code"] != 0 or result["timed_out"]
                             or not re.fullmatch(r"teamwork-curl-ready:[1-5]\d{2}", result["stdout"].strip())):
-                        failure.update(reason="https_probe_failed", exit_code=result["exit_code"],
-                                       timed_out=result["timed_out"])
-                        continue
-                    network_probe = "passed"
-                self.selected = candidate
-                self.diagnostic = {"status": "ready", "curl_binary": str(candidate.executable),
-                                   "source": candidate.source, "ssl_backend": backend, "https_probe": network_probe}
+                        # 程序已验证，网络/CA/策略失败不能再伪装成缺少 OpenSSL 或换程序重试。
+                        return self._https_warning("https_probe_failed", result["exit_code"])
+                    self.diagnostic["https_probe"] = "passed"
                 return self.diagnostic
             except OSError as exc:
+                if self.selected is candidate:
+                    return self._https_warning("https_probe_launch_failed")
                 failure.update(reason="sandbox_launch_failed", winerror=getattr(exc, "winerror", None))
             finally:
                 self.probing = None

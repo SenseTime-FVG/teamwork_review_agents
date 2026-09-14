@@ -10,10 +10,25 @@ test("curl 不可用和 HTTP TLS 错误不能展示成 Git 阻断", () => {
       payload: JSON.stringify({message: "HTTP TLS 不可用", error_code: "sandbox_http_tls_unavailable"})},
   ]);
   for (const message of messages) {
+    assert.equal(message.kind, "warning");
     assert.doesNotMatch(message.title, /Git|阻断/);
     assert.doesNotMatch(message.detail, /停止自动重试/);
   }
   assert.match(messages[0].title, /任务可继续/);
+});
+
+test("curl 程序已就绪但网络探测失败时保留具体阶段与告警语义", () => {
+  const [message] = presentRunLogs([{
+    id: 3, run_id: "run", created_at: 3, stream: "system", event_type: "run.curl_warning",
+    payload: JSON.stringify({message: "请检查网络或 CA，无需重装 OpenSSL。", curl_binary: "D:/runtimes/bin/curl.exe",
+      ssl_backend: "LibreSSL/4.3.2", https_probe: "failed", reason: "https_probe_failed"}),
+  }]);
+  assert.equal(message.kind, "warning");
+  assert.match(message.title, /程序已就绪/);
+  assert.match(message.body, /无需重装/);
+  assert.match(message.detail, /D:\/runtimes\/bin\/curl.exe/);
+  assert.match(message.detail, /LibreSSL\/4.3.2/);
+  assert.match(message.detail, /HTTPS 探测：failed/);
 });
 
 test("沙盒 Git 故障展示真实原因、错误码与停止重试提示", () => {
