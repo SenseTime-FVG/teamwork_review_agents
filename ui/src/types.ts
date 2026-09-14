@@ -589,6 +589,7 @@ export type AgentModelSnapshot = {
   fallback_used?: boolean;
   request_round?: number;
   quota_exhausted_models?: Array<{ provider_id: string; model: string | null }>;
+  context_compactions?: Array<Record<string, unknown>>;
 };
 
 export type RunDetail = RunSummary & {

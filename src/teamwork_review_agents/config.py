@@ -255,6 +255,34 @@ class ModelProviderConfig(BaseModel):
         return self
 
 
+class ContextCompactionConfig(BaseModel):
+    """自建模型循环的上下文预算；不修改完整 Codex CLI 的压缩设置。"""
+
+    enabled: bool = True
+    default_context_window_tokens: int = Field(default=131072, ge=2048)
+    reserved_output_tokens: int = Field(default=4096, ge=256)
+    trigger_ratio: float = Field(default=0.8, gt=0, lt=1)
+    target_ratio: float = Field(default=0.5, gt=0, lt=1)
+    keep_recent_rounds: int = Field(default=2, ge=0, le=16)
+    max_summary_tokens: int = Field(default=2048, ge=128)
+    tool_output_tokens: int = Field(default=4096, ge=256)
+    max_compaction_requests: int = Field(default=16, ge=1, le=64)
+    model_context_windows: dict[str, dict[str, PositiveInt]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> "ContextCompactionConfig":
+        """压缩目标必须低于触发阈值，并为输入和输出留下空间。"""
+
+        windows = [self.default_context_window_tokens] + [
+            size for models in self.model_context_windows.values() for size in models.values()
+        ]
+        if self.target_ratio >= self.trigger_ratio:
+            raise ValueError("上下文压缩目标必须低于触发阈值")
+        if min(windows) <= self.reserved_output_tokens + self.max_summary_tokens + 512:
+            raise ValueError("上下文窗口必须大于输出预留、摘要预算及结构余量之和")
+        return self
+
+
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
@@ -281,6 +309,7 @@ class RuntimeConfig(BaseModel):
         default_factory=ModelSelectionConfig,
     )
     default_model_fallbacks: list[ModelSelectionConfig] = Field(default_factory=list)
+    context_compaction: ContextCompactionConfig = Field(default_factory=ContextCompactionConfig)
     codex: CodexRuntimeConfig = Field(default_factory=CodexRuntimeConfig)
     mcp_startup_timeout_seconds: PositiveInt = 15
     mcp_tool_timeout_seconds: PositiveInt = 1800

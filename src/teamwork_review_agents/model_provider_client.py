@@ -13,6 +13,7 @@ import httpx
 
 from .config import ModelProviderConfig
 from .model_quota import is_quota_exhausted
+from .context_compaction import is_context_length_exceeded
 from .reasoning_effort import is_reasoning_effort_rejection
 
 
@@ -69,12 +70,14 @@ class ModelProviderRequestError(RuntimeError):
         fallbackable: bool | None = None,
         reasoning_effort_rejected: bool = False,
         quota_exhausted: bool = False,
+        context_length_exceeded: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
         self.reasoning_effort_rejected = reasoning_effort_rejected
         self.quota_exhausted = quota_exhausted
+        self.context_length_exceeded = context_length_exceeded
 
 
 class ExternalModelClient:
@@ -185,6 +188,8 @@ class ExternalModelClient:
             "id": str(document.get("id") or uuid.uuid4().hex),
             "output": output,
             "output_text": text,
+            # 保留上游截断状态，摘要不能把半份文本作为完整检查点。
+            "status": "incomplete" if choices[0].get("finish_reason") not in {None, "stop", "tool_calls", "function_call"} else "completed",
             "usage": _openai_usage(document.get("usage")),
         }
 
@@ -238,6 +243,8 @@ class ExternalModelClient:
             "id": str(document.get("id") or uuid.uuid4().hex),
             "output": output,
             "output_text": "".join(texts),
+            # 上游输出耗尽或拒绝完成时，不允许提交未完成摘要。
+            "status": "incomplete" if document.get("stop_reason") not in {None, "end_turn", "tool_use", "stop_sequence"} else "completed",
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -299,6 +306,8 @@ class ExternalModelClient:
             "id": uuid.uuid4().hex,
             "output": output,
             "output_text": "".join(texts),
+            # 非正常终止的候选保留为 incomplete，交由摘要流程拒绝。
+            "status": "incomplete" if candidates[0].get("finishReason") not in {None, "STOP"} else "completed",
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -346,6 +355,7 @@ class ExternalModelClient:
                     status_code=response.status_code,
                 ),
                 quota_exhausted=quota_exhausted,
+                context_length_exceeded=is_context_length_exceeded(fields),
             )
         try:
             document = response.json()
@@ -353,13 +363,15 @@ class ExternalModelClient:
             raise ModelProviderRequestError("模型 Provider 返回了无效 JSON") from exc
         if not isinstance(document, dict):
             raise ModelProviderRequestError("模型 Provider JSON 顶层不是对象")
-        if is_quota_exhausted(_extract_provider_error_fields(document)):
-            # 部分兼容服务以 HTTP 200 封装额度错误，不能把它当成正常模型结果。
+        fields = _extract_provider_error_fields(document)
+        if is_quota_exhausted(fields) or is_context_length_exceeded(fields):
+            # 部分兼容服务以 HTTP 200 封装额度或上下文错误，不能把它当成正常模型结果。
             raise ModelProviderRequestError(
                 _format_provider_http_error(response),
                 status_code=response.status_code,
-                fallbackable=True,
-                quota_exhausted=True,
+                fallbackable=is_quota_exhausted(fields),
+                quota_exhausted=is_quota_exhausted(fields),
+                context_length_exceeded=is_context_length_exceeded(fields),
             )
         return document
 

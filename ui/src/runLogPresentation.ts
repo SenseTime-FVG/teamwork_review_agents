@@ -59,6 +59,12 @@ const SYSTEM_TITLES: Record<string, string> = {
   "model.request_started": "新一轮请求选模",
   "model.quota_exhausted": "额度耗尽，本次运行跳过该模型",
   "model.reasoning_downgraded": "推理强度自动降级",
+  "context.compaction_started": "正在压缩执行历史",
+  "context.compacted": "上下文已压缩",
+  "context.compaction_failed": "上下文无法安全压缩",
+  "context.compaction_usage": "历史压缩用量",
+  "context.retry_after_compaction": "上下文超限，压缩后重试",
+  "context.tool_output_truncated": "工具结果已精简，完整日志保留",
   "run.cancel_requested": "已请求取消运行",
   "run.cancelled": "运行已取消",
   "run.timed_out": "运行超过总时限",
@@ -179,16 +185,32 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   const isError = log.stream === "stderr"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   // 能力告警及单个模型额度耗尽不等于整个任务已经终止。
-  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted"].includes(log.event_type);
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated"].includes(log.event_type);
   let body = "";
   let detail = "";
-  if (log.event_type === "model.reasoning_downgraded" && object) {
+  if (log.event_type.startsWith("context.") && object) {
+    // 保守预算不是精确 Token 用量，压缩摘要也不是 Agent 的最终结论。
+    body = log.event_type === "context.compacted"
+      ? `系统指令、Skill、工具定义和原始任务保持不变；执行历史保守估算由 ${textValue(object.before_estimated_tokens)} 降至 ${textValue(object.after_estimated_tokens)}。`
+      : textValue(object.error ?? object.message);
+    detail = [
+      object.model ? `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}` : "",
+      object.input_budget ? `输入预算：${textValue(object.input_budget)}；来源：${textValue(object.window_source)}` : "",
+      object.retained_rounds !== undefined ? `保留最近 ${textValue(object.retained_rounds)} 个完整回合；摘要请求 ${textValue(object.summary_requests)} 次` : "",
+      object.estimator === "utf8_bytes_conservative" ? "估算方式：UTF-8 序列化字节数及结构余量，不是精确 Token 计数。" : "",
+      object.summary ? `历史交接摘要（非最终结果）：\n${textValue(object.summary)}` : "",
+      object.call_id ? `工具调用：${textValue(object.call_id)}；原结果：${textValue(object.original_bytes)} 字节` : "",
+      object.usage ? prettyValue(object.usage) : "",
+      object.error_code ? `错误码：${textValue(object.error_code)}` : "",
+      object.retryable === false ? "已停止整轮自动重试，避免重复执行已完成操作。" : "",
+    ].filter(Boolean).join("\n");
+  } else if (log.event_type === "model.reasoning_downgraded" && object) {
     const next = object.to ? `改用 ${textValue(object.to)}` : "去掉 effort 参数，使用上游默认";
     body = `${textValue(object.from)} 不受上游支持，正在${next}重试。`;
     detail = `${textValue(object.provider_id)} / ${textValue(object.model)}\n${textValue(object.reason)}`;
   } else if (log.event_type === "model.attempt_failed" && object) {
     body = textValue(object.reason);
-    detail = `${textValue(object.provider_id)} / ${textValue(object.model)}`;
+    detail = `${textValue(object.provider_id)} / ${textValue(object.model)}${object.phase === "compaction" ? " · 历史压缩请求" : ""}`;
   } else if (["model.request_started", "model.quota_exhausted"].includes(log.event_type) && object) {
     body = textValue(object.message);
     detail = [
