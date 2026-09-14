@@ -16,6 +16,7 @@ from teamwork_review_agents.environment import resolve_provider_token
 from teamwork_review_agents.git_auth import current_git_environment
 from teamwork_review_agents.quick_setup import SetupRequest, apply_rule_selection, check_setup_connection
 from teamwork_review_agents.webapp import create_app
+from teamwork_review_agents.workspace import WorkspaceError
 
 
 @pytest.fixture
@@ -264,3 +265,49 @@ async def test_probe_errors_never_echo_upstream_secret(setup_manager, monkeypatc
     assert all(not item["ok"] for item in result)
     assert "setup-test-secret" not in str(result)
     assert current_git_environment() is None
+
+
+@pytest.mark.parametrize("message", [
+    "fatal: cannot exec '/tmp/askpass.sh': No such file or directory",
+    "fatal: Authentication failed for 'https://github.com/owner/new.git'",
+    "Git 操作超过 15 秒，请检查网络和 SSH 认证",
+    "schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS",
+])
+async def test_git_failure_keeps_safe_diagnostic(setup_manager, monkeypatch, message):
+    """API 成功而 Git 失败时，界面保留原生错误线索且不回显敏感信息。"""
+
+    config, repository_id = setup_manager.prepare_setup(draft(setup_manager))
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.get.return_value = httpx.Response(200, json={"id": 7})
+    monkeypatch.setattr(quick_setup.httpx, "AsyncClient", Mock(return_value=client))
+    upstream = message + "\nsetup-test-secret\nhttps://user:proxy-secret@proxy.test/?key=query-secret"
+    monkeypatch.setattr(quick_setup, "_run_git", Mock(side_effect=WorkspaceError(upstream)))
+    result = await check_setup_connection(config, repository_id)
+    assert result[0]["ok"] is True and result[1]["ok"] is False
+    assert message in result[1]["detail"]
+    assert all(secret not in str(result) for secret in ("setup-test-secret", "proxy-secret", "query-secret"))
+    assert current_git_environment() is None
+
+
+def test_check_api_returns_sanitized_git_detail_without_saving(setup_manager, monkeypatch):
+    """向导实际 API 返回安全 Git 错误，但不保存草稿或触发后台任务。"""
+
+    api_client = AsyncMock()
+    api_client.__aenter__.return_value = api_client
+    api_client.get.return_value = httpx.Response(200, json={"id": 7})
+    monkeypatch.setattr(quick_setup.httpx, "AsyncClient", Mock(return_value=api_client))
+    monkeypatch.setattr(quick_setup, "_run_git", Mock(side_effect=WorkspaceError(
+        "fatal: cannot exec askpass.sh: No such file or directory\nsetup-test-secret",
+    )))
+    original = setup_manager.path.read_bytes()
+    client = TestClient(create_app(setup_manager.path, start_scheduler=False))
+    payload = draft(setup_manager).model_dump(mode="json")
+    payload["token"] = "setup-test-secret"
+    response = client.post("/api/setup/check", json=payload)
+    assert response.status_code == 200
+    checks = response.json()["checks"]
+    assert checks[0]["ok"] is True and checks[1]["ok"] is False
+    assert "cannot exec askpass.sh" in checks[1]["detail"]
+    assert "setup-test-secret" not in response.text
+    assert setup_manager.path.read_bytes() == original

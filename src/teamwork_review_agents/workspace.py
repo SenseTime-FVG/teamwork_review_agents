@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 from .config import ProviderConfig, RepositoryConfig
 from .filesystem import remove_tree, temporary_directory
-from .git_auth import current_git_environment
+from .git_auth import current_git_environment, safe_git_error_detail
 from .models import ChangeRequestSnapshot
 from .process_control import process_group_options, terminate_process
 
@@ -223,15 +223,8 @@ def _run_git(
     def safe_error(stderr: str) -> str | None:
         """返回脱敏且有界的 Git 错误摘要。"""
 
-        detail = (stderr or "").replace("\x1b", "").strip()
-        if active_git_environment:
-            for secret_name in ("TEAMWORK_GIT_TOKEN",):
-                secret = active_git_environment.get(secret_name, "")
-                if secret:
-                    detail = detail.replace(secret, "********")
-        if not detail:
-            return None
-        return detail[-800:]
+        token = (active_git_environment or {}).get("TEAMWORK_GIT_TOKEN", "")
+        return safe_git_error_detail(stderr or "", secrets=(token,)) or None
 
     try:
         process = subprocess.Popen(

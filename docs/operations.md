@@ -181,6 +181,7 @@ teamwork-review-agents run
 | 健康接口不是当前 PID | 执行 `stop` 或 `restart`；不要按端口直接杀进程 |
 | PID 或锁文件丢失 | `stop` / `restart` 会按配置路径发现托管进程 |
 | 仓库没有被扫描 | 检查 Provider Token、仓库 `enabled`、远端项目和 API 地址 |
+| 一键配置 API 通过、Git 失败 | 查看 Git 检查的脱敏错误：`cannot exec` 检查临时凭据程序，`Authentication failed` 检查仓库代码读取权限，TLS/超时检查服务账号网络；API 能读仓库信息不等于 Git 能拉代码 |
 | 有事件但没有 Agent | 检查规则 `enabled`、事件名、仓库和条件 |
 | Agent 无法访问平台 | 用服务用户执行 `gh auth status` / `glab auth status`，再检查 `network_access` |
 | Codex 立即失败 | 检查 CLI 路径、Codex Home 登录和期望版本 |

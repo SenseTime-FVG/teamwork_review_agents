@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import shlex
 import sys
 import tempfile
-import subprocess
-from contextvars import ContextVar, Token
+import unicodedata
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Iterable, Iterator, Mapping
+from urllib.parse import quote, quote_plus, urlsplit, urlunsplit
 
 from .filesystem import remove_tree
 
@@ -41,6 +44,55 @@ def write_askpass_helper(helper: Path, *, python_binary: str | None = None) -> l
     return [python_binary or sys.executable, "-I", "-S", str(helper)]
 
 
+def write_askpass_launcher(launcher: Path, command: list[str]) -> None:
+    """让 Git 只执行脚本路径，解释器及参数在脚本内部安全转义。"""
+
+    # Git for Windows 使用自带的 sh 解释 shebang，Windows 路径需转换斜杠。
+    arguments = [part.replace("\\", "/") for part in command] if os.name == "nt" else command
+    launcher.write_text(
+        '#!/bin/sh\n# 凭据仅由隔离的 Python helper 从环境读取。\n'
+        f'exec {shlex.join(arguments)} "$@"\n',
+        encoding="utf-8", newline="\n",
+    )
+    launcher.chmod(0o700)
+
+
+def safe_git_error_detail(message: str, *, secrets: Iterable[str] = ()) -> str:
+    """先脱敏再截断，供 Git 日志和向导复用，避免暴露认证与代理凭据。"""
+
+    detail = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", message)
+    detail = "".join(char for char in detail if char in "\n\t" or unicodedata.category(char) not in {"Cc", "Cf"})
+    variants: set[str] = set()
+    for secret in secrets:
+        if secret:
+            variants.update((secret, quote(secret, safe=""), quote_plus(secret, safe="")))
+            for prefix in ("", "x-access-token:", "oauth2:"):
+                variants.add(base64.b64encode(f"{prefix}{secret}".encode()).decode())
+    for secret in sorted(variants, key=len, reverse=True):
+        detail = detail.replace(secret, "********")
+
+    def redact_url(match: re.Match[str]) -> str:
+        """保留主机与路径用于定位，移除任意 URL 用户凭据和查询参数。"""
+
+        try:
+            parsed = urlsplit(match.group())
+            host = parsed.hostname or "[远端]"
+            if ":" in host:
+                host = f"[{host}]"
+            authority = f"{host}:{parsed.port}" if parsed.port else host
+            return urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+        except ValueError:
+            return "[已隐藏的 URL]"
+
+    detail = re.sub(r"\b(?:https?|ssh|socks[45]h?)://[^\s\"'<>]+", redact_url, detail, flags=re.IGNORECASE)
+    detail = re.sub(r"(?im)\b((?:proxy-)?authorization\s*[:=])[^\r\n]*", r"\1 ********", detail)
+    detail = re.sub(
+        r"(?i)\b([\w-]*token|password|passwd|api[_-]?key|client_secret)(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1\2********", detail,
+    )
+    return detail.strip()[-800:]
+
+
 def current_git_environment() -> Mapping[str, str] | None:
     """返回当前异步任务和工作线程共享的 Git 环境补丁。"""
 
@@ -64,29 +116,17 @@ class GitCredentialContext:
             return self
         directory = Path(tempfile.mkdtemp(prefix="teamwork-git-auth-"))
         self._directory = directory
-        helper = directory / "askpass.py"
-        helper.write_text(
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            "prompt = (sys.argv[1] if len(sys.argv) > 1 else '').lower()\n"
-            "if 'username' in prompt:\n"
-            "    print(os.environ.get('TEAMWORK_GIT_USERNAME', 'x-access-token'))\n"
-            "elif 'password' in prompt:\n"
-            "    print(os.environ.get('TEAMWORK_GIT_TOKEN', ''))\n"
-            "else:\n"
-            "    print('')\n",
-            encoding="utf-8",
-        )
-        if os.name != "nt":
-            helper.chmod(0o700)
-        askpass = (
-            subprocess.list2cmdline([sys.executable, str(helper)])
-            if os.name == "nt"
-            else shlex.join([sys.executable, str(helper)])
-        )
+        try:
+            command = write_askpass_helper(directory / "askpass.py")
+            launcher = directory / "askpass.sh"
+            write_askpass_launcher(launcher, command)
+        except BaseException:
+            # 创建阶段尚未进入 with，也必须清理已经创建的本次临时文件。
+            self.close()
+            raise
         username = "oauth2" if self.provider_kind == "gitlab" else "x-access-token"
         self.environment = {
-            "GIT_ASKPASS": askpass,
+            "GIT_ASKPASS": str(launcher),
             "GIT_TERMINAL_PROMPT": "0",
             # 空 credential helper 让当前仓库 Token 优先于宿主机旧凭证。
             "GIT_CONFIG_COUNT": "1",

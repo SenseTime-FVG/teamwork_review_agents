@@ -61,6 +61,8 @@ jobs:
           tests/test_sandbox_mcp.py
           tests/test_agent_workspace_warmup.py::test_windows_warmup_checks_python_before_git
           tests/test_sandbox_git.py
+          tests/test_git_auth.py
+          tests/test_quick_setup.py
           tests/test_sandbox_curl.py
           tests/test_curl_runtime.py
           tests/test_sandbox_environment.py
