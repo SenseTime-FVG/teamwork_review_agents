@@ -28,6 +28,11 @@ from .codex_settings import (
 )
 from .config import AgentConfig, AppConfig, RepositoryConfig, effective_skill_ids
 from .environment import SecretRedactor
+from .context_compaction import (
+    ContextCompactionError,
+    ConversationContext,
+    resolve_context_window,
+)
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
 from .model_provider_credentials import ModelProviderCredentialStore
 from .model_provider_runtime import (
@@ -477,6 +482,16 @@ class CodexModelRunner:
                 status=status,
                 error=error,
             )
+        except ContextCompactionError as exc:
+            error = redactor.text(str(exc))
+            await emit("system", "context.compaction_failed", {
+                "error": error, "error_code": exc.error_code, "retryable": False,
+            })
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status="failed", error=error,
+                error_code=exc.error_code, retryable=False, usage=exc.usage,
+            )
         except SandboxGitError as exc:
             error = redactor.text(str(exc))
             await emit("system", "run.git_https_failed", {
@@ -545,6 +560,7 @@ class CodexModelRunner:
         request_round = 1
         exhausted_models: set[tuple[str, str | None]] = set()
         downgraded_efforts: dict[tuple[str, str | None], str | None] = {}
+        compactions: list[dict[str, Any]] = []
 
         def fallbackable_error(error: Exception) -> bool:
             """只把 Provider 暂时不可用类错误交给回退链。"""
@@ -761,6 +777,7 @@ class CodexModelRunner:
                     reasoning_downgrades=reasoning_downgrades,
                 )
                 snapshot["request_round"] = request_round
+                snapshot["context_compactions"] = redactor.data(compactions[-16:])
                 snapshot["quota_exhausted_models"] = [
                     {"provider_id": selection.provider_id, "model": selection.model}
                     for selection in model_plan
@@ -795,12 +812,12 @@ class CodexModelRunner:
                 diagnostic = await tool_executor.prepare_curl()
                 await emit("system", f"run.curl_{diagnostic['status']}", diagnostic)
                 prompt += "\n\n" + current_sandbox_curl().runtime_hint()
-        history: list[dict[str, Any]] = [
+        conversation = ConversationContext([
             {
                 "role": "user",
                 "content": [{"type": "input_text", "text": prompt}],
             }
-        ]
+        ], self.config.runtime.context_compaction)
         usage: dict[str, Any] = {}
         events: list[dict[str, Any]] = []
         response_id: str | None = None
@@ -862,8 +879,60 @@ class CodexModelRunner:
                 if len(events) < self.config.runtime.max_jsonl_events:
                     events.append(redactor.data(safe))
 
+        async def request_model(payload: dict[str, Any], callback: Any) -> dict[str, Any]:
+            """正常请求和摘要请求共享当前 Provider 的并发与超时边界。"""
+
+            semaphore = self._semaphore_for(
+                current_selection.provider_id if current_selection else self.provider_id,
+                current_selection.provider if current_selection else self.provider,
+            )
+            if semaphore is None:
+                return await client.create_response(payload, event_callback=callback)
+            async with semaphore:
+                return await client.create_response(payload, event_callback=callback)
+
+        async def summarize(payload: dict[str, Any]) -> str:
+            """摘要只产生交接文本，不能执行工具或冒充正常 Agent 回复。"""
+
+            nonlocal usage
+            incomplete = False
+
+            async def summary_progress(event: dict[str, Any]) -> None:
+                """仅续期进展，不将摘要流式片段写成任务最终答复。"""
+
+                nonlocal incomplete
+                incomplete = incomplete or event.get("type") == "response.incomplete"
+                progress()
+
+            progress()
+            await emit("system", "context.compaction_started", {
+                "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                "model": model, "request_round": request_round,
+                "message": "正在整理较早执行历史；系统指令、工具定义和原始任务不变。",
+            })
+            try:
+                summary_response = await request_model(redactor.data(payload), summary_progress)
+            except Exception as exc:
+                if incomplete:
+                    raise ContextCompactionError("摘要生成未完整结束；原历史保留") from exc
+                raise
+            if isinstance(summary_response.get("usage"), dict):
+                usage = _merge_usage(usage, summary_response["usage"])
+                await emit("system", "context.compaction_usage", {"usage": summary_response["usage"]})
+            output = summary_response.get("output", [])
+            if not isinstance(output, list) or any(
+                not isinstance(item, dict) or item.get("type") not in {"message", "reasoning"}
+                for item in output
+            ):
+                raise ContextCompactionError("摘要请求返回了工具调用或无效输出，已拒绝执行；原历史保留")
+            if incomplete or summary_response.get("status") in {"failed", "incomplete", "cancelled"}:
+                raise ContextCompactionError("摘要生成未完整结束；原历史保留")
+            return _response_text(summary_response)
+
         for round_index in range(_MAX_TOOL_ROUNDS):
             request_round = round_index + 1
+            context_retried: set[tuple[str, str | None]] = set()
+            force_compaction = False
             # 新请求从主链起点选模；只跳过本次运行已明确额度耗尽的候选。
             if round_index and not await activate(0):
                 await save_snapshot()
@@ -880,7 +949,7 @@ class CodexModelRunner:
                 payload: dict[str, Any] = {
                     "model": model,
                     "instructions": instructions,
-                    "input": history,
+                    "input": conversation.history(),
                     "tools": tools,
                     "tool_choice": "auto",
                     "parallel_tool_calls": False,
@@ -904,22 +973,32 @@ class CodexModelRunner:
                     payload["text"] = text_config
                 round_message_keys.clear()
                 round_message_parts.clear()
+                request_phase = "compaction"
                 try:
-                    provider_semaphore = self._semaphore_for(
+                    window, window_source = resolve_context_window(
+                        self.config.runtime.context_compaction,
                         current_selection.provider_id if current_selection else self.provider_id,
-                        current_selection.provider if current_selection else self.provider,
+                        model,
+                        driver=current_selection.provider.driver if current_selection else self.provider.driver,
+                        codex_home=codex_home(self.config.runtime.codex_home),
                     )
-                    if provider_semaphore is None:
-                        response = await client.create_response(
-                            payload,
-                            event_callback=receive_event,
-                        )
-                    else:
-                        async with provider_semaphore:
-                            response = await client.create_response(
-                                payload,
-                                event_callback=receive_event,
-                            )
+                    compacted = await conversation.ensure_budget(
+                        model=model,
+                        request_fields={key: value for key, value in payload.items() if key != "input"},
+                        window=window, summarize=summarize, force=force_compaction,
+                    )
+                    force_compaction = False
+                    if compacted is not None:
+                        compacted.update({
+                            "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                            "model": model, "request_round": request_round, "window_source": window_source,
+                        })
+                        compactions.append(compacted)
+                        await emit("system", "context.compacted", redactor.data(compacted))
+                        await save_snapshot()
+                    payload["input"] = conversation.history()
+                    request_phase = "inference"
+                    response = await request_model(payload, receive_event)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -928,6 +1007,9 @@ class CodexModelRunner:
                         isinstance(exc, (ModelProviderRequestError, CodexUpstreamError))
                         and exc.quota_exhausted
                     )
+                    if isinstance(exc, ContextCompactionError):
+                        # 无效摘要同样消耗模型额度，停止时仍保留已收到的用量。
+                        exc.usage = redactor.data(usage)
                     failure_payload = {
                         "provider_id": (
                             failed_selection.provider_id
@@ -940,6 +1022,7 @@ class CodexModelRunner:
                         "status": "failed",
                         "request_round": request_round,
                         "quota_exhausted": quota_exhausted,
+                        "phase": request_phase,
                         "reason": redactor.text(str(exc)),
                     }
                     attempts.append(failure_payload)
@@ -952,6 +1035,26 @@ class CodexModelRunner:
                             "message": "上游明确报告额度耗尽，本次运行后续请求将跳过此候选；新运行重新检查。",
                         })
                     await save_snapshot()
+                    if isinstance(exc, (ModelProviderRequestError, CodexUpstreamError)) and exc.context_length_exceeded:
+                        candidate = (failure_payload["provider_id"], model)
+                        if (
+                            request_phase == "inference"
+                            and self.config.runtime.context_compaction.enabled
+                            and candidate not in context_retried
+                        ):
+                            context_retried.add(candidate)
+                            force_compaction = True
+                            await emit("system", "context.retry_after_compaction", {
+                                **failure_payload,
+                                "message": "上游报告上下文超限，将压缩后仅重试当前请求一次，不重跑工具。",
+                            })
+                            continue
+                        raise ContextCompactionError(
+                            f"上下文压缩后仍然超限或摘要请求无法容纳：{redactor.text(str(exc))}；"
+                            "请检查当前模型窗口配置或减少固定 Prompt。",
+                            error_code="context_length_exceeded",
+                            usage=redactor.data(usage),
+                        ) from exc
                     if (
                         reasoning_effort
                         and not quota_exhausted
@@ -975,6 +1078,7 @@ class CodexModelRunner:
                             downgraded_efforts[(failed_selection.provider_id, failed_selection.model)] = lowered_effort
                         await emit("system", "model.reasoning_downgraded", downgrade)
                         await save_snapshot()
+                        force_compaction = False
                         continue
                     if (
                         fallbackable_error(exc)
@@ -997,6 +1101,7 @@ class CodexModelRunner:
                             },
                         )
                         await save_snapshot()
+                        force_compaction = False
                         continue
                     raise
                 attempts.append(
@@ -1020,7 +1125,7 @@ class CodexModelRunner:
             output = response.get("output")
             if not isinstance(output, list):
                 output = []
-            history.extend(item for item in output if isinstance(item, dict))
+            round_items = [item for item in output if isinstance(item, dict)]
             calls = [
                 item
                 for item in output
@@ -1127,13 +1232,20 @@ class CodexModelRunner:
                         redactor.data({"type": "item.completed", **completed_event})
                     )
                 await emit("stdout", "item.completed", completed_event)
-                history.append(
+                bounded_output = conversation.bound_tool_output(output_text, call_id)
+                if bounded_output != output_text:
+                    await emit("system", "context.tool_output_truncated", {
+                        "call_id": call_id, "original_bytes": len(output_text.encode("utf-8")),
+                        "message": "仅截短送给模型的工具结果副本，完整结果仍保留在执行日志中。",
+                    })
+                round_items.append(
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": output_text,
+                        "output": bounded_output,
                     }
                 )
+            conversation.append_round(round_items)
 
         raise RuntimeError(f"Codex 模型工具调用超过 {_MAX_TOOL_ROUNDS} 轮")
 

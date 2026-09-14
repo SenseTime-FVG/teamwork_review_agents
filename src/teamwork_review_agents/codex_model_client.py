@@ -25,6 +25,7 @@ from .codex_executable import resolve_codex_executable as resolve_executable
 from .codex_executable import CodexRuntimeError
 from .reasoning_effort import is_reasoning_effort_rejection
 from .model_quota import is_quota_exhausted
+from .context_compaction import is_context_length_exceeded
 
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -58,12 +59,14 @@ class CodexUpstreamError(CodexModelError):
         fallbackable: bool | None = None,
         reasoning_effort_rejected: bool = False,
         quota_exhausted: bool = False,
+        context_length_exceeded: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
         self.reasoning_effort_rejected = reasoning_effort_rejected
         self.quota_exhausted = quota_exhausted
+        self.context_length_exceeded = context_length_exceeded
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,7 @@ class CodexResponsesClient:
                                 fields,
                             ),
                             quota_exhausted=is_quota_exhausted(fields),
+                            context_length_exceeded=is_context_length_exceeded(fields),
                         )
                 if response is None:
                     raise CodexUpstreamError("Codex SSE 在 completed 事件前结束")
@@ -396,6 +400,7 @@ class CodexResponsesClient:
                                     status_code=response.status_code,
                                 ),
                                 quota_exhausted=quota_exhausted,
+                                context_length_exceeded=is_context_length_exceeded(fields),
                             )
                         content_type = response.headers.get("content-type", "")
                         if "text/event-stream" not in content_type:
@@ -428,6 +433,7 @@ class CodexResponsesClient:
                                         fields,
                                     ),
                                     quota_exhausted=is_quota_exhausted(fields),
+                                    context_length_exceeded=is_context_length_exceeded(fields),
                                 )
                             yield {"type": "response.completed", "response": document}
                             return
@@ -514,7 +520,7 @@ def _retryable_error(error: Exception) -> bool:
     """只在尚无任何事件时重试短暂网络和网关失败。"""
 
     if isinstance(error, CodexUpstreamError):
-        return not error.quota_exhausted and error.status_code in RETRYABLE_HTTP_STATUS
+        return not (error.quota_exhausted or error.context_length_exceeded) and error.status_code in RETRYABLE_HTTP_STATUS
     cause = error.__cause__
     return isinstance(
         cause,
