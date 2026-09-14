@@ -17,6 +17,7 @@ import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } f
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { presentRunLogs } from "./runLogPresentation";
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
+import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import type {
   Agent,
@@ -4112,7 +4113,7 @@ function ConfigHistory() {
               }}
             >
               <code>{shortRevision(version.revision)}</code>
-              <span>{version.source === "ui" ? "UI 保存" : version.source === "file" ? "文件热加载" : "服务启动"}</span>
+              <span>{version.source === "ui-quick-setup" ? "一键配置" : version.source === "ui" ? "UI 保存" : version.source === "file" ? "文件热加载" : "服务启动"}</span>
               <small>{timeText(version.created_at)}</small>
             </button>
           ))}
@@ -4130,6 +4131,7 @@ function RepositoryConnectionsEditor(props: {
   onSaved: (document: ConfigDocument, revision: string) => void;
   onError: (message: string) => void;
   onNotice: (message: string) => void;
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const [editingName, setEditingName] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -4138,6 +4140,7 @@ function RepositoryConnectionsEditor(props: {
   const [saving, setSaving] = useState(false);
   const providerNames = Object.keys(props.document.providers);
   const repositoryCount = props.document.repositories.length;
+  useEffect(() => { props.onEditingChange?.(editingName !== null); }, [editingName, props.onEditingChange]);
 
   function providerDefaults(kind: "github" | "gitlab") {
     return kind === "gitlab"
@@ -4838,7 +4841,7 @@ function RepositoryDetailEditor(props: {
           <div className="repository-preflight-head">
             <div>
               <strong>仓库 Skill 策略</strong>
-              <p>在 Agent 自身 Skill 白名单之上增加仓库限制；根 Agent 和 sub-agent 都按当前仓库重新计算。</p>
+              <p>按 Agent 列表或本仓库的覆盖列表增加限制；根 Agent 和 sub-agent 都按当前仓库重新计算。</p>
             </div>
           </div>
           <fieldset className="config-editor-surface repository-detail-config-group" disabled={props.disabled}>
@@ -4851,7 +4854,7 @@ function RepositoryDetailEditor(props: {
                   {
                     value: "unrestricted",
                     label: "不额外限制",
-                    description: "使用 Agent 自身配置的 Skill 白名单。",
+                    description: "使用 Agent 自身配置或本仓库覆盖的 Skill 白名单。",
                   },
                   {
                     value: "selected",
@@ -4879,6 +4882,16 @@ function RepositoryDetailEditor(props: {
                   }}
                 />
               )}
+              {Object.entries(repository.agent_skills ?? {}).map(([name, skills]) => (
+                <div key={name} className="page-stack">
+                  <ChoiceCards title={`本仓库 Skill 覆盖：${name}`} description="仅作用于此仓库；空列表表示此 Agent 不装载 Skill。最终仍受上方仓库策略限制。" values={skills} options={skillOptions} onChange={(values) => update({ agent_skills: { ...repository.agent_skills, [name]: values } })} />
+                  <button type="button" className="button secondary compact" onClick={() => {
+                    const assignments = { ...repository.agent_skills };
+                    delete assignments[name];
+                    update({ agent_skills: assignments });
+                  }}>移除此覆盖，恢复 Agent 自身配置</button>
+                </div>
+              ))}
             </div>
           </fieldset>
         </section>
@@ -6113,6 +6126,7 @@ function SkillsEditor(props: {
       allowed_skills: Array.isArray(repository.allowed_skills)
         ? repository.allowed_skills.map((skillId) => skillId === id ? nextId : skillId)
         : repository.allowed_skills,
+      agent_skills: Object.fromEntries(Object.entries(repository.agent_skills ?? {}).map(([name, values]) => [name, values.map((skillId) => skillId === id ? nextId : skillId)])),
     }));
     props.onChange({ ...props.document, skills, agents, repositories });
     return true;
@@ -6207,10 +6221,12 @@ function SkillsEditor(props: {
                         ]),
                       );
                       const repositories = props.document.repositories.map((repository) => {
-                        if (!Array.isArray(repository.allowed_skills)) return repository;
+                        const agent_skills = Object.fromEntries(Object.entries(repository.agent_skills ?? {}).map(([name, values]) => [name, values.filter((skillId) => skillId !== id)]));
+                        if (!Array.isArray(repository.allowed_skills)) return { ...repository, agent_skills };
                         const allowed_skills = repository.allowed_skills.filter((skillId) => skillId !== id);
                         return {
                           ...repository,
+                          agent_skills,
                           allowed_skills: repository.allowed_skills.length > 0 && allowed_skills.length === 0
                             ? null
                             : allowed_skills,
@@ -9865,6 +9881,7 @@ export default function App() {
   const [ruleDetailDirty, setRuleDetailDirty] = useState(false);
   const [pendingRuleExitTab, setPendingRuleExitTab] = useState<Tab | null>(null);
   const [repositoryDetailDirty, setRepositoryDetailDirty] = useState(false);
+  const [connectionEditing, setConnectionEditing] = useState(false);
   const [repositoryDetailOpen, setRepositoryDetailOpen] = useState(false);
   const [pendingRepositoryExitTab, setPendingRepositoryExitTab] = useState<Tab | null>(null);
   const [requestedRunId, setRequestedRunId] = useState<string | null>(null);
@@ -9873,6 +9890,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [token, setToken] = useState(getToken());
+  // 冻结向导打开时的配置与版本，后台变更由保存时的版本校验阻止覆盖。
+  const [setupDraft, setSetupDraft] = useState<{ document: ConfigDocument; revision: string } | null>(null);
 
   const refreshOperationalData = useCallback(async () => {
     const requestSequence = operationalRequestSequence.current + 1;
@@ -10493,6 +10512,12 @@ export default function App() {
           {loading && <div className="loading-screen"><span className="spinner" />正在连接后台服务…</div>}
           {!loading && document && (
             <>
+              {(tab === "overview" || (tab === "repositories" && !repositoryDetailOpen)) && (
+                <section className="section-card quick-setup-entry">
+                  <div><strong>{document.repositories.length ? "快速接入仓库" : "欢迎使用，先连接第一个仓库"}</strong><p>选择平台、填写 Token、启用所需规则；模型沿用已有配置。</p></div>
+                  <button type="button" className="button primary" disabled={editing || repositoryDetailDirty || connectionEditing} title={editing || repositoryDetailDirty || connectionEditing ? "请先保存或取消当前配置编辑" : undefined} onClick={() => setSetupDraft({ document: structuredClone(document), revision })}>一键配置</button>
+                </section>
+              )}
               {tab === "overview" && (
                 <Overview
                   status={status}
@@ -10561,6 +10586,7 @@ export default function App() {
                 <RepositoryConnectionsEditor
                   document={document}
                   revision={revision}
+                  onEditingChange={setConnectionEditing}
                   onSaved={acceptItemConfig}
                   onError={setError}
                   onNotice={(message) => {
@@ -10632,6 +10658,12 @@ export default function App() {
           )}
         </div>
       </main>
+      {setupDraft && <QuickSetupWizard {...setupDraft} onClose={() => setSetupDraft(null)} onSaved={(nextDocument, nextRevision) => {
+        acceptItemConfig(normalizeDocument(nextDocument), nextRevision);
+        setSetupDraft(null);
+        setNotice("仓库配置已完成，所选规则已生效；未额外立即执行 Agent。");
+        void refreshOperationalData();
+      }} />}
       <OverviewConfirmationDialog
         model={overviewConfirmation}
         busy={confirmingOverviewAction}

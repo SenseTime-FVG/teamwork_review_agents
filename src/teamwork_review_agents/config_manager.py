@@ -246,6 +246,10 @@ class ConfigManager:
                 next_agents[next_name] = copy.deepcopy(agent)
 
             if current_name is not None and current_name != next_name:
+                for repository in document.get("repositories", []):
+                    assignments = repository.get("agent_skills", {})
+                    if current_name in assignments:
+                        assignments[next_name] = assignments.pop(current_name)
                 for value in next_agents.values():
                     if not isinstance(value, dict):
                         continue
@@ -314,6 +318,8 @@ class ConfigManager:
                 for agent_name, value in agents.items()
                 if agent_name != name
             }
+            for repository in document.get("repositories", []):
+                repository.get("agent_skills", {}).pop(name, None)
             for value in next_agents.values():
                 if not isinstance(value, dict):
                     continue
@@ -930,6 +936,21 @@ class ConfigManager:
                 if not (isinstance(item, dict) and item.get("id") == repository_id)
             ]
             return self._persist_locked(document, source=source)
+
+    def prepare_setup(self, request: Any, *, persist: bool = False) -> tuple[AppConfig, str]:
+        """在同一配置锁内构造并验证向导；确认时一次原子提交全部变更。"""
+
+        from .quick_setup import build_setup_document
+
+        with self._lock:
+            current = protect_provider_credentials(self._read_raw())
+            self._assert_revision(current, request.revision)
+            document, repository_id = build_setup_document(current, request, self.path)
+            config = (
+                self._persist_locked(document, source="ui-quick-setup")
+                if persist else parse_config_data(document, self.path)
+            )
+            return config, repository_id
 
     def _assert_revision(
         self,

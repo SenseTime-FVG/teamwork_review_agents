@@ -285,7 +285,7 @@ class CodexRunner:
             overrides.append(
                 _skills_config_override(
                     skill_files,
-                    effective_skill_ids(agent, repository),
+                    effective_skill_ids(agent, repository, context.current_agent),
                 )
             )
         for override in overrides:
