@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import IO
 
@@ -33,8 +36,7 @@ from .process_control import (
 
 
 _RUNTIME_FILE_READ_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1)
-_POSIX_BACKGROUND_STARTUP_TIMEOUT_SECONDS = 5.0
-_WINDOWS_BACKGROUND_STARTUP_TIMEOUT_SECONDS = 30.0
+_BACKGROUND_STARTUP_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -156,13 +158,12 @@ def _is_native_windows() -> bool:
 
 
 def _effective_startup_timeout_seconds(value: float | None) -> float:
-    """返回显式值或当前平台适用的后台启动等待时间。"""
+    """所有平台使用相同启动预算，并拒绝零值、负数和非有限值。"""
 
-    if value is not None:
-        return value
-    if _is_native_windows():
-        return _WINDOWS_BACKGROUND_STARTUP_TIMEOUT_SECONDS
-    return _POSIX_BACKGROUND_STARTUP_TIMEOUT_SECONDS
+    timeout = _BACKGROUND_STARTUP_TIMEOUT_SECONDS if value is None else value
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("启动确认超时必须为大于零的有限秒数")
+    return timeout
 
 
 def _process_started_at(pid: int) -> str | None:
@@ -434,23 +435,41 @@ def _tail_log(path: Path, limit: int = 20) -> str:
     return "\n".join(lines[-limit:])
 
 
-def _health_process_id(host: str, port: int) -> int | None:
-    """读取健康接口实际响应进程的 PID，连接失败时返回空。"""
+def _check_health(
+    host: str,
+    port: int,
+    *,
+    timeout_seconds: float = 0.5,
+) -> tuple[int | None, str | None]:
+    """直连健康接口，返回 PID 或适合启动排障的失败原因。"""
 
-    url = f"{management_url(host, port)}/api/health"
+    # IPv6 通配监听使用同地址族回环；此处不改变管理界面的展示地址。
+    probe_host = "::1" if host == "::" else host
+    url = f"{management_url(probe_host, port)}/api/health"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(url, timeout=0.5) as response:
+        with opener.open(url, timeout=timeout_seconds) as response:
             if response.status != 200:
-                return None
+                return None, f"健康接口返回 HTTP {response.status}（{url}）"
             payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        return None, f"健康接口返回 HTTP {status}（{url}）"
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        failure = "连接或读取超时" if isinstance(reason, TimeoutError) else "无法连接"
+        return None, f"健康接口{failure}（{url}）"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, f"健康接口响应不是有效的 UTF-8 JSON（{url}）"
+    except HTTPException:
+        return None, f"健康接口 HTTP 响应不完整或格式错误（{url}）"
     if not isinstance(payload, dict):
-        return None
-    try:
-        return int(payload["pid"])
-    except (KeyError, TypeError, ValueError):
-        return None
+        return None, f"健康接口响应缺少有效 PID（{url}）"
+    pid = payload.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return None, f"健康接口响应缺少有效 PID（{url}）"
+    return pid, None
 
 
 def start_background(
@@ -474,12 +493,16 @@ def start_background(
         )
     if existing_records:
         existing = existing_records[0]
-        if _health_process_id(existing.host, existing.port) != existing.pid:
+        health_pid, health_error = _check_health(existing.host, existing.port)
+        if health_pid != existing.pid:
+            detail = health_error or (
+                f"健康接口 PID 不匹配：期望 {existing.pid}，实际 {health_pid}"
+            )
             return ProcessActionResult(
                 1,
                 (
                     f"检测到后台服务进程 PID {existing.pid}，但健康接口未由该进程响应；"
-                    "请执行 stop 或 restart 恢复"
+                    f"{detail}；请执行 stop 或 restart 恢复"
                 ),
                 existing,
             )
@@ -522,6 +545,7 @@ def start_background(
         )
 
     deadline = time.monotonic() + startup_timeout
+    pending_reason = "PID 文件尚未就绪"
     while time.monotonic() < deadline:
         return_code = process.poll()
         record = _read_record(paths)
@@ -532,15 +556,30 @@ def start_background(
                 1,
                 (
                     f"后台服务启动失败，退出码 {return_code}。"
+                    f"最后启动检查：{pending_reason}。"
                     f"日志：{paths.log_file}{detail}"
                 ),
             )
-        if (
-            record
-            and record.pid == process.pid
-            and _record_is_running(record)
-            and _health_process_id(host, port) == process.pid
-        ):
+        if record is None:
+            pending_reason = "PID 文件尚未就绪或无法读取有效记录"
+        elif record.pid != process.pid:
+            pending_reason = (
+                f"PID 文件不匹配：期望 {process.pid}，实际 {record.pid}"
+            )
+        elif not _record_is_running(record):
+            pending_reason = "进程身份检查未通过：PID、启动时间或进程状态尚未匹配"
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            health_pid, health_error = _check_health(
+                host, port, timeout_seconds=min(0.5, remaining)
+            )
+            pending_reason = health_error or (
+                f"健康接口 PID 不匹配：期望 {process.pid}，实际 {health_pid}"
+                if health_pid != process.pid else ""
+            )
+        if not pending_reason:
             return ProcessActionResult(
                 0,
                 (
@@ -550,7 +589,7 @@ def start_background(
                 ),
                 record,
             )
-        time.sleep(0.1)
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
     if process.poll() is None:
         try:
@@ -574,6 +613,7 @@ def start_background(
         1,
         (
             f"后台服务未在 {startup_timeout:g} 秒内完成启动，"
+            f"最后启动检查：{pending_reason}。"
             f"请查看日志：{paths.log_file}{detail}"
         ),
     )

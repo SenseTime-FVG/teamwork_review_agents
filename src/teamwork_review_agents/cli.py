@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -69,6 +70,18 @@ def add_server_arguments(
         parser.add_argument("--managed-child", action="store_true", help=argparse.SUPPRESS)
 
 
+def _positive_timeout(value: str) -> float:
+    """在执行启停操作之前校验用户提供的启动确认秒数。"""
+
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("启动确认超时必须为数字秒数") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("启动确认超时必须为大于零的有限秒数")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     """创建命令行参数解析器。"""
 
@@ -103,6 +116,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     restart = subparsers.add_parser("restart", help="停止后重新在后台启动服务")
     add_server_arguments(restart)
+    for background_parser in (start, restart):
+        background_parser.add_argument(
+            "--startup-timeout",
+            type=_positive_timeout,
+            metavar="SECONDS",
+            help="后台启动确认最长等待秒数，所有平台默认 30；就绪后立即返回",
+        )
 
     serve = subparsers.add_parser("serve", help="兼容命令，等同于 run")
     add_server_arguments(serve, include_managed_child=True)
@@ -277,7 +297,10 @@ def main() -> None:
             raise SystemExit(2)
         resolved, host, port = settings
         raise SystemExit(
-            _print_process_result(start_background(resolved, host=host, port=port))
+            _print_process_result(start_background(
+                resolved, host=host, port=port,
+                startup_timeout_seconds=args.startup_timeout,
+            ))
         )
     if args.command in {"stop", "end"}:
         raise SystemExit(_print_process_result(stop_managed_process(args.config)))
@@ -291,7 +314,10 @@ def main() -> None:
             raise SystemExit(_print_process_result(stop_result))
         print(stop_result.message)
         raise SystemExit(
-            _print_process_result(start_background(resolved, host=host, port=port))
+            _print_process_result(start_background(
+                resolved, host=host, port=port,
+                startup_timeout_seconds=args.startup_timeout,
+            ))
         )
     if args.command == "runs":
         config = load_config(args.config)

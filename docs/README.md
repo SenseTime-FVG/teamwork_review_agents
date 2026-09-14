@@ -19,6 +19,7 @@
 | 文档 | 用途 | 关联代码/模块 | 更新触发条件 |
 | --- | --- | --- | --- |
 | [`design.md`](design.md) | 当前系统实现语义的权威设计记录 | `src/teamwork_review_agents/`、`ui/src/` | 已实现的配置、事件、运行时、API 或 UI 语义变化 |
+| [`design-background-startup-confirmation.md`](design-background-startup-confirmation.md) | 后台启动等待与健康检查诊断 | `process_manager.py`、`cli.py` | 启动时限、健康探测或启动确认语义变化 |
 | [`design-model-runtime-log-normalization.md`](design-model-runtime-log-normalization.md) | 模型基座运行日志语义设计 | 模型基座运行时与日志 | 模型基座日志事件或展示语义变化 |
 | [`design-agent-workspace-preparation.md`](design-agent-workspace-preparation.md) | Agent 工作区准备与仓库级依赖缓存设计 | `agent_workspace.py`、缓存与仓库配置 | `agent_workspace`、准备步骤、缓存、沙盒或相关 UI 变化 |
 | [`design-agent-workspace-snapshot-warmup.md`](design-agent-workspace-snapshot-warmup.md) | 工作区依赖快照与手动预热设计 | `workspace_snapshot.py`、工作区预热 API 与 UI | 快照指纹、归档恢复、容量策略、预热流程或状态变化 |
@@ -34,6 +35,7 @@
 | 文档 | 用途 | 关联代码/模块 | 更新触发条件 |
 | --- | --- | --- | --- |
 | [`implementation-plan.md`](implementation-plan.md) | 项目阶段实施与验收记录 | 全项目历史实施范围 | 新增需要记录的实施阶段或验收结论 |
+| [`implementation-plan-background-startup-confirmation.md`](implementation-plan-background-startup-confirmation.md) | 后台启动确认实施与验收范围 | 进程管理与 CLI 测试 | 该实施方案或验收记录更新 |
 | [`implementation-plan-model-runtime-log-normalization.md`](implementation-plan-model-runtime-log-normalization.md) | 模型基座运行日志语义实施方案 | 模型基座运行时与日志 | 该实施方案本身或其验收记录更新 |
 | [`implementation-plan-agent-workspace-preparation.md`](implementation-plan-agent-workspace-preparation.md) | 工作区准备与依赖缓存实施方案 | 工作区准备、缓存和管理界面 | 该实施方案或验收记录更新 |
 | [`implementation-plan-agent-workspace-snapshot-warmup.md`](implementation-plan-agent-workspace-snapshot-warmup.md) | 工作区依赖快照与预热实施方案 | 快照、预热 API 和管理界面 | 该实施方案或验收记录更新 |
