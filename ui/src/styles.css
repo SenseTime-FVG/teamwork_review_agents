@@ -784,6 +784,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .curl-runtime-panel { margin-bottom: 16px; }
 .curl-runtime-panel code { overflow-wrap: anywhere; }
 .curl-runtime-panel details { margin-top: 12px; }
+/* 运行环境面板沿用暗色按钮，链接及键盘焦点不使用浏览器默认浅色主题。 */
+.curl-runtime-panel a, .curl-runtime-panel a:visited { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
+.curl-runtime-panel a:hover { color: var(--bright); }
+.curl-runtime-panel .button:focus-visible, .curl-runtime-panel a:focus-visible, .curl-runtime-panel summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
 .curl-runtime-status { padding: 12px; border: 1px solid #2e5941; border-radius: 8px; color: #9bd4b5; }
 .curl-runtime-status.is-warning { border-color: #66502b; color: #e8c47c; }
 .run-message-body, .run-message-detail { margin: 9px 0 0; white-space: pre-wrap; word-break: break-word; font: 400 9px/1.6 "SFMono-Regular", Consolas, monospace; }

@@ -57,7 +57,7 @@ export function CurlRuntimePanel() {
     <section className="section-card curl-runtime-panel">
       <div className="section-title-row">
         <div><h2>Windows HTTPS 运行环境</h2><p>由服务自动准备，无需手动安装 OpenSSL；使用已保存的配置。</p></div>
-        <button type="button" className="secondary" disabled={preparing} onClick={() => void prepare()}>
+        <button type="button" className="button secondary" disabled={preparing} aria-busy={preparing} onClick={() => void prepare()}>
           {preparing ? "正在准备…" : "重新检查并准备"}
         </button>
       </div>
