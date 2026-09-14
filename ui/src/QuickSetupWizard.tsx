@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { ConfigDocument } from "./types";
 import { initialSetupRules, setupAgents, setupRuleDescription, setupRules } from "./quickSetup";
+import { SetupIntentInput } from "./SetupIntentInput";
+import { SetupExitConfirmation } from "./SetupExitConfirmation";
 import "./quickSetup.css";
 
 type Summary = {
@@ -31,6 +33,8 @@ export function QuickSetupWizard(props: Props) {
   const [token, setToken] = useState("");
   const [systemVariable, setSystemVariable] = useState("GITHUB_TOKEN");
   const [showToken, setShowToken] = useState(false);
+  const [connectionVersion, setConnectionVersion] = useState(0);
+  const [confirmExit, setConfirmExit] = useState(false);
   const rules = setupRules(props.document);
   const [selected, setSelected] = useState(() => initialSetupRules(rules));
   const [useSkills, setUseSkills] = useState(false);
@@ -61,6 +65,7 @@ export function QuickSetupWizard(props: Props) {
   }
 
   function choosePlatform(value: string) {
+    setConnectionVersion((version) => version + 1); setShowToken(false);
     setPlatform(value); setExisting(""); setToken(""); setTokenSource("value");
     setRemote(""); setDisplayName(""); setSelected(initialSetupRules(rules)); setUseSkills(false); setAssignments({});
     setKind(value === "gitlab" ? "gitlab" : "github");
@@ -69,6 +74,7 @@ export function QuickSetupWizard(props: Props) {
   }
 
   function chooseRepository(id: string) {
+    setConnectionVersion((version) => version + 1); setShowToken(false);
     setExisting(id); setSelected(initialSetupRules(rules, id || undefined)); setToken("");
     const repository = props.document.repositories.find((item) => item.id === id);
     if (!repository) {
@@ -131,14 +137,14 @@ export function QuickSetupWizard(props: Props) {
   }
 
   function close() {
-    if (!busy && window.confirm("退出一键配置？本次尚未保存的草稿将被丢弃。")) props.onClose();
+    if (!busy) setConfirmExit(true);
   }
   const connectionReady = Boolean(baseUrl.trim() && remote.trim() && (
     tokenSource === "existing" ? existing : tokenSource === "value" ? token.trim() : systemVariable.trim()
   ));
   const hasFailedCheck = checks?.some((check) => !check.ok);
 
-  return <dialog className="quick-setup" ref={dialog} aria-labelledby="quick-setup-title" onCancel={(event) => { event.preventDefault(); close(); }}>
+  return <><dialog className="quick-setup" ref={dialog} aria-labelledby="quick-setup-title" onCancel={(event) => { event.preventDefault(); close(); }}>
     <header className="quick-setup-header"><div><span className="eyebrow">QUICK SETUP</span><h2 id="quick-setup-title">一键配置</h2><p>连接仓库，选择需要的规则，其余沿用现有配置。</p></div><button type="button" className="button secondary" disabled={busy} onClick={close}>取消</button></header>
     <ol className="quick-setup-steps" aria-label="配置步骤">{steps.map((title, index) => <li key={title} aria-current={step === index ? "step" : undefined} className={step === index ? "active" : ""}><span>{index + 1}</span>{title}</li>)}</ol>
     <div className="quick-setup-body">
@@ -149,11 +155,17 @@ export function QuickSetupWizard(props: Props) {
           <p className="quick-setup-note">自定义仍需使用 GitHub 或 GitLab API，并非任意 Git 服务。不会修改全局模型或 Agent 的模型设置。</p>
         </section>}
         {step === 1 && <section className="page-stack"><h3>连接仓库</h3>
+          <form className="page-stack" autoComplete="off" onSubmit={(event) => event.preventDefault()} aria-label="仓库信息">
           <label className="field"><span>配置目标</span><select value={existing} onChange={(event) => chooseRepository(event.target.value)}><option value="">添加新仓库</option>{props.document.repositories.map((repository) => <option key={repository.id} value={repository.id}>更新：{repository.display_name || repository.id}</option>)}</select></label>
-          <div className="form-grid two"><label className="field"><span>仓库 HTTPS / SSH 地址</span><input value={remote} onChange={(event) => setRemote(event.target.value)} placeholder={kind === "github" ? "https://github.com/owner/repo.git" : "git@gitlab.com:group/project.git"} /></label><label className="field"><span>显示名称（可选）</span><input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="留空使用项目名称" /></label></div>
+          <div className="form-grid two"><label className="field"><span>仓库 HTTPS / SSH 地址</span><input name="repository-remote" value={remote} onChange={(event) => setRemote(event.target.value)} placeholder={kind === "github" ? "https://github.com/owner/repo.git" : "git@gitlab.com:group/project.git"} /></label><label className="field"><span>显示名称（可选）</span><SetupIntentInput key={`name-${connectionVersion}`} name="repository-display-name" autoComplete="off" value={displayName} onValueChange={setDisplayName} placeholder="留空使用项目名称" /></label></div>
+          </form>
           <p className="quick-setup-note">API：{baseUrl}。{existing ? "更新会保留原仓库 ID、本地目录、启停状态和其他设置。" : "仓库 ID 和本地工作目录会自动生成，最后一步可查看。"}</p>
           <label className="field"><span>{tokenName} 凭证来源</span><select value={tokenSource} onChange={(event) => { setTokenSource(event.target.value); setToken(""); setShowToken(false); }}><option value="value">直接填写 Token</option><option value="system">引用宿主机环境变量</option>{existing && <option value="existing">保留当前仓库凭证</option>}</select></label>
-          {tokenSource === "value" && <label className="field"><span>{tokenName}</span><div className="quick-setup-secret"><input autoComplete="off" type={showToken ? "text" : "password"} value={token} onChange={(event) => setToken(event.target.value)} placeholder="填写平台访问 Token" /><button type="button" className="button secondary" aria-label={showToken ? "隐藏 Token" : "查看 Token 明文"} aria-pressed={showToken} onClick={() => setShowToken(!showToken)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{showToken && <path d="m3 3 18 18"/>}</svg></button></div><small>固定值会写入本地 config.yaml，请保护配置文件；API 展示、日志与配置历史保持脱敏。避免明文落盘可选择宿主机环境变量。</small></label>}
+          {tokenSource === "value" && <form autoComplete="on" onSubmit={(event) => event.preventDefault()} aria-label="平台凭据">
+            {/* 独立账号字段承接密码管理器的用户名，不能把仓库显示名称当成账号。 */}
+            <input type="text" name="platform-token-account" autoComplete="username" value={tokenName} readOnly hidden />
+            <label className="field"><span>{tokenName}</span><div className="quick-setup-secret"><SetupIntentInput key={`token-${connectionVersion}`} name="platform-access-token" autoComplete="current-password" type={showToken ? "text" : "password"} value={token} onValueChange={setToken} placeholder="点击或开始输入 Token" /><button type="button" className="button secondary" aria-label={showToken ? "隐藏 Token" : "查看 Token 明文"} aria-pressed={showToken} onClick={() => setShowToken(!showToken)}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{showToken && <path d="m3 3 18 18"/>}</svg></button></div><small>固定值会写入本地 config.yaml，请保护配置文件；API 展示、日志与配置历史保持脱敏。避免明文落盘可选择宿主机环境变量。</small></label>
+          </form>}
           {tokenSource === "system" && <label className="field"><span>宿主机变量名</span><input value={systemVariable} onChange={(event) => setSystemVariable(event.target.value)} /><small>变量必须存在于启动 Teamwork 服务的环境中，不是当前浏览器所在电脑的环境。</small></label>}
           <p className="quick-setup-note">新填凭证仅用于此仓库：Secret 开启、进程开启、Prompt 关闭。HTTPS Git 使用 Token；SSH 拉取仍需服务账号的 SSH 密钥和已确认的主机。gh / glab 仍需安装在服务端。</p>
         </section>}
@@ -188,5 +200,7 @@ export function QuickSetupWizard(props: Props) {
       </fieldset>
     </div>
     <footer className="quick-setup-footer"><span>{step + 1} / {steps.length}{busy ? " · 处理中…" : " · 尚未保存"}</span><div className="button-group"><button type="button" className="button secondary" disabled={busy || step === 0} onClick={() => changeStep(step - 1)}>上一步</button>{step < 3 ? <button type="button" className="button primary" disabled={busy || (step === 0 && !baseUrl.trim()) || (step === 1 && !connectionReady)} onClick={() => changeStep(step + 1)}>下一步</button> : step === 3 ? <button type="button" className="button primary" disabled={busy} onClick={() => void preview()}>检查配置</button> : <button type="button" className="button primary" disabled={busy || !summary || Boolean(hasFailedCheck && !acceptFailedCheck)} onClick={() => void complete()}>完成配置</button>}</div></footer>
-  </dialog>;
+  </dialog>{confirmExit && <SetupExitConfirmation onContinue={() => setConfirmExit(false)} onDiscard={() => {
+    setToken(""); props.onClose();
+  }} />}</>;
 }
