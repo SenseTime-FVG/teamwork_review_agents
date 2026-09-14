@@ -43,7 +43,12 @@ def make_zip(package="curl-test", extra=None):
             "bin/libcurl.dll": b"dummy-dll", "COPYING.txt": b"dummy-license",
             **(extra or {}),
         }.items():
-            archive.writestr(f"{package}/{name}", content)
+            # 保留恶意路径原文，避免 Windows 构造器提前将反斜杠修正为合法斜杠。
+            original_name = f"{package}/{name}"
+            member = zipfile.ZipInfo(original_name)
+            member.filename = original_name
+            member.orig_filename = original_name
+            archive.writestr(member, content)
     data = buffer.getvalue()
     return CurlDistribution(package, hashlib.sha256(data).hexdigest()), data
 
@@ -144,6 +149,18 @@ def test_archive_rejects_symlink_and_expansion_limit(monkeypatch):
     monkeypatch.setattr(distribution_module, "_MAX_EXPANDED", 1)
     with zipfile.ZipFile(io.BytesIO(data)) as archive, pytest.raises(CurlPreparationError):
         archive_entries(archive, distribution)
+
+
+def test_archive_checks_raw_name_even_after_windows_normalization():
+    """模拟 Windows 读取时的字段规范化，不能因此接受原本不允许的 ZIP 路径。"""
+
+    distribution, data = make_zip(extra={"bin\\evil": b"bad"})
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entry = next(entry for entry in archive.infolist() if "evil" in entry.orig_filename)
+        assert "\\" in entry.orig_filename
+        entry.filename = entry.orig_filename.replace("\\", "/")
+        with pytest.raises(CurlPreparationError):
+            archive_entries(archive, distribution)
 
 
 async def test_download_verifies_digest_and_never_follows_redirect(deployment, monkeypatch):
