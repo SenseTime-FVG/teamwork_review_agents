@@ -24,6 +24,7 @@ from .process_control import hidden_process_options
 from .codex_executable import resolve_codex_executable as resolve_executable
 from .codex_executable import CodexRuntimeError
 from .reasoning_effort import is_reasoning_effort_rejection
+from .model_quota import is_quota_exhausted
 
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -56,11 +57,13 @@ class CodexUpstreamError(CodexModelError):
         status_code: int | None = None,
         fallbackable: bool | None = None,
         reasoning_effort_rejected: bool = False,
+        quota_exhausted: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
         self.reasoning_effort_rejected = reasoning_effort_rejected
+        self.quota_exhausted = quota_exhausted
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,7 @@ class CodexResponsesClient:
                     ):
                         response = event["response"]
                     elif event_type in {"response.failed", "error"}:
+                        fields = _extract_upstream_error_fields(event)
                         raise CodexUpstreamError(
                             _format_upstream_error(
                                 event_type=event_type,
@@ -314,8 +318,9 @@ class CodexResponsesClient:
                             ),
                             fallbackable=_upstream_error_fallbackable(event),
                             reasoning_effort_rejected=is_reasoning_effort_rejection(
-                                _extract_upstream_error_fields(event),
+                                fields,
                             ),
+                            quota_exhausted=is_quota_exhausted(fields),
                         )
                 if response is None:
                     raise CodexUpstreamError("Codex SSE 在 completed 事件前结束")
@@ -375,19 +380,22 @@ class CodexResponsesClient:
                                     )
                                 )
                                 continue
+                            fields = _extract_upstream_error_fields(_decode_error_body(body))
+                            quota_exhausted = is_quota_exhausted(fields)
                             raise CodexUpstreamError(
                                 _format_upstream_error(
                                     payload=_decode_error_body(body),
                                     status_code=response.status_code,
                                 ),
                                 status_code=response.status_code,
-                                fallbackable=response.status_code
+                                fallbackable=quota_exhausted or response.status_code
                                 in {401, 402, 403, 404, 408, 409, 429}
                                 or response.status_code >= 500,
                                 reasoning_effort_rejected=is_reasoning_effort_rejection(
-                                    _extract_upstream_error_fields(_decode_error_body(body)),
+                                    fields,
                                     status_code=response.status_code,
                                 ),
+                                quota_exhausted=quota_exhausted,
                             )
                         content_type = response.headers.get("content-type", "")
                         if "text/event-stream" not in content_type:
@@ -412,12 +420,14 @@ class CodexResponsesClient:
                                     fallbackable=False,
                                 )
                             if _contains_upstream_error(document):
+                                fields = _extract_upstream_error_fields(document)
                                 raise CodexUpstreamError(
                                     _format_upstream_error(payload=document),
                                     fallbackable=_upstream_error_fallbackable(document),
                                     reasoning_effort_rejected=is_reasoning_effort_rejection(
-                                        _extract_upstream_error_fields(document),
+                                        fields,
                                     ),
+                                    quota_exhausted=is_quota_exhausted(fields),
                                 )
                             yield {"type": "response.completed", "response": document}
                             return
@@ -504,7 +514,7 @@ def _retryable_error(error: Exception) -> bool:
     """只在尚无任何事件时重试短暂网络和网关失败。"""
 
     if isinstance(error, CodexUpstreamError):
-        return error.status_code in RETRYABLE_HTTP_STATUS
+        return not error.quota_exhausted and error.status_code in RETRYABLE_HTTP_STATUS
     cause = error.__cause__
     return isinstance(
         cause,
@@ -589,6 +599,8 @@ def _upstream_error_fallbackable(payload: Any) -> bool:
     """区分模型服务不可用与请求内容本身无效的上游错误。"""
 
     fields = _extract_upstream_error_fields(payload)
+    if is_quota_exhausted(fields):
+        return True
     markers = " ".join(
         fields.get(name, "")
         for name in ("type", "code", "message")

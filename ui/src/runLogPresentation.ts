@@ -56,6 +56,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "turn.completed": "本轮处理完成",
   "model.attempt_failed": "模型请求失败",
   "model.fallback": "切换备用模型",
+  "model.request_started": "新一轮请求选模",
+  "model.quota_exhausted": "额度耗尽，本次运行跳过该模型",
   "model.reasoning_downgraded": "推理强度自动降级",
   "run.cancel_requested": "已请求取消运行",
   "run.cancelled": "运行已取消",
@@ -176,8 +178,8 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     : SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
-  // 可恢复的 HTTP 能力告警不代表任务终止，也不能冒充 Git 基础设施失败。
-  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable"].includes(log.event_type);
+  // 能力告警及单个模型额度耗尽不等于整个任务已经终止。
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted"].includes(log.event_type);
   let body = "";
   let detail = "";
   if (log.event_type === "model.reasoning_downgraded" && object) {
@@ -187,6 +189,12 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   } else if (log.event_type === "model.attempt_failed" && object) {
     body = textValue(object.reason);
     detail = `${textValue(object.provider_id)} / ${textValue(object.model)}`;
+  } else if (["model.request_started", "model.quota_exhausted"].includes(log.event_type) && object) {
+    body = textValue(object.message);
+    detail = [
+      `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}`,
+      textValue(object.reason),
+    ].filter(Boolean).join("\n");
   } else if ((log.event_type.startsWith("run.curl_") || log.event_type === "run.http_tls_unavailable") && object) {
     body = textValue(object.message) || "已在当前 Agent 沙盒中检查兼容 curl。";
     detail = [
