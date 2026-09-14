@@ -587,6 +587,8 @@ export type AgentModelSnapshot = {
   }>;
   fallback_attempts?: Array<Record<string, unknown>>;
   fallback_used?: boolean;
+  request_round?: number;
+  quota_exhausted_models?: Array<{ provider_id: string; model: string | null }>;
 };
 
 export type RunDetail = RunSummary & {

@@ -542,10 +542,15 @@ class CodexModelRunner:
         current_index = -1
         attempts: list[dict[str, Any]] = []
         fallback_was_used = False
+        request_round = 1
+        exhausted_models: set[tuple[str, str | None]] = set()
+        downgraded_efforts: dict[tuple[str, str | None], str | None] = {}
 
         def fallbackable_error(error: Exception) -> bool:
             """只把 Provider 暂时不可用类错误交给回退链。"""
 
+            if isinstance(error, (ModelProviderRequestError, CodexUpstreamError)) and error.quota_exhausted:
+                return True
             if isinstance(error, ModelProviderRequestError):
                 if error.fallbackable is not None:
                     return error.fallbackable
@@ -583,6 +588,17 @@ class CodexModelRunner:
             nonlocal configured_reasoning_effort
             while index < len(model_plan):
                 selection = model_plan[index]
+                candidate_key = (selection.provider_id, selection.model)
+                if candidate_key in exhausted_models:
+                    attempts.append({
+                        "provider_id": selection.provider_id,
+                        "model": selection.model,
+                        "request_round": request_round,
+                        "status": "skipped",
+                        "reason": "quota_exhausted",
+                    })
+                    index += 1
+                    continue
                 if not selection.provider.enabled:
                     attempts.append(
                         {
@@ -660,6 +676,10 @@ class CodexModelRunner:
                         )
                         else "provider_default"
                     )
+                if candidate_key in downgraded_efforts:
+                    # 重新选择模型时沿用已发现的兼容档位，包含省略 effort 的结果。
+                    reasoning_effort = downgraded_efforts[candidate_key]
+                    reasoning_effort_source = "compatibility_downgrade"
                 schema, text_config = _response_text_config(
                     current_agent.output_schema,
                     verbosity,
@@ -725,6 +745,28 @@ class CodexModelRunner:
                     )
                 return True
             return False
+
+        async def save_snapshot() -> None:
+            """保存当前选模和运行内跳过状态，不改写配置中的主模型。"""
+
+            if model_snapshot_callback is not None:
+                snapshot = _model_snapshot_update(
+                    model_plan,
+                    attempts,
+                    current_selection=current_selection,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_effort_source=reasoning_effort_source,
+                    fallback_used=fallback_was_used,
+                    configured_reasoning_effort=configured_reasoning_effort,
+                    reasoning_downgrades=reasoning_downgrades,
+                )
+                snapshot["request_round"] = request_round
+                snapshot["quota_exhausted_models"] = [
+                    {"provider_id": selection.provider_id, "model": selection.model}
+                    for selection in model_plan
+                    if (selection.provider_id, selection.model) in exhausted_models
+                ]
+                await model_snapshot_callback(snapshot)
 
         if not await activate(0):
             raise RuntimeError("模型主链与回退链没有可用的 Provider/模型")
@@ -821,6 +863,19 @@ class CodexModelRunner:
                     events.append(redactor.data(safe))
 
         for round_index in range(_MAX_TOOL_ROUNDS):
+            request_round = round_index + 1
+            # 新请求从主链起点选模；只跳过本次运行已明确额度耗尽的候选。
+            if round_index and not await activate(0):
+                await save_snapshot()
+                raise RuntimeError("本次运行的模型候选均已耗尽额度或不可用")
+            await emit("system", "model.request_started", {
+                "request_round": request_round,
+                "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "message": "新请求按主链顺序选模，跳过本次运行已耗尽额度的候选。",
+            })
+            await save_snapshot()
             while True:
                 payload: dict[str, Any] = {
                     "model": model,
@@ -869,6 +924,10 @@ class CodexModelRunner:
                     raise
                 except Exception as exc:
                     failed_selection = current_selection
+                    quota_exhausted = (
+                        isinstance(exc, (ModelProviderRequestError, CodexUpstreamError))
+                        and exc.quota_exhausted
+                    )
                     failure_payload = {
                         "provider_id": (
                             failed_selection.provider_id
@@ -879,25 +938,23 @@ class CodexModelRunner:
                         "reasoning_effort": reasoning_effort,
                         "reasoning_effort_source": reasoning_effort_source,
                         "status": "failed",
+                        "request_round": request_round,
+                        "quota_exhausted": quota_exhausted,
                         "reason": redactor.text(str(exc)),
                     }
                     attempts.append(failure_payload)
                     await emit("system", "model.attempt_failed", failure_payload)
-                    if model_snapshot_callback is not None:
-                        await model_snapshot_callback(
-                            _model_snapshot_update(
-                                model_plan,
-                                attempts,
-                                current_selection=failed_selection,
-                                reasoning_effort=reasoning_effort,
-                                reasoning_effort_source=reasoning_effort_source,
-                                fallback_used=fallback_was_used,
-                                configured_reasoning_effort=configured_reasoning_effort,
-                                reasoning_downgrades=reasoning_downgrades,
-                            )
-                        )
+                    if quota_exhausted and failed_selection is not None:
+                        exhausted_models.add((failed_selection.provider_id, failed_selection.model))
+                        await emit("system", "model.quota_exhausted", {
+                            **failure_payload,
+                            "scope": "agent_run",
+                            "message": "上游明确报告额度耗尽，本次运行后续请求将跳过此候选；新运行重新检查。",
+                        })
+                    await save_snapshot()
                     if (
                         reasoning_effort
+                        and not quota_exhausted
                         and isinstance(exc, (ModelProviderRequestError, CodexUpstreamError))
                         and exc.reasoning_effort_rejected
                     ):
@@ -914,20 +971,10 @@ class CodexModelRunner:
                         reasoning_downgrades.append(downgrade)
                         reasoning_effort = lowered_effort
                         reasoning_effort_source = "compatibility_downgrade"
+                        if failed_selection is not None:
+                            downgraded_efforts[(failed_selection.provider_id, failed_selection.model)] = lowered_effort
                         await emit("system", "model.reasoning_downgraded", downgrade)
-                        if model_snapshot_callback is not None:
-                            await model_snapshot_callback(
-                                _model_snapshot_update(
-                                    model_plan,
-                                    attempts,
-                                    current_selection=current_selection,
-                                    reasoning_effort=reasoning_effort,
-                                    reasoning_effort_source=reasoning_effort_source,
-                                    fallback_used=fallback_was_used,
-                                    configured_reasoning_effort=configured_reasoning_effort,
-                                    reasoning_downgrades=reasoning_downgrades,
-                                )
-                            )
+                        await save_snapshot()
                         continue
                     if (
                         fallbackable_error(exc)
@@ -946,21 +993,10 @@ class CodexModelRunner:
                                 if next_selection is not None
                                 else None,
                                 "reason": redactor.text(str(exc)),
+                                "request_round": request_round,
                             },
                         )
-                        if model_snapshot_callback is not None:
-                            await model_snapshot_callback(
-                                _model_snapshot_update(
-                                    model_plan,
-                                    attempts,
-                                    current_selection=next_selection,
-                                    reasoning_effort=reasoning_effort,
-                                    reasoning_effort_source=reasoning_effort_source,
-                                    fallback_used=True,
-                                    configured_reasoning_effort=configured_reasoning_effort,
-                                    reasoning_downgrades=reasoning_downgrades,
-                                )
-                            )
+                        await save_snapshot()
                         continue
                     raise
                 attempts.append(
@@ -972,21 +1008,10 @@ class CodexModelRunner:
                         "reasoning_effort": reasoning_effort,
                         "reasoning_effort_source": reasoning_effort_source,
                         "status": "response",
+                        "request_round": request_round,
                     }
                 )
-                if model_snapshot_callback is not None:
-                    await model_snapshot_callback(
-                        _model_snapshot_update(
-                            model_plan,
-                            attempts,
-                            current_selection=current_selection,
-                            reasoning_effort=reasoning_effort,
-                            reasoning_effort_source=reasoning_effort_source,
-                            fallback_used=fallback_was_used,
-                            configured_reasoning_effort=configured_reasoning_effort,
-                            reasoning_downgrades=reasoning_downgrades,
-                        )
-                    )
+                await save_snapshot()
                 break
             response_id = str(response.get("id") or response_id or "") or None
             response_usage = response.get("usage")

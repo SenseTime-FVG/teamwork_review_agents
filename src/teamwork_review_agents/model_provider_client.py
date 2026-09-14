@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import ModelProviderConfig
+from .model_quota import is_quota_exhausted
 from .reasoning_effort import is_reasoning_effort_rejection
 
 
@@ -67,11 +68,13 @@ class ModelProviderRequestError(RuntimeError):
         status_code: int | None = None,
         fallbackable: bool | None = None,
         reasoning_effort_rejected: bool = False,
+        quota_exhausted: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.fallbackable = fallbackable
         self.reasoning_effort_rejected = reasoning_effort_rejected
+        self.quota_exhausted = quota_exhausted
 
 
 class ExternalModelClient:
@@ -330,16 +333,19 @@ class ExternalModelClient:
                 fallbackable=True,
             ) from exc
         if response.status_code >= 400:
+            fields = _extract_provider_error_fields(_decode_provider_error_body(response.content))
+            quota_exhausted = is_quota_exhausted(fields)
             raise ModelProviderRequestError(
                 _format_provider_http_error(response),
                 status_code=response.status_code,
-                fallbackable=response.status_code
+                fallbackable=quota_exhausted or response.status_code
                 in {401, 402, 403, 404, 408, 409, 429}
                 or response.status_code >= 500,
                 reasoning_effort_rejected=is_reasoning_effort_rejection(
-                    _extract_provider_error_fields(_decode_provider_error_body(response.content)),
+                    fields,
                     status_code=response.status_code,
                 ),
+                quota_exhausted=quota_exhausted,
             )
         try:
             document = response.json()
@@ -347,6 +353,14 @@ class ExternalModelClient:
             raise ModelProviderRequestError("模型 Provider 返回了无效 JSON") from exc
         if not isinstance(document, dict):
             raise ModelProviderRequestError("模型 Provider JSON 顶层不是对象")
+        if is_quota_exhausted(_extract_provider_error_fields(document)):
+            # 部分兼容服务以 HTTP 200 封装额度错误，不能把它当成正常模型结果。
+            raise ModelProviderRequestError(
+                _format_provider_http_error(response),
+                status_code=response.status_code,
+                fallbackable=True,
+                quota_exhausted=True,
+            )
         return document
 
 
@@ -517,6 +531,9 @@ def _extract_provider_error_fields(payload: Any) -> dict[str, str]:
             normalized = str(key).lower().replace("-", "_").replace(" ", "_")
             field = _PROVIDER_ERROR_FIELD_ALIASES.get(normalized)
             if field and field not in fields:
+                if field == "type" and str(value) in {"error", "response.failed"}:
+                    # 事件封套的类型不是错误类型，继续读取内部 error 对象。
+                    continue
                 text = _sanitize_provider_error_text(
                     value,
                     limit=_PROVIDER_ERROR_FIELD_MAX_CHARS,
