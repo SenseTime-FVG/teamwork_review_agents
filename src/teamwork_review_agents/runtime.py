@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from .config import ScheduledRuleConfig
+from .curl_runtime import CurlRuntimeManager
 from .repository_migration import has_pending_repository_migration
 from .config_manager import ConfigManager
 from .orchestrator import CycleSummary, Orchestrator
@@ -19,6 +20,7 @@ class BackgroundRuntime:
 
     def __init__(self, manager: ConfigManager) -> None:
         self.manager = manager
+        self.curl_runtime = CurlRuntimeManager(lambda: manager.config)
         self.store = manager.store
         self.store.recover_interrupted_work()
         self._stop_event = asyncio.Event()
@@ -58,6 +60,7 @@ class BackgroundRuntime:
     async def start(self) -> None:
         """启动扫描与事件执行两个后台循环。"""
 
+        self.curl_runtime.start()
         if self._scan_task is None:
             self._scan_task = asyncio.create_task(
                 self._scan_loop(),
@@ -78,6 +81,7 @@ class BackgroundRuntime:
         """停止新工作、取消活动 Agent，并等待全部子进程安全收尾。"""
 
         self._stop_event.set()
+        await self.curl_runtime.close()
         self._scan_wake_event.set()
         self._dispatch_event.set()
         self._schedule_wake_event.set()
@@ -167,6 +171,7 @@ class BackgroundRuntime:
         self.manager.reload_if_changed()
         config = self.manager.config
         if config.revision != self._revision:
+            self.curl_runtime.start()
             self._orchestrator = Orchestrator(
                 config,
                 recover_interrupted=False,
@@ -270,6 +275,9 @@ class BackgroundRuntime:
     async def _run_dispatch_cycle(self) -> None:
         """独立领取并执行持久化事件，不占用扫描循环。"""
 
+        await self.curl_runtime.wait()
+        if self._stop_event.is_set():
+            return
         await self._repository_ready.wait()
         self.dispatching_events = True
         self.last_dispatch_started_at = time.time()
@@ -361,6 +369,7 @@ class BackgroundRuntime:
     ) -> None:
         """执行一个已到期周期，不阻塞后续周期的创建。"""
 
+        await self.curl_runtime.wait()
         if self._stop_event.is_set():
             await orchestrator.request_shutdown()
             return

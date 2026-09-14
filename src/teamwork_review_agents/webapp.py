@@ -304,6 +304,8 @@ def create_app(
         try:
             yield
         finally:
+            if not start_scheduler:
+                await runtime.curl_runtime.close()
             await manual_preflight_manager.close()
             await agent_workspace_warmup_manager.close()
             await repository_initialization_manager.close()
@@ -1275,6 +1277,19 @@ def create_app(
             effective_config_error,
             manager.config.runtime.managed_sandbox,
         )
+
+    @app.get("/api/runtime/curl")
+    async def curl_runtime_status() -> dict[str, Any]:
+        """查询程序准备状态，不能通过 GET 触发下载或执行。"""
+
+        return runtime.curl_runtime.snapshot()
+
+    @app.post("/api/runtime/curl/prepare")
+    async def prepare_curl_runtime() -> dict[str, Any]:
+        """管理员重试本部署的固定 curl 分发，复用现有 API 鉴权。"""
+
+        manager.reload_if_changed()
+        return runtime.curl_runtime.start(retry=True)
 
     @app.post("/api/codex/connection-test")
     async def codex_connection_test() -> dict[str, Any]:

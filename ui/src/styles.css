@@ -777,6 +777,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .message-error .run-message-rail span { border-color: var(--red); background: #35171b; }
 .message-error .run-message-card { border-color: #63333a; background: #241318; }
 .message-error .run-message-card header strong { color: #ff9696; }
+/* 可恢复的运行能力问题使用告警颜色，不与致命失败混淆。 */
+.message-warning .run-message-rail span { border-color: #c8a460; }
+.message-warning .run-message-card { border-color: #66502b; background: #231e13; }
+.message-warning .run-message-card header strong { color: #e8c47c; }
+.curl-runtime-panel { margin-bottom: 16px; }
+.curl-runtime-panel code { overflow-wrap: anywhere; }
+.curl-runtime-panel details { margin-top: 12px; }
+.curl-runtime-status { padding: 12px; border: 1px solid #2e5941; border-radius: 8px; color: #9bd4b5; }
+.curl-runtime-status.is-warning { border-color: #66502b; color: #e8c47c; }
 .run-message-body, .run-message-detail { margin: 9px 0 0; white-space: pre-wrap; word-break: break-word; font: 400 9px/1.6 "SFMono-Regular", Consolas, monospace; }
 .run-message-body { color: #bdc8d7; }
 .run-message-detail { max-height: 260px; overflow: auto; padding: 9px 10px; border: 1px solid #1d2a39; border-radius: 6px; background: #080d14; color: #8f9db0; }

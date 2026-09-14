@@ -16,6 +16,7 @@ import {
 import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { presentRunLogs } from "./runLogPresentation";
+import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import type {
   Agent,
@@ -2496,14 +2497,24 @@ function GlobalEnvironment(props: {
           })}
           help="留空自动检测当前服务账户已有的 Codex runtime / 服务 Python；创建工作区前在真实沙盒中验证。指定路径不可用时明确报错，不会自动换用其他解释器。"
         />
-        <Field
-          label="Windows 沙盒 curl 路径（可选）"
-          value={props.document.runtime.managed_sandbox?.curl_binary ?? ""}
-          onChange={(value) => patchSection("runtime", "managed_sandbox", {
-            ...(props.document.runtime.managed_sandbox ?? {}), curl_binary: value.trim() || null,
-          })}
-          help="留空从服务已安装的 Git / PATH 检测 OpenSSL curl.exe；只调整当前 Agent 环境。指定路径验证失败时提示，不自动替换、下载或关闭证书校验。"
-        />
+        <details>
+          <summary>高级：curl 自动准备与手动路径</summary>
+          <Toggle
+            label="自动准备 Windows HTTPS 运行环境"
+            checked={props.document.runtime.managed_sandbox?.curl_auto_prepare ?? true}
+            onChange={(value) => patchSection("runtime", "managed_sandbox", {
+              ...(props.document.runtime.managed_sandbox ?? {}), curl_auto_prepare: value,
+            })}
+          />
+          <Field
+            label="Windows 沙盒 curl 路径（可选）"
+            value={props.document.runtime.managed_sandbox?.curl_binary ?? ""}
+            onChange={(value) => patchSection("runtime", "managed_sandbox", {
+              ...(props.document.runtime.managed_sandbox ?? {}), curl_binary: value.trim() || null,
+            })}
+            help="通常无需填写：服务会复用兼容程序，缺少时自动准备固定版本。填写后仅使用指定 curl.exe，不自动下载或替换；不会关闭证书校验。"
+          />
+        </details>
         <div className="toggle-grid">
           <Toggle
             label="启用 Teamwork 托管外层沙盒"
@@ -10521,6 +10532,7 @@ export default function App() {
               )}
               {configurableTab && (
                 <>
+                  {tab === "environment" && <CurlRuntimePanel />}
                   <div className={`edit-mode-banner ${editing ? "editing" : ""}`}>
                     <span>{editing ? "编辑模式" : "只读模式"}</span>
                     <small>{editing ? "修改会暂存在页面中，请使用右上角保存或取消。" : "点击右上角“编辑配置”后才能修改。"}</small>

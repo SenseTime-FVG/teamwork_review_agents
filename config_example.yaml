@@ -70,8 +70,10 @@ database:
 #     # Windows 沙盒专用 Python；留空检测当前服务账户已有的 Codex runtime / 服务 Python。
 #     # 创建工作区前会在真实沙盒验证，显式路径失败不换用其他解释器；不自动安装或修改 ACL。
 #     python_binary: null
-#     # Windows 沙盒 curl.exe；留空从服务的 Git 安装 / PATH 检测 OpenSSL 版本。
-#     # 只在沙盒验证并调整当前 Agent 环境，找不到时提示，不自动安装或中止无关任务。
+#     # Windows 启动时自动准备兼容 curl：复用已有程序，缺少时下载固定官方版本并校验缓存。
+#     # 管理 UI 不等待准备；离线部署可放入对应官方 ZIP 后点击重新准备。不需要手动安装 OpenSSL。
+#     curl_auto_prepare: true
+#     # 高级选项：显式指定 curl.exe 后不自动下载或替换，通常留空即可。
 #     curl_binary: null
 #     # sub-agent 通过本轮独立的临时文件通道交给沙盒外 Broker 校验；
 #     # config.yaml、SQLite、基础仓库和其他工作区不会因此进入 Agent 沙盒。

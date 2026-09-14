@@ -227,6 +227,38 @@ async def test_automatic_fallback_and_default_ca(binary, tmp_path, monkeypatch):
     assert probe.await_count == 3
 
 
+async def test_https_failure_keeps_verified_program_and_does_not_try_other_installs(binary):
+    """程序与网络可用性分层，企业 CA 或网络策略失败不应提示用户安装 OpenSSL。"""
+
+    probe = AsyncMock(side_effect=[result(_VERSION), result(code=60, stderr="SSL certificate problem")])
+    with active_curl(binary) as context:
+        diagnostic = await context.prepare(probe, {}, probe_url="https://github.com/", network_access=True)
+        assert diagnostic["status"] == "warning"
+        assert diagnostic["https_probe"] == "failed"
+        assert context.selected.executable == binary
+        assert context.apply_environment({})["CURL_SSL_BACKEND"] == "openssl"
+        assert probe.await_count == 2
+
+
+@pytest.mark.parametrize("mode", ["timeout", "launch_error"])
+async def test_https_timeout_or_launch_error_does_not_discard_program(binary, mode):
+    """网络探测中耗尽预算或无法启动子进程，也不能退回缺少 OpenSSL 的提示。"""
+
+    async def probe(command, environment):
+        if "--version" in command:
+            return result(_VERSION)
+        if mode == "launch_error":
+            raise OSError("模拟临时启动失败")
+        await asyncio.Event().wait()
+
+    with active_curl(binary) as context:
+        diagnostic = await context.prepare(probe, {}, probe_url="https://github.com/", network_access=True, budget_seconds=0.02)
+        assert diagnostic["status"] == "warning"
+        assert diagnostic["https_probe"] == "failed"
+        assert context.selected.executable == binary
+        assert diagnostic["ssl_backend"]
+
+
 async def test_curl_cancellation_cleans_pending_probe(tool, binary, monkeypatch):
     """取消时完成沙盒子任务回收，候选权限不得残留。"""
 
