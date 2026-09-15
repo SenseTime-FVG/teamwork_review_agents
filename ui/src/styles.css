@@ -134,8 +134,10 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .overview-list-controls .select-combobox-trigger:focus-visible, .overview-list-controls input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .overview-list-controls .overview-number-filter { min-width: 92px; max-width: 112px; }
 .overview-list-controls .overview-custom-limit { min-width: 105px; }
-.overview-list-controls-numbered { max-width: 100%; display: grid; grid-template-columns: 92px 150px 118px; align-items: end; flex-wrap: nowrap; }
-.overview-list-controls-numbered.overview-list-controls-custom-limit { grid-template-columns: 92px 150px 118px 118px; }
+.overview-list-controls .overview-sort-field { min-width: 150px; }
+.overview-list-controls .overview-sort-direction { min-width: 118px; }
+.overview-list-controls-numbered { max-width: 100%; display: grid; grid-template-columns: 92px 150px 150px 118px 118px; align-items: end; flex-wrap: nowrap; }
+.overview-list-controls-numbered.overview-list-controls-custom-limit { grid-template-columns: 92px 150px 150px 118px 118px 118px; }
 .overview-list-controls-numbered > label, .overview-list-controls-numbered > label:first-child, .overview-list-controls-numbered > .select-field, .overview-list-controls-numbered > .select-field:first-child, .overview-list-controls-numbered .overview-number-filter, .overview-list-controls-numbered .overview-custom-limit { min-width: 0; max-width: none; }
 .overview-list-controls-numbered .select-combobox, .overview-list-controls-numbered input { width: 100%; min-width: 0; }
 .latest-event-reference { min-width: 150px; display: flex; flex-direction: column; gap: 4px; }

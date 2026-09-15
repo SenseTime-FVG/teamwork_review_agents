@@ -1010,8 +1010,27 @@ class StateStore:
         repository_id: str | None = None,
         number: int | None = None,
         status: str | Sequence[str] | None = None,
+        sort_by: str = "updated_at",
+        sort_direction: str = "desc",
     ) -> list[dict[str, Any]]:
         """返回已扫描 MR/PR 的最新快照摘要，不暴露平台原始响应。"""
+
+        sort_expressions = {
+            "updated_at": "julianday(json_extract(snapshots.payload, '$.updated_at'))",
+            "number": "CAST(json_extract(snapshots.payload, '$.number') AS INTEGER)",
+            "scanned_at": "snapshots.updated_at",
+            "latest_event_at": (
+                "julianday(json_extract("
+                "activity.cursor, '$.latest_activity.occurred_at'))"
+            ),
+        }
+        if sort_by not in sort_expressions:
+            raise ValueError(f"不支持的 MR/PR 排序字段：{sort_by}")
+        normalized_direction = sort_direction.lower()
+        if normalized_direction not in {"asc", "desc"}:
+            raise ValueError(f"不支持的排序方向：{sort_direction}")
+        sort_expression = sort_expressions[sort_by]
+        order_direction = normalized_direction.upper()
 
         conditions: list[str] = []
         parameters: list[Any] = []
@@ -1056,13 +1075,13 @@ class StateStore:
                      )
                  AND activity.number = json_extract(snapshots.payload, '$.number')
                 {where}
-                ORDER BY julianday(
-                             json_extract(snapshots.payload, '$.updated_at')
-                         ) DESC,
+                ORDER BY CASE WHEN {sort_expression} IS NULL THEN 1 ELSE 0 END ASC,
+                         {sort_expression} {order_direction},
                          json_extract(snapshots.payload, '$.repository_id') ASC,
                          CAST(
                              json_extract(snapshots.payload, '$.number') AS INTEGER
-                         ) DESC
+                         ) DESC,
+                         snapshots.snapshot_key ASC
                 {limit_clause}
                 """,
                 parameters,
@@ -3285,8 +3304,24 @@ class StateStore:
         repository_id: str | None = None,
         number: int | None = None,
         event_id: str | None = None,
+        sort_by: str = "occurred_at",
+        sort_direction: str = "desc",
     ) -> list[dict[str, Any]]:
         """返回最近 MR/PR 语义事件。"""
+
+        sort_expressions = {
+            "occurred_at": (
+                "julianday(json_extract(event_inbox.payload, '$.occurred_at'))"
+            ),
+            "number": "event_inbox.number",
+        }
+        if sort_by not in sort_expressions:
+            raise ValueError(f"不支持的事件排序字段：{sort_by}")
+        normalized_direction = sort_direction.lower()
+        if normalized_direction not in {"asc", "desc"}:
+            raise ValueError(f"不支持的排序方向：{sort_direction}")
+        sort_expression = sort_expressions[sort_by]
+        order_direction = normalized_direction.upper()
 
         conditions: list[str] = []
         parameters: list[Any] = []
@@ -3409,9 +3444,10 @@ class StateStore:
                 LEFT JOIN preflight_runs AS preflight
                     ON preflight.run_id = preflight_link.run_id
                 {where}
-                ORDER BY julianday(
-                             json_extract(event_inbox.payload, '$.occurred_at')
-                         ) DESC,
+                ORDER BY CASE WHEN {sort_expression} IS NULL THEN 1 ELSE 0 END ASC,
+                         {sort_expression} {order_direction},
+                         event_inbox.repository_id ASC,
+                         event_inbox.number DESC,
                          event_inbox.created_at DESC,
                          event_inbox.event_id DESC
                 {limit_clause}

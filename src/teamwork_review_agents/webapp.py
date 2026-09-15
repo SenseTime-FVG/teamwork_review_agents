@@ -1827,6 +1827,8 @@ def create_app(
         page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
         number: int | None = Query(default=None, ge=1),
+        sort_by: Literal["occurred_at", "number"] = "occurred_at",
+        sort_direction: Literal["asc", "desc"] = "desc",
         status: list[
             Literal[
                 "pending",
@@ -1848,6 +1850,8 @@ def create_app(
                 status=status,
                 repository_id=repository_id,
                 number=number,
+                sort_by=sort_by,
+                sort_direction=sort_direction,
             )
         total = await asyncio.to_thread(
             manager.store.count_events,
@@ -1864,6 +1868,8 @@ def create_app(
             status=status,
             repository_id=repository_id,
             number=number,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
         )
         return {
             "items": items,
@@ -1977,6 +1983,13 @@ def create_app(
         all_records: bool = False,
         page: int | None = Query(default=None, ge=1),
         repository_id: str | None = None,
+        sort_by: Literal[
+            "updated_at",
+            "number",
+            "scanned_at",
+            "latest_event_at",
+        ] = "updated_at",
+        sort_direction: Literal["asc", "desc"] = "desc",
         status: list[Literal["opened", "closed", "merged"]] | None = Query(
             default=None
         ),
@@ -2005,6 +2018,8 @@ def create_app(
             ),
             repository_id=repository_id,
             status=status,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
         )
         provider_map = manager.config.providers
         for record in records:
