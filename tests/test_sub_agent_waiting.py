@@ -31,7 +31,7 @@ class WaitingHarness:
         self.results = {}
         self.controls = {}
 
-    async def run(self, name, *, idle=0.4, total=5, cancel_check=None, source=None):
+    async def run(self, name, *, idle=0.4, total=5, cancel_check=None, source=None, as_child=False):
         """测试只缩短计时，不改变被验证的看门狗逻辑。"""
 
         agent = self.config.agents["code-reviewer"].model_copy(
@@ -45,7 +45,7 @@ class WaitingHarness:
             return source
 
         result = await self.runner._run_guarded(
-            run_id=name, root_run_id="parent", parent_run_id=None if name == "parent" else "parent",
+            run_id=name, root_run_id="parent", parent_run_id=None if name == "parent" and not as_child else "ancestor",
             agent_name=name, agent=agent, repository=self.config.repositories[0],
             context=self.context(name), prompt="本地回归", environment={},
             codex_runtime_directory=self.config.runtime.codex_home, skill_files={},
@@ -217,6 +217,7 @@ async def test_parent_stop_survives_child_return(waiting_harness, cause):
     h.runner._agent_loop = loop
     task = asyncio.create_task(h.run(
         "parent", total=0.4 if cause == "total" else 5,
+        as_child=cause == "total",
         cancel_check=cancelled, source=None if cause in {"total", "external"} else cause,
     ))
     await asyncio.wait_for(entered.wait(), timeout=3)
@@ -264,7 +265,7 @@ async def test_real_model_loop_does_not_continue_after_swallowed_cancel(waiting_
 
     monkeypatch.setattr(CodexResponsesClient, "create_response", response)
     h.runner.invoke_agent_callback = invoke
-    task = asyncio.create_task(h.run("parent", total=5 if swallowed_result == "external" else 0.4))
+    task = asyncio.create_task(h.run("parent", total=5 if swallowed_result == "external" else 0.4, as_child=True))
     await asyncio.wait_for(entered.wait(), timeout=3)
     if swallowed_result == "external":
         task.cancel()
@@ -389,15 +390,15 @@ async def test_interrupted_pre_model_run_is_persisted(executor_harness, monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("parent_times_out", [False, True])
-async def test_full_executor_nested_wait_and_terminal_state(executor_harness, monkeypatch, parent_times_out):
+@pytest.mark.parametrize("short_root_limit", [False, True])
+async def test_full_executor_nested_wait_and_terminal_state(executor_harness, monkeypatch, short_root_limit):
     """贯通真实执行器、嵌套工具与运行器，确认数据库终态和取消日志。"""
 
     executor, store, execute = executor_harness
     config = executor.config
     config.agents["code-reviewer"] = config.agents["code-reviewer"].model_copy(update={
         "idle_timeout_seconds": 0.4,
-        "timeout_seconds": 0.6 if parent_times_out else 6,
+        "timeout_seconds": 0.6 if short_root_limit else 6,
     })
     config.agents["security-reviewer"] = config.agents["security-reviewer"].model_copy(update={
         "idle_timeout_seconds": 0.4, "timeout_seconds": 6,
@@ -411,10 +412,7 @@ async def test_full_executor_nested_wait_and_terminal_state(executor_harness, mo
                 cancel_check=kwargs["cancel_check"], progress_callback=kwargs["progress"],
                 invoke_agent_callback=self.invoke_agent_callback,
             )
-            try:
-                await tool.execute("invoke_agent", {"agent_name": "security-reviewer", "task": "子任务测试"})
-            except AgentExecutionError:
-                assert parent_times_out
+            await tool.execute("invoke_agent", {"agent_name": "security-reviewer", "task": "子任务测试"})
             # 真实模型循环也检查这一边界，不能把子任务错误吞掉后继续执行。
             active_run_control.get().raise_if_stopped()
         else:
@@ -428,19 +426,38 @@ async def test_full_executor_nested_wait_and_terminal_state(executor_harness, mo
         )
 
     monkeypatch.setattr(CodexModelRunner, "_agent_loop", loop)
-    if parent_times_out:
-        with pytest.raises(AgentExecutionError) as caught:
-            await execute()
-        assert caught.value.error_code == "agent_total_timeout"
-    else:
-        assert (await execute()).status == "completed"
+    # 根 Agent 即使配置了很短的历史总时限，也应等活跃子任务完成。
+    assert (await execute()).status == "completed"
     runs = {row["agent_name"]: store.get_run(row["run_id"]) for row in store.list_runs()}
     assert len(runs) == 2
     parent, child = runs["code-reviewer"], runs["security-reviewer"]
     assert child["parent_run_id"] == parent["run_id"]
-    assert parent["status"] == ("timed_out" if parent_times_out else "completed")
-    assert child["status"] == ("cancelled" if parent_times_out else "completed")
-    if parent_times_out:
-        assert child["error_code"] == "parent_run_timeout"
-        assert child["cancel_source"] is None
-        assert sum(log["event_type"] == "run.cancelled" for log in store.list_run_logs(child["run_id"])) == 1
+    assert parent["status"] == "completed"
+    assert child["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["agent_idle_timeout", "remote_ci_timeout", "agent_total_timeout"])
+async def test_execution_timeout_does_not_restart_root(executor_harness, monkeypatch, code):
+    """贯通运行器、数据库和幂等预留，超时后不能再创建新会话执行整套流程。"""
+
+    executor, store, execute = executor_harness
+    calls = []
+
+    async def run(self, **kwargs):
+        """模拟已经进入运行阶段的超时，默认 retryable 由执行器收紧。"""
+
+        calls.append(kwargs["run_id"])
+        return AgentResult(run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
+                           agent_name=kwargs["agent_name"], status="timed_out", error="回归测试超时", error_code=code)
+
+    monkeypatch.setattr(CodexModelRunner, "run", run)
+    for _ in range(2):
+        with pytest.raises(AgentExecutionError) as caught:
+            await execute()
+        assert caught.value.retryable is False
+    assert len(calls) == 1
+    detail = store.get_run(calls[0])
+    assert detail["status"] == "timed_out"
+    assert detail["retryable"] == 0
+    assert detail["attempts"] == 1

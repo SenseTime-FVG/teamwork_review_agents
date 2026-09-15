@@ -39,6 +39,7 @@ class RunControl:
     parent: RunControl | None = None
     last_progress_at: float = field(default_factory=time.monotonic)
     waiting_children: int = 0
+    waiting_ci: int = 0
     stop: RunStop | None = None
 
     def progress(self) -> None:

@@ -59,6 +59,8 @@ database:
 #   git_timeout_seconds: 600
 #   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   agent_idle_timeout_seconds: 300
+#   # 远端 CI 等待默认 30 分钟，含排队与执行；不是本地 Preflight 执行超时。
+#   remote_ci_wait_timeout_seconds: 1800
 #   # 默认由 Teamwork 使用当前 Codex CLI 的原生平台执行器建立外层沙盒：
 #   # macOS 使用 Seatbelt，Linux / WSL 使用 Linux sandbox，原生 Windows 使用 Windows sandbox。
 #   managed_sandbox:
@@ -320,7 +322,7 @@ agents:
     # 自己的系统钥匙串登录态；空白名单表示不限制目标域名。
     network_access: true
     network_domains: []
-    # 单次 Codex CLI 运行最长秒数。
+    # 仅作为 sub-agent 时生效；根 Agent 没有固定总时限，仍检查无进展超时。
     timeout_seconds: 1200
     # 可选：覆盖 runtime.agent_idle_timeout_seconds；连续无进展时提前结束。
     # idle_timeout_seconds: 300

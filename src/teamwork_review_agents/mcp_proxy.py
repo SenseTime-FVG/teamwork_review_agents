@@ -10,6 +10,7 @@ from .mcp_bridge import (
     call_bridge,
     channel_from_environment,
     publish_comment_bridge,
+    wait_for_ci_bridge,
 )
 
 
@@ -57,6 +58,13 @@ async def publish_comment(body: str) -> dict[str, Any]:
         channel_from_environment(),
         body=body,
     )
+
+
+@mcp.tool(name="wait_for_ci", description="等待当前仓库 PR/MR 的远端 CI；超时保留成果，不自动重跑或合并。")
+async def wait_for_ci(number: int, expected_head_sha: str) -> dict[str, Any]:
+    """只通过受控通道请求服务侧等待当前仓库 CI。"""
+
+    return await wait_for_ci_bridge(channel_from_environment(), number=number, expected_head_sha=expected_head_sha)
 
 
 def main() -> None:

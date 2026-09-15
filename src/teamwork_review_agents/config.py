@@ -309,6 +309,8 @@ class RuntimeConfig(BaseModel):
     repository_initialization_timeout_seconds: PositiveInt = 1800
     git_timeout_seconds: PositiveInt = 600
     agent_idle_timeout_seconds: PositiveInt = 300
+    # 远端 CI 排队与执行共用等待期限，与本地 Preflight 超时独立。
+    remote_ci_wait_timeout_seconds: PositiveInt = 1800
     managed_sandbox: ManagedSandboxConfig = Field(
         default_factory=ManagedSandboxConfig,
     )
@@ -468,6 +470,7 @@ class RepositoryConfig(BaseModel):
     workspace: Path
     clone_url: str | None = None
     enabled: bool = True
+    remote_ci_wait_timeout_seconds: PositiveInt | None = None
     allowed_skills: list[str] | None = Field(default_factory=list)
     # 仅覆盖本仓库指定 Agent 的 Skill 列表，避免向导修改全局共享 Agent。
     agent_skills: dict[str, list[str]] = Field(default_factory=dict)

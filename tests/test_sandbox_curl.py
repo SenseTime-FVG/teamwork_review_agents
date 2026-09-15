@@ -451,7 +451,7 @@ async def test_model_loop_keeps_existing_tools_and_continues_after_http_error(to
     assert outcome.status == "completed", outcome.error
     assert len(requests) == 2
     assert process.await_count == 3
-    assert {item["name"] for item in requests[0]["tools"]} == {"execute_command", "apply_patch", "invoke_agent"}
+    assert {item["name"] for item in requests[0]["tools"]} == {"execute_command", "apply_patch", "invoke_agent", "wait_for_ci"}
     assert str(binary) in requests[0]["input"][0]["content"][0]["text"]
     assert "Teamwork HTTP TLS 提示" in json.dumps(requests[1], ensure_ascii=False)
     selected_environment = process.call_args_list[-1].args[0].environment

@@ -46,6 +46,7 @@ from .model_provider_runtime import (
     resolve_model_plan,
     resolve_model_snapshot,
 )
+from .remote_ci import CI_RUNTIME_INSTRUCTIONS
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
     CANCEL_SOURCE_SERVICE_SHUTDOWN,
@@ -439,6 +440,7 @@ class AgentExecutor:
             )
         return (
             f"{role_prompt}\n\n"
+            f"# 运行时等待与超时边界\n\n{CI_RUNTIME_INSTRUCTIONS}\n\n"
             "# 本次运行上下文\n\n"
             f"```json\n{json.dumps(context, ensure_ascii=False, indent=2)}\n```\n\n"
             f"{managed_comment_instruction}"
@@ -1262,6 +1264,10 @@ class AgentExecutor:
                             })
                 finally:
                     git_credentials.close()
+
+        # 运行阶段超时保留成果，不能让事件调度器用新会话重放整个任务。
+        if result.status == "timed_out" and workspace_prepared:
+            result.retryable = False
 
         if result.status == "cancelled":
             source = await cancellation_source()

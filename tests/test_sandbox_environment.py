@@ -379,7 +379,7 @@ async def test_real_windows_sandbox_askpass_and_credential_fill(tool, monkeypatc
             async with stdio_client(parameters) as streams:
                 async with ClientSession(*streams) as session:
                     await session.initialize()
-                    assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment"]
+                    assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment", "wait_for_ci"]
     finally:
         directory = context.directory
         context.close()

@@ -453,7 +453,7 @@ class CodexModelRunner:
             return AgentResult(
                 run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
                 agent_name=agent_name, status=stop.status, error=stop.error,
-                error_code=stop.error_code,
+                error_code=stop.error_code, retryable=False,
             )
 
         async def watchdog() -> None:
@@ -470,13 +470,14 @@ class CodexModelRunner:
                             control.stop = await requested_cancellation()
                     except Exception:
                         pass
-                if control.stop is None and now - started_at >= agent.timeout_seconds:
+                if control.stop is None and parent_run_id is not None and now - started_at >= agent.timeout_seconds:
                     control.stop = RunStop(
                         "timed_out", "agent_total_timeout", "Agent 超过总运行时限", "run.timed_out",
                     )
                 if (
                     control.stop is None
                     and not control.waiting_children
+                    and not control.waiting_ci
                     and now - control.last_progress_at >= idle_timeout
                 ):
                     control.stop = RunStop(

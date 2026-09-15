@@ -13,6 +13,7 @@ from teamwork_review_agents.models import AgentResult
 from teamwork_review_agents import mcp_server as mcp_server_module
 from teamwork_review_agents.mcp_server import invoke_agent
 from teamwork_review_agents.models import InvocationContext
+from teamwork_review_agents.state import StateStore
 
 
 async def test_mcp_server_lists_invoke_agent() -> None:
@@ -27,6 +28,7 @@ async def test_mcp_server_lists_invoke_agent() -> None:
     assert [tool.name for tool in tools.tools] == [
         "invoke_agent",
         "publish_comment",
+        "wait_for_ci",
     ]
 
 
@@ -78,6 +80,13 @@ async def test_mcp_propagates_shared_workspace_policy(
         event=event,
     )
     captured: dict[str, object] = {}
+    # 真实 MCP 等待需要服务端存在活动的父运行，避免孤立调用绕过停止状态。
+    store = StateStore(config.database.path)
+    store.initialize()
+    store.begin_agent_run(proposed_run_id="run-parent", root_run_id=None, parent_run_id=None,
+                          idempotency_key="run-parent", event_id=None, rule_name=None,
+                          agent_name="code-reviewer", resource_key="demo:1", prompt="测试", max_attempts=3)
+    store.mark_agent_run_running("run-parent")
 
     class FakeExecutor:
         """只记录 MCP 传给执行器的参数。"""

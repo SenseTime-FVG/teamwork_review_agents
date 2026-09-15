@@ -30,6 +30,8 @@ from .codex_settings import (
 from .environment import SecretRedactor
 from .mcp_bridge import ManagedMcpBroker, McpBridgeChannel
 from .models import AgentResult, InvocationContext
+from .state import StateStore
+from .run_waits import CI_TIMEOUT_MESSAGE, RunWaits, mcp_wait_timeout
 from .model_tools import ModelToolExecutor
 from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
 from .sandbox_curl import current_sandbox_curl, http_tls_hint
@@ -226,7 +228,7 @@ class CodexRunner:
         if use_mcp_bridge and windows_environment_separation():
             # 沙盒运行时不依赖服务 venv；Broker 仍由服务 Python 在沙盒外运行。
             mcp_python, *mcp_args = standalone_mcp_command()
-        enabled_tools = ["invoke_agent"]
+        enabled_tools = ["invoke_agent", "wait_for_ci"]
         if agent.managed_comment:
             enabled_tools.append("publish_comment")
         overrides = [
@@ -243,7 +245,7 @@ class CodexRunner:
             ),
             (
                 f"mcp_servers.{server_name}.tool_timeout_sec="
-                f"{self.config.runtime.mcp_tool_timeout_seconds}"
+                f"{mcp_wait_timeout(self.config):g}"
             ),
             (
                 f"mcp_servers.{server_name}.enabled_tools="
@@ -401,7 +403,7 @@ class CodexRunner:
                             response_timeout_seconds=max(
                                 1.0,
                                 float(
-                                    self.config.runtime.mcp_tool_timeout_seconds
+                                    mcp_wait_timeout(self.config)
                                 )
                                 - 1.0,
                             ),
@@ -736,6 +738,11 @@ class CodexRunner:
         git_failure: SandboxGitError | None = None
         started_at = time.monotonic()
         last_progress_at = started_at
+        # MCP 服务进程登记等待状态，CLI 看门狗只信任该记录而非模型自报的文本。
+        wait_store = StateStore(self.config.database.path)
+        await asyncio.to_thread(wait_store.initialize)
+        run_waits = RunWaits(wait_store)
+        was_waiting = False
         stream_failure_event = asyncio.Event()
 
         async def record_stream_failure(stream: str, error: Exception) -> None:
@@ -889,9 +896,15 @@ class CodexRunner:
                 except Exception:
                     # 取消检查短暂失败不能误杀正常运行，下一轮会继续检查。
                     pass
-            if stop_reason is None and now - started_at >= agent.timeout_seconds:
+            waiting, ci_timed_out = await asyncio.to_thread(run_waits.state, run_id)
+            if was_waiting and not waiting:
+                last_progress_at = now
+            was_waiting = waiting
+            if stop_reason is None and ci_timed_out:
+                stop_reason = "ci_timeout"
+            if stop_reason is None and parent_run_id is not None and now - started_at >= agent.timeout_seconds:
                 stop_reason = "total_timeout"
-            if stop_reason is None and now - last_progress_at >= idle_timeout:
+            if stop_reason is None and not waiting and now - last_progress_at >= idle_timeout:
                 stop_reason = "idle_timeout"
             if stop_reason is not None:
                 await terminate_process_group()
@@ -945,8 +958,8 @@ class CodexRunner:
                 events=events[-self.config.runtime.max_jsonl_events :],
                 error=error,
             )
-        if stop_reason == "total_timeout":
-            error = f"Codex CLI 运行超过 {agent.timeout_seconds} 秒"
+        if stop_reason in {"total_timeout", "ci_timeout"}:
+            error = CI_TIMEOUT_MESSAGE if stop_reason == "ci_timeout" else f"子 Agent 总运行超过 {agent.timeout_seconds} 秒，待处理；不自动重跑"
             await emit("system", "run.timed_out", error)
             return AgentResult(
                 run_id=run_id,
@@ -956,9 +969,11 @@ class CodexRunner:
                 status="timed_out",
                 events=events[-self.config.runtime.max_jsonl_events :],
                 error=error,
+                error_code="remote_ci_timeout" if stop_reason == "ci_timeout" else "agent_total_timeout",
+                retryable=False,
             )
         if stop_reason == "idle_timeout":
-            error = f"Codex CLI 连续 {idle_timeout} 秒没有 stdout / JSONL 进展"
+            error = f"Codex CLI 连续 {idle_timeout} 秒没有 stdout / JSONL 进展，待处理；不自动重跑"
             await emit("system", "run.idle_timed_out", error)
             return AgentResult(
                 run_id=run_id,
@@ -968,6 +983,7 @@ class CodexRunner:
                 status="timed_out",
                 events=events[-self.config.runtime.max_jsonl_events :],
                 error=error,
+                error_code="agent_idle_timeout", retryable=False,
             )
 
         max_events = self.config.runtime.max_jsonl_events

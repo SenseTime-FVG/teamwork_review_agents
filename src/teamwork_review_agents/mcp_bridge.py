@@ -187,6 +187,14 @@ async def publish_comment_bridge(
     )
 
 
+async def wait_for_ci_bridge(channel: McpBridgeChannel, *, number: int, expected_head_sha: str) -> dict[str, Any]:
+    """转发固定 CI 参数，不允许指定其他仓库、URL 或 Token。"""
+
+    return await _call_bridge_method(channel, method="wait_for_ci", params={
+        "number": number, "expected_head_sha": expected_head_sha,
+    })
+
+
 async def _call_bridge_method(
     channel: McpBridgeChannel,
     *,
@@ -409,7 +417,7 @@ async def _handle_request(
         if request.get("token") != channel.token:
             raise PermissionError("MCP Bridge 通道令牌无效")
         method = request.get("method")
-        if method not in {"invoke_agent", "publish_comment"}:
+        if method not in {"invoke_agent", "publish_comment", "wait_for_ci"}:
             raise PermissionError("MCP Bridge 请求的方法不在白名单中")
         params = request.get("params")
         if not isinstance(params, dict):
@@ -429,6 +437,14 @@ async def _handle_request(
             from .mcp_server import invoke_agent
 
             result = await invoke_agent(agent_name, task, extra_context)
+        elif method == "wait_for_ci":
+            from .remote_ci import validate_ci_arguments
+            from .mcp_server import wait_for_ci
+
+            if set(params) != {"number", "expected_head_sha"}:
+                raise ValueError("wait_for_ci 参数无效")
+            validate_ci_arguments(params["number"], params["expected_head_sha"])
+            result = await wait_for_ci(params["number"], params["expected_head_sha"])
         else:
             body = params.get("body")
             if not isinstance(body, str) or not body.strip():
@@ -450,8 +466,8 @@ async def _handle_request(
     _atomic_write_json(response_path, response)
 
 
-def _request_current_run_cancellation() -> None:
-    """把代理中断转换为当前 Agent 及其后代的持久化取消。"""
+def _request_current_run_cancellation() -> bool:
+    """普通中断持久化取消；已确认 CI 超时则返回专用收尾信号。"""
 
     config_path = os.environ.get("TEAMWORK_CONFIG_PATH")
     encoded_context = os.environ.get("TEAMWORK_INVOCATION_CONTEXT")
@@ -461,6 +477,7 @@ def _request_current_run_cancellation() -> None:
     # 延迟导入可避免主服务加载 CodexRunner 时形成循环依赖。
     from .codex_runner import decode_invocation_context
     from .config import load_config
+    from .run_waits import RunWaits
     from .state import CANCEL_SOURCE_ADMINISTRATOR, StateStore
 
     config = load_config(config_path)
@@ -468,10 +485,14 @@ def _request_current_run_cancellation() -> None:
     store = StateStore(config.database.path)
     store.initialize()
     source = store.agent_run_cancel_source(context.run_id)
+    if source is None and RunWaits(store).state(context.run_id)[1]:
+        # CI 看门狗关闭通道不代表人工取消，不能覆盖事件的不可重试超时结论。
+        return True
     store.request_cancel_run(
         context.run_id,
         source=source or CANCEL_SOURCE_ADMINISTRATOR,
     )
+    return False
 
 
 async def run_broker() -> None:
@@ -501,13 +522,18 @@ async def run_broker() -> None:
             if channel.stop_path.exists() and not stopping:
                 stopping = True
                 if tasks:
-                    await asyncio.to_thread(_request_current_run_cancellation)
+                    if await asyncio.to_thread(_request_current_run_cancellation):
+                        # CI 等待在超时后有意不返回模型，此处释放挂起请求并正常退出 Broker。
+                        for task in tasks.values():
+                            task.cancel()
             for cancellation_path in channel.cancellations_directory.glob(
                 "*.cancel.json"
             ):
                 with suppress(OSError):
                     cancellation_path.unlink()
-                await asyncio.to_thread(_request_current_run_cancellation)
+                if await asyncio.to_thread(_request_current_run_cancellation):
+                    for task in tasks.values():
+                        task.cancel()
             if not stopping:
                 for request_path in channel.requests_directory.glob(
                     "*.request.json"

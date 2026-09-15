@@ -70,9 +70,9 @@ async def test_standalone_proxy_has_no_site_dependency_and_keeps_protocol():
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
-                assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment"]
+                assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment", "wait_for_ci"]
                 await session.send_ping()
-                for name, arguments in [("invoke_agent", {"agent_name": "child", "task": "检查中文"}), ("publish_comment", {"body": "评论"})]:
+                for name, arguments in [("invoke_agent", {"agent_name": "child", "task": "检查中文"}), ("publish_comment", {"body": "评论"}), ("wait_for_ci", {"number": 12, "expected_head_sha": "a" * 40})]:
                     pending = asyncio.create_task(session.call_tool(name, arguments))
                     request = await _request(channel)
                     assert request["method"] == name
