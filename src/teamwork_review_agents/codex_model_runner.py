@@ -868,7 +868,11 @@ class CodexModelRunner:
                 "role": "user",
                 "content": [{"type": "input_text", "text": prompt}],
             }
-        ], self.config.runtime.context_compaction)
+        ], self.config.runtime.context_compaction, runtime_identity={
+            "agent_name": agent_name, "run_id": run_id,
+            "root_run_id": root_run_id, "parent_run_id": parent_run_id,
+            "repository_id": repository.id, "workspace": str(repository.workspace),
+        })
         usage: dict[str, Any] = {}
         events: list[dict[str, Any]] = []
         response_id: str | None = None
@@ -959,7 +963,7 @@ class CodexModelRunner:
             await emit("system", "context.compaction_started", {
                 "provider_id": current_selection.provider_id if current_selection else self.provider_id,
                 "model": model, "request_round": request_round,
-                "message": "正在整理较早执行历史；系统指令、工具定义和原始任务不变。",
+                "message": "正在参考完整任务上下文整理交接；原始任务和系统指令不变，摘要请求不执行工具。",
             })
             try:
                 summary_response = await request_model(redactor.data(payload), summary_progress)

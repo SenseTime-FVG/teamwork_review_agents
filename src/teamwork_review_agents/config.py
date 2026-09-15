@@ -261,7 +261,8 @@ class ContextCompactionConfig(BaseModel):
     enabled: bool = True
     default_context_window_tokens: int = Field(default=131072, ge=2048)
     reserved_output_tokens: int = Field(default=4096, ge=256)
-    trigger_ratio: float = Field(default=0.8, gt=0, lt=1)
+    # 比例按完整模型窗口计算，运行时仍保留输出空间的安全保护。
+    trigger_ratio: float = Field(default=0.95, gt=0, lt=1)
     target_ratio: float = Field(default=0.5, gt=0, lt=1)
     keep_recent_rounds: int = Field(default=2, ge=0, le=16)
     # 旧字段名误用了 token 和 max；兼容读取，但统一输出明确的软目标名称。
