@@ -20,8 +20,10 @@ import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
-import { overviewQuery, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
+import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
+import { fitOverlayToViewport } from "./overlayPlacement";
+import { DelayedTooltipButton } from "./DelayedTooltipButton";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -139,6 +141,7 @@ type ProviderExposureConfirmation = {
 };
 
 const DEFAULT_CHANGE_REQUEST_FILTER: OverviewFilter = {
+  repositoryId: "",
   number: "",
   status: "",
   statuses: [],
@@ -149,6 +152,7 @@ const DEFAULT_CHANGE_REQUEST_FILTER: OverviewFilter = {
 };
 
 const DEFAULT_EVENT_FILTER: OverviewFilter = {
+  repositoryId: "",
   number: "",
   status: "",
   statuses: [],
@@ -492,6 +496,7 @@ function SelectControl(props: {
   ariaLabelledBy?: string;
   className?: string;
   disabled?: boolean;
+  fitContent?: boolean;
 }) {
   const controlId = useId();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -526,6 +531,14 @@ function SelectControl(props: {
       const menu = menuRef.current;
       if (!trigger || !menu) return;
       const bounds = trigger.getBoundingClientRect();
+      if (props.fitContent) {
+        // 菜单可宽于触发器，但不超出当前视口；只对仓库选择器启用。
+        const viewportWidth = document.documentElement.clientWidth;
+        menu.style.minWidth = `${Math.min(bounds.width, Math.max(0, viewportWidth - 16))}px`;
+        menu.style.maxWidth = `${Math.max(0, viewportWidth - 16)}px`;
+        const placement = fitOverlayToViewport(bounds.left, menu.offsetWidth, viewportWidth);
+        menu.style.left = `${placement.left - bounds.left}px`;
+      }
       const spaceAbove = bounds.top;
       const spaceBelow = window.innerHeight - bounds.bottom;
       setOpenUpward(spaceBelow < menu.offsetHeight + 8 && spaceAbove > spaceBelow);
@@ -537,7 +550,7 @@ function SelectControl(props: {
       window.removeEventListener("resize", updatePlacement);
       window.removeEventListener("scroll", updatePlacement, true);
     };
-  }, [open, props.options.length]);
+  }, [open, props.options, props.fitContent]);
 
   useEffect(() => {
     if (!open || activeIndex < 0) return;
@@ -573,6 +586,7 @@ function SelectControl(props: {
         aria-haspopup="listbox"
         aria-activedescendant={open && activeIndex >= 0 ? `${controlId}-option-${activeIndex}` : undefined}
         disabled={props.disabled}
+        title={props.fitContent ? selectedOption?.label : undefined}
         onClick={() => {
           if (open) setOpen(false);
           else openOptions();
@@ -624,7 +638,7 @@ function SelectControl(props: {
         <div
           ref={menuRef}
           id={listboxId}
-          className={`select-combobox-options ${openUpward ? "open-upward" : ""}`}
+          className={`select-combobox-options ${openUpward ? "open-upward" : ""} ${props.fitContent ? "fit-content" : ""}`}
           role="listbox"
           aria-label={props.ariaLabel}
           aria-labelledby={props.ariaLabelledBy}
@@ -636,6 +650,7 @@ function SelectControl(props: {
               type="button"
               role="option"
               aria-selected={option.value === props.value}
+              title={props.fitContent ? option.label : undefined}
               className={`select-combobox-option ${index === activeIndex ? "active" : ""} ${option.value === props.value ? "selected" : ""}`}
               onMouseDown={(event) => event.preventDefault()}
               onMouseEnter={() => setActiveIndex(index)}
@@ -847,6 +862,7 @@ function SelectField(props: {
   help?: string;
   className?: string;
   disabled?: boolean;
+  fitContent?: boolean;
 }) {
   const fieldId = useId();
 
@@ -859,6 +875,7 @@ function SelectField(props: {
         options={props.options}
         ariaLabelledBy={`${fieldId}-label`}
         disabled={props.disabled}
+        fitContent={props.fitContent}
       />
       {props.help && <small>{props.help}</small>}
     </div>
@@ -1617,6 +1634,7 @@ function OverviewSortHeader(props: {
 
 function OverviewListControls(props: {
   filter: OverviewFilter;
+  repositoryOptions?: SelectOption[];
   statuses: Array<{ value: string; label: string }>;
   multiStatus?: boolean;
   showNumber?: boolean;
@@ -1654,12 +1672,23 @@ function OverviewListControls(props: {
 
   const controlClassName = [
     "overview-list-controls",
+    props.repositoryOptions ? "overview-list-controls-repository" : "",
     props.showNumber ? "overview-list-controls-numbered" : "",
     limitMode === "custom" ? "overview-list-controls-custom-limit" : "",
   ].filter(Boolean).join(" ");
 
   return (
     <div className={controlClassName}>
+      {props.repositoryOptions && (
+        <SelectField
+          className="overview-repository-filter"
+          label="仓库"
+          value={props.filter.repositoryId}
+          options={props.repositoryOptions}
+          fitContent
+          onChange={(repositoryId) => props.onChange({ ...props.filter, repositoryId })}
+        />
+      )}
       {props.showNumber && (
         <label className="overview-number-filter">
           <span>编号</span>
@@ -1956,6 +1985,7 @@ function Overview(props: {
   status: RuntimeStatus;
   overviewStatus: RuntimeStatus | null;
   repositoryId: string;
+  repositoryOptions: SelectOption[];
   events: EventRecord[];
   changeRequests: ChangeRequestRecord[];
   changeRequestFilter: OverviewFilter;
@@ -2015,14 +2045,14 @@ function Overview(props: {
           <p>配置版本 {shortRevision(props.status.config_revision)} · 全局最近扫描完成 {timeText(props.status.last_finished_at)}</p>
         </div>
         <div className="button-group">
-          <button className="button primary" title="立即扫描所有已启用仓库，不受概览筛选影响" onClick={() => props.onAction("scan")}>立即扫描（全局）</button>
-          <button
+          <DelayedTooltipButton className="button primary" description="该操作作用于全部仓库，不受顶部仓库筛选影响。" onClick={() => props.onAction("scan")}>立即扫描</DelayedTooltipButton>
+          <DelayedTooltipButton
             className="button secondary"
-            title="控制全局扫描调度，不受概览筛选影响"
+            description="该操作作用于全部仓库，不受顶部仓库筛选影响。"
             onClick={() => props.onAction(props.status.paused ? "resume" : "pause")}
           >
-            {props.status.paused ? "恢复（全局）" : "暂停（全局）"}
-          </button>
+            {props.status.paused ? "恢复" : "暂停"}
+          </DelayedTooltipButton>
         </div>
       </section>
       {(props.status.config_error || props.status.last_error || props.status.last_dispatch_error) && (
@@ -2040,7 +2070,7 @@ function Overview(props: {
         )}
       </div>
       <section className="section-card">
-        <div className="section-title-row">
+        <div className="section-title-row overview-list-heading">
           <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；最新平台事件来自 Provider Timeline，仅作为手动触发参考，不等同于已经入队的关联事件。</p></div>
           <div className="overview-section-tools">
             <div className="overview-selection-actions">
@@ -2072,6 +2102,7 @@ function Overview(props: {
             </div>
             <OverviewListControls
               filter={props.changeRequestFilter}
+              repositoryOptions={props.repositoryId ? undefined : props.repositoryOptions}
               statuses={CHANGE_REQUEST_STATUS_OPTIONS}
               multiStatus
               onChange={props.onChangeRequestFilterChange}
@@ -2183,7 +2214,7 @@ function Overview(props: {
           </table>
           {props.changeRequests.length === 0 && (
             <div className="empty">
-              {props.repositoryId
+              {props.repositoryId || props.changeRequestFilter.repositoryId
                 || props.changeRequestFilter.status
                 || props.changeRequestFilter.statuses.length > 0
                 ? "当前筛选条件下没有 MR / PR。"
@@ -2197,7 +2228,7 @@ function Overview(props: {
         />
       </section>
       <section className="section-card">
-        <div className="section-title-row">
+        <div className="section-title-row overview-list-heading">
           <div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div>
           <div className="overview-section-tools">
             <div className="overview-selection-actions">
@@ -2236,6 +2267,7 @@ function Overview(props: {
             </div>
             <OverviewListControls
               filter={props.eventFilter}
+              repositoryOptions={props.repositoryId ? undefined : props.repositoryOptions}
               statuses={EVENT_STATUS_OPTIONS}
               multiStatus
               showNumber
@@ -2315,7 +2347,7 @@ function Overview(props: {
           </table>
           {props.events.length === 0 && (
             <div className="empty">
-              {props.repositoryId
+              {props.repositoryId || props.eventFilter.repositoryId
                 || props.eventFilter.number
                 || props.eventFilter.status
                 || props.eventFilter.statuses.length > 0
@@ -9954,8 +9986,8 @@ export default function App() {
     setEvents([]);
     setChangeRequestPage(EMPTY_OVERVIEW_PAGE);
     setEventPage(EMPTY_OVERVIEW_PAGE);
-    setChangeRequestFilter((current) => ({ ...current, page: 1 }));
-    setEventFilter((current) => ({ ...current, page: 1 }));
+    setChangeRequestFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
+    setEventFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
     setChangeRequestSelectionMode(false);
     setSelectedSnapshotKeys([]);
     setEventSelectionMode(false);
@@ -10136,11 +10168,13 @@ export default function App() {
   }
 
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
+    overviewRequestSequence.current += 1;
     cancelChangeRequestSelection();
     setChangeRequestFilter({ ...filter, page: 1 });
   }
 
   function changeOverviewEventFilter(filter: OverviewFilter) {
+    overviewRequestSequence.current += 1;
     cancelEventSelection();
     setEventFilter({ ...filter, page: 1 });
   }
@@ -10471,12 +10505,28 @@ export default function App() {
     () => savedDocument?.repositories ?? document?.repositories ?? [],
     [document?.repositories, savedDocument?.repositories],
   );
+  const repositoryScopeOptions = useMemo(() => overviewRepositoryOptions(overviewRepositories), [overviewRepositories]);
 
   useEffect(() => {
     if (overviewRepositoryId && !overviewRepositories.some((item) => item.id === overviewRepositoryId)) {
       changeOverviewRepository("");
     }
   }, [overviewRepositoryId, overviewRepositories, changeOverviewRepository]);
+
+  useEffect(() => {
+    // 配置删除或改名后，局部仓库条件也及时回到全部，避免隐形的失效筛选。
+    const ids = new Set(overviewRepositories.map((item) => item.id));
+    if (changeRequestFilter.repositoryId && !ids.has(changeRequestFilter.repositoryId)) {
+      overviewRequestSequence.current += 1;
+      cancelChangeRequestSelection();
+      setChangeRequestFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
+    }
+    if (eventFilter.repositoryId && !ids.has(eventFilter.repositoryId)) {
+      overviewRequestSequence.current += 1;
+      cancelEventSelection();
+      setEventFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
+    }
+  }, [overviewRepositories, changeRequestFilter.repositoryId, eventFilter.repositoryId]);
 
   useEffect(() => {
     const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
@@ -10532,13 +10582,8 @@ export default function App() {
                   value={overviewRepositoryId}
                   disabled={loading || confirmingOverviewAction}
                   onChange={changeOverviewRepository}
-                  options={[
-                    { value: "", label: "全部仓库" },
-                    ...overviewRepositories.map((repository) => ({
-                      value: repository.id,
-                      label: repositoryLabel(repository, true),
-                    })),
-                  ]}
+                  options={repositoryScopeOptions}
+                  fitContent
                 />
               )}
             </div>
@@ -10575,6 +10620,7 @@ export default function App() {
                   status={status}
                   overviewStatus={overviewStatus}
                   repositoryId={overviewRepositoryId}
+                  repositoryOptions={repositoryScopeOptions}
                   events={events}
                   changeRequests={changeRequests}
                   changeRequestFilter={changeRequestFilter}
