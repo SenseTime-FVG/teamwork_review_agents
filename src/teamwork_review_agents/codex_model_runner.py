@@ -50,6 +50,7 @@ from .model_tools import (
 )
 from .models import AgentResult, InvocationContext
 from .reasoning_effort import next_reasoning_effort
+from .run_control import RunControl, RunStop, active_run_control, cancellation_stop
 from .sandbox_git import SandboxGitError, current_sandbox_git
 from .sandbox_curl import current_sandbox_curl
 from .skill_files import SkillProjection
@@ -62,6 +63,7 @@ from .subprocess_utils import (
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
 ModelSnapshotCallback = Callable[[dict[str, Any]], Awaitable[None]]
+CancelSourceCheck = Callable[[], Awaitable[str | None]]
 _MAX_TOOL_ROUNDS = 64
 _BASE_ENVIRONMENT_NAMES = {
     "PATH",
@@ -135,6 +137,7 @@ class CodexModelRunner:
         redactor: SecretRedactor | None = None,
         log_callback: LogCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        cancel_source_check: CancelSourceCheck | None = None,
         model_plan: Sequence[ResolvedModelSelection] | None = None,
         model_snapshot_callback: ModelSnapshotCallback | None = None,
     ) -> AgentResult:
@@ -317,6 +320,7 @@ class CodexModelRunner:
                 cancel_check=cancel_check,
                 model_plan=resolved_plan,
                 model_snapshot_callback=model_snapshot_callback,
+                cancel_source_check=cancel_source_check,
             )
         finally:
             try:
@@ -395,22 +399,17 @@ class CodexModelRunner:
         cancel_check: CancelCheck | None,
         model_plan: Sequence[ResolvedModelSelection],
         model_snapshot_callback: ModelSnapshotCallback | None,
+        cancel_source_check: CancelSourceCheck | None = None,
     ) -> AgentResult:
         """用统一看门狗覆盖模型请求、命令和 sub-agent 等待。"""
 
         started_at = time.monotonic()
-        last_progress_at = started_at
-        stop_reason: str | None = None
+        control = RunControl(run_id, parent=active_run_control.get())
+        control_token = active_run_control.set(control)
         idle_timeout = (
             agent.idle_timeout_seconds
             or self.config.runtime.agent_idle_timeout_seconds
         )
-
-        def progress() -> None:
-            """模型事件和工具输出都视为本轮语义进展。"""
-
-            nonlocal last_progress_at
-            last_progress_at = time.monotonic()
 
         main_task = asyncio.create_task(
             self._agent_loop(
@@ -429,60 +428,79 @@ class CodexModelRunner:
                 redactor=redactor,
                 emit=emit,
                 cancel_check=cancel_check,
-                progress=progress,
+                progress=control.progress,
                 model_plan=model_plan,
                 model_snapshot_callback=model_snapshot_callback,
             )
         )
 
+        async def requested_cancellation() -> RunStop:
+            """读取取消来源失败时使用中性提示，不猜测为管理员操作。"""
+
+            source = None
+            if cancel_source_check is not None:
+                with suppress(Exception):
+                    source = await cancel_source_check()
+            return cancellation_stop(source)
+
+        async def stopped_result() -> AgentResult:
+            """终态只使用已确定的停止原因，不被正常返回覆盖。"""
+
+            stop = control.effective_stop() or cancellation_stop(None)
+            await emit("system", stop.event_type, stop.error)
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status=stop.status, error=stop.error,
+                error_code=stop.error_code,
+            )
+
         async def watchdog() -> None:
             """轮询持久化取消、总时限与无进展时限。"""
 
-            nonlocal stop_reason
             while not main_task.done():
                 await asyncio.sleep(0.25)
+                if main_task.done():
+                    return
                 now = time.monotonic()
-                if cancel_check is not None:
+                if control.effective_stop() is None and cancel_check is not None:
                     try:
                         if await cancel_check():
-                            stop_reason = "cancelled"
+                            control.stop = await requested_cancellation()
                     except Exception:
                         pass
-                if stop_reason is None and now - started_at >= agent.timeout_seconds:
-                    stop_reason = "total_timeout"
-                if stop_reason is None and now - last_progress_at >= idle_timeout:
-                    stop_reason = "idle_timeout"
-                if stop_reason is not None:
+                if control.stop is None and now - started_at >= agent.timeout_seconds:
+                    control.stop = RunStop(
+                        "timed_out", "agent_total_timeout", "Agent 超过总运行时限", "run.timed_out",
+                    )
+                if (
+                    control.stop is None
+                    and not control.waiting_children
+                    and now - control.last_progress_at >= idle_timeout
+                ):
+                    control.stop = RunStop(
+                        "timed_out", "agent_idle_timeout", "Agent 长时间没有模型或工具进展",
+                        "run.idle_timed_out",
+                    )
+                if control.stop is not None:
                     main_task.cancel()
                     return
 
         watchdog_task = asyncio.create_task(watchdog())
         try:
-            return await main_task
+            result = await main_task
+            task = asyncio.current_task()
+            if control.effective_stop() is None and task is not None and task.cancelling():
+                control.stop = await requested_cancellation()
+            if control.effective_stop() is not None:
+                return await stopped_result()
+            return result
         except asyncio.CancelledError:
-            if stop_reason is None:
-                stop_reason = "cancelled"
-            if stop_reason == "total_timeout":
-                await emit("system", "run.timed_out", "Agent 超过总运行时限")
-                status = "timed_out"
-                error = "Agent 超过总运行时限"
-            elif stop_reason == "idle_timeout":
-                await emit("system", "run.idle_timed_out", "Agent 长时间没有模型或工具进展")
-                status = "timed_out"
-                error = "Agent 长时间没有模型或工具进展"
-            else:
-                await emit("system", "run.cancelled", "运行已由管理员取消")
-                status = "cancelled"
-                error = "运行已由管理员取消"
-            return AgentResult(
-                run_id=run_id,
-                root_run_id=root_run_id,
-                parent_run_id=parent_run_id,
-                agent_name=agent_name,
-                status=status,
-                error=error,
-            )
+            if control.effective_stop() is None:
+                control.stop = await requested_cancellation()
+            return await stopped_result()
         except ContextCompactionError as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
             error = redactor.text(str(exc))
             await emit("system", "context.compaction_failed", {
                 **redactor.data(exc.diagnostics),
@@ -494,6 +512,8 @@ class CodexModelRunner:
                 error_code=exc.error_code, retryable=False, usage=exc.usage,
             )
         except SandboxGitError as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
             error = redactor.text(str(exc))
             await emit("system", "run.git_https_failed", {
                 "error": error, "error_code": exc.error_code, "retryable": exc.retryable,
@@ -504,6 +524,8 @@ class CodexModelRunner:
                 error_code=exc.error_code, retryable=exc.retryable,
             )
         except Exception as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
             error = redactor.text(str(exc))
             await emit("system", "error", error)
             return _failed_result(
@@ -514,8 +536,11 @@ class CodexModelRunner:
                 error,
             )
         finally:
-            watchdog_task.cancel()
-            await asyncio.gather(watchdog_task, return_exceptions=True)
+            try:
+                watchdog_task.cancel()
+                await asyncio.gather(watchdog_task, return_exceptions=True)
+            finally:
+                active_run_control.reset(control_token)
 
     async def _agent_loop(
         self,
@@ -540,6 +565,14 @@ class CodexModelRunner:
         model_snapshot_callback: ModelSnapshotCallback | None,
     ) -> AgentResult:
         """执行 Responses/function_call_output 多轮循环。"""
+
+        control = active_run_control.get()
+
+        def check_stop() -> None:
+            """异步调用返回后先检查终止状态，再执行后续模型或工具。"""
+
+            if control is not None:
+                control.raise_if_stopped()
 
         schema: dict[str, Any] | None = None
         text_config: dict[str, Any] = {}
@@ -941,6 +974,7 @@ class CodexModelRunner:
             }))
 
         for round_index in range(_MAX_TOOL_ROUNDS):
+            check_stop()
             request_round = round_index + 1
             context_retried: set[tuple[str, str | None]] = set()
             force_compaction = False
@@ -1010,10 +1044,13 @@ class CodexModelRunner:
                         await save_snapshot()
                     payload["input"] = conversation.history()
                     request_phase = "inference"
+                    check_stop()
                     response = await request_model(payload, receive_event)
+                    check_stop()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    check_stop()
                     failed_selection = current_selection
                     quota_exhausted = (
                         isinstance(exc, (ModelProviderRequestError, CodexUpstreamError))
@@ -1175,6 +1212,7 @@ class CodexModelRunner:
                 )
 
             for call in calls:
+                check_stop()
                 name = str(call.get("name") or "")
                 call_id = str(call.get("call_id") or call.get("id") or "")
                 if not name or not call_id:
@@ -1215,6 +1253,7 @@ class CodexModelRunner:
                             else None
                         ),
                     )
+                    check_stop()
                     output_text = json.dumps(tool_result, ensure_ascii=False)
                     completed_item = _tool_log_item(
                         name,
@@ -1227,11 +1266,16 @@ class CodexModelRunner:
                     raise
                 except SandboxGitError:
                     # 基础设施失败必须终止本轮，不能由后续模型或子 Agent 掩盖。
+                    check_stop()
                     raise
                 except Exception as exc:
+                    check_stop()
                     error = redactor.text(str(exc))
                     output_text = json.dumps(
-                        {"error": error, "error_type": type(exc).__name__},
+                        {
+                            "error": error, "error_type": type(exc).__name__,
+                            **({"error_code": exc.error_code} if getattr(exc, "error_code", None) else {}),
+                        },
                         ensure_ascii=False,
                     )
                     completed_item = _tool_log_item(

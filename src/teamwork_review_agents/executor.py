@@ -18,6 +18,7 @@ from .codex_model_runner import CodexModelRunner
 from .codex_runner import CodexRunner
 from .codex_executable import CodexRuntimeError, active_codex_executable
 from .runtime_readiness import check_runtime_readiness
+from .run_control import active_run_control, cancellation_stop, inherited_stop
 from .subprocess_utils import selected_environment, WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
@@ -319,8 +320,11 @@ class AgentExecutor:
     def _cancel_requested(self, run_id: str) -> bool:
         """合并服务停止标志与持久化的单次运行取消请求。"""
 
-        return self._shutdown_requested.is_set() or self.store.agent_run_cancel_requested(
-            run_id
+        control = active_run_control.get()
+        return (
+            self._shutdown_requested.is_set()
+            or (control is not None and control.effective_stop() is not None)
+            or self.store.agent_run_cancel_requested(run_id)
         )
 
     async def _wait_for_run_capacity(
@@ -627,24 +631,12 @@ class AgentExecutor:
                 source=CANCEL_SOURCE_SERVICE_SHUTDOWN,
             )
 
-        await self._wait_for_run_capacity(
-            reservation.run_id,
-            agent_name=agent_name,
-            depth=depth,
-        )
-
         keys = self.lock_keys(
             agent_name,
             event,
             configured_repository,
             schedule,
         )
-        if keys:
-            await asyncio.to_thread(
-                self.store.set_agent_run_queue_reason,
-                reservation.run_id,
-                "resource_lock",
-            )
         lease = ResourceLease(
             self.store,
             keys,
@@ -661,6 +653,9 @@ class AgentExecutor:
         ) -> None:
             """将 Runner 流式事件写入当前运行日志。"""
 
+            # 取消终态在确认来源并完成收尾后统一持久化，避免同一取消出现两张卡片。
+            if event_type == "run.cancelled":
+                return
             await asyncio.to_thread(
                 self.store.append_run_log,
                 reservation.run_id,
@@ -672,7 +667,7 @@ class AgentExecutor:
         git_credentials = GitCredentialContext(
             resolve_provider_token(self.config, provider, configured_repository),
             provider_kind=provider.kind,
-        ).start()
+        )
         redactor = SecretRedactor(
             (git_credentials.token,) if git_credentials.token else ()
         )
@@ -688,8 +683,24 @@ class AgentExecutor:
         )
         target_head_sha: str | None = None
         result: AgentResult
+        interruption: asyncio.CancelledError | None = None
         executable_token = active_codex_executable.set(None)
         try:
+            acquired = await self._wait_for_run_capacity(
+                reservation.run_id,
+                agent_name=agent_name,
+                depth=depth,
+            )
+            if not acquired:
+                raise WorkspaceCancelled("运行在等待并发额度时中断")
+            # 取得并发额度后才准备临时凭据；排队取消不留下 helper。
+            git_credentials.start()
+            if keys:
+                await asyncio.to_thread(
+                    self.store.set_agent_run_queue_reason,
+                    reservation.run_id,
+                    "resource_lock",
+                )
             async with lease:
                 if isinstance(runner, (CodexRunner, CodexModelRunner)):
                     readiness_environment = resolve_environment(
@@ -1129,6 +1140,7 @@ class AgentExecutor:
                         ),
                         **(
                             {
+                                "cancel_source_check": cancellation_source,
                                 "model_plan": model_plan.selections,
                                 "model_snapshot_callback": (
                                     lambda snapshot: asyncio.to_thread(
@@ -1145,6 +1157,16 @@ class AgentExecutor:
                 if lease.lost:
                     result.status = "failed"
                     result.error = "运行期间写资源租约丢失，结果不再视为可信"
+        except asyncio.CancelledError as exc:
+            # 排队和准备阶段也必须留下终态，再继续向父级传播取消，不能转为普通工具错误。
+            interruption = exc
+            source = await cancellation_source()
+            stop = cancellation_stop(source) if source is not None else inherited_stop(reservation.run_id)
+            result = AgentResult(
+                run_id=reservation.run_id, root_run_id=reservation.root_run_id,
+                parent_run_id=reservation.parent_run_id, agent_name=agent_name,
+                status=stop.status, error=stop.error, error_code=stop.error_code,
+            )
         except SandboxGitError as exc:
             await persist_log("system", "run.git_https_failed", redactor.data({
                 "error": str(exc), "error_code": exc.error_code, "retryable": exc.retryable,
@@ -1243,10 +1265,14 @@ class AgentExecutor:
 
         if result.status == "cancelled":
             source = await cancellation_source()
-            if source == CANCEL_SOURCE_SERVICE_SHUTDOWN:
-                result.error = result.error or "服务停止时中断运行"
-            elif source == CANCEL_SOURCE_ADMINISTRATOR:
-                result.error = result.error or "运行已由管理员取消"
+            if source is not None:
+                stop = cancellation_stop(source)
+                result.error = stop.error
+                result.error_code = stop.error_code
+            elif result.error_code is None:
+                stop = inherited_stop(reservation.run_id)
+                result.error = stop.error
+                result.error_code = stop.error_code
 
         if owned_workspace and active_workspace is not None:
             try:
@@ -1301,10 +1327,12 @@ class AgentExecutor:
                 status="not-created",
                 reason="Agent 启动前未能准备临时工作区",
             )
-        await persist_log(
-            "system",
-            f"run.{result.status}",
-            {
+        await asyncio.to_thread(
+            self.store.append_run_log,
+            reservation.run_id,
+            stream="system",
+            event_type=f"run.{result.status}",
+            payload={
                 "status": result.status,
                 "error": result.error,
                 "error_code": result.error_code,
@@ -1313,6 +1341,8 @@ class AgentExecutor:
             },
         )
         await asyncio.to_thread(self.store.finish_agent_run, result)
+        if interruption is not None:
+            raise interruption
         if result.status != "completed":
             raise AgentExecutionError(
                 result.error or f"Agent {agent_name} 执行失败",

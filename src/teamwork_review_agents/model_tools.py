@@ -9,7 +9,7 @@ import re
 import shlex
 import sys
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -25,6 +25,7 @@ from .sandbox_environment import sandbox_executable_environment
 from .codex_executable import resolve_codex_executable
 from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
 from .sandbox_curl import current_sandbox_curl, https_probe_url, http_tls_hint
+from .run_control import active_run_control
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -455,16 +456,19 @@ class ModelToolExecutor:
             raise ValueError("invoke_agent.task 必须是非空字符串")
         if extra_context is not None and not isinstance(extra_context, dict):
             raise ValueError("invoke_agent.extra_context 必须是对象")
-        self.progress_callback()
-        result = await self.invoke_agent_callback(
-            self.context,
-            agent_name.strip(),
-            task.strip(),
-            extra_context,
-            started_callback,
-        )
-        self.progress_callback()
-        return result
+        control = active_run_control.get()
+        # 子任务自己判断是否有进展；父任务只暂停 idle，总时限仍然生效。
+        with control.waiting_for_child() if control is not None else nullcontext():
+            try:
+                return await self.invoke_agent_callback(
+                    self.context,
+                    agent_name.strip(),
+                    task.strip(),
+                    extra_context,
+                    started_callback,
+                )
+            finally:
+                self.progress_callback()
 
     def _wrap(self, inner_command: list[str], *, environment: Mapping[str, str] | None = None) -> ProcessLaunch:
         """受限 Agent 的每个本地进程都必须进入 Teamwork 托管沙盒。"""
