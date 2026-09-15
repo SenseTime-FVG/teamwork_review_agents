@@ -306,6 +306,8 @@ Agent 先显示“排队中”，表示等待并发额度或资源锁；开始�
 
 这两个超时可以在管理界面左侧“全局配置与环境”中修改，分别显示为“基础仓库初始化超时（秒）”和“Git 操作超时（秒）”。
 
+内嵌模型模式使用 `runtime.agent_idle_timeout_seconds`（默认 `300` 秒，可由 Agent 的 `idle_timeout_seconds` 覆盖）判断模型或工具是否长时间没有进展。父 Agent 等待 `invoke_agent` 期间暂停自己的无进展计时，由子 Agent 自己判断是否卡住；子任务返回后重新计时，不需要同步子任务日志或向父模型注入心跳。父 Agent 的 `timeout_seconds` 总时限仍包含等待子任务的时间，人工取消和服务停止也始终有效。日志区分自身超时、父任务超时导致的中断、管理员取消与服务停止；已经触发的停止不能被子任务错误处理吞掉后继续执行。
+
 Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktree，所以 Git、测试
 和平台 CLI 都会作用于正确仓库。Teamwork 会在每次 `codex exec` 最后强制设置
 `project_doc_max_bytes=0`，只关闭仓库 `AGENTS.md` 的自动指令注入，不改变工作目录、
