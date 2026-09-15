@@ -52,8 +52,28 @@
 3. 必须读取 target branch，不得把 source branch 当作目标分支。
 4. 合并前和合并后 SHA 必须来自本次 PR / MR 的合并事件，或能够由平台与仓库事实共同验证；不能用当前目标分支 HEAD、PR head / MR source 分支 SHA、`merge-base` 或猜测值代替。
 5. 两个 SHA 必须是当前仓库中存在的完整 commit 对象，二者不能相同，且合并前 SHA 必须是合并后 SHA 的祖先。
-6. 刷新目标分支远程引用后，确认合并后 SHA 是远程目标分支 HEAD 的祖先或与其相同；验证通过后，将此时的目标分支远程完整 HEAD 记为 `TARGET_HEAD_AT_START`。
+6. 成功刷新已核验 remote 的目标分支远程引用后，立即读取其完整 commit SHA 并记为 `TARGET_HEAD_AT_START`；按下列固定命令确认合并后 SHA 是它的祖先或与其相同。校验全部通过后才能使用这个基线继续流程，后续不得重新赋值以掩盖目标分支漂移。
 7. 无法确认两个 SHA 对应同一次 MR 合并前后的目标分支状态时立即停止。
+
+## 固定祖先校验命令与退出码
+
+将已通过平台事实与本地 commit 对象核验的“合并前目标分支 SHA”赋给 `MERGE_BEFORE_SHA`，“合并后目标分支 SHA”赋给 `MERGE_AFTER_SHA`。它们分别与后文的 `<合并前SHA>`、`<合并后SHA>` 相同；三个变量都必须是完整 commit SHA，不得填分支名、缩写或 PR head / MR source SHA。
+
+在已核验的当前项目工作区中，按顺序独立执行以下两条命令，不得交换参数：
+
+```bash
+git merge-base --is-ancestor "$MERGE_BEFORE_SHA" "$MERGE_AFTER_SHA"
+git merge-base --is-ancestor "$MERGE_AFTER_SHA" "$TARGET_HEAD_AT_START"
+```
+
+`--is-ancestor A B` 只回答“A 是否为 B 的祖先或与其相同”。第一条检查“合并前 → 合并后”，第二条检查“合并后 → 启动时的远程目标分支 HEAD”。原始 PR / MR 合并后，目标分支正常新增提交是允许的，不要求 `MERGE_AFTER_SHA` 等于 `TARGET_HEAD_AT_START`；从 `MERGE_AFTER_SHA` 创建组合分支的规则不变。
+
+- 每条命令执行后立即保存它自己的退出码和 stderr，再执行下一步。Bash 使用原始 `$?`，PowerShell 使用原始 `$LASTEXITCODE`，或直接读取子进程的 `returncode`；不得记录 `echo`、取反命令或整个循环的退出码。使用 `set -e` 等遇错退出模式时，必须确保非零退出码仍能被捕获并报告。
+- 退出码 `0`：该项祖先关系校验通过；两项都通过才能继续。
+- 退出码 `1`：该项祖先关系不成立，停止并记录实际命令、两端 SHA 的角色及退出码；不能把该结果直接等同于已证实的强制推送或历史改写。
+- 其他退出码：Git 命令执行异常，停止并报告“祖先关系无法验证”，保留退出码和脱敏后的 stderr，不得当成“不是祖先”。不得用 `if git ...; then ...; else ...; fi` 将所有非零退出码一律归为关系不成立。
+- 浅仓库、缺失对象或历史不完整时，先从已核验的 remote 补齐所需历史再校验；无法补齐则停止并报告“祖先关系无法验证”，不得据此断言历史改写。
+- 禁止用反向检查 `TARGET_HEAD_AT_START → MERGE_AFTER_SHA` 或 `MERGE_AFTER_SHA → MERGE_BEFORE_SHA` 的失败代替上述正向检查。反向退出码 `1` 与正向退出码 `0` 可以同时成立，这是目标分支正常向前推进时的预期情况。
 
 # 三、生成组合自动更新分支
 
@@ -276,6 +296,7 @@ PR / MR 描述应简洁包含：原始 PR / MR 链接和编号、固定合并后
 
 - 原始 PR / MR 标题、编号和链接；
 - PR / MR 目标分支、合并前 SHA和合并后 SHA；
+- 两项固定祖先校验的实际命令、两端完整 SHA 的角色、各自退出码，以及异常时脱敏后的 stderr；未执行的项注明“未执行”，不得推断通过；
 - 组合自动更新分支；
 - 两个已校验的实际子 Agent 名称；
 - 依赖阶段状态、提交 SHA、推送与验证摘要；

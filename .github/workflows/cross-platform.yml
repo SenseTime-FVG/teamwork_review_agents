@@ -75,6 +75,7 @@ jobs:
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
           tests/test_config_and_runner.py::test_runner_only_accepts_explicit_provider_token_environment
           tests/test_context_compaction.py
+          tests/test_combined_update_ancestry.py
           tests/test_tool_results.py
           tests/test_sub_agent_waiting.py
           tests/test_model_runtime.py::test_model_tool_environment_uses_empty_run_codex_home
