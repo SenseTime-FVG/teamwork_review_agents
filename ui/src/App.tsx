@@ -20,7 +20,7 @@ import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
-import { overviewQuery, overviewStatusPath } from "./overviewScope";
+import { overviewQuery, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import type {
   Agent,
@@ -1581,10 +1581,43 @@ function EnvironmentEditor(props: {
   );
 }
 
+function OverviewSortHeader(props: {
+  label: string;
+  field: OverviewSortField;
+  filter: OverviewFilter;
+  onChange: (filter: OverviewFilter) => void;
+}) {
+  const active = props.filter.sortBy === props.field;
+  const nextFilter = toggleOverviewSort(props.filter, props.field);
+  const nextDirectionLabel = props.field === "number"
+    ? (nextFilter.sortDirection === "desc" ? "编号从大到小" : "编号从小到大")
+    : (nextFilter.sortDirection === "desc" ? "时间从新到旧" : "时间从旧到新");
+  const actionLabel = `${props.label}：点击按${nextDirectionLabel}排序`;
+
+  return (
+    <th
+      scope="col"
+      aria-sort={active ? (props.filter.sortDirection === "asc" ? "ascending" : "descending") : undefined}
+    >
+      <button
+        type="button"
+        className={`overview-sort-header${active ? " active" : ""}`}
+        title={actionLabel}
+        aria-label={actionLabel}
+        onClick={() => props.onChange(nextFilter)}
+      >
+        <span>{props.label}</span>
+        <span className="overview-sort-indicator" aria-hidden="true">
+          {active ? (props.filter.sortDirection === "asc" ? "↑" : "↓") : "↕"}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 function OverviewListControls(props: {
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
-  sortOptions: Array<{ value: OverviewSortField; label: string }>;
   multiStatus?: boolean;
   showNumber?: boolean;
   onChange: (filter: OverviewFilter) => void;
@@ -1660,34 +1693,6 @@ function OverviewListControls(props: {
           ]}
         />
       )}
-      <SelectField
-        label="排序"
-        className="overview-sort-field"
-        value={props.filter.sortBy}
-        onChange={(sortBy) => props.onChange({
-          ...props.filter,
-          sortBy: sortBy as OverviewSortField,
-        })}
-        options={props.sortOptions}
-      />
-      <SelectField
-        label="顺序"
-        className="overview-sort-direction"
-        value={props.filter.sortDirection}
-        onChange={(sortDirection) => props.onChange({
-          ...props.filter,
-          sortDirection: sortDirection as "asc" | "desc",
-        })}
-        options={props.filter.sortBy === "number"
-          ? [
-              { value: "desc", label: "从大到小" },
-              { value: "asc", label: "从小到大" },
-            ]
-          : [
-              { value: "desc", label: "从新到旧" },
-              { value: "asc", label: "从旧到新" },
-            ]}
-      />
       <SelectField
         label="展示"
         value={limitMode}
@@ -2068,12 +2073,6 @@ function Overview(props: {
             <OverviewListControls
               filter={props.changeRequestFilter}
               statuses={CHANGE_REQUEST_STATUS_OPTIONS}
-              sortOptions={[
-                { value: "updated_at", label: "远端更新时间" },
-                { value: "number", label: "MR / PR 编号" },
-                { value: "scanned_at", label: "最近扫描时间" },
-                { value: "latest_event_at", label: "最新平台事件时间" },
-              ]}
               multiStatus
               onChange={props.onChangeRequestFilterChange}
             />
@@ -2084,7 +2083,13 @@ function Overview(props: {
             <thead>
               <tr>
                 {props.selectionMode && <th className="overview-selection-column">选择</th>}
-                <th>MR / PR</th><th>仓库</th><th>状态</th><th>远端更新</th><th>最近扫描</th><th>首次事件</th><th>最新平台事件</th><th>操作</th>
+                <OverviewSortHeader label="MR / PR" field="number" filter={props.changeRequestFilter} onChange={props.onChangeRequestFilterChange} />
+                <th>仓库</th><th>状态</th>
+                <OverviewSortHeader label="远端更新" field="updated_at" filter={props.changeRequestFilter} onChange={props.onChangeRequestFilterChange} />
+                <OverviewSortHeader label="最近扫描" field="scanned_at" filter={props.changeRequestFilter} onChange={props.onChangeRequestFilterChange} />
+                <th>首次事件</th>
+                <OverviewSortHeader label="最新平台事件" field="latest_event_at" filter={props.changeRequestFilter} onChange={props.onChangeRequestFilterChange} />
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -2232,10 +2237,6 @@ function Overview(props: {
             <OverviewListControls
               filter={props.eventFilter}
               statuses={EVENT_STATUS_OPTIONS}
-              sortOptions={[
-                { value: "occurred_at", label: "事件时间" },
-                { value: "number", label: "MR / PR 编号" },
-              ]}
               multiStatus
               showNumber
               onChange={props.onEventFilterChange}
@@ -2244,7 +2245,16 @@ function Overview(props: {
         </div>
         <div className="table-wrap">
           <table>
-            <thead><tr>{props.eventSelectionMode && <th className="overview-selection-column">选择</th>}<th>事件</th><th>仓库</th><th>编号</th><th>事件状态</th><th>Agent</th><th>时间</th><th>操作</th></tr></thead>
+            <thead>
+              <tr>
+                {props.eventSelectionMode && <th className="overview-selection-column">选择</th>}
+                <th>事件</th><th>仓库</th>
+                <OverviewSortHeader label="编号" field="number" filter={props.eventFilter} onChange={props.onEventFilterChange} />
+                <th>事件状态</th><th>Agent</th>
+                <OverviewSortHeader label="时间" field="occurred_at" filter={props.eventFilter} onChange={props.onEventFilterChange} />
+                <th>操作</th>
+              </tr>
+            </thead>
             <tbody>
               {props.events.map((event) => (
                 <tr

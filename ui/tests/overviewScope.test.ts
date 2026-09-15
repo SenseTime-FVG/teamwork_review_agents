@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { overviewQuery, overviewStatusPath } from "../src/overviewScope.ts";
-import type { OverviewFilter } from "../src/overviewScope.ts";
+import { overviewQuery, overviewStatusPath, toggleOverviewSort } from "../src/overviewScope.ts";
+import type { OverviewFilter, OverviewSortField } from "../src/overviewScope.ts";
 
 const filter: OverviewFilter = {
   number: "151",
@@ -63,9 +63,46 @@ test("两个概览列表分别携带自己的默认排序", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.match(app, /DEFAULT_CHANGE_REQUEST_FILTER[\s\S]*sortBy: "updated_at"[\s\S]*sortDirection: "desc"/);
   assert.match(app, /DEFAULT_EVENT_FILTER[\s\S]*sortBy: "occurred_at"[\s\S]*sortDirection: "desc"/);
-  assert.match(app, /\{ value: "latest_event_at", label: "最新平台事件时间" \}/);
-  assert.match(app, /\{ value: "occurred_at", label: "事件时间" \}/);
-  assert.match(app, /props\.filter\.sortBy === "number"/);
+});
+
+test("点击表头切换字段默认降序，重复点击反转方向并回到第一页", () => {
+  const fields: OverviewSortField[] = ["number", "updated_at", "scanned_at", "latest_event_at", "occurred_at"];
+  for (const field of fields) {
+    const original: OverviewFilter = {
+      ...filter,
+      sortBy: field === "number" ? "updated_at" : "number",
+      sortDirection: "desc",
+    };
+    const descending = toggleOverviewSort(original, field);
+    assert.deepEqual(descending, { ...original, page: 1, sortBy: field, sortDirection: "desc" });
+    const ascending = toggleOverviewSort(descending, field);
+    assert.deepEqual(ascending, { ...descending, sortDirection: "asc" });
+    assert.deepEqual(toggleOverviewSort(ascending, field), descending);
+    assert.equal(original.page, 2);
+    assert.equal(original.sortDirection, "desc");
+  }
+});
+
+test("排序入口绑定对应表头与列表回调，移除额外排序下拉框", () => {
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const controls = app.slice(app.indexOf("function OverviewListControls"), app.indexOf("function OverviewPagination"));
+  assert.doesNotMatch(controls, /label="排序"|label="顺序"|sortOptions/);
+  const headers = [...app.matchAll(/<OverviewSortHeader label="([^"]+)" field="([^"]+)" filter=\{props\.(\w+)\} onChange=\{props\.(\w+)\}/g)]
+    .map((match) => match.slice(1));
+  assert.deepEqual(headers, [
+    ["MR / PR", "number", "changeRequestFilter", "onChangeRequestFilterChange"],
+    ["远端更新", "updated_at", "changeRequestFilter", "onChangeRequestFilterChange"],
+    ["最近扫描", "scanned_at", "changeRequestFilter", "onChangeRequestFilterChange"],
+    ["最新平台事件", "latest_event_at", "changeRequestFilter", "onChangeRequestFilterChange"],
+    ["编号", "number", "eventFilter", "onEventFilterChange"],
+    ["时间", "occurred_at", "eventFilter", "onEventFilterChange"],
+  ]);
+  const header = app.slice(app.indexOf("function OverviewSortHeader"), app.indexOf("function OverviewListControls"));
+  assert.match(header, /<button\s+type="button"/);
+  assert.match(header, /aria-sort=\{active \? \(props\.filter\.sortDirection === "asc" \? "ascending" : "descending"\) : undefined\}/);
+  assert.match(header, /onClick=\{\(\) => props\.onChange\(nextFilter\)\}/);
+  assert.match(app, /function changeOverviewChangeRequestFilter[\s\S]*?cancelChangeRequestSelection\(\);[\s\S]*?setChangeRequestFilter\(\{ \.\.\.filter, page: 1 \}\)/);
+  assert.match(app, /function changeOverviewEventFilter[\s\S]*?cancelEventSelection\(\);[\s\S]*?setEventFilter\(\{ \.\.\.filter, page: 1 \}\)/);
 });
 
 test("仓库选择接线保持单一范围，清理跨仓库状态并隔离旧请求", () => {
