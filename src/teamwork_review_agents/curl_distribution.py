@@ -194,7 +194,12 @@ def publish_archive(root: Path, distribution: CurlDistribution, archive_path: Pa
     """固定目录锁内校验并原子发布，损坏旧目录隔离保存，不直接递归删除。"""
 
     data = read_verified_archive(archive_path, distribution)
-    temporary = Path(tempfile.mkdtemp(prefix=".install-", dir=root))
+    # Python 3.12.4+ 在 Windows 会将 tempfile.mkdtemp 的 0o700 转换为
+    # 仅当前用户/管理员可访问的 ACL；沙盒受限令牌随后无法读取正式程序。
+    # 使用普通 mkdir 继承缓存根目录的 ACL，Unix 仍保留私有 staging 权限。
+    temporary = root / f".install-{uuid.uuid4().hex}"
+    temporary.mkdir(mode=0o700 if os.name != "nt" else 0o755)
+    require_plain_path(temporary, directory=True)
     target = root / distribution.package
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:

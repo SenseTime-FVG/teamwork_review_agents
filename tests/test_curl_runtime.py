@@ -240,6 +240,69 @@ async def test_offline_prepare_and_bad_archive_quarantine(deployment, monkeypatc
     await manager.close()
 
 
+@pytest.mark.parametrize("mode", ["repaired", "persistent_denial", "already_repaired", "probe_changed", "probe_failed"])
+async def test_old_managed_cache_repairs_once_without_download(deployment, monkeypatch, mode):
+    """旧缓存执行被拒绝时离线重建；锁内已恢复、其他错误或持续失败均有界退出。"""
+
+    config, root, distribution, data, probe = deployment
+    archive = write_offline(root, distribution, data)
+    publish_archive(root, distribution, archive)
+    denied = {"code": "sandbox_process_denied", "message": "模拟旧缓存执行被拒绝"}
+    ready = {"code": "ready", "backend": "LibreSSL/test"}
+    failed = {"code": "version_probe_failed", "message": "模拟非权限错误"}
+    probe.side_effect = {
+        "repaired": [denied, denied, ready],
+        "persistent_denial": [denied, denied, denied],
+        "already_repaired": [denied, ready],
+        "probe_changed": [denied, failed],
+        "probe_failed": [failed],
+    }[mode]
+    download = AsyncMock(side_effect=AssertionError("旧缓存修复只能使用已有安装包"))
+    monkeypatch.setattr(curl_runtime, "download_archive", download)
+    manager = CurlRuntimeManager(lambda: config)
+    try:
+        manager.start()
+        await asyncio.wait_for(manager.wait(), timeout=5)
+        state = manager.snapshot()
+        assert state["status"] == ("ready" if mode in {"repaired", "already_repaired"} else "unavailable")
+        if mode == "repaired":
+            assert state["source"] == "repaired_cache"
+        assert len(list(root.glob(".*.invalid-*"))) == (1 if mode in {"repaired", "persistent_denial"} else 0)
+        assert installed_candidate(root, distribution) is not None
+        assert archive.read_bytes() == data
+        assert not list(root.glob(".install-*"))
+        download.assert_not_called()
+        assert probe.await_count <= 3
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize("mode", ["disabled", "explicit"])
+async def test_managed_cache_repair_respects_configuration(deployment, monkeypatch, mode):
+    """关闭自动准备或显式指定缓存路径时，仍不自动替换程序。"""
+
+    config, root, distribution, data, probe = deployment
+    archive = write_offline(root, distribution, data)
+    executable, ca = publish_archive(root, distribution, archive)
+    if mode == "disabled":
+        config.runtime.managed_sandbox.curl_auto_prepare = False
+    else:
+        config.runtime.managed_sandbox.curl_binary = executable
+        monkeypatch.setattr(curl_runtime, "curl_candidates", lambda *args: [CurlCandidate(executable, "configured_path", ca)])
+    probe.return_value = {"code": "sandbox_process_denied"}
+    download = AsyncMock(side_effect=AssertionError("不能下载"))
+    monkeypatch.setattr(curl_runtime, "download_archive", download)
+    manager = CurlRuntimeManager(lambda: config)
+    try:
+        manager.start()
+        await manager.wait()
+        assert manager.snapshot()["status"] == ("disabled" if mode == "disabled" else "unavailable")
+        assert not list(root.glob(".*.invalid-*"))
+        download.assert_not_called()
+    finally:
+        await manager.close()
+
+
 @pytest.mark.parametrize("mode", ["non_windows", "disabled", "explicit", "permission_failure", "existing"])
 async def test_existing_or_explicit_programs_do_not_trigger_unwanted_download(deployment, monkeypatch, mode):
     """显式路径、平台禁用或权限故障不能被自动下载悄悄替代。"""

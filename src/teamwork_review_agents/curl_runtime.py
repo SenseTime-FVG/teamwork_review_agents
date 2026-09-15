@@ -167,10 +167,11 @@ class CurlRuntimeManager:
         """程序就绪不代表所有仓库网络或证书策略均已通过。"""
 
         self._status = {"status": "ready", "message": "兼容 curl 已就绪；实际 HTTPS 按每个 Agent 的权限检查。",
-                        "source": candidate.source, "curl_binary": str(candidate.executable), "ssl_backend": diagnostic["backend"]}
+                        "source": candidate.source, "curl_binary": str(candidate.executable),
+                        "ssl_backend": diagnostic["backend"]}
 
     async def _prepare(self, config: AppConfig) -> None:
-        """仅缺少程序/后端不兼容时准备分发；TLS 请求错误不能触发安装。"""
+        """缺少兼容程序时准备分发；项目旧缓存执行被拒绝时有界重建。"""
 
         managed = config.runtime.managed_sandbox
         lock = None
@@ -189,13 +190,18 @@ class CurlRuntimeManager:
                     if installed:
                         candidates.insert(0, CurlCandidate(installed[0], "managed_cache", installed[1]))
                 failures: list[dict[str, str]] = []
+                repair_managed_cache = False
                 for candidate in candidates:
                     diagnostic = await inspect_installed_curl(candidate, config)
                     if diagnostic["code"] == "ready":
                         self._ready(candidate, diagnostic)
                         return
                     failures.append({"path": str(candidate.executable), **diagnostic})
-                if managed.curl_binary is not None or any(item["code"] not in {"executable_missing", "backend_incompatible"} for item in failures):
+                    if candidate.source == "managed_cache" and diagnostic["code"] == "sandbox_process_denied":
+                        repair_managed_cache = True
+                if managed.curl_binary is not None or (not repair_managed_cache and any(
+                    item["code"] not in {"executable_missing", "backend_incompatible"} for item in failures
+                )):
                     self._status = {"status": "unavailable", "message": "已有 curl 未通过执行验证；未重复下载，请检查下方具体原因。", "candidates": failures}
                     return
                 distribution = distribution_for_machine()
@@ -212,7 +218,22 @@ class CurlRuntimeManager:
                         await asyncio.sleep(0.2)
                 # 另一进程可能已经发布，锁内再检查以避免重复下载或替换。
                 installed = installed_candidate(root, distribution)
-                if installed is None:
+                if installed is not None and repair_managed_cache:
+                    candidate = CurlCandidate(installed[0], "managed_cache", installed[1])
+                    diagnostic = await inspect_installed_curl(candidate, config)
+                    if diagnostic["code"] == "ready":
+                        self._ready(candidate, diagnostic)
+                        return
+                    if diagnostic["code"] != "sandbox_process_denied":
+                        self._status = {"status": "unavailable", "message": "已有 curl 未通过执行验证；未重建，请检查下方具体原因。",
+                                        "candidates": [{"path": str(candidate.executable), **diagnostic}]}
+                        return
+                    # 旧版本的私有临时目录 ACL 会随 rename 保留。只从校验过的
+                    # 本地归档重建项目缓存一次；不改 ACL、不替换用户指定的程序。
+                    self._status = {"status": "preparing", "message": "正在自动重建旧 curl 缓存并验证执行权限。"}
+                    installed = publish_archive(root, distribution, root / "downloads" / distribution.filename)
+                    source = "repaired_cache"
+                elif installed is None:
                     archive_path = root / "downloads" / distribution.filename
                     if archive_path.exists() or archive_path.is_symlink():
                         try:
