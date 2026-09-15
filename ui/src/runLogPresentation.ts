@@ -86,6 +86,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "context.summary_rewrite": "正在进一步收短摘要",
   "context.retry_after_compaction": "上下文超限，压缩后重试",
   "context.tool_output_truncated": "工具结果已精简，完整日志保留",
+  "context.tool_output_stored": "工具结果已保存，可分段读取",
+  "run.tool_output_failed": "工具结果无法完整交付",
   "run.cancel_requested": "已请求取消运行",
   "run.cancelled": "运行已取消",
   "run.timed_out": "运行超过总时限",
@@ -210,6 +212,7 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
   let body = "";
   let detail = "";
   if (log.event_type.startsWith("context.") && object) {
+    const outputFile = asObject(object.output_file);
     // 保守预算不是精确 Token 用量，压缩摘要也不是 Agent 的最终结论。
     body = log.event_type === "context.compacted"
       ? `系统指令、Skill、工具定义和原始任务保持不变；执行历史保守估算由 ${textValue(object.before_estimated_tokens)} 降至 ${textValue(object.after_estimated_tokens)}。`
@@ -226,10 +229,14 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
       object.estimator === "utf8_bytes_conservative" ? "估算方式：UTF-8 序列化字节数及结构余量，不是精确 Token 计数。" : "",
       object.summary ? `历史交接摘要（非最终结果）：\n${textValue(object.summary)}` : "",
       object.call_id ? `工具调用：${textValue(object.call_id)}；原结果：${textValue(object.original_bytes)} 字节` : "",
+      outputFile ? `完整脱敏结果：${textValue(outputFile.path)}\n大小：${textValue(outputFile.bytes)} 字节\nSHA-256：${textValue(outputFile.sha256)}\n${textValue(outputFile.lifetime)}` : "",
       object.usage ? prettyValue(object.usage) : "",
       object.error_code ? `错误码：${textValue(object.error_code)}` : "",
       object.retryable === false ? "已停止整轮自动重试，避免重复执行已完成操作。" : "",
     ].filter(Boolean).join("\n");
+  } else if (log.event_type === "run.tool_output_failed" && object) {
+    body = textValue(object.error);
+    detail = `错误码：${textValue(object.error_code)}\n已停止整轮自动重试，避免重复执行有副作用的工具。`;
   } else if (log.event_type === "model.reasoning_downgraded" && object) {
     const next = object.to ? `改用 ${textValue(object.to)}` : "去掉 effort 参数，使用上游默认";
     body = `${textValue(object.from)} 不受上游支持，正在${next}重试。`;

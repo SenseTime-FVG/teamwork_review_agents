@@ -31,6 +31,7 @@ from .environment import SecretRedactor
 from .context_compaction import (
     ContextCompactionError,
     ConversationContext,
+    estimate_tokens,
     resolve_context_window,
 )
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
@@ -51,6 +52,7 @@ from .model_tools import (
 from .models import AgentResult, InvocationContext
 from .reasoning_effort import next_reasoning_effort
 from .run_control import RunControl, RunStop, active_run_control, cancellation_stop
+from .tool_results import ToolResultError, ToolResultStore
 from .sandbox_git import SandboxGitError, current_sandbox_git
 from .sandbox_curl import current_sandbox_curl
 from .skill_files import SkillProjection
@@ -511,6 +513,18 @@ class CodexModelRunner:
                 agent_name=agent_name, status="failed", error=error,
                 error_code=exc.error_code, retryable=False, usage=exc.usage,
             )
+        except ToolResultError as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
+            error = redactor.text(str(exc))
+            await emit("system", "run.tool_output_failed", {
+                "error": error, "error_code": exc.error_code, "retryable": False,
+            })
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status="failed", error=error,
+                error_code=exc.error_code, retryable=False,
+            )
         except SandboxGitError as exc:
             if control.effective_stop() is not None:
                 return await stopped_result()
@@ -838,6 +852,7 @@ class CodexModelRunner:
             invoke_agent_callback=self.invoke_agent_callback,
             codex_runtime_directory=codex_runtime_directory,
         )
+        tool_results = ToolResultStore(codex_runtime_directory, redactor)
         if managed_sandbox and current_sandbox_git() is not None:
             await emit("system", "run.git_https_started", {"ssl_backend": "openssl"})
             diagnostic = await tool_executor.check_git_https()
@@ -1211,7 +1226,7 @@ class CodexModelRunner:
                     events=events,
                 )
 
-            for call in calls:
+            for call_index, call in enumerate(calls):
                 check_stop()
                 name = str(call.get("name") or "")
                 call_id = str(call.get("call_id") or call.get("id") or "")
@@ -1254,6 +1269,8 @@ class CodexModelRunner:
                         ),
                     )
                     check_stop()
+                    # 送模正文和补读文件使用同一份脱敏结果，不在文件中留下凭据。
+                    tool_result = redactor.data(tool_result)
                     output_text = json.dumps(tool_result, ensure_ascii=False)
                     completed_item = _tool_log_item(
                         name,
@@ -1263,6 +1280,9 @@ class CodexModelRunner:
                         result=redactor.data(tool_result),
                     )
                 except asyncio.CancelledError:
+                    raise
+                except ToolResultError:
+                    check_stop()
                     raise
                 except SandboxGitError:
                     # 基础设施失败必须终止本轮，不能由后续模型或子 Agent 掩盖。
@@ -1292,17 +1312,31 @@ class CodexModelRunner:
                         redactor.data({"type": "item.completed", **completed_event})
                     )
                 await emit("stdout", "item.completed", completed_event)
-                bounded_output = conversation.bound_tool_output(output_text, call_id)
-                if bounded_output != output_text:
-                    await emit("system", "context.tool_output_truncated", {
+                # 只计算固定内容和当前完整工具回合；旧历史占用交给已有压缩机制。
+                result_shell = {"type": "function_call_output", "call_id": call_id, "output": ""}
+                fixed_request = {
+                    **{key: value for key, value in payload.items() if key != "input"},
+                    "input": conversation.fixed_messages + round_items + [result_shell],
+                }
+                available = window - self.config.runtime.context_compaction.reserved_output_tokens - estimate_tokens(fixed_request) - 256
+                # 同回合多工具给后续结果留出位置，不能让首个正文挤掉后续文件引用。
+                available //= len(calls) - call_index
+                model_output, reference = tool_results.prepare(
+                    output_text,
+                    inline_bytes=self.config.runtime.context_compaction.tool_output_inline_bytes,
+                    available_bytes=max(0, available),
+                )
+                if reference is not None:
+                    await emit("system", "context.tool_output_stored", {
                         "call_id": call_id, "original_bytes": len(output_text.encode("utf-8")),
-                        "message": "仅截短送给模型的工具结果副本，完整结果仍保留在执行日志中。",
+                        "output_file": reference,
+                        "message": "完整脱敏结果已保存到本轮文件，模型可用现有命令工具分段读取；这不是上下文摘要压缩。",
                     })
                 round_items.append(
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": bounded_output,
+                        "output": model_output,
                     }
                 )
             conversation.append_round(round_items)
