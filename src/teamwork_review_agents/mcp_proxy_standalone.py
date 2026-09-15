@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -31,6 +32,13 @@ _TOOLS = [
         "inputSchema": {"type": "object", "required": ["body"],
                         "properties": {"body": {"type": "string"}}, "additionalProperties": False},
     },
+    {
+        "name": "wait_for_ci",
+        "description": "等待当前仓库 PR/MR 的远端 CI；超时保留成果，不自动重跑或合并。",
+        "inputSchema": {"type": "object", "required": ["number", "expected_head_sha"],
+                        "properties": {"number": {"type": "integer", "minimum": 1},
+                                       "expected_head_sha": {"type": "string"}}, "additionalProperties": False},
+    },
 ]
 
 
@@ -47,7 +55,7 @@ def _write_json(path: Path, value: dict) -> None:
 
 
 async def _call_bridge(method: str, params: dict) -> dict:
-    """只转发两种固定方法，Broker 继续承担配置、权限与运行上下文校验。"""
+    """只转发固定方法，Broker 继续承担配置、权限与运行上下文校验。"""
 
     directory = os.environ.get("TEAMWORK_MCP_CHANNEL_DIR", "")
     token = os.environ.get("TEAMWORK_MCP_CHANNEL_TOKEN", "")
@@ -104,6 +112,10 @@ def _tool_arguments(params: dict) -> tuple[str, dict]:
                       "extra_context": arguments.get("extra_context")}
     if name == "publish_comment" and set(arguments) == {"body"} and isinstance(arguments["body"], str):
         return name, arguments
+    if name == "wait_for_ci" and set(arguments) == {"number", "expected_head_sha"}:
+        number, sha = arguments["number"], arguments["expected_head_sha"]
+        if isinstance(number, int) and not isinstance(number, bool) and number > 0 and isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
+            return name, arguments
     raise ValueError("工具名称或参数无效")
 
 

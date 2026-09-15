@@ -305,6 +305,18 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_run_logs_cursor
                 ON run_logs(run_id, id);
 
+                CREATE TABLE IF NOT EXISTS agent_run_waits (
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    wait_key TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    deadline REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'waiting',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY(run_id, kind, wait_key),
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS config_versions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     revision TEXT NOT NULL UNIQUE,
@@ -3110,6 +3122,10 @@ class StateStore:
                 result[key] = json.loads(result[key])
         result.pop("events", None)
         result["children"] = [dict(child) for child in children]
+        # 等待记录只含阶段、期限和安全摘要，不包含凭据或平台原始输出。
+        from .run_waits import RunWaits
+
+        result["waits"] = RunWaits(self).list(run_id)
         return result
 
     @staticmethod

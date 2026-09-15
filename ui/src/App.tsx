@@ -328,6 +328,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       repository_initialization_timeout_seconds: 1800,
       git_timeout_seconds: 600,
       agent_idle_timeout_seconds: 300,
+      remote_ci_wait_timeout_seconds: 1800,
       ...runtimeInput,
       managed_sandbox: {
         enabled: true,
@@ -2479,6 +2480,7 @@ function GlobalEnvironment(props: {
           <Field label="基础仓库初始化无进展超时（秒）" type="number" value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)} onChange={(value) => patchSection("runtime", "repository_initialization_timeout_seconds", Number(value))} help="仅连续无有效进展才超时；持续下载不受总耗时限制。" />
           <Field label="Git 无进展超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} help="用于 fetch、运行 clone 和工作区操作；仓库锁等待另行计时。" />
           <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
+          <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留 PR 和工作区，不自动重跑。与本地 CI 执行超时独立。" />
           <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
@@ -4855,6 +4857,11 @@ function RepositoryDetailEditor(props: {
               onChange={(workspace) => { directoryEdited.current = true; update({ workspace }); }}
               help="修改目录并保存后，会搬移已有仓库并修复工作区引用；成功后不保留旧目录"
             />
+            <Field label="远端 CI 等待超时（分钟，可选）" type="number"
+              value={repository.remote_ci_wait_timeout_seconds == null ? "" : repository.remote_ci_wait_timeout_seconds / 60}
+              placeholder={`继承全局 ${Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} 分钟`}
+              onChange={(value) => update({ remote_ci_wait_timeout_seconds: value ? Math.round(Number(value) * 60) : undefined })}
+              help="包含远端 CI 排队和执行；到期保留 PR、不自动重跑，与下方本地 CI 门禁超时独立。" />
           </div>
         </fieldset>
         <section className="repository-preflight-section">
@@ -6549,7 +6556,7 @@ function AgentsEditor(props: {
                       ? "缓存与用户级配置写入本次运行目录，结束后清理"
                       : "命令继续直接使用启动服务用户的 HOME"}
                 />
-                <Field label="总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} />
+                <Field label="作为子 Agent 的总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} help="作为主 Agent 运行时无固定总时限，仍受无进展超时约束；等待子 Agent 或受控 CI 时单独计时。" />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
@@ -9461,6 +9468,13 @@ function AgentRunDetailDrawer(props: {
             <div className="run-drawer-body">
               {error && <div className="alert error">{error}</div>}
               {!detail && !error && <div className="empty tall">正在加载运行详情…</div>}
+              {detail?.waits?.filter((wait) => wait.kind === "ci").map((wait) => (
+                <div key={wait.wait_key} className={`alert ci-wait-note ${wait.status === "timed_out" ? "error" : ""}`} role="status">
+                  远端 CI · PR/MR #{wait.wait_key.split(":")[0]} · {wait.status === "waiting" ? "等待中" : wait.status === "timed_out" ? "等待超时，待处理" : "等待已结束"}
+                  <br />开始：{timeText(wait.started_at)} · 截止：{timeText(wait.deadline)}（轮询不重置期限）
+                  {wait.status === "timed_out" && <p>已保留 PR、分支和工作区；不会自动从头重跑或合并。</p>}
+                </div>
+              ))}
               {detail && drawerTab === "messages" && (
                 <RunMessageFeed
                   logs={logs}

@@ -25,7 +25,9 @@ from .sandbox_environment import sandbox_executable_environment
 from .codex_executable import resolve_codex_executable
 from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
 from .sandbox_curl import current_sandbox_curl, https_probe_url, http_tls_hint
-from .run_control import active_run_control
+from .run_control import RunStop, active_run_control
+from .remote_ci import CI_TOOL_DESCRIPTION, CI_TOOL_PARAMETERS, RemoteCIWaiter
+from .run_waits import CI_TIMEOUT_MESSAGE
 from .tool_results import TOOL_CAPTURE_LIMIT_BYTES, ToolResultError
 
 
@@ -57,6 +59,10 @@ def teamwork_function_tools(
     """生成 Codex Responses 接受的 Teamwork 函数工具定义。"""
 
     tools: list[dict[str, Any]] = [
+        {
+            "type": "function", "name": "wait_for_ci",
+            "description": CI_TOOL_DESCRIPTION, "parameters": CI_TOOL_PARAMETERS,
+        },
         {
             "type": "function",
             "name": "execute_command",
@@ -210,7 +216,36 @@ class ModelToolExecutor:
             )
         if name == "publish_comment":
             return await self._publish_comment(arguments)
+        if name == "wait_for_ci":
+            return await self._wait_for_ci(arguments)
         raise ValueError(f"未知 Teamwork 工具：{name}")
+
+    async def _wait_for_ci(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """CI 使用自己的固定期限，超时后不能让模型继续清理或重放。"""
+
+        if set(arguments) != {"number", "expected_head_sha"}:
+            raise ValueError("wait_for_ci 只接受当前仓库 PR/MR 编号和源提交 SHA")
+        control = active_run_control.get()
+        if control is not None:
+            control.raise_if_stopped()
+            control.waiting_ci += 1
+        try:
+            result = await RemoteCIWaiter(self.config, StateStore(self.config.database.path)).wait(
+                self.context, arguments.get("number"), arguments.get("expected_head_sha"),
+                cancel_check=self.cancel_check,
+            )
+            if result["status"] == "timed_out":
+                current = control
+                while current is not None:
+                    if current.stop is None:
+                        current.stop = RunStop("timed_out", "remote_ci_timeout", CI_TIMEOUT_MESSAGE, "run.timed_out")
+                    current = current.parent
+                raise asyncio.CancelledError
+            return result
+        finally:
+            if control is not None:
+                control.waiting_ci -= 1
+                control.progress()
 
     async def _publish_comment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """把顶层评论交给 Teamwork 托管服务发布或更新。"""
@@ -457,7 +492,7 @@ class ModelToolExecutor:
         if extra_context is not None and not isinstance(extra_context, dict):
             raise ValueError("invoke_agent.extra_context 必须是对象")
         control = active_run_control.get()
-        # 子任务自己判断是否有进展；父任务只暂停 idle，总时限仍然生效。
+        # 子任务自行限时；父运行暂停 idle，仅当父运行本身也是子任务时保留总时限。
         with control.waiting_for_child() if control is not None else nullcontext():
             try:
                 return await self.invoke_agent_callback(
@@ -467,6 +502,16 @@ class ModelToolExecutor:
                     extra_context,
                     started_callback,
                 )
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == "remote_ci_timeout":
+                    # CLI 子运行的控制状态不在本进程，必须把确定的 CI 超时传到内嵌父链。
+                    current = control
+                    while current is not None:
+                        if current.stop is None:
+                            current.stop = RunStop("timed_out", "remote_ci_timeout", CI_TIMEOUT_MESSAGE, "run.timed_out")
+                        current = current.parent
+                    raise asyncio.CancelledError from exc
+                raise
             finally:
                 self.progress_callback()
 

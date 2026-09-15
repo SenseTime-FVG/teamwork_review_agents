@@ -849,6 +849,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .alert { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; padding: 11px 14px; border: 1px solid; border-radius: 8px; font-size: 11px; }
 .alert.error { color: #ffaaaa; border-color: #603036; background: #211216; }
 .alert.success { color: #91e6b7; border-color: #28563d; background: #10241a; }
+/* CI 等待有多行期限与保留说明，不能套用普通告警的左右分栏布局。 */
+.alert.ci-wait-note { display: block; line-height: 1.7; }
+.ci-wait-note:not(.error) { color: #a6bbd0; border-color: #304659; background: #0d1923; }
+.ci-wait-note p { margin: 6px 0 0; }
 .alert button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 16px; }
 .empty { padding: 24px; color: #5f6d80; text-align: center; font-size: 11px; }
 .empty.tall { min-height: 420px; display: grid; place-items: center; }

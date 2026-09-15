@@ -633,7 +633,7 @@ def test_runner_enables_only_agent_gateway(snapshot_factory, configured_app_fact
     ).command
     joined = " ".join(command)
     assert "--ignore-user-config" not in command
-    assert "enabled_tools=[\"invoke_agent\"]" in joined
+    assert "enabled_tools=[\"invoke_agent\", \"wait_for_ci\"]" in joined
     assert (
         'features.code_mode.direct_only_tool_namespaces=["mcp__teamwork_agent_gateway"]'
         in command
@@ -670,7 +670,7 @@ def test_runner_enables_managed_comment_tool(
     command = CodexRunner(config).build_launch(agent, repository, context).command
 
     assert (
-        'enabled_tools=["invoke_agent", "publish_comment"]'
+        'enabled_tools=["invoke_agent", "wait_for_ci", "publish_comment"]'
         in " ".join(command)
     )
 

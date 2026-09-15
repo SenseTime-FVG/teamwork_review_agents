@@ -46,6 +46,7 @@ export type Repository = {
   workspace: string;
   clone_url?: string;
   enabled?: boolean;
+  remote_ci_wait_timeout_seconds?: number | null;
   allowed_skills?: string[] | null;
   agent_skills?: Record<string, string[]>;
   environment?: EnvironmentMap;
@@ -202,6 +203,7 @@ export type CodexInheritedSetting = {
 };
 
 export type RuntimeConfig = Record<string, unknown> & {
+  remote_ci_wait_timeout_seconds?: number;
   max_concurrent_agents?: number;
   agent_concurrency_limit?: number;
   codex_binary?: string;
@@ -606,6 +608,7 @@ export type AgentModelSnapshot = {
 };
 
 export type RunDetail = RunSummary & {
+  waits?: Array<{ kind: string; wait_key: string; started_at: number; deadline: number; status: string; detail: Record<string, unknown> }>;
   prompt: string;
   environment: Record<string, string>;
   config_revision?: string;

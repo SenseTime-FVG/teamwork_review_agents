@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ from .config import load_config
 from .executor import AgentExecutor, sub_agent_idempotency_key
 from .managed_comments import ManagedCommentService
 from .state import StateStore
+from .remote_ci import CI_TOOL_DESCRIPTION, RemoteCIWaiter
+from .run_waits import RunWaits, mcp_wait_timeout
 
 
 # Python 3.14 不会自动解析该泛型前向引用，显式重建可避免设置字段不完整。
@@ -109,11 +112,12 @@ async def invoke_agent(
             extra_context=extra_context,
         ),
     }
-    if context.inherit_workspace or "workspace" in child.write_scopes:
-        async with _sub_agent_write_lock:
+    async with RunWaits(store).child(context.run_id, str(uuid.uuid4()), mcp_wait_timeout(config)):
+        if context.inherit_workspace or "workspace" in child.write_scopes:
+            async with _sub_agent_write_lock:
+                result = await executor.execute(**execute_arguments)
+        else:
             result = await executor.execute(**execute_arguments)
-    else:
-        result = await executor.execute(**execute_arguments)
     if result is None:
         return {
             "status": "deduplicated",
@@ -145,6 +149,28 @@ async def publish_comment(body: str) -> dict[str, Any]:
         config,
         store,
     ).publish_agent_comment(context, body)
+
+
+@mcp.tool(name="wait_for_ci", description=CI_TOOL_DESCRIPTION)
+async def wait_for_ci(number: int, expected_head_sha: str) -> dict[str, Any]:
+    """在服务侧等待 CI；到期不返回给模型继续执行，由 CLI 看门狗收尾。"""
+
+    config, context = _load_invocation()
+    if context.current_agent not in config.agents:
+        raise PermissionError("当前 Agent 不存在")
+    store = StateStore(config.database.path)
+    await asyncio.to_thread(store.initialize)
+
+    async def cancelled():
+        """沿用管理员取消和服务停止的持久化状态。"""
+
+        return await asyncio.to_thread(store.agent_run_cancel_requested, context.run_id)
+
+    result = await RemoteCIWaiter(config, store).wait(context, number, expected_head_sha, cancel_check=cancelled)
+    if result["status"] == "timed_out":
+        # 后台看门狗会读取截止记录并终止进程组，禁止模型接到普通工具错误后继续清理。
+        await asyncio.Event().wait()
+    return result
 
 
 def main() -> None:

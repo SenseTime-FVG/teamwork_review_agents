@@ -241,11 +241,13 @@ PR / MR 描述应简洁包含：原始 PR / MR 链接和编号、固定合并后
 
 # 十、等待门禁并自动合并
 
+远端 CI 等待必须调用 `wait_for_ci(number, expected_head_sha)`，传入本次新建 PR / MR 的编号和 `AUTO_UPDATE_HEAD_SHA`，不得使用 shell 长轮询。后台按仓库或全局配置独立限时，默认 30 分钟，含排队与执行；状态查询不刷新截止时间。等待超时是待处理终态，不属于下文的业务失败清理：保留本次 PR / MR、分支、提交和工作区，不再次调用依赖或文档 Agent，不执行“失败与分支清理”，也不得合并。工具只确认观察到的 CI，成功返回后仍必须重新核验下列全部门禁及源、目标 SHA。
+
 1. 将创建后的 PR / MR 源分支 HEAD 记为 `AUTO_UPDATE_HEAD_SHA`。后续 Checks / Pipeline、可合并状态和合并操作必须对应这个精确 SHA。
 2. 每次关键状态刷新必须同时查询：PR / MR 当前状态、head/source 与 base/target branch、源分支 HEAD、目标分支 HEAD、可合并状态和该 SHA 对应的平台必要检查。
 3. 远程目标分支 HEAD 不等于 `TARGET_HEAD_AT_START` 时判定任务失败并执行清理。
 4. 源分支 HEAD 变化、head/source 或 base/target branch 变化、PR / MR 身份无法确认时判定任务失败并执行清理；不得审核或合并未经本流程验证的新提交。
-5. GitHub Checks / Actions / Commit Status 或 GitLab Pipeline / Job 等必要检查仍在运行时，按有限间隔持续非交互查询，不得把运行中当作成功或失败。
+5. GitHub Checks / Actions / Commit Status 或 GitLab Pipeline / Job 等必要检查仍在运行时，使用上述受控工具等待，不得把运行中当作成功或失败。
 6. 平台明确确认项目没有配置 CI，且目标分支保护不要求 CI 时，将 CI 记为“不适用”；不得把查询失败或未知状态当作没有 CI。
 7. 必要检查、审批、冲突检查、分支保护、GitHub Ruleset / Merge Queue、GitLab Protected Branch 或其他平台门禁失败时判定任务失败并执行清理。
 8. 只有 PR / MR 仍打开、身份和 SHA 未变化、平台明确无冲突且可合并，并且全部必要门禁通过时，才允许自动合并。

@@ -29,6 +29,7 @@ async def test_mcp_proxy_only_exposes_teamwork_gateway_tools() -> None:
     assert [tool.name for tool in tools.tools] == [
         "invoke_agent",
         "publish_comment",
+        "wait_for_ci",
     ]
 
 
