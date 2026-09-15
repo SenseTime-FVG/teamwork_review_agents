@@ -32,7 +32,6 @@ from .context_compaction import (
     ContextCompactionError,
     ConversationContext,
     estimate_tokens,
-    resolve_context_window,
 )
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
 from .model_provider_credentials import ModelProviderCredentialStore
@@ -1008,6 +1007,8 @@ class CodexModelRunner:
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "message": "新请求按主链顺序选模，跳过本次运行已耗尽额度的候选。",
+                "context_window_tokens": current_selection.context_window_tokens if current_selection else None,
+                "context_window_source": current_selection.context_window_source if current_selection else None,
             })
             await save_snapshot()
             while True:
@@ -1040,13 +1041,10 @@ class CodexModelRunner:
                 round_message_parts.clear()
                 request_phase = "compaction"
                 try:
-                    window, window_source = resolve_context_window(
-                        self.config.runtime.context_compaction,
-                        current_selection.provider_id if current_selection else self.provider_id,
-                        model,
-                        driver=current_selection.provider.driver if current_selection else self.provider.driver,
-                        codex_home=codex_home(self.config.runtime.codex_home),
-                    )
+                    # 当前候选已由统一解析器展开；回退时立即使用新候选自己的预算。
+                    assert current_selection is not None
+                    window = current_selection.context_window_tokens
+                    window_source = current_selection.context_window_source
                     compacted = await conversation.ensure_budget(
                         model=model,
                         request_fields={key: value for key, value in payload.items() if key != "input"},
@@ -1467,6 +1465,8 @@ def _model_snapshot_update(
         "reasoning_effort": reasoning_effort,
         "reasoning_effort_source": reasoning_effort_source,
         "configured_reasoning_effort": configured_reasoning_effort,
+        "context_window_tokens": current_selection.context_window_tokens if current_selection else None,
+        "context_window_source": current_selection.context_window_source if current_selection else None,
         "reasoning_downgrades": list(reasoning_downgrades[-32:]),
         "fallback_plan": [
             {
@@ -1477,6 +1477,8 @@ def _model_snapshot_update(
                 "model": item.model,
                 "model_source": item.model_source,
                 "resolved_label": item.resolved_label,
+                "context_window_tokens": item.context_window_tokens,
+                "context_window_source": item.context_window_source,
                 "reasoning_effort": (
                     item.reasoning_effort
                     if supports_reasoning_effort(item.provider, item.model)

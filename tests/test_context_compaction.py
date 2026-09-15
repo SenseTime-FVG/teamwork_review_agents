@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from teamwork_review_agents.config import ContextCompactionConfig, ModelProviderConfig, ModelSelectionConfig
 from teamwork_review_agents.context_compaction import (
     ConversationContext, ContextCompactionError, SUMMARY_INSTRUCTIONS, SUMMARY_PREFIX, SUMMARY_REQUEST,
-    estimate_tokens, resolve_context_window, summary_payload,
+    estimate_tokens, summary_payload,
 )
 from teamwork_review_agents.codex_model_client import CodexResponsesClient, CodexUpstreamError
 from teamwork_review_agents.codex_model_runner import CodexModelRunner, _instructions
@@ -32,7 +32,7 @@ def _settings(**overrides):
     """小窗口让测试只使用少量数据即可触发压缩。"""
 
     return ContextCompactionConfig(**{
-        "default_context_window_tokens": 8192, "reserved_output_tokens": 512,
+        "reserved_output_tokens": 512,
         "summary_target_bytes": 512, "tool_output_inline_bytes": 65536,
         "trigger_ratio": 0.7, "target_ratio": 0.4, "keep_recent_rounds": 1,
         **overrides,
@@ -330,26 +330,13 @@ def test_tool_pairing():
 
 
 @pytest.mark.parametrize("overrides", [
-    {"target_ratio": 0.8}, {"reserved_output_tokens": 8000},
-    {"model_context_windows": {"a": {"small": 1000}}},
+    {"target_ratio": 0.8},
 ])
 def test_invalid_compaction_budgets_rejected(overrides):
     """预算配置错误必须在保存时拒绝。"""
 
     with pytest.raises(ValidationError):
         _settings(**overrides)
-
-
-def test_model_window_resolution_is_scoped_and_has_safe_fallback(tmp_path):
-    """覆盖按 Provider/模型匹配；Codex 缓存不可用时使用明确的默认预算。"""
-
-    settings = _settings(model_context_windows={"a": {"same": 16000}})
-    (tmp_path / "models_cache.json").write_text(json.dumps({"models": [{"slug": "same", "context_window": 24000}]}), encoding="utf-8")
-    assert resolve_context_window(settings, "a", "same", driver="codex_cli", codex_home=tmp_path) == (16000, "configured")
-    assert resolve_context_window(settings, "b", "same", driver="codex_cli", codex_home=tmp_path) == (24000, "codex_model_cache")
-    assert resolve_context_window(settings, "b", "same", driver="openai_responses", codex_home=tmp_path) == (8192, "conservative_default")
-    (tmp_path / "models_cache.json").write_text("invalid", encoding="utf-8")
-    assert resolve_context_window(settings, "b", "same", driver="codex_cli", codex_home=tmp_path)[0] == 8192
 
 
 async def test_builtin_prompts_fit_default_fixed_budget(configured_app_factory):
@@ -403,11 +390,13 @@ async def test_builtin_prompts_remain_complete_summary_reference(configured_app_
 def run_context(configured_app_factory, monkeypatch):
     """通过真实 HTTP 协议适配器验证运行器，禁止网络和真实工具执行。"""
 
-    async def run(handler, *, settings=None, output_size=2400, fallback=False):
+    async def run(handler, *, settings=None, output_size=2400, fallback=False, window=None, windows=None):
         config = configured_app_factory()
         config.runtime.context_compaction = settings or _settings()
+        # 窗口归属 Provider，与压缩算法参数独立；默认测试使用小窗口。
+        window = window or (8192 if settings is None or settings.reserved_output_tokens == 512 else 272000)
         for name in ("a", "b"):
-            config.model_providers[name] = ModelProviderConfig(display_name=name, driver="openai_responses", base_url=f"https://{name}.example.test", default_model=f"gpt-{name}")
+            config.model_providers[name] = ModelProviderConfig(display_name=name, driver="openai_responses", base_url=f"https://{name}.example.test", default_model=f"gpt-{name}", context_window_tokens=(windows or {}).get(name, window))
         config.runtime.default_model = ModelSelectionConfig(provider="a", model="gpt-a")
         config.runtime.default_model_fallbacks = [ModelSelectionConfig(provider="b", model="gpt-b")] if fallback else []
         credentials = ModelProviderCredentialStore(config.database.path.parent / "model-provider-credentials")
@@ -591,12 +580,15 @@ async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(r
             return httpx.Response(503, json={"error": {"code": "server_error"}})
         return _tool(2) if len(normal) == 4 else _response("完成")
 
-    settings = _settings(model_context_windows={"a": {"gpt-a": 32000}, "b": {"gpt-b": 6500}})
-    outcome = await run_context(handler, settings=settings, fallback=True)
+    outcome = await run_context(handler, settings=_settings(), fallback=True, windows={"a": 32000, "b": 6500})
     assert outcome.result.status == "completed"
     assert [body["model"] for body in normal] == ["gpt-a", "gpt-a", "gpt-a", "gpt-b", "gpt-a"]
     assert summaries and all(body["model"] == "gpt-b" for body in summaries)
     assert outcome.calls == [0, 1, 2]
+    fallback_snapshots = [item for item in outcome.snapshots if item.get("provider_id") == "b"]
+    assert fallback_snapshots and all(item["context_window_tokens"] == 6500 for item in fallback_snapshots)
+    assert outcome.snapshots[-1]["context_window_tokens"] == 32000
+    assert all(item["window_source"] == "provider:b" for item in outcome.snapshots[-1]["context_compactions"])
     assert SUMMARY_PREFIX.splitlines()[0] in json.dumps(normal[-1], ensure_ascii=False)
 
 
@@ -648,7 +640,7 @@ async def test_large_tool_output_keeps_complete_readable_file(run_context, windo
             assert result["exit_code"] == 0
         return _tool(0) if len(normal) == 1 else _response("完成")
 
-    outcome = await run_context(handler, output_size=output_size, settings=_settings(default_context_window_tokens=window))
+    outcome = await run_context(handler, output_size=output_size, settings=_settings(), window=window)
     assert outcome.result.status == "completed" and outcome.calls == [0]
     assert paths and not paths[0].exists()
     assert any(event == "context.tool_output_stored" for event, _ in outcome.logs)
