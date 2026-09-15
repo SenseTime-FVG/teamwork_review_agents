@@ -393,7 +393,7 @@ Windows 托管沙盒运行会追加本轮 Git 配置 `http.sslBackend=openssl`�
 
 ### Windows 沙盒内 curl HTTPS
 
-通常不需要用户安装 OpenSSL 或填写 curl 路径，也不新增 HTTP 工具。Windows 后台服务启动后自动检查已有兼容 curl；缺少程序或只有不兼容的 TLS 后端时，从 curl 官方下载项目固定版本，校验 SHA-256 后放入数据库目录旁的 `runtimes/curl` 缓存。默认 SQLite 位于 `data/` 时，缓存即 `data/runtimes/curl/`。后续启动复用并验证缓存，不在每轮 Agent 运行时下载。当前固定分发为官方 `8.22.0_1` x64 / ARM64 构建，包含静态 LibreSSL 和 CA 文件；版本与摘要随项目代码审核更新，不自动追踪 latest。
+通常不需要用户安装 OpenSSL 或填写 curl 路径，也不新增 HTTP 工具。Windows 后台服务启动后自动检查已有兼容 curl；缺少程序或只有不兼容的 TLS 后端时，从 curl 官方下载项目固定版本，校验 SHA-256 后放入数据库目录旁的 `runtimes/curl` 缓存。默认 SQLite 位于 `data/` 时，缓存即 `data/runtimes/curl/`。后续启动复用并验证缓存，不在每轮 Agent 运行时下载。安装目录继承缓存根目录权限；旧版本缓存若因私有目录权限被沙盒拒绝执行，服务会从已校验的本地安装包自动重建一次并重新验证，无需用户手动修改目录权限。当前固定分发为官方 `8.22.0_1` x64 / ARM64 构建，包含静态 LibreSSL 和 CA 文件；版本与摘要随项目代码审核更新，不自动追踪 latest。
 
 初始化异步执行，管理页面和仓库扫描不等待下载；首次事件分发和定时任务最多等待本次 90 秒准备结束。下载或执行验证失败后，管理服务仍可使用，也不阻断无需 curl 的 Agent。可在「全局配置与环境 → Windows HTTPS 运行环境」查看状态、路径及具体原因，点击“重新检查并准备”重试；配置尚未保存的改动不会用于准备。手动路径和 `runtime.managed_sandbox.curl_auto_prepare: false` 位于高级配置；指定 `curl_binary` 后只验证该路径，不会悄悄下载或替换。自动化 CLI 单次运行不负责部署准备。
 
