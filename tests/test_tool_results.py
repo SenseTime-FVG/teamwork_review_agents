@@ -181,12 +181,17 @@ async def test_existing_command_tool_reads_missing_middle(executor):
     assert result["truncated"] is False
 
 
-def test_read_only_agent_can_read_runtime_files(executor):
-    """沿用既有运行目录授权，不扩大 Git 工作区或整个临时目录的写权限。"""
+@pytest.mark.parametrize("windows_separation", [False, True])
+def test_read_only_agent_can_read_runtime_files(executor, monkeypatch, verified_test_sandbox_python, windows_separation):
+    """模拟已通过运行前验证的沙盒，检查两种平台策略下的精确运行目录授权。"""
 
-    agent = executor.agent.model_copy(update={"sandbox": "read-only"})
+    monkeypatch.setattr("teamwork_review_agents.managed_sandbox.windows_environment_separation", lambda: windows_separation)
+    agent = executor.config.agents["code-reviewer"]
     profile = permission_profile_override(agent, codex_runtime_directory=executor.codex_runtime_directory)
     assert f'{json.dumps(str(executor.codex_runtime_directory.resolve()))}="write"' in profile
+    if windows_separation:
+        for directory in verified_test_sandbox_python.readable_directories:
+            assert f'{json.dumps(str(Path(directory).resolve()))}="read"' in profile
 
 
 async def test_command_output_over_one_megabyte_is_complete(executor):
