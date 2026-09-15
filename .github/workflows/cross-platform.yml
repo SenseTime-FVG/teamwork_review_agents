@@ -71,6 +71,7 @@ jobs:
           tests/test_hidden_subprocess.py
           tests/test_process_manager.py
           tests/test_preflight.py
+          tests/test_preflight_orchestration.py
           tests/test_workspace.py::test_workspace_is_cloned_and_change_request_ref_is_fetched
           tests/test_config_and_runner.py::test_runner_only_accepts_explicit_provider_token_environment
           tests/test_context_compaction.py

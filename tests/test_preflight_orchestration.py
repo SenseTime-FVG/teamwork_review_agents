@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from unittest.mock import AsyncMock
+
+import pytest
 
 from teamwork_review_agents.config import parse_config_data
 from teamwork_review_agents.events import detect_events
@@ -12,6 +16,7 @@ from teamwork_review_agents.models import (
     PreflightResult,
 )
 from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
+from teamwork_review_agents.preflight import PreflightStepUpdate, StepExecutionOutcome, preflight_idempotency_key
 
 
 def preflight_config(tmp_path):
@@ -86,7 +91,7 @@ class FakePreflightExecutor:
         self.result = result
         self.calls = 0
 
-    async def ensure_passed(self, _event):
+    async def ensure_passed(self, _event, *, event_ids=None):
         self.calls += 1
         return self.result
 
@@ -102,6 +107,159 @@ def result(status: str, *, error: str | None = None) -> PreflightResult:
         exit_code=1 if status == "failure" else None,
         error=error,
     )
+
+
+def mixed_ci_batch(tmp_path, snapshot_factory):
+    """批次首事件未匹配，两个事件需要 CI，另一个只运行直接 Agent。"""
+
+    config = preflight_config(tmp_path)
+    config.rules[0].events = ["change_request.commits_changed", "change_request.target_commits_changed"]
+    config.agents["direct-reviewer"] = config.agents["reviewer"].model_copy()
+    config.rules.append(config.rules[0].model_copy(update={
+        "name": "direct-review", "events": ["change_request.opened"],
+        "agents": ["direct-reviewer"], "run_preflight": False,
+    }))
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo", head_sha="b" * 40)
+    template = detect_events(None, snapshot, emit_initial=True)[0]
+    events = [template.model_copy(update={"id": name, "type": event_type, "batch_id": "mixed-ci-batch"})
+              for name, event_type in [
+                  ("aa-unmatched", "change_request.updated"),
+                  ("bb-ci", "change_request.commits_changed"),
+                  ("cc-ci", "change_request.target_commits_changed"),
+                  ("dd-direct", "change_request.opened"),
+              ]]
+    orchestrator.store.save_snapshot_and_events(snapshot, events)
+    return orchestrator, events
+
+
+async def test_all_ci_events_are_linked_before_preparation_and_while_steps_run(tmp_path, snapshot_factory, monkeypatch):
+    """真实编排和 CI 执行器在准备及步骤期间都关联所有门禁事件，排除无关事件。"""
+
+    orchestrator, events = mixed_ci_batch(tmp_path, snapshot_factory)
+    ci_ids = {"bb-ci", "cc-ci"}
+    prepared = []
+    started, release = asyncio.Event(), asyncio.Event()
+    agents = FakeAgentExecutor()
+    orchestrator.executor = agents
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setattr(orchestrator.preflight, "_set_remote_status", AsyncMock())
+    monkeypatch.setattr(orchestrator.preflight, "_sync_failure_comment_safely", AsyncMock())
+
+    def assert_linked(phase):
+        """从新连接读取，确保关联已经提交且列表、详情都能看见。"""
+
+        records = {item["event_id"]: item for item in orchestrator.store.list_events()}
+        runs = orchestrator.store.list_preflight_runs()
+        assert len(runs) == 1 and runs[0]["phase"] == phase
+        run_id = runs[0]["run_id"]
+        assert runs[0]["event_id"] in ci_ids
+        for event_id in ci_ids:
+            assert records[event_id]["status"] == "processing"
+            assert records[event_id]["preflight_status"] == "running"
+            assert records[event_id]["preflight_run_id"] == run_id
+            assert orchestrator.store.get_event_detail(event_id)["preflight"]["run_id"] == run_id
+        assert records["aa-unmatched"]["status"] == "unmatched"
+        assert all(records[event_id]["preflight_run_id"] is None for event_id in ("aa-unmatched", "dd-direct"))
+        return run_id
+
+    @contextmanager
+    def worktree(*_args, **_kwargs):
+        """在任何真实 Git 或网络操作前核验关联。"""
+        prepared.append(assert_linked("preparing"))
+        yield tmp_path
+
+    async def steps(_config, **kwargs):
+        """暂停步骤以便检查处理中详情，释放后返回确定性的门禁失败。"""
+        await kwargs["on_step_update"](PreflightStepUpdate(step_index=0, status="running"))
+        started.set()
+        await release.wait()
+        await kwargs["on_step_update"](PreflightStepUpdate(step_index=0, status="failure", exit_code=1))
+        return StepExecutionOutcome(status="failure", failed_step="test", exit_code=1)
+
+    monkeypatch.setattr("teamwork_review_agents.preflight.temporary_change_request_worktree", worktree)
+    monkeypatch.setattr("teamwork_review_agents.preflight.execute_preflight_steps", steps)
+    processing = asyncio.create_task(orchestrator.process_events(CycleSummary()))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        run_id = assert_linked("running_steps")
+        assert prepared == [run_id]
+        assert orchestrator.store.get_preflight_run(run_id)["steps"][0]["status"] == "running"
+        assert agents.calls == ["direct-reviewer"]
+    finally:
+        release.set()
+        await asyncio.wait_for(processing, timeout=10)
+    records = {item["event_id"]: item for item in orchestrator.store.list_events()}
+    assert all(records[event_id]["status"] == "completed" and records[event_id]["preflight_status"] == "failure" for event_id in ci_ids)
+    assert agents.calls == ["direct-reviewer"]
+
+
+@pytest.mark.parametrize("mode", ["new", "retry", "restart_exhausted"])
+def test_preflight_reservation_atomically_links_batch_in_every_creation_path(tmp_path, snapshot_factory, mode):
+    """新建、异常重试和手动换代均在返回预留记录时完成全部事件关联。"""
+
+    orchestrator, events = mixed_ci_batch(tmp_path, snapshot_factory)
+    store = orchestrator.store
+    event = events[1]
+    arguments = dict(idempotency_key="batch-key", event_id=event.id, repository_id=event.repository_id,
+                     number=event.number, head_sha=event.current_snapshot.head_sha,
+                     config_revision=orchestrator.config.revision, max_attempts=1 if mode == "restart_exhausted" else 2)
+    if mode != "new":
+        old = store.begin_preflight_run(proposed_run_id="old-ci", **arguments)
+        store.finish_preflight_run(PreflightResult(run_id=old.run_id, repository_id=event.repository_id,
+            number=event.number, head_sha=event.current_snapshot.head_sha, status="error", error="模拟工作区异常"))
+    reservation = store.begin_preflight_run(proposed_run_id="new-ci", **arguments,
+        event_ids=("bb-ci", "cc-ci", "cc-ci"), restart_exhausted_error=mode == "restart_exhausted")
+    assert reservation.run_id == ("old-ci" if mode == "retry" else "new-ci")
+    for event_id in ("bb-ci", "cc-ci"):
+        record = next(item for item in store.list_events() if item["event_id"] == event_id)
+        assert record["preflight_status"] == "running"
+        assert record["preflight_run_id"] == reservation.run_id
+        assert record["preflight_reused"] == 0
+    with store.connect() as connection:
+        linked = connection.execute("SELECT event_id FROM event_preflight_links WHERE run_id=? ORDER BY event_id", (reservation.run_id,)).fetchall()
+    assert [row["event_id"] for row in linked] == ["bb-ci", "cc-ci"]
+
+
+@pytest.mark.parametrize("published", [False, True])
+async def test_cached_ci_links_all_current_events_before_remote_delivery(tmp_path, snapshot_factory, monkeypatch, published):
+    """缓存结果在状态回写或评论同步等待期间就对当前事件可见，即使回写随后异常。"""
+
+    orchestrator, events = mixed_ci_batch(tmp_path, snapshot_factory)
+    store = orchestrator.store
+    event = events[1]
+    old_event = event.model_copy(update={"id": "old-event"})
+    store.enqueue_events([old_event])
+    reservation = store.begin_preflight_run(proposed_run_id="cached-ci",
+        idempotency_key=preflight_idempotency_key(orchestrator.config, event), event_id=old_event.id,
+        repository_id=event.repository_id, number=event.number, head_sha=event.current_snapshot.head_sha,
+        config_revision=orchestrator.config.revision, max_attempts=2)
+    cached = PreflightResult(run_id=reservation.run_id, repository_id=event.repository_id,
+        number=event.number, head_sha=event.current_snapshot.head_sha, status="failure", status_published=published)
+    store.finish_preflight_run(cached)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def deliver(*_args, **_kwargs):
+        """只模拟耗时网络回写，禁止测试调用真实平台。"""
+        started.set()
+        await release.wait()
+        raise RuntimeError("模拟回写失败")
+
+    monkeypatch.setattr(orchestrator.preflight,
+        "_sync_failure_comment_safely" if published else "_publish_terminal_result", deliver)
+    processing = asyncio.create_task(orchestrator.preflight.ensure_passed(event, event_ids=("bb-ci", "cc-ci")))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        records = {item["event_id"]: item for item in store.list_events()}
+        for event_id in ("bb-ci", "cc-ci"):
+            assert records[event_id]["preflight_run_id"] == "cached-ci"
+            assert records[event_id]["preflight_reused"] == 1
+        assert all(records[event_id]["preflight_run_id"] is None for event_id in ("aa-unmatched", "dd-direct"))
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="模拟回写失败"):
+            await asyncio.wait_for(processing, timeout=10)
+    assert len(store.list_preflight_runs()) == 1
 
 
 def test_rule_can_request_preflight_without_repository_ci_configuration(
@@ -257,7 +415,7 @@ async def test_matching_event_stays_processing_while_preflight_is_running(
     release = asyncio.Event()
 
     class WaitingRecordedPreflightExecutor:
-        async def ensure_passed(self, current_event):
+        async def ensure_passed(self, current_event, *, event_ids=None):
             reservation = orchestrator.store.begin_preflight_run(
                 proposed_run_id="preflight-waiting",
                 idempotency_key="demo:7:waiting-preflight",
@@ -267,6 +425,7 @@ async def test_matching_event_stays_processing_while_preflight_is_running(
                 head_sha=current_event.new.head_sha,
                 config_revision=orchestrator.config.revision,
                 max_attempts=2,
+                event_ids=event_ids,
             )
             assert reservation is not None
             started.set()
@@ -414,7 +573,7 @@ async def test_failed_preflight_only_blocks_rules_that_requested_ci(
     class WaitingPreflightExecutor:
         calls = 0
 
-        async def ensure_passed(self, _event):
+        async def ensure_passed(self, _event, *, event_ids=None):
             self.calls += 1
             await asyncio.wait_for(direct_started.wait(), timeout=1)
             return result("failure")
@@ -519,7 +678,7 @@ async def test_superseded_preflight_continues_with_newer_head_event(
         def __init__(self) -> None:
             self.heads: list[str] = []
 
-        async def ensure_passed(self, event):
+        async def ensure_passed(self, event, *, event_ids=None):
             self.heads.append(event.new.head_sha)
             if len(self.heads) == 1:
                 return PreflightResult(

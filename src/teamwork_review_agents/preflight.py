@@ -732,15 +732,22 @@ class PreflightExecutor:
             )
         return result.model_copy(update={"status_published": True})
 
-    async def ensure_passed(self, event: ChangeEvent) -> PreflightResult:
-        """返回当前 Head 的已有终态，或执行一次新的 Preflight。"""
+    async def ensure_passed(
+        self, event: ChangeEvent, *, event_ids: tuple[str, ...] | None = None,
+    ) -> PreflightResult:
+        """立即关联受门禁约束的事件，再复用结果或执行当前 Head 的 CI。"""
 
+        linked_event_ids = event_ids if event_ids is not None else (event.id,)
         repository = self.repositories[event.repository_id]
         provider_config = self.config.providers[repository.provider]
         snapshot = event.current_snapshot
         key = preflight_idempotency_key(self.config, event)
         cached = await asyncio.to_thread(self.store.load_preflight_result, key)
         if cached is not None and cached.status != "error":
+            # 状态回写和评论同步也可能耗时，复用关系必须先对当前事件可见。
+            await asyncio.to_thread(
+                self.store.link_events_to_preflight, linked_event_ids, cached.run_id, reused=True,
+            )
             cached = cached.model_copy(
                 update={"source_generation": event.source_generation}
             )
@@ -773,10 +780,14 @@ class PreflightExecutor:
             config_revision=self.config.revision,
             max_attempts=self.config.runtime.event_retry_count + 1,
             restart_exhausted_error=event.origin == "manual",
+            event_ids=linked_event_ids,
         )
         if reservation is None:
             current = await asyncio.to_thread(self.store.load_preflight_result, key)
             if current is not None:
+                await asyncio.to_thread(
+                    self.store.link_events_to_preflight, linked_event_ids, current.run_id, reused=True,
+                )
                 return current.model_copy(
                     update={
                         "reused": True,

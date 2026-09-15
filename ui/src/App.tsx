@@ -19,6 +19,7 @@ import { gitBytesText, gitProgressText, presentRunLogs } from "./runLogPresentat
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
+import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -186,16 +187,6 @@ const CHANGE_REQUEST_STATUS_OPTIONS = [
   { value: "opened", label: "打开" },
   { value: "closed", label: "已关闭" },
   { value: "merged", label: "已合并" },
-];
-
-const EVENT_STATUS_OPTIONS = [
-  { value: "pending", label: "待处理" },
-  { value: "processing", label: "规则匹配中" },
-  { value: "unmatched", label: "未触发" },
-  { value: "triggered", label: "已触发" },
-  { value: "completed", label: "已处理" },
-  { value: "failed", label: "处理失败" },
-  { value: "cancelled", label: "已取消" },
 ];
 
 let bodyScrollLockCount = 0;
@@ -8175,54 +8166,6 @@ function queueReasonLabel(reason?: string | null): string | null {
   return labels[reason] ?? reason;
 }
 
-function unmatchedReasonLabel(reason?: string | null): string | null {
-  if (!reason) return null;
-  const labels: Record<string, string> = {
-    scan_deduplicated: "本扫描周期内已被更新事件替代",
-  };
-  return labels[reason] ?? reason;
-}
-
-function eventStatusPresentation(event: EventRecord): {
-  label: string;
-  visualStatus: string;
-  details?: string;
-} {
-  const labels: Record<string, string> = {
-    pending: "待处理",
-    processing: "规则匹配中",
-    unmatched: "未触发",
-    triggered: "已触发",
-    completed: event.trigger_count > 0 ? "已处理" : "已结束",
-    failed: "处理失败",
-    cancelled: "已取消",
-  };
-  let label = labels[event.status] ?? event.status;
-  let visualStatus = event.status;
-  if (event.error?.includes("状态回写失败")) {
-    label = "状态回写失败";
-    visualStatus = "failed";
-  } else if (event.status === "processing" && event.preflight_status === "running") {
-    label = "本地 CI 中";
-  } else if (event.status === "completed" && event.preflight_status === "failure") {
-    label = "本地 CI 未通过";
-    visualStatus = "failed";
-  } else if (event.status === "completed" && event.preflight_status === "timed_out") {
-    label = "本地 CI 超时";
-    visualStatus = "failed";
-  } else if (event.status === "completed" && event.preflight_status === "superseded") {
-    label = "Head 已更新，已跳过";
-    visualStatus = "unmatched";
-  } else if (event.status === "failed" && event.preflight_status === "error") {
-    label = "本地 CI 异常";
-  }
-  const details = event.error
-    ?? event.preflight_error
-    ?? unmatchedReasonLabel(event.unmatched_reason)
-    ?? (event.preflight_failed_step ? `失败步骤：${event.preflight_failed_step}` : undefined);
-  return { label, visualStatus, details };
-}
-
 function EventStatusPill({
   event,
   onClick,
@@ -8443,7 +8386,7 @@ function eventStatusExplanation(event: EventRecord): string {
     return "事件处理已结束，但向平台回写状态时失败。";
   }
   if (event.preflight_status === "running") {
-    return "本地 Preflight / CI 正在执行，规则将在检查结束后继续处理。";
+    return "本地 Preflight / CI 正在执行，受该门禁约束的 Agent 将在检查通过后启动。";
   }
   if (event.preflight_status === "superseded") {
     return "事件记录的 Head 已被后续提交取代且无法再获取，本次检查已跳过；同一 MR / PR 的后续事件会继续处理。";
@@ -8456,7 +8399,7 @@ function eventStatusExplanation(event: EventRecord): string {
   if (event.status === "pending") {
     return queueReasonLabel(event.queue_reason) ?? "事件正在等待调度。";
   }
-  if (event.status === "processing") return "正在匹配触发规则并准备后续处理。";
+  if (event.status === "processing") return "事件正在处理中，具体进展请查看关联的 CI、Agent 详情和日志。";
   if (event.status === "unmatched") {
     const reason = unmatchedReasonLabel(event.unmatched_reason);
     return reason ? `事件未触发：${reason}。` : "没有启用的触发规则匹配这个事件。";
