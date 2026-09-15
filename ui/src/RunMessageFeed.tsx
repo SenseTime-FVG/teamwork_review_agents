@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RunLog } from "./types";
-import { presentRunLogs } from "./runLogPresentation";
+import { presentRunLogs, runMessageRepeatLabel } from "./runLogPresentation";
 
 function messageTime(value: number): string {
   return new Date(value * 1000).toLocaleTimeString("zh-CN", {
@@ -80,7 +80,7 @@ export function RunMessageFeed(props: {
               <header>
                 <strong>{message.title}</strong>
                 <span className="run-message-meta">
-                  {message.repeatCount > 1 && <em>重复 {message.repeatCount} 次</em>}
+                  {message.repeatCount > 1 && <em>{runMessageRepeatLabel(message)}</em>}
                   <time>{messageTime(message.lastCreatedAt)}</time>
                 </span>
               </header>

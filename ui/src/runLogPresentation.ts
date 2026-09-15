@@ -38,6 +38,14 @@ export type RunMessage = {
   linkedAgentName?: string;
 };
 
+// CI 进度重复表示同次等待中的相同查询结果，不代表重新执行 CI 或调用工具。
+export function runMessageRepeatLabel(message: Pick<RunMessage, "eventType" | "repeatCount">): string {
+  if (message.repeatCount <= 1) return "";
+  return message.eventType === "ci.wait.progress"
+    ? `相同状态 · 已查询 ${message.repeatCount} 次`
+    : `重复 ${message.repeatCount} 次`;
+}
+
 type JsonObject = Record<string, unknown>;
 
 const SYSTEM_TITLES: Record<string, string> = {
