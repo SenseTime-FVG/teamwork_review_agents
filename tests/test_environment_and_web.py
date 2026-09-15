@@ -1320,6 +1320,53 @@ def test_web_api_config_preview_logs_and_static_ui(tmp_path, snapshot_factory) -
         assert "Teamwork Review Agents" in static.text
 
 
+def test_overview_status_repository_scope_preserves_global_controls(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """仓库概览与列表使用同一范围，但不改变全局服务状态或扫描操作。"""
+
+    app = create_app(write_config(tmp_path), start_scheduler=False)
+    with TestClient(app) as client:
+        store = app.state.config_manager.store
+        for repository_id, number, state in [("first", 1, "opened"), ("first", 2, "closed"), ("second", 3, "merged")]:
+            snapshot = snapshot_factory(provider="provider-main", repository_id=repository_id, number=number, state=state)
+            store.save_snapshot_and_events(snapshot, detect_events(None, snapshot, emit_initial=True))
+        completed_at = "2026-09-15T12:00:00+00:00"
+        store.set_service_state("repository_scan:first", {"completed_at": completed_at, "started_at": "2026-09-15T11:59:00+00:00"})
+        runtime = app.state.runtime
+        runtime.paused = True
+        runtime.running_cycle = True
+        runtime.last_started_at = 1234.0
+        runtime.last_finished_at = 2345.0
+
+        all_status = client.get("/api/status").json()
+        assert all_status["repository_id"] is None
+        assert all_status["stats"]["change_requests"]["total"] == 3
+        assert client.get("/api/status?repository_id=").json()["stats"] == all_status["stats"]
+        first = client.get("/api/status?repository_id=first").json()
+        assert first["stats"]["change_requests"] == {"total": 2, "opened": 1, "closed": 1}
+        assert first["repository_id"] == "first"
+        assert first["repository_last_scan_completed_at"] == completed_at
+        for name in ("paused", "running_cycle", "last_started_at", "last_finished_at"):
+            assert first[name] == all_status[name]
+        # 列表可以继续缩小范围，但概览统计必须统计仓库全部记录。
+        page = client.get("/api/change-requests?repository_id=first&status=opened&page=1&limit=1").json()
+        assert page["total"] == 1
+        assert page["items"][0]["repository_id"] == "first"
+        events = client.get("/api/events?repository_id=first&page=1&limit=1").json()
+        assert events["total"] == sum(first["stats"]["events"].values())
+        assert events["items"][0]["repository_id"] == "first"
+        for repository_id, expected_total in [("second", 1), ("unknown", 0)]:
+            result = client.get("/api/status", params={"repository_id": repository_id}).json()
+            assert result["repository_id"] == repository_id
+            assert result["stats"]["change_requests"]["total"] == expected_total
+            assert result["repository_last_scan_completed_at"] is None
+        assert runtime.paused is True
+        assert runtime.running_cycle is True
+        assert client.get("/api/status").json()["stats"] == all_status["stats"]
+
+
 def test_overview_api_filters_status_repository_and_limit(
     tmp_path,
     snapshot_factory,

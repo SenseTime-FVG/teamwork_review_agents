@@ -3225,22 +3225,50 @@ class StateStore:
                 result["trigger_context"] = json.loads(result["trigger_context"])
         return results
 
-    def dashboard_stats(self) -> dict[str, Any]:
-        """返回管理首页需要的运行与事件统计。"""
+    def dashboard_stats(self, repository_id: str | None = None) -> dict[str, Any]:
+        """按仓库范围统计概览，未指定仓库时保留全局汇总。"""
+
+        run_where = ""
+        run_parameters: tuple[Any, ...] = ()
+        event_where = ""
+        event_parameters: tuple[Any, ...] = ()
+        if repository_id:
+            # 新记录使用仓库字段；旧记录依次通过关联事件、资源键恢复归属。
+            escaped_id = repository_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            run_where = """
+                WHERE COALESCE(agent_runs.repository_id, event_inbox.repository_id) = ?
+                   OR (agent_runs.repository_id IS NULL
+                       AND event_inbox.repository_id IS NULL
+                       AND agent_runs.resource_key LIKE ? ESCAPE '\\')
+            """
+            run_parameters = (repository_id, f"%:{escaped_id}:%")
+            event_where = "WHERE repository_id = ?"
+            event_parameters = (repository_id,)
 
         with self.connect() as connection:
             run_rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM agent_runs GROUP BY status"
+                f"""
+                SELECT agent_runs.status, COUNT(*) AS count FROM agent_runs
+                LEFT JOIN event_inbox ON event_inbox.event_id = agent_runs.event_id
+                {run_where}
+                GROUP BY agent_runs.status
+                """,
+                run_parameters,
             ).fetchall()
             event_rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM event_inbox GROUP BY status"
+                f"SELECT status, COUNT(*) AS count FROM event_inbox {event_where} GROUP BY status",
+                event_parameters,
             ).fetchall()
             snapshot_rows = connection.execute(
                 "SELECT payload FROM snapshots"
             ).fetchall()
-        change_requests: dict[str, int] = {"total": len(snapshot_rows)}
+        change_requests: dict[str, int] = {"total": 0}
         for row in snapshot_rows:
-            state = ChangeRequestSnapshot.model_validate_json(row["payload"]).state
+            snapshot = ChangeRequestSnapshot.model_validate_json(row["payload"])
+            if repository_id and snapshot.repository_id != repository_id:
+                continue
+            state = snapshot.state
+            change_requests["total"] += 1
             change_requests[state] = change_requests.get(state, 0) + 1
         return {
             "runs": {row["status"]: row["count"] for row in run_rows},

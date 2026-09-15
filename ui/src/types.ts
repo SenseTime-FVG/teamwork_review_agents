@@ -428,6 +428,8 @@ export type ConfigDocument = {
 };
 
 export type RuntimeStatus = {
+  repository_id?: string | null;
+  repository_last_scan_completed_at?: string | null;
   paused: boolean;
   running_cycle: boolean;
   dispatching_events: boolean;

@@ -23,6 +23,73 @@ from teamwork_review_agents.state import (
 )
 
 
+def test_dashboard_stats_scope_includes_children_schedules_and_legacy_runs(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """仓库统计覆盖子任务和定时任务，兼容事件及资源键归属但不串仓库。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = snapshot_factory(repository_id="repo_%", number=1)
+    second = snapshot_factory(repository_id="repo_ab", number=2, state="closed")
+    first_event = detect_events(None, first, emit_initial=True)[0]
+    second_event = detect_events(None, second, emit_initial=True)[0]
+    store.save_snapshot_and_events(first, [first_event])
+    store.save_snapshot_and_events(second, [second_event])
+    store.finish_event(second_event.id)
+
+    records = [
+        ("root", "repo_%", first_event.id, None, "running", "event"),
+        ("child", "repo_%", first_event.id, "root", "completed", "event"),
+        ("schedule", "repo_%", None, None, "queued", "schedule"),
+        ("legacy-event", None, first_event.id, None, "failed", "event"),
+        ("legacy-resource", None, None, None, "preparing", "event"),
+        ("other", "repo_ab", second_event.id, None, "running", "event"),
+        ("other-legacy", None, None, None, "queued", "event"),
+        ("global-schedule", None, None, None, "queued", "schedule"),
+    ]
+    for run_id, repository_id, event_id, parent, status, source in records:
+        resource = (
+            "global-schedule" if run_id == "global-schedule"
+            else "github:repo_ab:2" if run_id.startswith("other")
+            else "github:repo_%:1"
+        )
+        assert store.begin_agent_run(
+            proposed_run_id=run_id,
+            root_run_id=parent,
+            parent_run_id=parent,
+            idempotency_key=run_id,
+            event_id=event_id,
+            rule_name="review",
+            agent_name="reviewer",
+            resource_key=resource,
+            repository_id=repository_id,
+            trigger_source=source,
+            prompt="测试仓库统计",
+            max_attempts=1,
+        ) is not None
+        with store.connect() as connection:
+            connection.execute("UPDATE agent_runs SET status = ? WHERE run_id = ?", (status, run_id))
+
+    assert store.dashboard_stats("repo_%") == {
+        "runs": {"running": 1, "completed": 1, "queued": 1, "failed": 1, "preparing": 1},
+        "events": {"pending": 1},
+        "change_requests": {"total": 1, "opened": 1},
+    }
+    assert store.dashboard_stats("repo_ab") == {
+        "runs": {"running": 1, "queued": 1},
+        "events": {"completed": 1},
+        "change_requests": {"total": 1, "closed": 1},
+    }
+    assert store.dashboard_stats("missing") == {
+        "runs": {}, "events": {}, "change_requests": {"total": 0},
+    }
+    assert sum(store.dashboard_stats()["runs"].values()) == len(records)
+    assert store.dashboard_stats()["change_requests"] == {"total": 2, "opened": 1, "closed": 1}
+    assert store.dashboard_stats("") == store.dashboard_stats()
+
+
 def test_terminal_target_event_is_lightweight_retained_and_pruned_without_losing_run(
     tmp_path,
     snapshot_factory,
