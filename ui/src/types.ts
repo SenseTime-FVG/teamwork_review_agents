@@ -113,6 +113,18 @@ export type GitCommandDetail = {
   finished_at?: number | null;
   exit_code?: number | null;
   error?: string | null;
+  timeout_kind?: "idle";
+  idle_seconds?: number;
+  last_progress_at?: number | null;
+  progress?: {
+    stage: string;
+    label: string;
+    percent: number | null;
+    current: number;
+    total: number | null;
+    received_bytes: number | null;
+    bytes_per_second: number | null;
+  } | null;
 };
 
 export type RepositoryGitDetail = {

@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 from .config import ProviderConfig, RepositoryConfig
 from .filesystem import remove_tree, temporary_directory
 from .git_auth import current_git_environment, safe_git_error_detail
+from .git_progress import GitOutputReader, GitProgressTracker, with_git_progress
 from .models import ChangeRequestSnapshot
 from .process_control import process_group_options, terminate_process
 
@@ -48,7 +50,7 @@ RunWorkspaceKind = Literal["worktree", "clone"]
 
 @dataclass(frozen=True)
 class GitProgressEvent:
-    """一条不包含原始输出或认证信息的 Git 命令状态。"""
+    """一条不包含原始输出或认证信息的 Git 命令状态及量化进度。"""
 
     command_id: str
     operation: str
@@ -60,6 +62,10 @@ class GitProgressEvent:
     finished_at: float | None = None
     exit_code: int | None = None
     error: str | None = None
+    timeout_kind: str = "idle"
+    idle_seconds: int = 0
+    last_progress_at: float | None = None
+    progress: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         """返回可直接写入日志或管理 API 的安全结构。"""
@@ -75,6 +81,10 @@ class GitProgressEvent:
             "finished_at": self.finished_at,
             "exit_code": self.exit_code,
             "error": self.error,
+            "timeout_kind": self.timeout_kind,
+            "idle_seconds": self.idle_seconds,
+            "last_progress_at": self.last_progress_at,
+            "progress": self.progress,
         }
 
 
@@ -158,7 +168,7 @@ def _run_git(
     cancel_check: GitCancelCheck | None = None,
     progress_callback: GitProgressCallback | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """在独立进程组运行 Git，并支持安全进度、超时与取消。"""
+    """在独立进程组运行 Git，无有效进展才超时，持续进展不设总时限。"""
 
     git_binary = shutil.which("git")
     if not git_binary:
@@ -166,6 +176,8 @@ def _run_git(
     command_id = str(uuid.uuid4())
     started_at = time.time()
     monotonic_started_at = time.monotonic()
+    tracker = GitProgressTracker(monotonic_started_at)
+    arguments = with_git_progress(arguments)
     safe_command = _safe_git_command(arguments)
 
     def report(
@@ -174,10 +186,11 @@ def _run_git(
         exit_code: int | None = None,
         error: str | None = None,
     ) -> None:
-        """回调只携带脱敏命令元数据，禁止泄露原始 Git 输出。"""
+        """回调只携带脱敏元数据和解析后的数字，不因心跳刷新进展时间。"""
 
         if progress_callback is None:
             return
+        last_progress, last_progress_at, progress = tracker.snapshot()
         with suppress(Exception):
             progress_callback(
                 GitProgressEvent(
@@ -195,30 +208,32 @@ def _run_git(
                     else None,
                     exit_code=exit_code,
                     error=error,
+                    idle_seconds=max(0, int(time.monotonic() - last_progress)),
+                    last_progress_at=last_progress_at,
+                    progress=progress,
                 )
             )
 
-    def terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
+    def terminate(process: subprocess.Popen[bytes]) -> None:
         """终止 Git 进程组或进程树，避免 ssh 与 index-pack 成为遗留进程。"""
 
-        if process.poll() is not None:
-            return "", ""
         with suppress(ProcessLookupError, PermissionError):
             terminate_process(process.pid, force=False, tree=True)
         try:
-            return process.communicate(timeout=2)
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             with suppress(ProcessLookupError, PermissionError):
                 terminate_process(process.pid, force=True, tree=True)
             with suppress(subprocess.TimeoutExpired):
-                return process.communicate(timeout=2)
-        return "", ""
+                process.wait(timeout=2)
 
-    child_environment = None
+    child_environment = os.environ.copy()
     active_git_environment = current_git_environment()
     if active_git_environment:
-        child_environment = os.environ.copy()
         child_environment.update(active_git_environment)
+    # Git 的进度语法固定为英文，中文仅由安全阶段映射在界面中展示。
+    child_environment["LC_ALL"] = "C"
+    child_environment["LANGUAGE"] = "C"
 
     def safe_error(stderr: str) -> str | None:
         """返回脱敏且有界的 Git 错误摘要。"""
@@ -232,47 +247,63 @@ def _run_git(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             env=child_environment,
             **process_group_options(),
         )
     except OSError as exc:
         report("failed", error="无法启动 Git 命令")
         raise WorkspaceError("无法启动 Git 命令") from exc
+    assert process.stdout is not None and process.stderr is not None
+    pipe_finished = threading.Event()
+    stdout_reader = GitOutputReader(process.stdout, finished=pipe_finished)
+    stderr_reader = GitOutputReader(process.stderr, finished=pipe_finished, tracker=tracker)
+    readers = (stdout_reader, stderr_reader)
+    for reader in readers:
+        reader.start()
     report("started")
-    last_progress_at = 0
-    while True:
-        if cancel_check is not None and cancel_check():
-            terminate(process)
-            report("cancelled", error="Git 操作已由管理员取消")
-            raise WorkspaceCancelled("运行已在 Git 工作区准备期间取消")
-        elapsed = time.monotonic() - monotonic_started_at
-        if elapsed >= timeout_seconds:
-            _, stderr = terminate(process)
-            detail = safe_error(stderr)
-            report(
-                "timed_out",
-                error=(
-                    f"Git 操作超过 {timeout_seconds} 秒"
-                    + (f"：{detail}" if detail else "")
-                ),
-            )
-            message = f"Git 操作超过 {timeout_seconds} 秒，请检查网络和 SSH 认证"
-            if detail:
-                message += f"：{detail}"
-            raise WorkspaceError(message)
-        try:
-            stdout, stderr = process.communicate(
-                timeout=min(0.25, max(0.01, timeout_seconds - elapsed))
-            )
-            break
-        except subprocess.TimeoutExpired:
-            elapsed_seconds = int(time.monotonic() - monotonic_started_at)
-            if elapsed_seconds - last_progress_at >= 10:
-                last_progress_at = elapsed_seconds
+    last_report = time.monotonic()
+    stop_state: str | None = None
+    try:
+        # 即使根进程退出，也必须等待管道排空，避免遗留子进程占住管道。
+        while process.poll() is None or any(reader.is_alive() for reader in readers):
+            if cancel_check is not None and cancel_check():
+                stop_state = "cancelled"
+                break
+            now = time.monotonic()
+            last_progress, _, _ = tracker.snapshot()
+            if now - last_progress >= timeout_seconds:
+                stop_state = "timed_out"
+                break
+            if now - last_report >= 1:
+                last_report = now
                 report("progress")
+            pipe_finished.wait(min(0.1, max(0.001, timeout_seconds - (now - last_progress))))
+            pipe_finished.clear()
+    finally:
+        if process.poll() is None or any(reader.is_alive() for reader in readers):
+            terminate(process)
+        for reader in readers:
+            reader.join(timeout=2)
+        if any(reader.is_alive() for reader in readers):
+            # 根进程可能已退出，但忽略温和终止的后代仍持有管道；必须强制回收。
+            with suppress(ProcessLookupError, PermissionError):
+                terminate_process(process.pid, force=True, tree=True)
+            for reader in readers:
+                reader.join(timeout=2)
+    stdout, stderr = stdout_reader.text(), stderr_reader.text()
+    if stop_state == "cancelled":
+        report("cancelled", error="Git 操作已由管理员取消")
+        raise WorkspaceCancelled("运行已在 Git 工作区准备期间取消")
+    if stop_state == "timed_out":
+        detail = safe_error(stderr)
+        message = f"Git 操作连续无有效进展超过 {timeout_seconds} 秒，请检查网络和 SSH/HTTPS 认证"
+        if detail:
+            message += f"：{detail}"
+        report("timed_out", error=message)
+        raise WorkspaceError(message)
+    if any(reader.error for reader in readers):
+        report("failed", error="读取 Git 命令输出失败")
+        raise WorkspaceError("读取 Git 命令输出失败")
     result = subprocess.CompletedProcess(
         [git_binary, *arguments],
         process.returncode,

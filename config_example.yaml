@@ -53,9 +53,9 @@ database:
 #   inherit_user_mcp_servers: false
 #   # 在保持隔离时，可按 ~/.codex/config.toml 中的 MCP 名称显式放行所需服务。
 #   allowed_user_mcp_servers: []
-#   # 基础仓库首次克隆的超时，默认 30 分钟。
+#   # 基础仓库首次克隆连续无有效进展才超时，默认 30 分钟；持续下载不受总耗时限制。
 #   repository_initialization_timeout_seconds: 1800
-#   # 基础仓库就绪后，fetch、运行 clone 和 worktree 等单次 Git 操作的超时，默认 10 分钟。
+#   # 基础仓库就绪后，fetch、运行 clone 和 worktree 等 Git 操作的无进展超时，默认 10 分钟。
 #   git_timeout_seconds: 600
 #   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   agent_idle_timeout_seconds: 300
