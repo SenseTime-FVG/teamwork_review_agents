@@ -1611,9 +1611,11 @@ class StateStore:
         config_revision: str,
         max_attempts: int,
         restart_exhausted_error: bool = False,
+        event_ids: Iterable[str] | None = None,
     ) -> PreflightReservation | None:
         """幂等创建 CI 运行，并允许手动事件换代已耗尽的异常记录。"""
 
+        linked_event_ids = tuple(dict.fromkeys(event_ids if event_ids is not None else (event_id,)))
         now = time.time()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1646,17 +1648,8 @@ class StateStore:
                         now,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO event_preflight_links (
-                        event_id, run_id, reused, linked_at
-                    )
-                    SELECT ?, ?, 0, ?
-                    WHERE EXISTS (
-                        SELECT 1 FROM event_inbox WHERE event_id = ?
-                    )
-                    """,
-                    (event_id, proposed_run_id, now, event_id),
+                self._link_events_to_preflight(
+                    connection, linked_event_ids, proposed_run_id, reused=False, linked_at=now,
                 )
                 connection.commit()
                 return PreflightReservation(proposed_run_id, 1)
@@ -1700,17 +1693,8 @@ class StateStore:
                         now,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO event_preflight_links (
-                        event_id, run_id, reused, linked_at
-                    )
-                    SELECT ?, ?, 0, ?
-                    WHERE EXISTS (
-                        SELECT 1 FROM event_inbox WHERE event_id = ?
-                    )
-                    """,
-                    (event_id, proposed_run_id, now, event_id),
+                self._link_events_to_preflight(
+                    connection, linked_event_ids, proposed_run_id, reused=False, linked_at=now,
                 )
                 connection.commit()
                 return PreflightReservation(proposed_run_id, 1)
@@ -1728,20 +1712,8 @@ class StateStore:
                 """,
                 (attempts, event_id, source_generation, now, row["run_id"]),
             )
-            connection.execute(
-                """
-                INSERT INTO event_preflight_links (
-                    event_id, run_id, reused, linked_at
-                )
-                SELECT ?, ?, 0, ?
-                WHERE EXISTS (
-                    SELECT 1 FROM event_inbox WHERE event_id = ?
-                )
-                ON CONFLICT(event_id, run_id) DO UPDATE SET
-                    reused = 0,
-                    linked_at = excluded.linked_at
-                """,
-                (event_id, row["run_id"], now, event_id),
+            self._link_events_to_preflight(
+                connection, linked_event_ids, str(row["run_id"]), reused=False, linked_at=now,
             )
             connection.commit()
             return PreflightReservation(str(row["run_id"]), attempts)
@@ -1835,33 +1807,43 @@ class StateStore:
         *,
         reused: bool,
     ) -> None:
-        """把一次新执行或复用的 CI 结果关联到当前匹配事件。"""
+        """立即关联一次复用的 CI，或幂等补全当前匹配事件的终态关系。"""
 
         ids = tuple(dict.fromkeys(event_ids))
         if not ids:
             return
         now = time.time()
         with self.connect() as connection:
-            connection.executemany(
-                """
-                INSERT INTO event_preflight_links (
-                    event_id, run_id, reused, linked_at
-                )
-                SELECT ?, ?, ?, ?
-                WHERE EXISTS (
-                    SELECT 1 FROM event_inbox WHERE event_id = ?
-                ) AND EXISTS (
-                    SELECT 1 FROM preflight_runs WHERE run_id = ?
-                )
-                ON CONFLICT(event_id, run_id) DO UPDATE SET
-                    reused = excluded.reused,
-                    linked_at = excluded.linked_at
-                """,
-                [
-                    (event_id, run_id, int(reused), now, event_id, run_id)
-                    for event_id in ids
-                ],
+            self._link_events_to_preflight(connection, ids, run_id, reused=reused, linked_at=now)
+
+    @staticmethod
+    def _link_events_to_preflight(
+        connection: sqlite3.Connection,
+        event_ids: Iterable[str],
+        run_id: str,
+        *,
+        reused: bool,
+        linked_at: float,
+    ) -> None:
+        """沿用调用方事务，使 CI 创建/重试与全部匹配事件关联一起提交。"""
+
+        connection.executemany(
+            """
+            INSERT INTO event_preflight_links (
+                event_id, run_id, reused, linked_at
             )
+            SELECT ?, ?, ?, ?
+            WHERE EXISTS (
+                SELECT 1 FROM event_inbox WHERE event_id = ?
+            ) AND EXISTS (
+                SELECT 1 FROM preflight_runs WHERE run_id = ?
+            )
+            ON CONFLICT(event_id, run_id) DO UPDATE SET
+                reused = excluded.reused,
+                linked_at = excluded.linked_at
+            """,
+            [(event_id, run_id, int(reused), linked_at, event_id, run_id) for event_id in event_ids],
+        )
 
     def initialize_preflight_steps(
         self,

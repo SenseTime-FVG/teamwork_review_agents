@@ -854,7 +854,11 @@ class Orchestrator:
                         for event in invocation.events
                     )
                 )
-                representative = claimed_events[0]
+                # CI 代表必须实际命中门禁规则，不能把未匹配的批次首事件挂到 CI 上。
+                representative = (
+                    preflight_invocations[0].events[0]
+                    if preflight_invocations else claimed_events[0]
+                )
                 direct_dispatches = [
                     (
                         event.id,
@@ -888,7 +892,9 @@ class Orchestrator:
                 ):
                     summary.preflight_runs += 1
                     try:
-                        preflight_result = await self.preflight.ensure_passed(representative)
+                        preflight_result = await self.preflight.ensure_passed(
+                            representative, event_ids=preflight_matched_event_ids,
+                        )
                     except Exception as exc:
                         summary.preflight_errors += 1
                         ready_preflight_invocations = []

@@ -436,6 +436,8 @@ try {
 
 通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
 
+事件列表中 `processing` 统一显示为“处理中”，不只表示规则匹配，也可能正在准备工作区、执行本地 CI 或回写结果。同批次真正等待 CI 的事件在 CI 创建或复用时立即建立关联，具体阶段、步骤和输出可在事件详情中查看；未匹配规则或仅直接运行 Agent 的事件不会被额外挂到 CI。CI 失败、超时等终态仍单独显示，门禁未通过不会启动受该 CI 约束的 Agent。
+
 开启 `publish_failure_comment` 后，Preflight 以 `status_context` 作为独立槽位，并且同一 PR 只保留一条活动失败评论：每次真实 CI 再次失败或超时时先删除旧评论，再在时间线底部创建本轮评论；相同 CI 结果被多个事件复用时不反复刷新，映射缺失时才补建；当前最新源版本成功后会删除该槽位全部历史失败评论。Agent 托管评论仍按源版本代次保留审核历史，不受该策略影响。
 
 ![GitHub 本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
