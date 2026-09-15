@@ -11,6 +11,16 @@ export type OverviewFilter = {
   sortDirection: "asc" | "desc";
 };
 
+export function toggleOverviewSort(filter: OverviewFilter, sortBy: OverviewSortField): OverviewFilter {
+  // 切换列时默认降序，重复点击当前列时反转方向，其他筛选条件保持不变。
+  return {
+    ...filter,
+    page: 1,
+    sortBy,
+    sortDirection: filter.sortBy === sortBy && filter.sortDirection === "desc" ? "asc" : "desc",
+  };
+}
+
 export function overviewQuery(filter: OverviewFilter, repositoryId: string, includeNumber = false): string {
   const parameters = new URLSearchParams();
   parameters.set("page", String(filter.page));

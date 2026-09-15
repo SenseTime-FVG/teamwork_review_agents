@@ -134,10 +134,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .overview-list-controls .select-combobox-trigger:focus-visible, .overview-list-controls input:focus { border-color: #47775d; box-shadow: 0 0 0 3px rgba(96, 211, 148, .07); }
 .overview-list-controls .overview-number-filter { min-width: 92px; max-width: 112px; }
 .overview-list-controls .overview-custom-limit { min-width: 105px; }
-.overview-list-controls .overview-sort-field { min-width: 150px; }
-.overview-list-controls .overview-sort-direction { min-width: 118px; }
-.overview-list-controls-numbered { max-width: 100%; display: grid; grid-template-columns: 92px 150px 150px 118px 118px; align-items: end; flex-wrap: nowrap; }
-.overview-list-controls-numbered.overview-list-controls-custom-limit { grid-template-columns: 92px 150px 150px 118px 118px 118px; }
+.overview-list-controls-numbered { max-width: 100%; display: grid; grid-template-columns: 92px 150px 118px; align-items: end; flex-wrap: nowrap; }
+.overview-list-controls-numbered.overview-list-controls-custom-limit { grid-template-columns: 92px 150px 118px 118px; }
 .overview-list-controls-numbered > label, .overview-list-controls-numbered > label:first-child, .overview-list-controls-numbered > .select-field, .overview-list-controls-numbered > .select-field:first-child, .overview-list-controls-numbered .overview-number-filter, .overview-list-controls-numbered .overview-custom-limit { min-width: 0; max-width: none; }
 .overview-list-controls-numbered .select-combobox, .overview-list-controls-numbered input { width: 100%; min-width: 0; }
 .latest-event-reference { min-width: 150px; display: flex; flex-direction: column; gap: 4px; }
@@ -531,6 +529,11 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 }
 table { width: 100%; border-collapse: collapse; font-size: 11px; }
 th { padding: 9px 10px; color: #647287; text-align: left; font-size: 9px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
+.overview-sort-header { display: inline-flex; align-items: center; gap: 5px; width: 100%; min-height: 24px; margin: -4px 0; padding: 4px 0; border: 0; border-radius: 3px; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; white-space: nowrap; cursor: pointer; }
+.overview-sort-header.active { color: var(--accent); }
+.overview-sort-header:hover { color: var(--bright); }
+.overview-sort-header:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.overview-sort-indicator { flex: 0 0 1em; text-align: center; font-size: 12px; line-height: 1; }
 td { padding: 11px 10px; color: #aab6c5; border-bottom: 1px solid var(--line-soft); }
 tbody tr:last-child td { border-bottom: 0; }
 .overview-selection-column { width: 46px; min-width: 46px; text-align: center; }
