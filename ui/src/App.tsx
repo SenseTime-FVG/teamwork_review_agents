@@ -21,7 +21,7 @@ import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewStatusPath } from "./overviewScope";
-import type { OverviewFilter } from "./overviewScope";
+import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -138,12 +138,24 @@ type ProviderExposureConfirmation = {
   variable: EnvironmentVariable;
 };
 
-const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
+const DEFAULT_CHANGE_REQUEST_FILTER: OverviewFilter = {
   number: "",
   status: "",
   statuses: [],
   limit: 10,
   page: 1,
+  sortBy: "updated_at",
+  sortDirection: "desc",
+};
+
+const DEFAULT_EVENT_FILTER: OverviewFilter = {
+  number: "",
+  status: "",
+  statuses: [],
+  limit: 10,
+  page: 1,
+  sortBy: "occurred_at",
+  sortDirection: "desc",
 };
 
 const EMPTY_OVERVIEW_PAGE: OverviewPage = {
@@ -1572,6 +1584,7 @@ function EnvironmentEditor(props: {
 function OverviewListControls(props: {
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
+  sortOptions: Array<{ value: OverviewSortField; label: string }>;
   multiStatus?: boolean;
   showNumber?: boolean;
   onChange: (filter: OverviewFilter) => void;
@@ -1647,6 +1660,34 @@ function OverviewListControls(props: {
           ]}
         />
       )}
+      <SelectField
+        label="排序"
+        className="overview-sort-field"
+        value={props.filter.sortBy}
+        onChange={(sortBy) => props.onChange({
+          ...props.filter,
+          sortBy: sortBy as OverviewSortField,
+        })}
+        options={props.sortOptions}
+      />
+      <SelectField
+        label="顺序"
+        className="overview-sort-direction"
+        value={props.filter.sortDirection}
+        onChange={(sortDirection) => props.onChange({
+          ...props.filter,
+          sortDirection: sortDirection as "asc" | "desc",
+        })}
+        options={props.filter.sortBy === "number"
+          ? [
+              { value: "desc", label: "从大到小" },
+              { value: "asc", label: "从小到大" },
+            ]
+          : [
+              { value: "desc", label: "从新到旧" },
+              { value: "asc", label: "从旧到新" },
+            ]}
+      />
       <SelectField
         label="展示"
         value={limitMode}
@@ -2027,6 +2068,12 @@ function Overview(props: {
             <OverviewListControls
               filter={props.changeRequestFilter}
               statuses={CHANGE_REQUEST_STATUS_OPTIONS}
+              sortOptions={[
+                { value: "updated_at", label: "远端更新时间" },
+                { value: "number", label: "MR / PR 编号" },
+                { value: "scanned_at", label: "最近扫描时间" },
+                { value: "latest_event_at", label: "最新平台事件时间" },
+              ]}
               multiStatus
               onChange={props.onChangeRequestFilterChange}
             />
@@ -2185,6 +2232,10 @@ function Overview(props: {
             <OverviewListControls
               filter={props.eventFilter}
               statuses={EVENT_STATUS_OPTIONS}
+              sortOptions={[
+                { value: "occurred_at", label: "事件时间" },
+                { value: "number", label: "MR / PR 编号" },
+              ]}
               multiStatus
               showNumber
               onChange={props.onEventFilterChange}
@@ -9788,10 +9839,10 @@ export default function App() {
   );
   const [eventPage, setEventPage] = useState<OverviewPage>(EMPTY_OVERVIEW_PAGE);
   const [changeRequestFilter, setChangeRequestFilter] = useState<OverviewFilter>(
-    DEFAULT_OVERVIEW_FILTER,
+    DEFAULT_CHANGE_REQUEST_FILTER,
   );
   const [eventFilter, setEventFilter] = useState<OverviewFilter>(
-    DEFAULT_OVERVIEW_FILTER,
+    DEFAULT_EVENT_FILTER,
   );
   const [executionFilter, setExecutionFilter] = useState<ExecutionFilter>(
     DEFAULT_EXECUTION_FILTER,

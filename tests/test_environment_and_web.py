@@ -1411,6 +1411,13 @@ def test_overview_api_filters_status_repository_and_limit(
             first.key,
             second.key,
         ]
+        snapshots_by_number = client.get(
+            "/api/change-requests?all_records=true&sort_by=number&sort_direction=desc"
+        ).json()
+        assert [item["snapshot_key"] for item in snapshots_by_number] == [
+            second.key,
+            first.key,
+        ]
         filtered_snapshots = client.get(
             "/api/change-requests?repository_id=second&status=closed&limit=10"
         ).json()
@@ -1467,6 +1474,13 @@ def test_overview_api_filters_status_repository_and_limit(
         assert [item["event_id"] for item in all_events] == [
             first_event.id,
             second_event.id,
+        ]
+        events_by_number = client.get(
+            "/api/events?all_records=true&sort_by=number&sort_direction=desc"
+        ).json()
+        assert [item["event_id"] for item in events_by_number] == [
+            second_event.id,
+            first_event.id,
         ]
         filtered_events = client.get(
             "/api/events?repository_id=second&status=cancelled&limit=10"
@@ -1669,7 +1683,13 @@ def test_overview_api_filters_status_repository_and_limit(
         assert client.get("/api/preflight-runs/missing").status_code == 404
         assert client.get("/api/events?status=unknown").status_code == 422
         assert client.get("/api/events?number=0").status_code == 422
+        assert client.get("/api/events?sort_by=unknown").status_code == 422
+        assert client.get("/api/events?sort_direction=sideways").status_code == 422
         assert client.get("/api/change-requests?status=unknown").status_code == 422
+        assert client.get("/api/change-requests?sort_by=unknown").status_code == 422
+        assert client.get(
+            "/api/change-requests?sort_direction=sideways"
+        ).status_code == 422
 
 
 def test_codex_runtime_options_report_catalog_and_user_model(

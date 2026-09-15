@@ -557,6 +557,138 @@ def test_overview_lists_filter_sort_and_apply_optional_limits(
     assert store.get_change_request_detail("second", 999) is None
 
 
+def test_overview_lists_support_configurable_sorting(
+    tmp_path,
+    snapshot_factory,
+) -> None:
+    """概览排序应覆盖完整结果集，并把缺失时间稳定放在末尾。"""
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first = snapshot_factory(
+        repository_id="first",
+        number=20,
+        updated_at="2026-08-18T10:00:00Z",
+    )
+    second = snapshot_factory(
+        repository_id="first",
+        number=10,
+        updated_at="2026-08-18T09:00:00Z",
+    )
+    third = snapshot_factory(
+        repository_id="second",
+        number=30,
+        updated_at="2026-08-18T08:00:00Z",
+    )
+    first_event = detect_events(None, first, emit_initial=True)[0]
+    second_event = detect_events(None, second, emit_initial=True)[0]
+    third_event = detect_events(None, third, emit_initial=True)[0]
+    store.save_snapshot_and_events(
+        first,
+        [first_event],
+        activity_cursor={
+            "latest_activity_checked": True,
+            "latest_activity": {
+                "id": "first-activity",
+                "type": "committed",
+                "occurred_at": "2026-08-18T08:30:00Z",
+            },
+        },
+    )
+    store.save_snapshot_and_events(
+        second,
+        [second_event],
+        activity_cursor={
+            "latest_activity_checked": True,
+            "latest_activity": {
+                "id": "second-activity",
+                "type": "committed",
+                "occurred_at": "2026-08-18T10:30:00Z",
+            },
+        },
+    )
+    store.save_snapshot_and_events(third, [third_event])
+    with store.connect() as connection:
+        connection.executemany(
+            "UPDATE snapshots SET updated_at = ? WHERE snapshot_key = ?",
+            [(100.0, first.key), (300.0, second.key), (200.0, third.key)],
+        )
+
+    def snapshot_keys(**kwargs) -> list[str]:
+        """按指定顺序返回快照键。"""
+
+        return [
+            item["snapshot_key"] for item in store.list_snapshots(None, **kwargs)
+        ]
+
+    assert snapshot_keys() == [first.key, second.key, third.key]
+    assert snapshot_keys(sort_by="number", sort_direction="asc") == [
+        second.key,
+        first.key,
+        third.key,
+    ]
+    assert snapshot_keys(sort_by="number", sort_direction="desc") == [
+        third.key,
+        first.key,
+        second.key,
+    ]
+    assert snapshot_keys(sort_by="scanned_at", sort_direction="asc") == [
+        first.key,
+        third.key,
+        second.key,
+    ]
+    assert snapshot_keys(sort_by="latest_event_at", sort_direction="desc") == [
+        second.key,
+        first.key,
+        third.key,
+    ]
+    assert snapshot_keys(sort_by="latest_event_at", sort_direction="asc") == [
+        first.key,
+        second.key,
+        third.key,
+    ]
+    assert store.list_snapshots(
+        1,
+        offset=1,
+        sort_by="number",
+        sort_direction="desc",
+    )[0]["snapshot_key"] == first.key
+
+    def event_ids(**kwargs) -> list[str]:
+        """按指定顺序返回事件 ID。"""
+
+        return [item["event_id"] for item in store.list_events(None, **kwargs)]
+
+    assert event_ids(sort_by="number", sort_direction="asc") == [
+        second_event.id,
+        first_event.id,
+        third_event.id,
+    ]
+    assert event_ids(sort_by="number", sort_direction="desc") == [
+        third_event.id,
+        first_event.id,
+        second_event.id,
+    ]
+    assert event_ids(sort_by="occurred_at", sort_direction="asc") == [
+        third_event.id,
+        second_event.id,
+        first_event.id,
+    ]
+    assert store.list_events(
+        1,
+        offset=1,
+        sort_by="number",
+        sort_direction="desc",
+    )[0]["event_id"] == first_event.id
+
+    with pytest.raises(ValueError, match="MR/PR 排序字段"):
+        store.list_snapshots(sort_by="unknown")
+    with pytest.raises(ValueError, match="事件排序字段"):
+        store.list_events(sort_by="unknown")
+    with pytest.raises(ValueError, match="排序方向"):
+        store.list_events(sort_direction="sideways")
+
+
 def test_event_claim_respects_attempt_limit(tmp_path, snapshot_factory) -> None:
     store = StateStore(tmp_path / "state.db")
     store.initialize()
