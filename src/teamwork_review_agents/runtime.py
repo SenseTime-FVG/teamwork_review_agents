@@ -204,11 +204,19 @@ class BackgroundRuntime:
             },
         )
 
-    async def snapshot(self) -> dict[str, Any]:
-        """组合实时服务状态和数据库统计。"""
+    async def snapshot(self, repository_id: str | None = None) -> dict[str, Any]:
+        """组合全局服务状态与可选仓库范围的统计，筛选不改变调度范围。"""
 
-        stats = await asyncio.to_thread(self.store.dashboard_stats)
+        stats = await asyncio.to_thread(self.store.dashboard_stats, repository_id)
+        repository_scan = None
+        if repository_id:
+            repository_scan = await asyncio.to_thread(
+                self.store.get_service_state,
+                Orchestrator._scan_state_key(repository_id),
+            )
         return {
+            "repository_id": repository_id or None,
+            "repository_last_scan_completed_at": (repository_scan or {}).get("completed_at"),
             "paused": self.paused,
             "running_cycle": self.running_cycle,
             "dispatching_events": self.dispatching_events,

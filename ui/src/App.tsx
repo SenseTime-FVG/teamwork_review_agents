@@ -20,6 +20,8 @@ import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
+import { overviewQuery, overviewStatusPath } from "./overviewScope";
+import type { OverviewFilter } from "./overviewScope";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -77,17 +79,6 @@ function RepositoryName({ id }: { id: string }) {
   const names = useContext(RepositoryNamesContext);
   return <span title={id}>{names[id] || id}</span>;
 }
-
-type OverviewLimit = number | null;
-
-type OverviewFilter = {
-  repositoryId: string;
-  number: string;
-  status: string;
-  statuses: string[];
-  limit: OverviewLimit;
-  page: number;
-};
 
 type OverviewPage = {
   total: number;
@@ -148,7 +139,6 @@ type ProviderExposureConfirmation = {
 };
 
 const DEFAULT_OVERVIEW_FILTER: OverviewFilter = {
-  repositoryId: "",
   number: "",
   status: "",
   statuses: [],
@@ -378,26 +368,6 @@ function timeText(timestamp?: number | null): string {
 
 function dateTimeText(value?: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
-}
-
-function overviewQuery(filter: OverviewFilter, includeNumber = false): string {
-  const parameters = new URLSearchParams();
-  parameters.set("page", String(filter.page));
-  if (filter.limit === null) {
-    parameters.set("all_records", "true");
-  } else {
-    parameters.set("limit", String(filter.limit));
-  }
-  if (filter.repositoryId) parameters.set("repository_id", filter.repositoryId);
-  if (includeNumber && /^\d+$/.test(filter.number) && Number(filter.number) > 0) {
-    parameters.set("number", filter.number);
-  }
-  if (filter.statuses.length > 0) {
-    filter.statuses.forEach((status) => parameters.append("status", status));
-  } else if (filter.status) {
-    parameters.set("status", filter.status);
-  }
-  return parameters.toString();
 }
 
 function executionQuery(filter: ExecutionFilter): string {
@@ -1600,7 +1570,6 @@ function EnvironmentEditor(props: {
 }
 
 function OverviewListControls(props: {
-  repositories: Repository[];
   filter: OverviewFilter;
   statuses: Array<{ value: string; label: string }>;
   multiStatus?: boolean;
@@ -1645,19 +1614,6 @@ function OverviewListControls(props: {
 
   return (
     <div className={controlClassName}>
-      <SelectField
-        className="overview-repository-filter"
-        label="仓库"
-        value={props.filter.repositoryId}
-        onChange={(repositoryId) => props.onChange({ ...props.filter, repositoryId })}
-        options={[
-          { value: "", label: "全部仓库" },
-          ...props.repositories.map((repository) => ({
-            value: repository.id,
-            label: `${repositoryLabel(repository, true)} · ${repository.project}`,
-          })),
-        ]}
-      />
       {props.showNumber && (
         <label className="overview-number-filter">
           <span>编号</span>
@@ -1952,9 +1908,10 @@ function AgentActionConfirmationDialog(props: {
 
 function Overview(props: {
   status: RuntimeStatus;
+  overviewStatus: RuntimeStatus | null;
+  repositoryId: string;
   events: EventRecord[];
   changeRequests: ChangeRequestRecord[];
-  repositories: Repository[];
   changeRequestFilter: OverviewFilter;
   eventFilter: OverviewFilter;
   changeRequestPage: OverviewPage;
@@ -1991,10 +1948,12 @@ function Overview(props: {
     kind: "agent" | "preflight";
     id: string;
   } | null>(null);
-  const runTotal = Object.values(props.status.stats.runs).reduce((sum, value) => sum + value, 0);
-  const eventTotal = Object.values(props.status.stats.events).reduce((sum, value) => sum + value, 0);
-  const changeRequestTotal = props.status.stats.change_requests.total ?? 0;
-  const pendingEvents = (props.status.stats.events.pending ?? 0) + (props.status.stats.events.processing ?? 0);
+  const overviewStatus = props.overviewStatus;
+  const stats = overviewStatus?.stats ?? EMPTY_STATUS.stats;
+  const runTotal = Object.values(stats.runs).reduce((sum, value) => sum + value, 0);
+  const eventTotal = Object.values(stats.events).reduce((sum, value) => sum + value, 0);
+  const changeRequestTotal = stats.change_requests.total ?? 0;
+  const pendingEvents = (stats.events.pending ?? 0) + (stats.events.processing ?? 0);
   const selectedItems = props.changeRequests.filter((item) => (
     item.latest_event && props.selectedSnapshotKeys.includes(item.snapshot_key)
   ));
@@ -2005,28 +1964,34 @@ function Overview(props: {
     <div className="page-stack">
       <section className="hero-card">
         <div>
-          <span className="eyebrow">后台调度器</span>
+          <span className="eyebrow">后台调度器 · 全局</span>
           <h1>{props.status.paused ? "扫描已暂停" : props.status.running_cycle ? "正在扫描" : props.status.dispatching_events ? "Agent 调度进行中" : "服务运行正常"}</h1>
-          <p>配置版本 {shortRevision(props.status.config_revision)} · 最近扫描完成 {timeText(props.status.last_finished_at)}</p>
+          <p>配置版本 {shortRevision(props.status.config_revision)} · 全局最近扫描完成 {timeText(props.status.last_finished_at)}</p>
         </div>
         <div className="button-group">
-          <button className="button primary" onClick={() => props.onAction("scan")}>立即扫描</button>
+          <button className="button primary" title="立即扫描所有已启用仓库，不受概览筛选影响" onClick={() => props.onAction("scan")}>立即扫描（全局）</button>
           <button
             className="button secondary"
+            title="控制全局扫描调度，不受概览筛选影响"
             onClick={() => props.onAction(props.status.paused ? "resume" : "pause")}
           >
-            {props.status.paused ? "恢复" : "暂停"}
+            {props.status.paused ? "恢复（全局）" : "暂停（全局）"}
           </button>
         </div>
       </section>
       {(props.status.config_error || props.status.last_error || props.status.last_dispatch_error) && (
         <div className="alert error">{props.status.config_error ?? props.status.last_error ?? props.status.last_dispatch_error}</div>
       )}
+      {!overviewStatus ? <div className="empty" role="status">正在加载所选范围的统计与列表…</div> : <>
       <div className="metric-grid">
-        <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{props.status.stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
+        <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
         <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
-        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{props.status.stats.runs.running ?? 0} 个执行中 · {props.status.stats.runs.preparing ?? 0} 个准备中 · {props.status.stats.runs.queued ?? 0} 个排队中</small></div>
-        <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
+        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{stats.runs.running ?? 0} 个执行中 · {stats.runs.preparing ?? 0} 个准备中 · {stats.runs.queued ?? 0} 个排队中</small></div>
+        {props.repositoryId ? (
+          <div className="metric-card"><span>最近成功扫描</span><strong>{overviewStatus.repository_last_scan_completed_at ? "已完成" : "暂无记录"}</strong><small>{dateTimeText(overviewStatus.repository_last_scan_completed_at)}</small></div>
+        ) : (
+          <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
+        )}
       </div>
       <section className="section-card">
         <div className="section-title-row">
@@ -2060,7 +2025,6 @@ function Overview(props: {
               )}
             </div>
             <OverviewListControls
-              repositories={props.repositories}
               filter={props.changeRequestFilter}
               statuses={CHANGE_REQUEST_STATUS_OPTIONS}
               multiStatus
@@ -2167,7 +2131,7 @@ function Overview(props: {
           </table>
           {props.changeRequests.length === 0 && (
             <div className="empty">
-              {props.changeRequestFilter.repositoryId
+              {props.repositoryId
                 || props.changeRequestFilter.status
                 || props.changeRequestFilter.statuses.length > 0
                 ? "当前筛选条件下没有 MR / PR。"
@@ -2219,7 +2183,6 @@ function Overview(props: {
               )}
             </div>
             <OverviewListControls
-              repositories={props.repositories}
               filter={props.eventFilter}
               statuses={EVENT_STATUS_OPTIONS}
               multiStatus
@@ -2291,7 +2254,7 @@ function Overview(props: {
           </table>
           {props.events.length === 0 && (
             <div className="empty">
-              {props.eventFilter.repositoryId
+              {props.repositoryId
                 || props.eventFilter.number
                 || props.eventFilter.status
                 || props.eventFilter.statuses.length > 0
@@ -2305,6 +2268,7 @@ function Overview(props: {
           onPageChange={props.onEventPageChange}
         />
       </section>
+      </>}
       <ChangeRequestDetailDrawer
         changeRequest={selectedChangeRequest}
         active={selectedEvent === null && selectedExecution === null && !props.confirmationOpen}
@@ -9813,6 +9777,8 @@ export default function App() {
   const [document, setDocument] = useState<ConfigDocument | null>(null);
   const [savedDocument, setSavedDocument] = useState<ConfigDocument | null>(null);
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
+  const [overviewRepositoryId, setOverviewRepositoryId] = useState("");
+  const [overviewStatus, setOverviewStatus] = useState<RuntimeStatus | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [preflightRuns, setPreflightRuns] = useState<PreflightRunSummary[]>([]);
   const [events, setEvents] = useState<EventRecord[]>([]);
@@ -9891,11 +9857,21 @@ export default function App() {
   const refreshOverviewData = useCallback(async () => {
     const requestSequence = overviewRequestSequence.current + 1;
     overviewRequestSequence.current = requestSequence;
-    const [nextEvents, nextChangeRequests] = await Promise.all([
-      api<PaginatedOverviewResponse<EventRecord>>(`/api/events?${overviewQuery(eventFilter, true)}`),
-      api<PaginatedOverviewResponse<ChangeRequestRecord>>(`/api/change-requests?${overviewQuery(changeRequestFilter)}`),
-    ]);
+    // 统计与列表同批替换，旧请求即使晚返回也不能覆盖当前仓库范围。
+    let response;
+    try {
+      response = await Promise.all([
+        api<RuntimeStatus>(overviewStatusPath(overviewRepositoryId)),
+        api<PaginatedOverviewResponse<EventRecord>>(`/api/events?${overviewQuery(eventFilter, overviewRepositoryId, true)}`),
+        api<PaginatedOverviewResponse<ChangeRequestRecord>>(`/api/change-requests?${overviewQuery(changeRequestFilter, overviewRepositoryId)}`),
+      ]);
+    } catch (reason) {
+      if (requestSequence === overviewRequestSequence.current) throw reason;
+      return;
+    }
     if (requestSequence !== overviewRequestSequence.current) return;
+    const [nextOverviewStatus, nextEvents, nextChangeRequests] = response;
+    setOverviewStatus(nextOverviewStatus);
     setEvents(nextEvents.items);
     setChangeRequests(nextChangeRequests.items);
     setEventPage(nextEvents);
@@ -9906,7 +9882,25 @@ export default function App() {
     if (nextChangeRequests.page !== changeRequestFilter.page) {
       setChangeRequestFilter((current) => ({ ...current, page: nextChangeRequests.page }));
     }
-  }, [changeRequestFilter, eventFilter]);
+  }, [changeRequestFilter, eventFilter, overviewRepositoryId]);
+
+  const changeOverviewRepository = useCallback((repositoryId: string) => {
+    // 立即使旧请求失效，同时清理跨仓库的详情、分页、勾选及未提交确认。
+    overviewRequestSequence.current += 1;
+    setOverviewRepositoryId(repositoryId);
+    setOverviewStatus(null);
+    setChangeRequests([]);
+    setEvents([]);
+    setChangeRequestPage(EMPTY_OVERVIEW_PAGE);
+    setEventPage(EMPTY_OVERVIEW_PAGE);
+    setChangeRequestFilter((current) => ({ ...current, page: 1 }));
+    setEventFilter((current) => ({ ...current, page: 1 }));
+    setChangeRequestSelectionMode(false);
+    setSelectedSnapshotKeys([]);
+    setEventSelectionMode(false);
+    setSelectedEventIds([]);
+    setOverviewConfirmation(null);
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -9950,7 +9944,7 @@ export default function App() {
   }, [refreshOperationalData]);
   useEffect(() => {
     void refreshOverviewData().catch((reason) => {
-      setError(reason instanceof Error ? reason.message : "概览列表加载失败");
+      setError(reason instanceof Error ? reason.message : "概览统计与列表加载失败");
     });
     const timer = window.setInterval(() => { void refreshOverviewData().catch(() => undefined); }, 3000);
     return () => window.clearInterval(timer);
@@ -10411,18 +10405,20 @@ export default function App() {
     [document?.repositories, savedDocument?.repositories],
   );
 
+  // 停用仓库仍可查看历史数据；只使用已保存配置，不让编辑草稿改变查询范围。
+  const overviewRepositories = useMemo(
+    () => savedDocument?.repositories ?? document?.repositories ?? [],
+    [document?.repositories, savedDocument?.repositories],
+  );
+
+  useEffect(() => {
+    if (overviewRepositoryId && !overviewRepositories.some((item) => item.id === overviewRepositoryId)) {
+      changeOverviewRepository("");
+    }
+  }, [overviewRepositoryId, overviewRepositories, changeOverviewRepository]);
+
   useEffect(() => {
     const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
-    setChangeRequestFilter((current) => (
-      current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "", page: 1 }
-        : current
-    ));
-    setEventFilter((current) => (
-      current.repositoryId && !enabledIds.has(current.repositoryId)
-        ? { ...current, repositoryId: "", page: 1 }
-        : current
-    ));
     setExecutionFilter((current) => (
       current.repositoryId && !enabledIds.has(current.repositoryId)
         ? { ...current, repositoryId: "" }
@@ -10464,7 +10460,28 @@ export default function App() {
       </aside>
       <main className="main" ref={mainRef}>
         <header className="topbar">
-          <div><span className="eyebrow">MR / PR AUTOMATION</span><h1>{tabs.find((item) => item.id === tab)?.label}</h1></div>
+          <div className="topbar-heading">
+            <span className="eyebrow">MR / PR AUTOMATION</span>
+            <div className="topbar-title-row">
+              <h1>{tabs.find((item) => item.id === tab)?.label}</h1>
+              {tab === "overview" && (
+                <SelectControl
+                  className="overview-scope-selector"
+                  ariaLabel="运行概览仓库"
+                  value={overviewRepositoryId}
+                  disabled={loading || confirmingOverviewAction}
+                  onChange={changeOverviewRepository}
+                  options={[
+                    { value: "", label: "全部仓库" },
+                    ...overviewRepositories.map((repository) => ({
+                      value: repository.id,
+                      label: repositoryLabel(repository, true),
+                    })),
+                  ]}
+                />
+              )}
+            </div>
+          </div>
           <div className="top-actions">
             <label className="token-field"><span>管理 Token</span><input type="password" value={token} placeholder="本机模式可留空" onChange={(event) => setToken(event.target.value)} onBlur={() => { persistToken(token); if (!editing) void load(); }} /></label>
             {tab !== "model-providers" && (configurableTab || editing) && (
@@ -10493,10 +10510,12 @@ export default function App() {
               )}
               {tab === "overview" && (
                 <Overview
+                  key={overviewRepositoryId}
                   status={status}
+                  overviewStatus={overviewStatus}
+                  repositoryId={overviewRepositoryId}
                   events={events}
                   changeRequests={changeRequests}
-                  repositories={enabledRepositories}
                   changeRequestFilter={changeRequestFilter}
                   eventFilter={eventFilter}
                   changeRequestPage={changeRequestPage}

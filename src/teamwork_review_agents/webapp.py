@@ -369,8 +369,10 @@ def create_app(
         return {"status": "ok", "version": app.version, "pid": os.getpid()}
 
     @app.get("/api/status")
-    async def status() -> dict[str, Any]:
-        return await runtime.snapshot()
+    async def status(repository_id: str | None = None) -> dict[str, Any]:
+        """仓库范围只影响概览数据，全局服务控制状态保持不变。"""
+
+        return await runtime.snapshot(repository_id=repository_id or None)
 
     @app.post("/api/control/scan")
     async def scan_now() -> dict[str, Any]:
