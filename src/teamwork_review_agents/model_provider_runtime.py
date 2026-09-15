@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_settings import codex_home, read_user_inherited_settings, read_user_model
-from .config import AgentConfig, AppConfig, ModelProviderConfig
+from .config import DEFAULT_CONTEXT_WINDOW_TOKENS, AgentConfig, AppConfig, ModelProviderConfig
 
 
 class ModelProviderUnavailableError(RuntimeError):
@@ -25,6 +25,8 @@ class ResolvedModelSelection:
     resolved_label: str
     reasoning_effort: str | None = None
     unresolved_reason: str | None = None
+    context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    context_window_source: str = "system_default"
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ def _resolve_provider_selection(
     provider_id: str,
     configured_model: str | None,
     configured_reasoning_effort: str | None = None,
+    configured_context_window: int | None = None,
+    context_window_source: str | None = None,
     source: str,
     require_enabled: bool,
 ) -> ResolvedModelSelection:
@@ -99,6 +103,16 @@ def _resolve_provider_selection(
         label = f"全局回退（{provider.display_name} / {concrete}）"
     else:
         label = f"{provider.display_name} / Provider 默认模型（{concrete}）"
+    # 窗口与模型候选一同解析，所有驱动使用同一套显式配置和继承语义。
+    if configured_context_window is not None:
+        window = configured_context_window
+        window_source = context_window_source or source
+    elif provider.context_window_tokens is not None:
+        window = provider.context_window_tokens
+        window_source = f"provider:{provider_id}"
+    else:
+        window = DEFAULT_CONTEXT_WINDOW_TOKENS
+        window_source = "system_default"
     return ResolvedModelSelection(
         provider_id=provider_id,
         provider=provider,
@@ -107,6 +121,8 @@ def _resolve_provider_selection(
         resolved_label=label,
         reasoning_effort=configured_reasoning_effort,
         unresolved_reason=unresolved_reason,
+        context_window_tokens=window,
+        context_window_source=window_source,
     )
 
 
@@ -139,10 +155,18 @@ def resolve_model_selection(
     source = "agent" if agent.model else "provider"
     if not explicit_provider and not agent.model:
         source = "global"
+    # 显式选 Provider 时不继承全局窗口；只继承模型的 Agent 则跟随全局有效值。
+    window = agent.context_window_tokens
+    window_source = "agent" if window is not None else None
+    if window is None and source == "global":
+        window = config.runtime.default_model.context_window_tokens
+        window_source = "global"
     return _resolve_provider_selection(
         config,
         provider_id=provider_id,
         configured_model=agent.model,
+        configured_context_window=window,
+        context_window_source=window_source,
         configured_reasoning_effort=(
             None
             if explicit_provider or agent.model
@@ -166,6 +190,7 @@ def resolve_model_plan(
             provider_id=item.provider,
             configured_model=item.model,
             configured_reasoning_effort=item.reasoning_effort,
+            configured_context_window=item.context_window_tokens,
             source="agent_fallback",
             require_enabled=False,
         )
@@ -176,6 +201,7 @@ def resolve_model_plan(
         provider_id=config.runtime.default_model.provider,
         configured_model=config.runtime.default_model.model,
         configured_reasoning_effort=config.runtime.default_model.reasoning_effort,
+        configured_context_window=config.runtime.default_model.context_window_tokens,
         source="global",
         require_enabled=False,
     )
@@ -185,6 +211,7 @@ def resolve_model_plan(
             provider_id=item.provider,
             configured_model=item.model,
             configured_reasoning_effort=item.reasoning_effort,
+            configured_context_window=item.context_window_tokens,
             source="global_fallback",
             require_enabled=False,
         )
@@ -220,6 +247,7 @@ def effective_agent_config(
     updates: dict[str, Any] = {
         "model_provider": selection.provider_id,
         "model": selection.model,
+        "context_window_tokens": selection.context_window_tokens,
     }
     if supports_reasoning_effort(provider, selection.model):
         if selection.reasoning_effort:
@@ -337,6 +365,8 @@ def resolve_model_snapshot(
         "model": selection.model,
         "model_source": selection.model_source,
         "resolved_label": selection.resolved_label,
+        "context_window_tokens": selection.context_window_tokens,
+        "context_window_source": selection.context_window_source,
         "unresolved_reason": selection.unresolved_reason,
         "reasoning_effort": reasoning,
         "reasoning_effort_source": reasoning_source,
@@ -354,6 +384,8 @@ def resolve_model_snapshot(
             "model": item.model,
             "model_source": item.model_source,
             "resolved_label": item.resolved_label,
+            "context_window_tokens": item.context_window_tokens,
+            "context_window_source": item.context_window_source,
             "reasoning_effort": (
                 item.reasoning_effort
                 if supports_reasoning_effort(item.provider, item.model)

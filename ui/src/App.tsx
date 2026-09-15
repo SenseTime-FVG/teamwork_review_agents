@@ -24,6 +24,8 @@ import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOve
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import { fitOverlayToViewport } from "./overlayPlacement";
 import { DelayedTooltipButton } from "./DelayedTooltipButton";
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, formatContextWindow, providerContextWindow, inheritedProviderWindow, inheritedAgentWindow, contextWindowSourceLabel } from "./contextWindow";
+import type { ContextWindow } from "./contextWindow";
 import type {
   Agent,
   ChangeRequestDetailRecord,
@@ -470,9 +472,10 @@ function Field(props: {
   placeholder?: string;
   help?: string;
   disabled?: boolean;
+  className?: string;
 }) {
   return (
-    <label className="field">
+    <label className={`field ${props.className ?? ""}`}>
       <span>{props.label}</span>
       <input
         type={props.type ?? "text"}
@@ -2450,7 +2453,9 @@ function GlobalEnvironment(props: {
             label="默认 Provider"
             value={defaultSelection.provider}
             onChange={(provider) => patchSection("runtime", "default_model", {
+              ...defaultSelection,
               provider,
+              model: undefined,
               reasoning_effort: undefined,
             })}
             options={Object.entries(props.document.model_providers).map(([id, provider]) => ({
@@ -2466,6 +2471,7 @@ function GlobalEnvironment(props: {
             placeholder={defaultModelPlaceholder}
             models={providerModels}
             onChange={(model) => patchSection("runtime", "default_model", {
+              ...defaultSelection,
               provider: defaultSelection.provider,
               model: model || undefined,
               reasoning_effort: modelSupportsReasoningEffort(
@@ -2497,6 +2503,11 @@ function GlobalEnvironment(props: {
                 ]
               : [{ value: "", label: "不适用（非 GPT 模型）" }]}
             help={defaultSupportsReasoning ? "仅 GPT 系列模型支持显式推理 effort" : "当前模型不支持推理 effort"}
+          />
+          <ContextWindowField
+            value={defaultSelection.context_window_tokens}
+            inherited={inheritedProviderWindow(props.document, defaultSelection.provider)}
+            onChange={(context_window_tokens) => patchSection("runtime", "default_model", { ...defaultSelection, context_window_tokens })}
           />
         </div>
         <ModelFallbackEditor
@@ -3123,7 +3134,7 @@ function ModelProvidersEditor(props: {
                     </span>
                   </span>
                   <span><strong>{provider.driver === "codex_cli" ? "Codex CLI" : modelProviderDriverLabel(provider.driver)}</strong><small>{mode}</small></span>
-                  <span><strong>{resolved.concrete}</strong><small>{provider.default_model ? "Provider 默认" : "动态解析"}</small></span>
+                  <span><strong>{resolved.concrete}</strong><small>{provider.default_model ? "Provider 默认" : "动态解析"}</small><small>窗口：{formatContextWindow(providerContextWindow(provider).tokens)}{provider.context_window_tokens == null ? "（系统默认）" : ""}</small></span>
                   <span className="provider-config-badges">
                     <em className={provider.enabled === false ? "disabled" : "enabled"}>
                       {provider.enabled === false ? "已停用" : "已启用"}
@@ -3226,6 +3237,11 @@ function ModelProvidersEditor(props: {
                           : undefined,
                       })}
                       help={modelHelp}
+                    />
+                    <ContextWindowField
+                      value={selected.context_window_tokens}
+                      inherited={{ tokens: DEFAULT_CONTEXT_WINDOW_TOKENS, source: "系统默认" }}
+                      onChange={(context_window_tokens) => updateProvider({ context_window_tokens })}
                     />
                     {external && <Field label="请求超时（秒）" type="number" value={Number(selected.request_timeout_seconds ?? 120)} onChange={(value) => updateProvider({ request_timeout_seconds: Number(value) })} />}
                     {external && <Field label="并发上限（可选）" type="number" value={selected.max_concurrency ?? ""} onChange={(value) => updateProvider({ max_concurrency: value ? Number(value) : null })} />}
@@ -3350,6 +3366,24 @@ function ModelProvidersEditor(props: {
       />
     </>
   );
+}
+
+function ContextWindowField(props: {
+  value?: number | null;
+  inherited: ContextWindow;
+  onChange: (value: number | null) => void;
+}) {
+  // 空值保留继承语义；只显示有效数值，不将 placeholder 固化到草稿。
+  const effective = props.value ?? props.inherited.tokens;
+  return <Field
+    className="context-window-field"
+    label="上下文窗口（tokens，可选）"
+    type="number"
+    value={props.value ?? ""}
+    placeholder={`继承：${formatContextWindow(props.inherited.tokens)}`}
+    onChange={(value) => props.onChange(value === "" ? null : Number(value))}
+    help={`当前有效：${formatContextWindow(effective)} · ${props.value == null ? props.inherited.source : "当前显式配置"}；留空继承`}
+  />;
 }
 
 function effectiveInheritedModel(
@@ -3548,6 +3582,11 @@ function ModelFallbackEditor(props: {
                     ]
                   : [{ value: "", label: "不适用（非 GPT 模型）" }]}
                 className="model-fallback-reasoning-field"
+              />
+              <ContextWindowField
+                value={selection.context_window_tokens}
+                inherited={inheritedProviderWindow(props.document, selection.provider)}
+                onChange={(context_window_tokens) => update(index, { context_window_tokens })}
               />
               <div className="model-fallback-actions">
                 <button
@@ -6562,6 +6601,11 @@ function AgentsEditor(props: {
                     help="未指定模型时始终继承全局默认 Provider 与模型"
                   />
                 )}
+                <ContextWindowField
+                  value={agent.context_window_tokens}
+                  inherited={inheritedAgentWindow(props.document, agent)}
+                  onChange={(context_window_tokens) => update(name, { context_window_tokens })}
+                />
                 <SelectField
                   label="本地文件权限（Sandbox）"
                   value={agent.sandbox ?? "read-only"}
@@ -9533,6 +9577,9 @@ function AgentRunDetailDrawer(props: {
                       <div><dt>模型来源</dt><dd>{detail.model_snapshot
                         ? modelSettingSourceLabel(detail.model_snapshot.model_source)
                         : "—"}</dd></div>
+                      <div><dt>上下文窗口</dt><dd>{detail.model_snapshot?.context_window_tokens
+                        ? `${formatContextWindow(detail.model_snapshot.context_window_tokens)} · ${contextWindowSourceLabel(detail.model_snapshot.context_window_source)}`
+                        : "历史运行未记录"}</dd></div>
                       {detail.model_snapshot && "configured_reasoning_effort" in detail.model_snapshot && (
                         <div><dt>配置推理强度</dt><dd>{detail.model_snapshot.configured_reasoning_effort ?? "未显式配置"}</dd></div>
                       )}
@@ -9567,6 +9614,7 @@ function AgentRunDetailDrawer(props: {
                               {index > 0 && " → "}
                               {item.resolved_label ?? `${item.provider_name ?? item.provider_id} / ${item.model ?? "Provider 默认模型"}`}
                               {item.reasoning_effort ? ` · effort ${item.reasoning_effort}` : ""}
+                              {item.context_window_tokens ? ` · 窗口 ${formatContextWindow(item.context_window_tokens)}（${contextWindowSourceLabel(item.context_window_source)}）` : ""}
                             </span>
                           ))}
                         </span>

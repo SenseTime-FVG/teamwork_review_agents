@@ -448,7 +448,9 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .choice-section { padding: 15px; border: 1px solid var(--line-soft); border-radius: 9px; background: #0a111a; }
 .model-fallback-section { margin-top: 14px; padding: 15px; border: 1px solid var(--line-soft); border-radius: 9px; background: #0a111a; }
 .model-fallback-list { display: grid; gap: 10px; margin: 12px 0; }
-.model-fallback-row { display: grid; grid-template-columns: 52px minmax(170px, .72fr) minmax(220px, 1.18fr) minmax(145px, .7fr) auto; gap: 10px; align-items: start; padding: 10px; border: 1px solid #1d2a39; border-radius: 8px; background: #0d1621; }
+/* 窗口数字输入的原生步进按钮也使用深色外观。 */
+.context-window-field input { color-scheme: dark; }
+.model-fallback-row { display: grid; grid-template-columns: 52px minmax(130px, .8fr) minmax(160px, 1.1fr) minmax(125px, .7fr) minmax(180px, 1fr) auto; gap: 10px; align-items: start; padding: 10px; border: 1px solid #1d2a39; border-radius: 8px; background: #0d1621; }
 .model-fallback-index { align-self: center; color: #8fa0b4; font-size: 10px; font-weight: 700; white-space: nowrap; }
 .model-fallback-provider-field { min-width: 0; }
 .model-fallback-provider-field > span { color: #8f9eb1; font-size: 11px; }
@@ -462,7 +464,8 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .run-fallback-trace strong { color: #9ed5b1; font-size: 11px; }
 .run-fallback-attempts { margin-top: 10px; }
 .run-fallback-attempts summary { color: #9ed5b1; }
-@media (max-width: 900px) { .model-fallback-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .model-fallback-index { grid-column: 1 / -1; } .model-fallback-actions { grid-column: 1 / -1; } }
+/* 新增窗口输入后，中等屏幕使用两列，避免长 Provider 名挤出回退项。 */
+@media (max-width: 1200px) { .model-fallback-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .model-fallback-index { grid-column: 1 / -1; } .model-fallback-actions { grid-column: 1 / -1; } }
 @media (max-width: 560px) { .model-fallback-row { grid-template-columns: minmax(0, 1fr); } }
 .choice-title strong { color: var(--bright); font-size: 12px; }
 .choice-title p { margin: 5px 0 13px; color: #6e7d91; font-size: 10px; line-height: 1.55; }

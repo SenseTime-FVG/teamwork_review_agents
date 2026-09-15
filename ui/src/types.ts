@@ -140,6 +140,7 @@ export type RepositoryGitDetail = {
 };
 
 export type Agent = {
+  context_window_tokens?: number | null;
   prompt_file?: string;
   prompt?: string;
   model_provider?: string;
@@ -170,6 +171,7 @@ export type Agent = {
 };
 
 export type ModelSelection = {
+  context_window_tokens?: number | null;
   provider: string;
   model?: string | null;
   reasoning_effort?: string | null;
@@ -216,6 +218,7 @@ export type RuntimeConfig = Record<string, unknown> & {
   agent_idle_timeout_seconds?: number;
   managed_sandbox?: ManagedSandboxConfig;
   default_model?: {
+    context_window_tokens?: number | null;
     provider: string;
     model?: string | null;
     reasoning_effort?: string | null;
@@ -233,6 +236,7 @@ export type ModelProviderDriver =
   | "gemini_generate_content";
 
 export type ModelProviderConfig = {
+  context_window_tokens?: number | null;
   display_name: string;
   driver: ModelProviderDriver;
   enabled?: boolean;
@@ -567,6 +571,8 @@ export type RunSummary = {
 };
 
 export type AgentModelSnapshot = {
+  context_window_tokens?: number | null;
+  context_window_source?: string | null;
   execution_mode: "cli" | "model";
   provider_id?: string;
   provider_name?: string;
@@ -592,6 +598,8 @@ export type AgentModelSnapshot = {
   resolved_label?: string;
   unresolved_reason?: string | null;
   fallback_plan?: Array<{
+    context_window_tokens?: number | null;
+    context_window_source?: string | null;
     provider_id: string;
     provider_name?: string;
     provider_driver?: ModelProviderDriver;

@@ -21,6 +21,7 @@ CodexConfigValue = CodexConfigPrimitive | list[CodexConfigPrimitive]
 
 BUILTIN_CODEX_CLI_PROVIDER_ID = "codex-cli"
 LEGACY_CODEX_OAUTH_PROVIDER_ID = "codex-oauth"
+DEFAULT_CONTEXT_WINDOW_TOKENS = 272000
 
 CODEX_STRUCTURED_CONFIG_KEYS = {
     "execution_mode",
@@ -193,6 +194,8 @@ class ModelSelectionConfig(BaseModel):
     provider: str = BUILTIN_CODEX_CLI_PROVIDER_ID
     model: str | None = None
     reasoning_effort: str | None = None
+    # 留空继承当前节点的 Provider，不固化解析后的默认值。
+    context_window_tokens: int | None = Field(default=None, ge=2048, strict=True)
 
 
 class ModelProviderConfig(BaseModel):
@@ -215,6 +218,9 @@ class ModelProviderConfig(BaseModel):
     model_reasoning_effort: str | None = None
     model_verbosity: Literal["low", "medium", "high"] | None = None
     personality: Literal["none", "friendly", "pragmatic"] | None = None
+
+    # 未配置时统一采用项目默认窗口，不能由本机模型缓存隐式覆盖。
+    context_window_tokens: int | None = Field(default=None, ge=2048, strict=True)
 
     @field_validator("base_url")
     @classmethod
@@ -259,7 +265,6 @@ class ContextCompactionConfig(BaseModel):
     """自建模型循环的上下文预算；不修改完整 Codex CLI 的压缩设置。"""
 
     enabled: bool = True
-    default_context_window_tokens: int = Field(default=131072, ge=2048)
     reserved_output_tokens: int = Field(default=4096, ge=256)
     # 比例按完整模型窗口计算，运行时仍保留输出空间的安全保护。
     trigger_ratio: float = Field(default=0.95, gt=0, lt=1)
@@ -274,19 +279,13 @@ class ContextCompactionConfig(BaseModel):
     tool_output_inline_bytes: int = Field(default=65536, ge=4096, le=1048576)
     max_compaction_requests: int = Field(default=16, ge=1, le=64)
     max_summary_rewrites: int = Field(default=2, ge=0, le=4)
-    model_context_windows: dict[str, dict[str, PositiveInt]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_budget(self) -> "ContextCompactionConfig":
-        """压缩目标必须低于触发阈值，并为输入和输出留下空间。"""
+        """压缩目标必须低于触发阈值；窗口余量在完整配置中校验。"""
 
-        windows = [self.default_context_window_tokens] + [
-            size for models in self.model_context_windows.values() for size in models.values()
-        ]
         if self.target_ratio >= self.trigger_ratio:
             raise ValueError("上下文压缩目标必须低于触发阈值")
-        if min(windows) <= self.reserved_output_tokens + 512:
-            raise ValueError("上下文窗口必须大于输出预留及结构余量之和")
         return self
 
 
@@ -526,6 +525,8 @@ class AgentConfig(BaseModel):
     prompt: str | None = None
     model_provider: str | None = None
     model: str | None = None
+    # 继承全局模型时跟随全局窗口；显式选 Provider 时跟随该 Provider。
+    context_window_tokens: int | None = Field(default=None, ge=2048, strict=True)
     model_fallbacks: list[ModelSelectionConfig] | None = None
     model_reasoning_effort: str | None = None
     fast_mode: Literal["inherit", "standard", "fast"] = "inherit"
@@ -791,6 +792,23 @@ class AppConfig(BaseModel):
                     "全局模型回退链引用了不存在的 Provider："
                     f"{selection.provider}"
                 )
+
+        # 每个可配置节点都需容纳输出预留；继承结果只来自这些值或系统默认。
+        window_nodes = [
+            *self.model_providers.values(), self.runtime.default_model,
+            *self.runtime.default_model_fallbacks, *self.agents.values(),
+        ]
+        window_nodes.extend(
+            item for agent in self.agents.values() for item in (agent.model_fallbacks or [])
+        )
+        windows = [
+            provider.context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS
+            for provider in self.model_providers.values()
+        ] + [
+            node.context_window_tokens for node in window_nodes if node.context_window_tokens is not None
+        ]
+        if min(windows) <= self.runtime.context_compaction.reserved_output_tokens + 512:
+            raise ValueError("上下文窗口必须大于输出预留及 512 的结构余量之和")
 
         reserved_token_names = {"CODEX_API_KEY", "OPENAI_API_KEY"}
         provider_token_names = {
@@ -1142,7 +1160,68 @@ def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
                 and not value.get("model_provider")
             ):
                 value["model_provider"] = default_provider
+    _migrate_context_windows(data)
     return data
+
+
+def _migrate_context_windows(data: dict[str, Any]) -> None:
+    """旧预算仅迁移一次到可见字段，未启用模型的覆盖保留归档。"""
+
+    runtime = data.get("runtime", {})
+    settings = runtime.get("context_compaction")
+    if not isinstance(settings, dict):
+        return
+    providers = data["model_providers"]
+    if "default_context_window_tokens" in settings:
+        default = settings.pop("default_context_window_tokens")
+        # 使用相同字段校验，避免迁移静默接受非法窗口。
+        ModelSelectionConfig(context_window_tokens=default)
+        for provider in providers.values():
+            if isinstance(provider, dict):
+                provider.setdefault("context_window_tokens", default)
+    overrides = settings.pop("model_context_windows", None)
+    if overrides is None:
+        return
+    if not isinstance(overrides, dict):
+        raise ValueError("旧 model_context_windows 必须为 Provider / 模型窗口映射")
+    for models in overrides.values():
+        if not isinstance(models, dict):
+            raise ValueError("旧 model_context_windows 必须为 Provider / 模型窗口映射")
+        for size in models.values():
+            ModelSelectionConfig(context_window_tokens=size)
+    remaining = copy.deepcopy(overrides)
+
+    def migrate_node(node: Any, *, agent_node: bool = False) -> None:
+        """只折叠可确定的显式模型节点；继承全局的 Agent 不生成覆盖。"""
+
+        if not isinstance(node, dict):
+            return
+        provider_id = node.get("model_provider" if agent_node else "provider")
+        if agent_node and not provider_id:
+            return
+        provider_id = provider_id or BUILTIN_CODEX_CLI_PROVIDER_ID
+        provider = providers.get(provider_id, {})
+        if not isinstance(provider, dict):
+            return
+        model = node.get("model") or provider.get("default_model") or next(iter(provider.get("models") or []), None)
+        size = overrides.get(provider_id, {}).get(model)
+        if size is not None:
+            node.setdefault("context_window_tokens", size)
+            remaining[provider_id].pop(model, None)
+
+    migrate_node(runtime.get("default_model"))
+    for node in runtime.get("default_model_fallbacks") or []:
+        migrate_node(node)
+    for agent in (data.get("agents") or {}).values():
+        migrate_node(agent, agent_node=True)
+        if isinstance(agent, dict):
+            for node in agent.get("model_fallbacks") or []:
+                migrate_node(node)
+    unused = {key: models for key, models in remaining.items() if models}
+    if unused:
+        archived = settings.setdefault("legacy_model_context_windows", {})
+        for key, models in unused.items():
+            archived.setdefault(key, {}).update(models)
 
 
 def _resolve_config_paths(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:

@@ -85,13 +85,18 @@ database:
 #   default_model:
 #     provider: codex-cli
 #     # model: gpt-5.6-sol
+#     # 留空继承该 Provider 的上下文窗口，默认 272000。
+#     context_window_tokens: null
+#   # 回退项的窗口独立继承该项 Provider，不继承主模型的显式覆盖。
+#   default_model_fallbacks:
+#     - provider: openai-compatible
+#       model: example-model
+#       context_window_tokens: null
 #   # 仅作用于 Teamwork 自建模型循环；完整 Codex CLI 模式使用自身的压缩机制。
 #   # 摘要模型参考完整任务上下文，但只替换较早历史；原始任务、系统指令等原样保留。
 #   context_compaction:
 #     enabled: true
-#     # 未显式覆盖时，Codex 基座优先读模型缓存窗口；外部/未知模型用此默认预算。
-#     # 不是所有模型的实际窗口，必要时按下方 Provider / 模型覆盖。
-#     default_context_window_tokens: 131072
+#     # 窗口在 Provider / 模型 / Agent 上配置；此处只保留压缩算法参数。
 #     reserved_output_tokens: 4096
 #     # 按完整窗口的 95% 触发；若输出预留使安全输入上限更低，则提前保护。
 #     trigger_ratio: 0.95
@@ -106,11 +111,6 @@ database:
 #     # 收短也计入总请求上限；不重跑已经执行的工具。
 #     max_compaction_requests: 16
 #     max_summary_rewrites: 2
-#     model_context_windows: {}
-#     # 覆盖示例（请填写上游实际窗口，不要照抄示例数值）：
-#     # model_context_windows:
-#     #   openai-compatible:
-#     #     example-model: 65536
 #   # Codex CLI 内部执行参数；不会修改 config.toml。
 #   codex:
 #     # 默认使用基座模式，由 Teamwork 复用 Codex OAuth 登录态执行模型工具循环；
@@ -144,6 +144,8 @@ database:
 #   codex-cli:
 #     display_name: Codex CLI
 #     driver: codex_cli
+#     # 省略或 null 表示系统默认 272000，不从 Codex 缓存读取窗口。
+#     context_window_tokens: null
 #     # 内置 Provider 可以停用，但不能删除；被停用时引用它的新运行会明确失败。
 #     enabled: true
 #     # 执行模式由上方 runtime.codex.execution_mode 控制，默认是基座模式。
@@ -155,6 +157,8 @@ database:
 #     # 可选 openai_responses、openai_chat_completions、anthropic_messages、
 #     # gemini_generate_content；协议必须与上游服务一致。
 #     driver: openai_responses
+#     # 请按上游真实容量填写；省略或 null 同样使用 272000。
+#     context_window_tokens: null
 #     enabled: true
 #     base_url: https://api.example.com
 #     default_model: example-model
@@ -310,6 +314,13 @@ agents:
     # runtime.default_model。只指定 Provider 时使用该 Provider 的默认模型。
     # model_provider: openai-compatible
     # model: example-model
+    # 窗口留空：继承全局模型时跟随全局窗口；显式选 Provider 时跟随该 Provider。
+    # context_window_tokens: null
+    # Agent 回退项留空时跟随自己的 Provider，而非 Agent 主模型或全局窗口。
+    # model_fallbacks:
+    #   - provider: openai-compatible
+    #     model: example-model
+    #     context_window_tokens: null
     # model_reasoning_effort、fast_mode、model_verbosity、personality 和 web_search
     # 可以继续覆盖 Provider 或 Codex CLI 驱动默认设置。
     # read-only：本地只读；workspace-write：允许写本次独立运行 clone（含其 .git）

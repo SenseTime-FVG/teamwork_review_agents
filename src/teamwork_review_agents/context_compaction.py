@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -60,32 +59,6 @@ def estimate_tokens(value: Any) -> int:
     """以 UTF-8 序列化字节作保守文本预算，不冒充精确 tokenizer 计数。"""
 
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-
-def resolve_context_window(
-    settings: ContextCompactionConfig, provider_id: str, model: str,
-    *, driver: str, codex_home: Path,
-) -> tuple[int, str]:
-    """先使用模型级覆盖，再读取 Codex 缓存；未知模型采用显式默认预算。"""
-
-    configured = settings.model_context_windows.get(provider_id, {}).get(model)
-    if configured:
-        return configured, "configured"
-    if driver == "codex_cli":
-        try:
-            path = codex_home / "models_cache.json"
-            if path.stat().st_size <= 4 * 1024 * 1024:
-                document = json.loads(path.read_text(encoding="utf-8"))
-                models = document.get("models", []) if isinstance(document, dict) else []
-                for item in models if isinstance(models, list) else []:
-                    if not isinstance(item, dict) or item.get("slug") != model:
-                        continue
-                    window = item.get("context_window")
-                    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
-                        return window, "codex_model_cache"
-        except (OSError, ValueError):
-            pass
-    return settings.default_context_window_tokens, "conservative_default"
 
 
 def _summary_item(text: str) -> dict[str, Any]:
