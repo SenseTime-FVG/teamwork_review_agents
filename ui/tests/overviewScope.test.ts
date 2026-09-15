@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { overviewQuery, overviewStatusPath, toggleOverviewSort } from "../src/overviewScope.ts";
+import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "../src/overviewScope.ts";
 import type { OverviewFilter, OverviewSortField } from "../src/overviewScope.ts";
 
 const filter: OverviewFilter = {
+  repositoryId: "",
   number: "151",
   status: "",
   statuses: ["processing", "failed"],
@@ -105,11 +106,46 @@ test("排序入口绑定对应表头与列表回调，移除额外排序下拉�
   assert.match(app, /function changeOverviewEventFilter[\s\S]*?cancelEventSelection\(\);[\s\S]*?setEventFilter\(\{ \.\.\.filter, page: 1 \}\)/);
 });
 
-test("仓库选择接线保持单一范围，清理跨仓库状态并隔离旧请求", () => {
-  // 现有轻量前端测试通过源码接线检查防止重新引入重复仓库选择器。
+test("顶部具体仓库优先，全部模式允许两个列表各自筛选", () => {
+  const snapshots = { ...filter, repositoryId: "a" };
+  const events = { ...filter, repositoryId: "b" };
+  assert.equal(new URLSearchParams(overviewQuery(snapshots, "")).get("repository_id"), "a");
+  assert.equal(new URLSearchParams(overviewQuery(events, "", true)).get("repository_id"), "b");
+  assert.equal(overviewStatusPath(""), "/api/status");
+  for (const local of [snapshots, events]) {
+    const query = new URLSearchParams(overviewQuery(local, "top"));
+    assert.equal(query.get("repository_id"), "top");
+    assert.equal(query.get("sort_direction"), "asc");
+  }
+});
+
+test("只有重名的仓库追加 ID，无名称和首尾空白也正确处理", () => {
+  assert.deepEqual(overviewRepositoryOptions([
+    { id: "repo-a", display_name: "Box-Agent" },
+    { id: "repo-b", display_name: " 重名 " },
+    { id: "repo-c", display_name: "重名" },
+    { id: "legacy", display_name: "" },
+    { id: "unique" },
+    { id: "alias", display_name: "legacy" },
+  ]), [
+    { value: "", label: "全部仓库" },
+    { value: "repo-a", label: "Box-Agent" },
+    { value: "repo-b", label: "重名（repo-b）" },
+    { value: "repo-c", label: "重名（repo-c）" },
+    { value: "legacy", label: "legacy（legacy）" },
+    { value: "unique", label: "unique" },
+    { value: "alias", label: "legacy（alias）" },
+  ]);
+  assert.deepEqual(overviewRepositoryOptions([]), [{ value: "", label: "全部仓库" }]);
+});
+
+test("仓库选择区分整体与局部范围，清理跨仓库状态并隔离旧请求", () => {
+  // 验证局部下拉只在全部模式展示，同时保留既有排序接线和请求隔离。
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const controls = app.slice(app.indexOf("function OverviewListControls"), app.indexOf("function OverviewPagination"));
-  assert.doesNotMatch(controls, /仓库|repositoryId/);
+  assert.match(controls, /props.repositoryOptions &&/);
+  assert.match(controls, /value=\{props.filter.repositoryId\}/);
+  assert.equal((app.match(/repositoryOptions=\{props.repositoryId \? undefined : props.repositoryOptions\}/g) ?? []).length, 2);
   assert.match(app, /ariaLabel="运行概览仓库"/);
   assert.match(app, /overviewQuery\(eventFilter, overviewRepositoryId, true\)/);
   assert.match(app, /overviewQuery\(changeRequestFilter, overviewRepositoryId\)/);
@@ -117,8 +153,8 @@ test("仓库选择接线保持单一范围，清理跨仓库状态并隔离旧�
   const change = app.slice(app.indexOf("const changeOverviewRepository ="), app.indexOf("const load = useCallback"));
   assert.match(change, /overviewRequestSequence.current \+= 1/);
   assert.match(change, /setOverviewStatus\(null\)/);
-  assert.match(change, /setChangeRequestFilter\(\(current\) => \(\{ \.\.\.current, page: 1 \}\)\)/);
-  assert.match(change, /setEventFilter\(\(current\) => \(\{ \.\.\.current, page: 1 \}\)\)/);
+  assert.match(change, /setChangeRequestFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
+  assert.match(change, /setEventFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
   assert.match(change, /setSelectedSnapshotKeys\(\[\]\)/);
   assert.match(change, /setSelectedEventIds\(\[\]\)/);
   assert.match(change, /setOverviewConfirmation\(null\)/);
