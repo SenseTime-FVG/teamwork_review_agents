@@ -86,14 +86,15 @@ database:
 #     provider: codex-cli
 #     # model: gpt-5.6-sol
 #   # 仅作用于 Teamwork 自建模型循环；完整 Codex CLI 模式使用自身的压缩机制。
-#   # 固定系统指令、Skill、工具定义和原始任务不压缩；只归纳较早的完整执行回合。
+#   # 摘要模型参考完整任务上下文，但只替换较早历史；原始任务、系统指令等原样保留。
 #   context_compaction:
 #     enabled: true
 #     # 未显式覆盖时，Codex 基座优先读模型缓存窗口；外部/未知模型用此默认预算。
 #     # 不是所有模型的实际窗口，必要时按下方 Provider / 模型覆盖。
 #     default_context_window_tokens: 131072
 #     reserved_output_tokens: 4096
-#     trigger_ratio: 0.8
+#     # 按完整窗口的 95% 触发；若输出预留使安全输入上限更低，则提前保护。
+#     trigger_ratio: 0.95
 #     target_ratio: 0.5
 #     keep_recent_rounds: 2
 #     # 摘要软目标，不是失败上限；超过目标但完整请求能装下且已缩小时照常接受。

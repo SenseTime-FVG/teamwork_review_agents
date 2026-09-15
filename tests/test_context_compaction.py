@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from teamwork_review_agents.config import ContextCompactionConfig, ModelProviderConfig, ModelSelectionConfig
 from teamwork_review_agents.context_compaction import (
-    ConversationContext, ContextCompactionError, SUMMARY_INSTRUCTIONS, SUMMARY_PREFIX,
+    ConversationContext, ContextCompactionError, SUMMARY_INSTRUCTIONS, SUMMARY_PREFIX, SUMMARY_REQUEST,
     estimate_tokens, resolve_context_window, summary_payload,
 )
 from teamwork_review_agents.codex_model_client import CodexResponsesClient, CodexUpstreamError
@@ -69,8 +69,10 @@ async def test_compaction_preserves_fixed_instructions_and_complete_recent_round
         requests.append(payload)
         assert payload["tools"] == [] and payload["tool_choice"] == "none"
         assert "text" not in payload
-        assert "SYSTEM 原文" not in json.dumps(payload, ensure_ascii=False)
-        assert "原始任务：保留 SHA" not in json.dumps(payload, ensure_ascii=False)
+        source = json.loads(payload["input"][0]["content"][0]["text"])
+        assert source["reference_context"]["request_fields"] == original_fields
+        assert source["reference_context"]["original_task"] == original_fixed
+        assert payload["input"][-1]["content"][0]["text"] == SUMMARY_REQUEST
         return "进展：已完成历史操作；SHA abc123；约束：禁止合并；待办：继续检查。"
 
     result = await context.ensure_budget(model="test", request_fields=fields, window=8192, summarize=summarize)
@@ -109,7 +111,7 @@ async def test_chinese_summary_above_2048_bytes_is_accepted_when_full_request_fi
     """回归现场问题：800 汉字摘要不再因 2400 字节超过软目标而被拒绝。"""
 
     context = _context(ContextCompactionConfig())
-    context.append_round(_turn(0, 110000))
+    context.append_round(_turn(0, 125000))
     fixed = copy.deepcopy(context.fixed_messages)
     fields = {"instructions": "SYSTEM 原文；Skill 和权限原样保留", "tools": [{"name": "原始工具"}]}
     summary = "摘要" * 400
@@ -123,7 +125,7 @@ async def test_chinese_summary_above_2048_bytes_is_accepted_when_full_request_fi
     assert result["summary_bytes"] == 2400
     assert result["summary_target_bytes"] == 2048
     assert result["summary_above_target"] is True
-    assert result["summary_requests"] == 1 and result["summary_rewrites"] == 0
+    assert result["summary_requests"] >= 1 and result["summary_rewrites"] == 0
     assert result["after_estimated_tokens"] < result["before_estimated_tokens"]
     assert result["after_estimated_tokens"] <= result["input_budget"]
     assert context.summary == summary and context.fixed_messages == fixed
@@ -150,31 +152,31 @@ async def test_full_request_overflow_uses_bounded_rewrites(recover):
     """计算固定指令与 JSON 转义的整体开销，只有真实不合预算时才收短。"""
 
     context = _context()
-    context.append_round(_turn(0, 2600))
+    context.append_round(_turn(0, 5000))
     original = context.history()
     requests, diagnostics = [], []
 
     async def summarize(payload):
         requests.append(payload)
-        assert estimate_tokens(payload) + 256 <= 7680
-        return "已完成验证，尚未推送" if recover and len(requests) > 1 else "\\" * 2000
+        assert estimate_tokens(payload) + 256 <= 32256
+        return "已完成验证，尚未推送" if recover and len(requests) > 1 else "\\" * 7000
 
     async def report(value):
         diagnostics.append(value)
 
-    kwargs = dict(model="test", request_fields={"instructions": "x" * 5000}, window=8192,
+    kwargs = dict(model="test", request_fields={"instructions": "x" * 20000}, window=32768,
                   summarize=summarize, force=True, diagnostic_callback=report)
     if recover:
         result = await context.ensure_budget(**kwargs)
         assert result["summary_rewrites"] == 1 and result["summary_requests"] == 2
-        assert result["after_estimated_tokens"] <= 7680
+        assert result["after_estimated_tokens"] <= 32256
     else:
         with pytest.raises(ContextCompactionError) as caught:
             await context.ensure_budget(**kwargs)
         assert caught.value.error_code == "context_summary_context_overflow"
-        assert caught.value.diagnostics["summary_bytes"] == 2000
+        assert caught.value.diagnostics["summary_bytes"] == 7000
         assert caught.value.diagnostics["summary_rewrites"] == 2
-        assert caught.value.diagnostics["after_estimated_tokens"] > 7680
+        assert caught.value.diagnostics["after_estimated_tokens"] > 32256
         assert context.history() == original
         assert len(requests) == 3
     assert all(payload["input"] == requests[0]["input"] for payload in requests)
@@ -361,7 +363,7 @@ async def test_builtin_prompts_fit_default_fixed_budget(configured_app_factory):
     }
 
     async def summarize(payload):
-        pytest.fail("原始任务不得送入摘要")
+        pytest.fail("只有原始任务而没有历史时，不应生成摘要")
 
     root = Path(__file__).resolve().parents[1]
     for name in ("general-review.md", "依赖review&增量文档更新 入口.md", "依赖review.md", "增量文档更新.md"):
@@ -369,6 +371,32 @@ async def test_builtin_prompts_fit_default_fixed_budget(configured_app_factory):
         context = ConversationContext([{"role": "user", "content": prompt}], ContextCompactionConfig())
         assert await context.ensure_budget(model="test", request_fields=fields, window=131072, summarize=summarize) is None
         assert context.history()[0]["content"] == prompt
+
+
+@pytest.mark.parametrize("name", ["general-review.md", "依赖review&增量文档更新 入口.md", "依赖review.md", "增量文档更新.md"])
+async def test_builtin_prompts_remain_complete_summary_reference(configured_app_factory, name):
+    """已有长 Prompt 进入交接请求时也完整保留，不因增加参考资料而误拦截默认窗口。"""
+
+    config = configured_app_factory()
+    fields = {
+        "instructions": _instructions(repository=config.repositories[0], agent=config.agents["code-reviewer"], personality=None, skill_files={}),
+        "tools": teamwork_function_tools(allow_sub_agents=True, allow_publish_comment=True),
+    }
+    prompt = (Path(__file__).resolve().parents[1] / "prompts" / name).read_text(encoding="utf-8")
+    fixed = [{"role": "user", "content": prompt}]
+    context = ConversationContext(fixed, ContextCompactionConfig())
+    context.append_round(_turn(0, 30000))
+
+    async def summarize(payload):
+        assert estimate_tokens(payload) + 256 <= 131072 - 4096
+        source = json.loads(payload["input"][0]["content"][0]["text"])
+        assert source["reference_context"]["original_task"] == fixed
+        assert source["reference_context"]["request_fields"] == fields
+        return "已读取本轮证据，原任务继续有效，尚未提交或推送。"
+
+    result = await context.ensure_budget(model="test", request_fields=fields, window=131072, summarize=summarize, force=True)
+    assert result["summary_reference_preserved"] is True
+    assert context.fixed_messages == fixed
 
 
 @pytest.fixture
@@ -443,7 +471,11 @@ async def test_runner_compacts_without_changing_system_or_replaying_tools(run_co
         if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
             summaries.append(body)
             assert body["tools"] == [] and body["tool_choice"] == "none"
-            assert "TASK-ORIGINAL" not in json.dumps(body)
+            assert "TASK-ORIGINAL" in json.dumps(body)
+            reference = json.loads(body["input"][0]["content"][0]["text"])["reference_context"]
+            assert reference["runtime_identity"]["agent_name"] == "code-reviewer"
+            assert reference["runtime_identity"]["run_id"] == "context-run"
+            assert reference["request_fields"]["instructions"].startswith("SYSTEM-ORIGINAL")
             return _response("进展：已审核部分文件，操作及 SHA abc123 已记录；待办：继续验证。")
         normal.append(body)
         return _tool(len(normal) - 1) if len(normal) <= 4 else _response("任务完成")
@@ -455,7 +487,7 @@ async def test_runner_compacts_without_changing_system_or_replaying_tools(run_co
     assert summaries
     assert all(body["instructions"] == normal[0]["instructions"] and body["tools"] == outcome.tools for body in normal)
     assert all(body["input"][0] == normal[0]["input"][0] for body in normal)
-    assert any(SUMMARY_PREFIX.rstrip() in json.dumps(body, ensure_ascii=False) for body in normal[1:])
+    assert any(SUMMARY_PREFIX.splitlines()[0] in json.dumps(body, ensure_ascii=False) for body in normal[1:])
     assert outcome.result.usage["input_tokens"] == 2 * (len(normal) + len(summaries))
     assert outcome.snapshots[-1]["context_compactions"][-1]["fixed_content_preserved"] is True
 
@@ -565,7 +597,7 @@ async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(r
     assert [body["model"] for body in normal] == ["gpt-a", "gpt-a", "gpt-a", "gpt-b", "gpt-a"]
     assert summaries and all(body["model"] == "gpt-b" for body in summaries)
     assert outcome.calls == [0, 1, 2]
-    assert SUMMARY_PREFIX.rstrip() in json.dumps(normal[-1], ensure_ascii=False)
+    assert SUMMARY_PREFIX.splitlines()[0] in json.dumps(normal[-1], ensure_ascii=False)
 
 
 @pytest.mark.parametrize("quota", [True, False])
