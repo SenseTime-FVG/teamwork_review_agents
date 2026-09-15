@@ -304,6 +304,7 @@ class RuntimeConfig(BaseModel):
     expected_codex_version: str | None = None
     inherit_user_mcp_servers: bool = False
     allowed_user_mcp_servers: list[str] = Field(default_factory=list)
+    # 保留旧键以兼容已有配置，含义改为连续没有有效 Git 进展的时限。
     repository_initialization_timeout_seconds: PositiveInt = 1800
     git_timeout_seconds: PositiveInt = 600
     agent_idle_timeout_seconds: PositiveInt = 300

@@ -1,4 +1,24 @@
-import type { RunLog } from "./types";
+import type { GitCommandDetail, RunLog } from "./types";
+
+// 仓库、Agent 和 CI 共用安全进度文本；未知阶段不伪造完成百分比。
+export function gitProgressText(command: Partial<GitCommandDetail>): string {
+  const progress = command.progress;
+  if (command.timeout_kind !== "idle") return "";
+  const parts = [progress?.label ?? "等待 Git 报告可量化进度"];
+  if (progress?.percent != null) parts.push(`当前阶段 ${progress.percent}%`);
+  if (progress?.current != null) parts.push(`对象 / 文件 ${progress.current}${progress.total != null ? ` / ${progress.total}` : ""}`);
+  if (progress?.received_bytes != null) parts.push(`已传输 ${gitBytesText(progress.received_bytes)}`);
+  if (progress?.bytes_per_second != null) parts.push(`最近报告速度 ${gitBytesText(progress.bytes_per_second)}/s`);
+  parts.push(`无有效进展 ${command.idle_seconds ?? 0} 秒`);
+  return parts.join(" · ");
+}
+
+export function gitBytesText(value: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
 
 export type RunMessageKind = "agent" | "command" | "tool" | "file" | "system" | "warning" | "error" | "complete";
 
@@ -256,8 +276,9 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     body = textValue(object.operation);
     detail = [
       object.command ? textValue(object.command) : "",
-      `耗时：${textValue(object.elapsed_seconds)} 秒`,
-      object.timeout_seconds ? `超时：${textValue(object.timeout_seconds)} 秒` : "",
+      `总耗时：${textValue(object.elapsed_seconds)} 秒`,
+      object.timeout_seconds ? `${object.timeout_kind === "idle" ? "无进展超时" : "超时"}：${textValue(object.timeout_seconds)} 秒` : "",
+      gitProgressText(object as Partial<GitCommandDetail>),
       object.exit_code !== undefined && object.exit_code !== null ? `退出码：${textValue(object.exit_code)}` : "",
       object.error ? `错误：${textValue(object.error)}` : "",
     ].filter(Boolean).join("\n");

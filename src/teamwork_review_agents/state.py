@@ -3004,6 +3004,32 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_latest_git_logs(self, run_id: str) -> list[dict[str, Any]]:
+        """按命令合并最新 Git 状态，不截取前若干日志而遗漏长任务进展。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                WITH valid_logs AS (
+                    SELECT id,
+                           CASE WHEN json_valid(payload)
+                                THEN json_extract(payload, '$.command_id')
+                                ELSE NULL END AS command_id
+                    FROM run_logs
+                    WHERE run_id = ? AND event_type GLOB 'workspace.git.*'
+                ), commands AS (
+                    SELECT MIN(id) AS first_id, MAX(id) AS latest_id
+                    FROM valid_logs WHERE typeof(command_id) = 'text'
+                    GROUP BY command_id
+                )
+                SELECT logs.* FROM commands
+                JOIN run_logs AS logs ON logs.id = commands.latest_id
+                ORDER BY commands.first_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def append_preflight_log(
         self,
         run_id: str,

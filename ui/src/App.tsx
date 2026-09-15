@@ -15,7 +15,7 @@ import {
 } from "./api";
 import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } from "./api";
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
-import { presentRunLogs } from "./runLogPresentation";
+import { gitBytesText, gitProgressText, presentRunLogs } from "./runLogPresentation";
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
@@ -36,6 +36,7 @@ import type {
   EventDetailRecord,
   EventDispatchDetail,
   EventRecord,
+  GitCommandDetail,
   ManualEventReplayBatchResponse,
   ManualLatestEventBatchResponse,
   ModelProviderConfig,
@@ -2475,8 +2476,8 @@ function GlobalEnvironment(props: {
           <Field label="日志保留（天）" type="number" value={Number(props.document.web.log_retention_days)} onChange={(value) => patchSection("web", "log_retention_days", Number(value))} />
           <Field label="全局并发上限" type="number" value={Number(props.document.runtime.max_concurrent_agents ?? 5)} onChange={(value) => patchSection("runtime", "max_concurrent_agents", Number(value))} help="默认 5；与运行时 Agent 并发数取较小值" />
           <Field label="Agent 运行并发数" type="number" value={Number(props.document.runtime.agent_concurrency_limit ?? 5)} onChange={(value) => patchSection("runtime", "agent_concurrency_limit", Number(value))} help="与全局并发上限取较小值" />
-          <Field label="基础仓库初始化超时（秒）" type="number" value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)} onChange={(value) => patchSection("runtime", "repository_initialization_timeout_seconds", Number(value))} />
-          <Field label="Git 操作超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} />
+          <Field label="基础仓库初始化无进展超时（秒）" type="number" value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)} onChange={(value) => patchSection("runtime", "repository_initialization_timeout_seconds", Number(value))} help="仅连续无有效进展才超时；持续下载不受总耗时限制。" />
+          <Field label="Git 无进展超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} help="用于 fetch、运行 clone 和工作区操作；仓库锁等待另行计时。" />
           <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
           <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
@@ -4410,9 +4411,28 @@ function RepositoryGitDetailDrawer(props: {
                         <span className={`git-command-status status-${command.state}`}>{gitCommandStatusText(command.state)}</span>
                       </header>
                       {command.command && <pre>{command.command}</pre>}
+                      {command.timeout_kind === "idle" && (
+                        <div className="git-live-progress">
+                          <div className="git-live-progress-heading">
+                            <strong>{command.progress?.label ?? "等待 Git 报告可量化进度"}</strong>
+                            {command.progress?.percent != null && <span>当前阶段 {command.progress.percent}%</span>}
+                          </div>
+                          {command.progress?.percent != null && <progress aria-label={`${command.progress.label}进度`} max={100} value={command.progress.percent} />}
+                          {command.progress && <div className="git-live-metrics">
+                            <span>对象 / 文件：{command.progress.current}{command.progress.total != null ? ` / ${command.progress.total}` : ""}</span>
+                            {command.progress.received_bytes != null && <span>已传输：{gitBytesText(command.progress.received_bytes)}</span>}
+                            {command.progress.bytes_per_second != null && <span>最近报告速度：{gitBytesText(command.progress.bytes_per_second)}/s</span>}
+                          </div>}
+                          <div className="git-live-metrics">
+                            <span>无有效进展：{command.idle_seconds ?? 0} 秒</span>
+                            <span>最近有效进展：{command.last_progress_at ? timeText(command.last_progress_at) : "尚未收到"}</span>
+                          </div>
+                          {["started", "progress"].includes(command.state) && (command.idle_seconds ?? 0) >= 60 && <p className="git-idle-warning">已有 {command.idle_seconds} 秒未收到有效进展，可能停滞；连续达到 {command.timeout_seconds} 秒才会超时。</p>}
+                        </div>
+                      )}
                       <dl>
-                        <div><dt>耗时</dt><dd>{command.elapsed_seconds} 秒</dd></div>
-                        <div><dt>超时</dt><dd>{command.timeout_seconds} 秒</dd></div>
+                        <div><dt>总耗时</dt><dd>{command.elapsed_seconds} 秒</dd></div>
+                        <div><dt>{command.timeout_kind === "idle" ? "无进展超时" : command.command_id === "repository-lock" ? "等待超时" : "总超时（旧记录）"}</dt><dd>{command.timeout_seconds} 秒</dd></div>
                         <div><dt>退出码</dt><dd>{command.exit_code ?? "—"}</dd></div>
                         <div><dt>完成时间</dt><dd>{timeText(command.finished_at)}</dd></div>
                       </dl>
@@ -4422,7 +4442,7 @@ function RepositoryGitDetailDrawer(props: {
                 ))}
                 {props.detail.commands.length === 0 && <div className="empty tall">还没有 Git 命令记录。</div>}
               </div>
-              <p className="git-detail-safety">命令已隐藏 URL 认证信息和查询参数；不会展示原始 stdout、stderr 或 Token。</p>
+              <p className="git-detail-safety">仅展示解析后的阶段进度，不代表整个仓库的完成比例。持续有效进展不会因总耗时超时；命令与错误已脱敏，不展示原始输出或 Token。</p>
             </>
           )}
         </div>
@@ -9041,12 +9061,8 @@ function PreflightRunDetailDrawer(props: {
   const liveOutput = logs.map((log) => {
     if (log.event_type === "git_progress") {
       try {
-        const progress = JSON.parse(log.payload) as {
-          operation?: string;
-          state?: string;
-          elapsed_seconds?: number;
-        };
-        return `[Git] ${progress.operation ?? "Git 操作"} · ${progress.state ?? "运行中"} · ${progress.elapsed_seconds ?? 0} 秒\n`;
+        const progress = JSON.parse(log.payload) as Partial<GitCommandDetail>;
+        return `[Git] ${progress.operation ?? "Git 操作"} · ${progress.state ?? "运行中"} · 总耗时 ${progress.elapsed_seconds ?? 0} 秒${progress.timeout_kind === "idle" ? ` · ${gitProgressText(progress)}` : ""}\n`;
       } catch {
         return `${log.payload}\n`;
       }

@@ -296,9 +296,8 @@ class RepositoryInitializationManager:
                 "commands": [],
             }
         logs = await asyncio.to_thread(
-            self.config_manager.store.list_run_logs,
+            self.config_manager.store.list_latest_git_logs,
             str(agent_run["run_id"]),
-            limit=2000,
         )
         commands: dict[str, dict[str, Any]] = {}
         order: list[str] = []
@@ -417,7 +416,7 @@ class RepositoryInitializationManager:
                 )
 
                 def progress(git_event: GitProgressEvent) -> None:
-                    """保存脱敏 Git 阶段，不接收命令、远端或输出。"""
+                    """保存脱敏命令和结构化进度，不接收原始输出或凭据。"""
 
                     operation.record_command(git_event.as_dict())
                     operation.phase = git_event.operation

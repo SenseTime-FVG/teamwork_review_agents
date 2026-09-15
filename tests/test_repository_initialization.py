@@ -145,6 +145,8 @@ def test_repository_workspace_can_initialize_and_update(tmp_path: Path) -> None:
         )
         assert clone_command["state"] == "completed"
         assert clone_command["timeout_seconds"] == 1800
+        assert clone_command["timeout_kind"] == "idle"
+        assert clone_command["idle_seconds"] >= 0
         assert clone_command["command"].startswith("git clone ")
         assert run_git("rev-parse", "HEAD", cwd=workspace) == run_git(
             "rev-parse",
@@ -294,3 +296,24 @@ def test_repository_detail_exposes_agent_git_steps_without_raw_output(
         encoded = json.dumps(detail, ensure_ascii=False)
         assert "stdout" not in encoded
         assert "stderr" not in encoded
+
+        # 长下载超过旧的 2000 条上限后，仍读取最后进度并保留命令首次顺序。
+        with store.connect() as connection:
+            connection.executemany(
+                "INSERT INTO run_logs (run_id, created_at, stream, event_type, payload) VALUES (?, ?, ?, ?, ?)",
+                [(reservation.run_id, time.time(), "system", "workspace.git.progress", json.dumps({
+                    "command_id": "command-1", "state": "progress", "elapsed_seconds": index,
+                })) for index in range(2100)],
+            )
+        store.append_run_log(reservation.run_id, stream="system", event_type="workspace.git.started", payload={"command_id": "command-2"})
+        store.append_run_log(reservation.run_id, stream="system", event_type="workspace.git.progress", payload="不是 JSON")
+        store.append_run_log(reservation.run_id, stream="system", event_type="workspace.git.completed", payload={
+            "command_id": "command-1", "state": "completed", "elapsed_seconds": 2200,
+            "timeout_kind": "idle", "idle_seconds": 0, "last_progress_at": time.time(),
+            "progress": {"label": "接收对象", "percent": 100, "current": 10, "total": 10},
+        })
+        latest = client.get("/api/repositories/demo/workspace/details").json()["commands"]
+        assert [command["command_id"] for command in latest] == ["command-1", "command-2"]
+        assert latest[0]["state"] == "completed"
+        assert latest[0]["elapsed_seconds"] == 2200
+        assert latest[0]["progress"]["percent"] == 100

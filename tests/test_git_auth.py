@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import shlex
 import shutil
@@ -267,10 +268,12 @@ def test_workspace_error_and_progress_share_redaction(git_environment, monkeypat
 
     encoded = base64.b64encode(f"oauth2:{TEST_TOKEN}".encode()).decode()
     process = Mock(returncode=128)
-    process.communicate.return_value = (
-        "", f"fatal: Authentication failed\n{TEST_TOKEN} {encoded}\n"
-        "https://proxy-user:proxy-password@proxy.test/?key=query-secret",
-    )
+    process.poll.return_value = 128
+    process.stdout = io.BytesIO()
+    process.stderr = io.BytesIO((
+        f"fatal: Authentication failed\n{TEST_TOKEN} {encoded}\n"
+        "https://proxy-user:proxy-password@proxy.test/?key=query-secret"
+    ).encode())
     monkeypatch.setattr(workspace.subprocess, "Popen", Mock(return_value=process))
     progress = []
     with pytest.raises(WorkspaceError) as captured:
