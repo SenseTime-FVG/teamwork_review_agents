@@ -269,7 +269,8 @@ class ContextCompactionConfig(BaseModel):
         default=2048, ge=128,
         validation_alias=AliasChoices("summary_target_bytes", "max_summary_tokens"),
     )
-    tool_output_tokens: int = Field(default=4096, ge=256)
+    # 仅决定返回正文还是完整文件引用；旧 tool_output_tokens 作为未知字段忽略。
+    tool_output_inline_bytes: int = Field(default=65536, ge=4096, le=1048576)
     max_compaction_requests: int = Field(default=16, ge=1, le=64)
     max_summary_rewrites: int = Field(default=2, ge=0, le=4)
     model_context_windows: dict[str, dict[str, PositiveInt]] = Field(default_factory=dict)

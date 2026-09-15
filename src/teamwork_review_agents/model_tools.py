@@ -26,6 +26,7 @@ from .codex_executable import resolve_codex_executable
 from .sandbox_git import SandboxGitError, classify_git_failure, current_sandbox_git, is_simple_git_command
 from .sandbox_curl import current_sandbox_curl, https_probe_url, http_tls_hint
 from .run_control import active_run_control
+from .tool_results import TOOL_CAPTURE_LIMIT_BYTES, ToolResultError
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -42,7 +43,6 @@ InvokeAgentCallback = Callable[
     Awaitable[dict[str, Any]],
 ]
 
-_TOOL_OUTPUT_LIMIT_BYTES = 1_000_000
 _COMMAND_LIMIT_BYTES = 256 * 1024
 _PATCH_LIMIT_BYTES = 4 * 1024 * 1024
 _PROCESS_TERMINATE_GRACE_SECONDS = 3.0
@@ -62,7 +62,7 @@ def teamwork_function_tools(
             "name": "execute_command",
             "description": (
                 "在当前 Agent 工作区中执行一条 shell 命令。"
-                "workdir 必须是工作区内的相对目录；输出会被限制长度。"
+                "workdir 必须是工作区内的相对目录；普通结果完整返回，大结果提供完整文件路径供分段补读。"
             ),
             "parameters": {
                 "type": "object",
@@ -519,24 +519,24 @@ class ModelToolExecutor:
         assert process.stderr is not None
         stdout = bytearray()
         stderr = bytearray()
-        truncated = False
+        capture_limit = asyncio.get_running_loop().create_future()
 
         async def drain(stream: asyncio.StreamReader, target: bytearray) -> None:
-            """持续读取管道，保留总计不超过上限的前部内容。"""
+            """保留完整输出；触及资源保护上限时明确失败，不能静默丢弃后半部。"""
 
-            nonlocal truncated
             while chunk := await stream.read(64 * 1024):
                 self.progress_callback()
-                remaining = _TOOL_OUTPUT_LIMIT_BYTES - len(stdout) - len(stderr)
-                if remaining > 0:
-                    target.extend(chunk[:remaining])
-                if len(chunk) > max(0, remaining):
-                    truncated = True
+                if capture_limit.done():
+                    # 触顶后只排空管道，避免终止子进程时因无人消费输出而死锁。
+                    continue
+                if len(stdout) + len(stderr) + len(chunk) > TOOL_CAPTURE_LIMIT_BYTES:
+                    capture_limit.set_result(None)
+                    continue
+                target.extend(chunk)
 
-        stdout_task = asyncio.create_task(drain(process.stdout, stdout))
-        stderr_task = asyncio.create_task(drain(process.stderr, stderr))
-        timed_out = False
-        try:
+        async def feed_input() -> None:
+            """输入与输出并行，超时和捕获保护也覆盖等待标准输入的阶段。"""
+
             if input_text is not None:
                 assert process.stdin is not None
                 try:
@@ -548,21 +548,50 @@ class ModelToolExecutor:
                     process.stdin.close()
                     with suppress(BrokenPipeError, ConnectionResetError):
                         await process.stdin.wait_closed()
-            await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+
+        def capture_error() -> ToolResultError:
+            """保护触发不代表工具成功，禁止自动重复执行副作用。"""
+
+            return ToolResultError(
+                "命令输出超过单次 16MiB 捕获保护上限，已中止；结果不完整，不能视为成功，也不会自动重跑命令",
+                error_code="tool_output_capture_limit",
+            )
+
+        stdout_task = asyncio.create_task(drain(process.stdout, stdout))
+        stderr_task = asyncio.create_task(drain(process.stderr, stderr))
+        input_task = asyncio.create_task(feed_input())
+        completion = asyncio.gather(process.wait(), stdout_task, stderr_task, input_task)
+        timed_out = False
+        try:
+            done, _ = await asyncio.wait((completion, capture_limit), timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED)
+            if capture_limit in done:
+                raise capture_error()
+            if not done:
+                raise TimeoutError
+            await completion
         except TimeoutError:
             timed_out = True
             await _terminate_process(process)
         except asyncio.CancelledError:
             await _terminate_process(process)
             raise
+        except ToolResultError:
+            await _terminate_process(process)
+            raise
         finally:
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await asyncio.gather(stdout_task, stderr_task, input_task, return_exceptions=True)
+            # 收回组合任务中的异常，避免取消/超时后留下未观察的后台任务。
+            await asyncio.gather(completion, return_exceptions=True)
+        if capture_limit.done():
+            # 超时清理同时触顶时也不能将截断后的输出当成完整结果。
+            raise capture_error()
+        capture_limit.cancel()
         return {
             "exit_code": process.returncode,
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace"),
             "timed_out": timed_out,
-            "truncated": truncated,
+            "truncated": False,
         }
 
 

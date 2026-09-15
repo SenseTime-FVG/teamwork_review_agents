@@ -25,6 +25,7 @@ from teamwork_review_agents.model_provider_client import ExternalModelClient, Mo
 from teamwork_review_agents.model_provider_credentials import ModelProviderCredentialStore
 from teamwork_review_agents.model_provider_runtime import resolve_model_plan
 from teamwork_review_agents.model_tools import ModelToolExecutor, teamwork_function_tools
+from teamwork_review_agents.tool_results import ToolResultError, ToolResultStore
 
 
 def _settings(**overrides):
@@ -32,7 +33,7 @@ def _settings(**overrides):
 
     return ContextCompactionConfig(**{
         "default_context_window_tokens": 8192, "reserved_output_tokens": 512,
-        "summary_target_bytes": 512, "tool_output_tokens": 4096,
+        "summary_target_bytes": 512, "tool_output_inline_bytes": 65536,
         "trigger_ratio": 0.7, "target_ratio": 0.4, "keep_recent_rounds": 1,
         **overrides,
     })
@@ -316,21 +317,14 @@ async def test_summary_call_limit_and_fixed_content_failure():
     assert len(context.rounds) == 1
 
 
-def test_tool_pairing_and_output_budget():
-    """不拆散工具配对；送模结果带截短标记和退出码，原始内容不改变。"""
+def test_tool_pairing():
+    """不拆散工具调用与结果的配对。"""
 
     context = _context()
     with pytest.raises(ContextCompactionError, match="配对"):
         context.append_round(_turn(0)[:1])
-    raw = json.dumps({"exit_code": 1, "stdout": "首" + '汉字"\\' * 10000 + "尾"}, ensure_ascii=False)
-    bounded = context.bound_tool_output(raw, "call-0")
-    assert len(bounded.encode("utf-8")) <= context.settings.tool_output_tokens
-    result = json.loads(bounded)
-    assert result["truncated_for_context"] is True
-    assert result["exit_code"] == 1
-    assert "首" in result["head"] and "尾" in result["tail"]
-    disabled = _context(_settings(enabled=False))
-    assert disabled.bound_tool_output(raw, "call-0") == raw
+    context.append_round(_turn(0))
+    assert context.rounds == [_turn(0)]
 
 
 @pytest.mark.parametrize("overrides", [
@@ -602,8 +596,36 @@ async def test_summary_provider_failure_uses_fallback_without_replaying_tools(ru
     assert failures[0]["phase"] == "compaction"
 
 
-async def test_tool_output_log_is_not_truncated_with_model_copy(run_context):
-    """送模截短不影响原日志，模型看见截短提示而不是虚假的完整输出。"""
+@pytest.mark.parametrize("window,output_size", [(131072, 70000), (8192, 30000)])
+async def test_large_tool_output_keeps_complete_readable_file(run_context, window, output_size):
+    """模型在运行时能补读完整结果，结束后临时文件清理，原始日志仍完整。"""
+
+    normal, paths = [], []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        assert not body["instructions"].startswith(SUMMARY_INSTRUCTIONS)
+        normal.append(body)
+        if len(normal) == 2:
+            output = next(item["output"] for item in body["input"] if item.get("type") == "function_call_output")
+            result = json.loads(output)
+            path = Path(result["output_file"]["path"])
+            paths.append(path)
+            assert json.loads(path.read_text(encoding="utf-8")) == {"exit_code": 0, "stdout": "结果" + "x" * output_size}
+            assert "execute_command" in result["read_hint"]
+            assert result["exit_code"] == 0
+        return _tool(0) if len(normal) == 1 else _response("完成")
+
+    outcome = await run_context(handler, output_size=output_size, settings=_settings(default_context_window_tokens=window))
+    assert outcome.result.status == "completed" and outcome.calls == [0]
+    assert paths and not paths[0].exists()
+    assert any(event == "context.tool_output_stored" for event, _ in outcome.logs)
+    assert any("x" * output_size in json.dumps(payload) for event, payload in outcome.logs if event == "item.completed")
+
+
+@pytest.mark.parametrize("output_size", [5628, 30000])
+async def test_normal_tool_output_reaches_model_in_full_with_legacy_config(run_context, output_size):
+    """截图中的普通输出不再被旧配置的 4096 字节预算截短。"""
 
     normal = []
 
@@ -613,12 +635,77 @@ async def test_tool_output_log_is_not_truncated_with_model_copy(run_context):
         normal.append(body)
         return _tool(0) if len(normal) == 1 else _response("完成")
 
-    outcome = await run_context(handler, output_size=30000, settings=_settings(default_context_window_tokens=32000))
-    assert outcome.result.status == "completed" and outcome.calls == [0]
+    outcome = await run_context(handler, output_size=output_size, settings=ContextCompactionConfig(tool_output_tokens=4096))
+    assert outcome.result.status == "completed"
     output = next(item["output"] for item in normal[-1]["input"] if item.get("type") == "function_call_output")
-    assert json.loads(output)["truncated_for_context"] is True
-    assert len(output.encode("utf-8")) <= 4096
-    assert any("x" * 30000 in json.dumps(payload) for event, payload in outcome.logs if event == "item.completed")
+    assert json.loads(output) == {"exit_code": 0, "stdout": "结果" + "x" * output_size}
+    assert not any(event.startswith("context.") for event, _ in outcome.logs)
+
+
+async def test_multiple_large_outputs_share_round_budget(run_context):
+    """同回合多个工具都留下可读引用，不让第一个结果占满小窗口。"""
+
+    normal, paths = [], []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+            return _response("工具都已完成，文件证据已经检查。")
+        normal.append(body)
+        if len(normal) == 1:
+            return httpx.Response(200, json={"output": [_turn(0)[0], _turn(1)[0]]})
+        outputs = [json.loads(item["output"]) for item in body["input"] if item.get("type") == "function_call_output"]
+        assert len(outputs) == 2
+        for output in outputs:
+            path = Path(output["output_file"]["path"])
+            paths.append(path)
+            assert len(json.loads(path.read_text(encoding="utf-8"))["stdout"]) == 30002
+        return _response("完成")
+
+    outcome = await run_context(handler, output_size=30000, settings=_settings(trigger_ratio=0.95))
+    assert outcome.result.status == "completed" and outcome.calls == [0, 1]
+    assert len(paths) == 2 and all(not path.exists() for path in paths)
+
+
+async def test_tool_storage_failure_stops_run_without_replay(run_context, monkeypatch):
+    """工具执行后保存失败是不可自动重试错误，不发第二个模型请求或重跑命令。"""
+
+    normal = []
+
+    async def handler(request):
+        normal.append(json.loads(request.content))
+        return _tool(0)
+
+    def failed(self, *args, **kwargs):
+        """模拟已执行工具后磁盘写入失败。"""
+        raise ToolResultError("模拟磁盘已满")
+
+    monkeypatch.setattr(ToolResultStore, "prepare", failed)
+    outcome = await run_context(handler)
+    assert outcome.result.status == "failed" and outcome.result.retryable is False
+    assert outcome.result.error_code == "tool_output_storage_failed"
+    assert outcome.calls == [0] and len(normal) == 1
+    assert any(event == "run.tool_output_failed" for event, _ in outcome.logs)
+
+
+async def test_cancelled_run_cleans_tool_result_files(run_context):
+    """取消不会遗留临时证据文件，也不会重新执行工具。"""
+
+    paths, normal = [], []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        normal.append(body)
+        if len(normal) == 1:
+            return _tool(0)
+        output = next(item["output"] for item in body["input"] if item.get("type") == "function_call_output")
+        paths.append(Path(json.loads(output)["output_file"]["path"]))
+        assert paths[0].exists()
+        raise asyncio.CancelledError
+
+    outcome = await run_context(handler, output_size=70000, settings=ContextCompactionConfig())
+    assert outcome.result.status == "cancelled" and outcome.calls == [0]
+    assert paths and not paths[0].exists()
 
 
 async def test_disabled_compaction_still_stops_deterministic_context_error(run_context):
@@ -635,7 +722,7 @@ async def test_disabled_compaction_still_stops_deterministic_context_error(run_c
     assert outcome.result.error_code == "context_length_exceeded"
     assert outcome.result.retryable is False
     assert outcome.calls == [0] and len(calls) == 2
-    assert "x" * 30000 in json.dumps(calls[-1])
+    assert "output_file" in json.dumps(calls[-1])
 
 
 @pytest.mark.parametrize("driver", ["openai_chat_completions", "anthropic_messages", "gemini_generate_content"])

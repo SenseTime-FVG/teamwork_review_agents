@@ -97,8 +97,9 @@ database:
 #     # 摘要软目标，不是失败上限；超过目标但完整请求能装下且已缩小时照常接受。
 #     # 旧键 max_summary_tokens 仍可读取，保存后使用新名称；当前按字节保守估算。
 #     summary_target_bytes: 2048
-#     # 单个工具结果的送模副本字节上限；原始执行日志不裁剪。
-#     tool_output_tokens: 4096
+#     # 普通结果完整返回；超过阈值或当前窗口装不下时提供完整文件供补读，不丢弃中间内容。
+#     # 旧 tool_output_tokens 已忽略；新字段仅决定正文返回阈值，单位是字节。
+#     tool_output_inline_bytes: 65536
 #     # 收短也计入总请求上限；不重跑已经执行的工具。
 #     max_compaction_requests: 16
 #     max_summary_rewrites: 2

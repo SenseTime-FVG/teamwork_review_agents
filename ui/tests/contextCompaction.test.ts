@@ -2,6 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { presentRunLogs } from "../src/runLogPresentation.ts";
 
+test("完整工具文件显示补读信息而非压缩或截断告警", () => {
+  const [stored, failed] = presentRunLogs([
+    {id: 1, run_id: "run", created_at: 1, stream: "system", event_type: "context.tool_output_stored",
+      payload: JSON.stringify({call_id: "call-2", original_bytes: 70000,
+        message: "完整脱敏结果已保存，模型可分段读取；这不是上下文摘要压缩。",
+        output_file: {path: "D:\\runtime\\tool-results\\result-abc.json", bytes: 70000, sha256: "abc123",
+          lifetime: "仅本次运行期间有效；运行结束随临时目录清理"}})},
+    {id: 2, run_id: "run", created_at: 2, stream: "system", event_type: "run.tool_output_failed",
+      payload: JSON.stringify({error: "无法保存完整工具结果", error_code: "tool_output_storage_failed", retryable: false})},
+  ]);
+  assert.equal(stored.kind, "system");
+  assert.equal(stored.title, "工具结果已保存，可分段读取");
+  assert.match(stored.body, /不是上下文摘要压缩/);
+  assert.match(stored.detail, /result-abc.json/);
+  assert.match(stored.detail, /70000 字节/);
+  assert.match(stored.detail, /SHA-256：abc123/);
+  assert.match(stored.detail, /运行结束随临时目录清理/);
+  assert.equal(failed.kind, "error");
+  assert.match(failed.body, /无法保存完整工具结果/);
+  assert.match(failed.detail, /停止整轮自动重试/);
+});
+
 test("压缩记录保留不可变边界，并区分预算估算和最终结果", () => {
   const [message] = presentRunLogs([{
     id: 1, run_id: "run", created_at: 1, stream: "system", event_type: "context.compacted",
