@@ -51,15 +51,13 @@ def _prompt_language(agent_language: Any, global_language: Any = None) -> str:
         if value is None or isinstance(value, Undefined):
             continue
         if isinstance(value, str):
-            normalized = value.strip().lower()
-            if not normalized:
+            language = value.strip()
+            if not language:
                 continue
-            if normalized in aliases:
-                return aliases[normalized]
-        # 不回显配置原值，避免把误填的凭证或指令带入异常与日志。
-        raise PromptRenderError(
-            "Prompt 语言配置无效：仅支持中文/英文、zh/en、zh-CN/en-US 或 Chinese/English"
-        )
+            # 字典只规范中英文别名；其他语言保留原文与大小写，不二次渲染。
+            return aliases.get(language.lower(), language)
+        # 非字符串属于调用类型错误，不回显配置原值。
+        raise PromptRenderError("Prompt 语言配置无效：语言值必须是字符串")
     return "中文"
 
 
