@@ -23,6 +23,7 @@ from .process_manager import (
     stop_managed_process,
 )
 from .state import StateStore
+from .service_urls import service_access_message
 from .webapp import create_app
 
 
@@ -171,6 +172,20 @@ async def _serve(
     server = uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="info")
     )
+
+    async def report_access_when_ready() -> None:
+        """只在绑定端口及应用启动成功后打印，避免把失败启动误报为可访问。"""
+
+        while not server.started and not server.should_exit:
+            await asyncio.sleep(0.05)
+        if server.started and not server.should_exit:
+            message = await asyncio.to_thread(
+                service_access_message, host, port,
+                admin_token_required=bool(config.web.admin_token_env),
+            )
+            print(message, flush=True)
+
+    address_reporter = asyncio.create_task(report_access_when_ready(), name="teamwork-service-address-reporter")
     watcher: asyncio.Task[None] | None = None
     if stop_check is not None:
 
@@ -190,6 +205,9 @@ async def _serve(
     try:
         await server.serve()
     finally:
+        address_reporter.cancel()
+        with suppress(asyncio.CancelledError):
+            await address_reporter
         if watcher is not None:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
@@ -201,7 +219,7 @@ def _server_settings(
     config_path: Path,
     host_override: str | None,
     port_override: int | None,
-) -> tuple[Path, str, int] | None:
+) -> tuple[Path, str, int, bool] | None:
     """校验服务配置并返回最终监听参数。"""
 
     resolved = resolve_config_path(config_path)
@@ -219,7 +237,7 @@ def _server_settings(
     if host not in {"127.0.0.1", "localhost", "::1"} and not config.web.admin_token_env:
         print("配置错误：监听非本机地址时必须配置 web.admin_token_env")
         return None
-    return resolved, host, port
+    return resolved, host, port, bool(config.web.admin_token_env)
 
 
 def _run_server(
@@ -234,7 +252,7 @@ def _run_server(
     settings = _server_settings(config_path, host_override, port_override)
     if settings is None:
         return 2
-    resolved, host, port = settings
+    resolved, host, port, _ = settings
     lease = ServiceLease.acquire(
         resolved,
         host=host,
@@ -295,11 +313,12 @@ def main() -> None:
         settings = _server_settings(args.config, args.host, args.port)
         if settings is None:
             raise SystemExit(2)
-        resolved, host, port = settings
+        resolved, host, port, admin_token_required = settings
         raise SystemExit(
             _print_process_result(start_background(
                 resolved, host=host, port=port,
                 startup_timeout_seconds=args.startup_timeout,
+                admin_token_required=admin_token_required,
             ))
         )
     if args.command in {"stop", "end"}:
@@ -308,7 +327,7 @@ def main() -> None:
         settings = _server_settings(args.config, args.host, args.port)
         if settings is None:
             raise SystemExit(2)
-        resolved, host, port = settings
+        resolved, host, port, admin_token_required = settings
         stop_result = stop_managed_process(resolved)
         if stop_result.exit_code:
             raise SystemExit(_print_process_result(stop_result))
@@ -317,6 +336,7 @@ def main() -> None:
             _print_process_result(start_background(
                 resolved, host=host, port=port,
                 startup_timeout_seconds=args.startup_timeout,
+                admin_token_required=admin_token_required,
             ))
         )
     if args.command == "runs":

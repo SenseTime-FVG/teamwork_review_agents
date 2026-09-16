@@ -137,6 +137,55 @@ def test_background_service_starts_and_stops(tmp_path) -> None:
     assert running_process(config_path) is None
 
 
+def test_cli_start_and_restart_print_addresses_without_changing_auth(tmp_path, monkeypatch):
+    """真实隔离 CLI 启停展示实际端口，并验证本机管理 API 仍要求虚构 Token。"""
+
+    port = _unused_port()
+    config_path = _write_config(tmp_path, port)
+    config_path.write_text(yaml.safe_dump({
+        "database": {"path": str(tmp_path / "state.db")},
+        "web": {"host": "0.0.0.0", "port": 8080, "admin_token_env": "FIXTURE_ADMIN_TOKEN"},
+    }), encoding="utf-8")
+    token = "startup-address-test-only"
+    monkeypatch.setenv("FIXTURE_ADMIN_TOKEN", token)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    pids = []
+    try:
+        for command in ("start", "restart"):
+            result = subprocess.run(
+                [sys.executable, "-m", "teamwork_review_agents", command, "-c", str(config_path),
+                 "--port", str(port), "--startup-timeout", "30"],
+                capture_output=True, text=True, encoding="utf-8", timeout=50,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert f"监听地址：0.0.0.0:{port}" in result.stdout
+            assert f"本机访问：http://127.0.0.1:{port}" in result.stdout
+            assert "局域网访问" in result.stdout
+            assert "需要管理员 Token" in result.stdout
+            assert token not in result.stdout + result.stderr
+            pids.append(_wait_health_pid(port))
+            with pytest.raises(urllib.error.HTTPError) as denied:
+                opener.open(f"http://127.0.0.1:{port}/api/status", timeout=3)
+            assert denied.value.code == 401
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/api/status",
+                                             headers={"Authorization": f"Bearer {token}"})
+            with opener.open(request, timeout=3) as response:
+                assert response.status == 200
+        assert pids[0] != pids[1]
+        # 后台日志由真正的前台子进程写入，不能只验证父进程拼接的启动提示。
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            log = runtime_paths(config_path).log_file.read_text(encoding="utf-8")
+            if log.count("本机访问：") >= 2:
+                break
+            time.sleep(0.05)
+        assert log.count(f"本机访问：http://127.0.0.1:{port}") >= 2
+        assert token not in log
+    finally:
+        stop_managed_process(config_path, timeout_seconds=10)
+    assert running_process(config_path) is None
+
+
 def test_service_lease_matches_only_its_stop_request(tmp_path) -> None:
     """停止请求必须绑定进程启动时间，陈旧 PID 不能误停新服务。"""
 
@@ -234,7 +283,8 @@ def test_startup_timeout_rejects_invalid_api_value(value) -> None:
 
 @pytest.mark.parametrize("command", ["start", "restart"])
 @pytest.mark.parametrize("timeout", [None, "60", "7.5"])
-def test_cli_passes_startup_timeout(command, timeout, tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("requires_token", [False, True])
+def test_cli_passes_startup_timeout(command, timeout, requires_token, tmp_path, monkeypatch) -> None:
     """CLI 将默认或显式预算传入后台启动器，重启仍先完成停止。"""
 
     start = Mock(return_value=ProcessActionResult(0, "已启动"))
@@ -242,7 +292,7 @@ def test_cli_passes_startup_timeout(command, timeout, tmp_path, monkeypatch) -> 
     monkeypatch.setattr(cli, "start_background", start)
     monkeypatch.setattr(cli, "stop_managed_process", stop)
     config = tmp_path / "config.yaml"
-    monkeypatch.setattr(cli, "_server_settings", lambda *args: (config, "127.0.0.1", 8080))
+    monkeypatch.setattr(cli, "_server_settings", lambda *args: (config, "127.0.0.1", 8080, requires_token))
     arguments = ["teamwork-review-agents", command]
     if timeout is not None:
         arguments.extend(["--startup-timeout", timeout])
@@ -253,6 +303,7 @@ def test_cli_passes_startup_timeout(command, timeout, tmp_path, monkeypatch) -> 
     start.assert_called_once_with(
         config, host="127.0.0.1", port=8080,
         startup_timeout_seconds=None if timeout is None else float(timeout),
+        admin_token_required=requires_token,
     )
     assert stop.call_count == (1 if command == "restart" else 0)
 
@@ -312,6 +363,28 @@ def test_default_budget_accepts_service_ready_after_five_seconds(simulated_start
     assert result.exit_code == 0
     assert 8 <= state.clock.seconds < 9
     state.terminate.assert_not_called()
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_background_success_lists_actual_binding_addresses(simulated_start, monkeypatch, already_running):
+    """正常启动和重复启动都展示实际服务端口，不能沿用调用者误传的端口。"""
+
+    state = simulated_start
+    record = ProcessRecord(12345, str(state.config), "start", "0.0.0.0", 9093, True)
+    monkeypatch.setattr(process_manager, "_read_record", lambda *args: record)
+    if already_running:
+        monkeypatch.setattr(process_manager, "_running_processes", lambda *args: [record])
+    monkeypatch.setattr("teamwork_review_agents.service_urls.local_interface_addresses",
+                        lambda family: [("Wi-Fi", "192.168.1.20"), ("Ethernet", "10.2.0.3")])
+    result = start_background(state.config, host="0.0.0.0", port=8080 if already_running else 9093,
+                              admin_token_required=True)
+    assert result.exit_code == 0
+    assert "监听地址：0.0.0.0:9093" in result.message
+    assert "本机访问：http://127.0.0.1:9093" in result.message
+    assert "候选（Wi-Fi）：http://192.168.1.20:9093" in result.message
+    assert "候选（Ethernet）：http://10.2.0.3:9093" in result.message
+    assert "需要管理员 Token" in result.message
+    assert ("已在运行" in result.message) is already_running
 
 
 @pytest.mark.parametrize("failure, expected", [

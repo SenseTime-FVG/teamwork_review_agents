@@ -20,6 +20,7 @@ from typing import IO
 
 import portalocker
 
+from .service_urls import http_url, service_access_message
 from .process_control import (
     ProcessIdentity,
     descendant_process_identities,
@@ -80,10 +81,8 @@ def resolve_config_path(config_path: str | Path) -> Path:
 def management_url(host: str, port: int) -> str:
     """将监听地址转换为可在本机打开的管理界面地址。"""
 
-    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    if ":" in display_host and not display_host.startswith("["):
-        display_host = f"[{display_host}]"
-    return f"http://{display_host}:{port}"
+    display_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    return http_url(display_host, port)
 
 
 def runtime_paths(config_path: str | Path) -> RuntimePaths:
@@ -478,6 +477,7 @@ def start_background(
     host: str,
     port: int,
     startup_timeout_seconds: float | None = None,
+    admin_token_required: bool | None = None,
 ) -> ProcessActionResult:
     """启动脱离当前终端的后台服务进程。"""
 
@@ -509,8 +509,8 @@ def start_background(
         return ProcessActionResult(
             0,
             (
-                f"后台服务已在运行：PID {existing.pid}，"
-                f"{management_url(existing.host, existing.port)}"
+                f"后台服务已在运行：PID {existing.pid}\n"
+                f"{service_access_message(existing.host, existing.port, admin_token_required=admin_token_required)}"
             ),
             existing,
         )
@@ -584,7 +584,7 @@ def start_background(
                 0,
                 (
                     f"后台服务已启动：PID {record.pid}\n"
-                    f"管理界面：{management_url(record.host, record.port)}\n"
+                    f"{service_access_message(record.host, record.port, admin_token_required=admin_token_required)}\n"
                     f"后台日志：{paths.log_file}"
                 ),
                 record,
