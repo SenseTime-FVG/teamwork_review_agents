@@ -59,7 +59,10 @@ LANGUAGE_TEMPLATE = "{{ AGENT_LANGUAGE | prompt_language(LANGUAGE) }}"
         ("中文", "英文", "中文"),
         (" EN ", "中文", "英文"),
         ("英文", None, "英文"),
-        ("zh", "无效但不会读取的全局值", "中文"),
+        ("zh", "French", "中文"),
+        ("日本語", "en", "日本語"),
+        (" Français ", "中文", "Français"),
+        (" ", "\tPortuguês (Brasil)\n", "Português (Brasil)"),
     ],
 )
 def test_each_prompt_selects_its_own_language(
@@ -119,9 +122,25 @@ def test_language_aliases_are_normalized(key, value, expected) -> None:
 
 
 @pytest.mark.parametrize("key", ["AGENT_LANGUAGE", "LANGUAGE"])
-@pytest.mark.parametrize("value", ["invalid-sensitive-value", "{{ 7 * 7 }}", 1, False])
-def test_invalid_nonempty_language_is_rejected_without_echo(key, value) -> None:
-    """非法非空语言不能作为指令注入模板，也不应回显到错误中。"""
+@pytest.mark.parametrize("value", ["日语", "日本語", "French", "zh-TW", "Português (Brasil)"])
+def test_custom_language_preserves_original_text(key, value) -> None:
+    """字典之外的语言只去掉首尾空白，不改写大小写或内部文本。"""
+
+    assert render_prompt(LANGUAGE_TEMPLATE, {key: f" \t{value}\n"}) == value
+
+
+@pytest.mark.parametrize("key", ["AGENT_LANGUAGE", "LANGUAGE"])
+@pytest.mark.parametrize("value", ["{{ 7 * 7 }}", "{% if true %}日本語{% endif %}", "${{LANGUAGE}}"])
+def test_custom_language_is_not_rendered_as_a_template(key, value) -> None:
+    """语言值中的模板标记仅原样输出，不会作为 Jinja 再执行一次。"""
+
+    assert render_prompt(LANGUAGE_TEMPLATE, {key: value}) == value
+
+
+@pytest.mark.parametrize("key", ["AGENT_LANGUAGE", "LANGUAGE"])
+@pytest.mark.parametrize("value", [1, False, [], {}])
+def test_nonstring_language_is_rejected_without_echo(key, value) -> None:
+    """非字符串仍属于调用错误，不将配置内容写入错误消息。"""
 
     with pytest.raises(PromptRenderError, match="Prompt 语言配置无效") as error:
         render_prompt(LANGUAGE_TEMPLATE, {key: value})
@@ -226,15 +245,23 @@ def test_language_only_reads_explicit_host_environment(language_config_path, mon
     assert render_prompt(LANGUAGE_TEMPLATE, resolved.prompt_values) == "英文"
 
 
-def test_agent_execution_and_preview_use_the_same_language(language_config_path) -> None:
+@pytest.mark.parametrize(
+    ("parent_language", "global_language"),
+    [("中文", "英文"), ("日本語", "French")],
+)
+def test_agent_execution_and_preview_use_the_same_language(
+    language_config_path, parent_language, global_language,
+) -> None:
     """执行器与预览使用同一语言解析，父子 Agent 各自选择语言。"""
 
     config = load_config(language_config_path)
+    config.agents["parent"].environment["GENERAL_REVIEWER_LANGUAGE"].value = parent_language
+    config.environment.global_variables["LANGUAGE"].value = global_language
     repository = config.repositories[0]
     executor = AgentExecutor(config, StateStore(config.database.path))
     app = create_app(language_config_path, start_scheduler=False)
     with TestClient(app) as client:
-        for name, language in (("parent", "中文"), ("child", "英文")):
+        for name, language in (("parent", parent_language), ("child", global_language)):
             agent = config.agents[name]
             resolved = resolve_environment(config, repository, agent, None, name)
             prompt = executor.build_prompt(
@@ -250,17 +277,16 @@ def test_agent_execution_and_preview_use_the_same_language(language_config_path)
             assert preview.json()["rendered"].startswith(f"# 使用语言\n\n{language}\n")
             assert prompt.startswith(preview.json()["rendered"].strip())
 
-        invalid = client.post("/api/prompts/preview", json={
+        custom = client.post("/api/prompts/preview", json={
             "template": LANGUAGE_TEMPLATE,
-            "variables": {"LANGUAGE": "invalid-sensitive-value"},
+            "variables": {"LANGUAGE": "日本語"},
         })
-        assert invalid.status_code == 422
-        assert "Prompt 语言配置无效" in invalid.json()["detail"]
-        assert "invalid-sensitive-value" not in invalid.text
+        assert custom.status_code == 200
+        assert custom.json()["rendered"] == "日本語"
 
     with pytest.raises(AgentExecutionError, match="Prompt 语言配置无效"):
         executor.build_prompt(
             agent_name="child", event=None, repository=repository, task="测试任务",
-            extra_context=None, prompt_values={"LANGUAGE": "invalid-sensitive-value"},
+            extra_context=None, prompt_values={"LANGUAGE": 1},
             change_ref="test-ref", actions=[],
         )

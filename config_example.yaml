@@ -206,7 +206,7 @@ web:
 #       expose_to_prompt: true
 #       expose_to_process: false
 #     # Prompt 全局语言：各 Agent 专用语言非空时优先；都为空时默认中文。
-#     # 支持中文/英文、zh/en、zh-CN/en-US、Chinese/English。
+#     # 中英文及 zh/en 等别名会规范化；其他语言文本（如日本語、French）原样输出。
 #     # 完整写法：value 与 from_system 只能选择一个；只需传给 Prompt。
 #     LANGUAGE:
 #       value: 英文
