@@ -556,6 +556,8 @@ class AgentConfig(BaseModel):
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     managed_comment: bool = False
     managed_comment_model_signature: bool = False
+    # 签名文案独立于 Prompt 语言，旧配置默认保持中文。
+    managed_comment_model_signature_language: Literal["zh", "en", "bilingual"] = "zh"
     managed_comment_slot: str | None = Field(default=None, min_length=1, max_length=128)
     allowed_sub_agents: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)

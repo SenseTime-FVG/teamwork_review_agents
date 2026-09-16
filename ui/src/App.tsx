@@ -377,6 +377,7 @@ function createEmptyAgent(): Agent {
     write_scopes: ["change_request", "workspace"],
     managed_comment: false,
     managed_comment_model_signature: false,
+    managed_comment_model_signature_language: "zh",
     allowed_sub_agents: [],
     skills: [],
     environment: {},
@@ -6889,12 +6890,28 @@ function AgentsEditor(props: {
                           : writeScopes,
                       })}
                     />
-                    <Toggle
-                      label="附加模型签名"
-                      checked={agent.managed_comment_model_signature ?? false}
-                      disabled={!(agent.managed_comment ?? false)}
-                      onChange={(managed_comment_model_signature) => update(name, { managed_comment_model_signature })}
-                    />
+                    <div className="managed-comment-signature-controls">
+                      <Toggle
+                        label="附加模型签名"
+                        checked={agent.managed_comment_model_signature ?? false}
+                        disabled={!(agent.managed_comment ?? false)}
+                        onChange={(managed_comment_model_signature) => update(name, { managed_comment_model_signature })}
+                      />
+                      <SelectControl
+                        ariaLabel="模型签名语言"
+                        className="managed-comment-language"
+                        value={agent.managed_comment_model_signature_language ?? "zh"}
+                        disabled={!agent.managed_comment || !agent.managed_comment_model_signature}
+                        onChange={(language) => update(name, {
+                          managed_comment_model_signature_language: language as Agent["managed_comment_model_signature_language"],
+                        })}
+                        options={[
+                          { value: "zh", label: "中文" },
+                          { value: "en", label: "English" },
+                          { value: "bilingual", label: "双语" },
+                        ]}
+                      />
+                    </div>
                   </div>
                 </div>
                 <p className="network-permission-state">

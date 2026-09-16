@@ -462,6 +462,7 @@ def test_managed_comment_requires_stable_slot() -> None:
 
     default_agent = AgentConfig.model_validate({"prompt": "测试"})
     assert default_agent.managed_comment_model_signature is False
+    assert default_agent.managed_comment_model_signature_language == "zh"
 
 
 @pytest.mark.parametrize(
