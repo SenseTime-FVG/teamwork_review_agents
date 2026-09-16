@@ -9,7 +9,7 @@ GitHub/GitLab 平台连接已经按仓库解析各自的 Provider Token，但旧
 - Provider Token 始终强制标记为 Secret，配置历史、运行快照和日志继续脱敏。
 - Provider Token 默认不进入 Prompt，模型上下文不能直接读取明文凭据。
 - Provider Token 默认进入运行进程，使 Agent、模型工具命令和仓库 CI 使用当前仓库解析出的平台身份。
-- 仓库环境变量继续覆盖全局同名变量，Agent 环境变量继续覆盖仓库同名变量。
+- 同名环境变量按仓库 > Agent > 全局优先级整项覆盖，详见[仓库环境优先级设计](design-repository-environment-precedence.md)。
 - `gh` / `glab` 仍使用宿主机安装的可执行文件；环境中的 `GITHUB_TOKEN` / `GITLAB_TOKEN` 只负责覆盖其认证身份。
 - 管理员可以关闭“进程”开关；明确保存为 `false` 的现有配置不被加载器或升级过程改写。
 

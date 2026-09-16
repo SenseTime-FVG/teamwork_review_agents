@@ -8,7 +8,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from teamwork_review_agents.config import load_config
+from teamwork_review_agents.config import EnvironmentVariable, load_config
 from teamwork_review_agents.config_manager import ConfigManager, ConfigRevisionConflict
 from teamwork_review_agents.codex_account import CodexAccountError
 from teamwork_review_agents.codex_settings import read_user_inherited_settings
@@ -136,7 +136,7 @@ def test_environment_precedence_template_and_redaction(
         "run-test",
     )
 
-    assert resolved.all_values["LEVEL"] == "agent"
+    assert resolved.all_values["LEVEL"] == "repository"
     assert resolved.all_values["MR_NUMBER"] == "7"
     assert resolved.prompt_values["GLOBAL_SECRET"] == ""
     assert resolved.process_values["GLOBAL_SECRET"] == "system-secret"
@@ -144,7 +144,7 @@ def test_environment_precedence_template_and_redaction(
     assert resolved.prompt_values["GITHUB_TEST_TOKEN"] == "provider-secret"
     assert resolved.process_values["GITHUB_TEST_TOKEN"] == "provider-secret"
     assert resolved.audit_values["GITHUB_TEST_TOKEN"] == MASK
-    assert render_prompt("${{LEVEL}}/${{MISSING}}", resolved.prompt_values) == "agent/"
+    assert render_prompt("${{LEVEL}}/${{MISSING}}", resolved.prompt_values) == "repository/"
     assert SecretRedactor(resolved.secret_values).text(
         "system-secret first-secret"
     ) == f"{MASK} {MASK}"
@@ -161,6 +161,149 @@ def test_environment_precedence_template_and_redaction(
     assert delegated.all_values["RUN_ID"] == "run-child"
     assert "MR_TITLE" not in delegated.all_values
     assert "EVENT_TYPE" not in delegated.process_values
+    assert delegated.all_values["LEVEL"] == "repository"
+
+
+@pytest.mark.parametrize(("repository_has_value", "agent_has_value", "expected"), [
+    (True, True, "repository"), (False, True, "agent"), (False, False, "global"),
+])
+def test_environment_priority_falls_back_only_when_definition_is_absent(
+    configured_app_factory, repository_has_value, agent_has_value, expected,
+) -> None:
+    """仓库优先于 Agent，只有缺少整项配置才继续使用低优先级默认值。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    config.environment.global_variables["LEVEL"] = EnvironmentVariable(value="global")
+    if agent_has_value:
+        agent.environment["LEVEL"] = EnvironmentVariable(value="agent")
+    if repository_has_value:
+        repository.environment["LEVEL"] = EnvironmentVariable(value="repository")
+    resolved = resolve_environment(config, repository, agent, None, "priority-test")
+    assert resolved.all_values["LEVEL"] == expected
+    assert resolved.prompt_values["LEVEL"] == expected
+    assert resolved.process_values["LEVEL"] == expected
+    assert resolved.audit_values["LEVEL"] == expected
+
+
+def test_same_agent_uses_each_repository_without_mutating_configuration(configured_app_factory) -> None:
+    """复用 Agent 时仓库值彼此隔离，解析不能回写共享 Agent 或全局配置。"""
+
+    config = configured_app_factory()
+    agent = config.agents["code-reviewer"]
+    agent.environment["LEVEL"] = EnvironmentVariable(value="agent")
+    first = config.repositories[0]
+    first.environment["LEVEL"] = EnvironmentVariable(value="first")
+    second = first.model_copy(deep=True, update={"id": "second", "environment": {"LEVEL": EnvironmentVariable(value="second")}})
+    before = config.model_dump()
+    for repository, expected in ((first, "first"), (second, "second"), (first, "first")):
+        assert resolve_environment(config, repository, agent, None, "reuse-test").process_values["LEVEL"] == expected
+    assert config.model_dump() == before
+
+
+@pytest.mark.parametrize(("secret", "prompt", "process"), [
+    (True, False, False), (False, True, True), (True, True, False), (True, False, True),
+])
+def test_repository_overrides_source_secret_and_exposure_as_one_definition(
+    configured_app_factory, monkeypatch, secret, prompt, process,
+) -> None:
+    """仓库来源与全部开关一起生效，不能继承同名 Agent 变量的个别字段。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    agent.environment["CHOICE"] = EnvironmentVariable(
+        value="unused-agent-value", secret=not secret, expose_to_prompt=not prompt, expose_to_process=not process,
+    )
+    repository.environment["CHOICE"] = EnvironmentVariable(
+        from_system="TEST_REPOSITORY_SETTING", secret=secret, expose_to_prompt=prompt, expose_to_process=process,
+    )
+    monkeypatch.setenv("TEST_REPOSITORY_SETTING", "repository-value")
+    resolved = resolve_environment(config, repository, agent, None, "definition-test")
+    assert resolved.all_values["CHOICE"] == "repository-value"
+    assert resolved.prompt_values["CHOICE"] == ("repository-value" if prompt else "")
+    assert resolved.process_values.get("CHOICE") == ("repository-value" if process else None)
+    assert resolved.audit_values["CHOICE"] == (MASK if secret else "repository-value")
+    assert ("repository-value" in resolved.secret_values) is secret
+    assert "unused-agent-value" not in resolved.secret_values
+
+
+@pytest.mark.parametrize("from_system", [False, True])
+def test_empty_repository_value_does_not_restore_agent_value(configured_app_factory, monkeypatch, from_system) -> None:
+    """显式空值或缺失宿主机引用仍覆盖低优先级，不能悄悄换用其他环境。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    config.environment.global_variables["LEVEL"] = EnvironmentVariable(value="global")
+    agent.environment["LEVEL"] = EnvironmentVariable(value="agent")
+    monkeypatch.delenv("TEST_ABSENT_REPOSITORY_SETTING", raising=False)
+    repository.environment["LEVEL"] = EnvironmentVariable(
+        **({"from_system": "TEST_ABSENT_REPOSITORY_SETTING"} if from_system else {"value": ""}),
+    )
+    resolved = resolve_environment(config, repository, agent, None, "empty-test")
+    assert resolved.all_values["LEVEL"] == resolved.prompt_values["LEVEL"] == resolved.process_values["LEVEL"] == ""
+
+
+def test_repository_cannot_override_builtin_run_variables(configured_app_factory, snapshot_factory) -> None:
+    """即使仓库优先级提高，系统运行身份和工作目录依然由服务决定。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    names = ("RUN_ID", "REPOSITORY_ID", "REPOSITORY_WORKSPACE", "MR_NUMBER")
+    for environment in (config.environment.global_variables, agent.environment, repository.environment):
+        environment.update({name: EnvironmentVariable(value="cannot-override") for name in names})
+    event = detect_events(None, snapshot_factory(provider=repository.provider), emit_initial=True)[0]
+    resolved = resolve_environment(config, repository, agent, event, "real-run")
+    for values in (resolved.all_values, resolved.prompt_values, resolved.process_values, resolved.audit_values):
+        assert values["RUN_ID"] == "real-run"
+        assert values["REPOSITORY_ID"] == repository.id
+        assert values["REPOSITORY_WORKSPACE"] == str(repository.workspace)
+        assert values["MR_NUMBER"] == str(event.number)
+
+
+def test_provider_service_token_and_repository_preparation_ignore_agent_overrides(configured_app_factory, monkeypatch) -> None:
+    """平台 Token 与仓库准备保持原链路；Agent 环境中的仓库 Token 仍强制脱敏。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    agent = config.agents["code-reviewer"]
+    provider = config.providers[repository.provider]
+    token_name = provider.token_env
+    monkeypatch.setenv(token_name, "test-host-token")
+    config.environment.global_variables[token_name] = EnvironmentVariable(value="test-global-token")
+    agent.environment[token_name] = EnvironmentVariable(value="test-agent-token")
+    repository.environment[token_name] = EnvironmentVariable(value="test-repository-token", secret=False)
+    resolved = resolve_environment(config, repository, agent, None, "token-test")
+    assert resolved.process_values[token_name] == "test-repository-token"
+    assert resolved.audit_values[token_name] == MASK
+    assert "test-repository-token" in resolved.secret_values
+    assert resolve_provider_token(config, provider, repository) == "test-repository-token"
+    assert resolve_repository_process_environment(config, repository, "prepare").process_values[token_name] == "test-repository-token"
+    del repository.environment[token_name]
+    assert resolve_provider_token(config, provider, repository) == "test-global-token"
+    assert resolve_repository_process_environment(config, repository, "prepare").process_values[token_name] == "test-global-token"
+    del config.environment.global_variables[token_name]
+    assert resolve_provider_token(config, provider, repository) == "test-host-token"
+
+
+def test_sub_agent_uses_own_defaults_below_repository(configured_app_factory) -> None:
+    """子 Agent 使用自己的默认变量，仓库仍优先，父 Agent 的独有变量不传递。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    parent = config.agents["code-reviewer"]
+    child = config.agents["security-reviewer"]
+    parent.environment.update(LEVEL=EnvironmentVariable(value="parent"), PARENT_ONLY=EnvironmentVariable(value="parent-only"))
+    child.environment["LEVEL"] = EnvironmentVariable(value="child")
+    repository.environment["LEVEL"] = EnvironmentVariable(value="repository")
+    resolved = resolve_environment(config, repository, child, None, "child", include_change_request=False)
+    assert resolved.process_values["LEVEL"] == "repository"
+    assert "PARENT_ONLY" not in resolved.all_values
+    del repository.environment["LEVEL"]
+    assert resolve_environment(config, repository, child, None, "child").process_values["LEVEL"] == "child"
 
 
 def test_config_manager_masks_and_merges_reordered_repositories(tmp_path) -> None:
