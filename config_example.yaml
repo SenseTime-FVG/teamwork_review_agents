@@ -363,6 +363,8 @@ agents:
     managed_comment: true
     # 可选：由 Teamwork 根据本轮固化的模型快照在托管评论末尾追加模型签名。
     managed_comment_model_signature: true
+    # 签名语言：zh 中文（默认）、en 英文、bilingual 双语；不影响评论正文语言。
+    managed_comment_model_signature_language: zh
     managed_comment_slot: 90d75f2e-9c29-4b77-8ce9-6b30d76b9b1a
     # 只授予 invoke_agent 调用权限；空数组表示不能委托其他 Agent。
     allowed_sub_agents: []

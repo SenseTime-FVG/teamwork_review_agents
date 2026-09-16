@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from .config import AppConfig
 from .environment import resolve_provider_token
@@ -15,7 +15,20 @@ from .state import StateStore
 
 
 _COMMENT_LIMIT_BYTES = 60 * 1024
-_UNKNOWN_MODEL_SIGNATURE = "Codex 账号默认（未记录具体模型）"
+_SignatureLanguage = Literal["zh", "en", "bilingual"]
+_MODEL_SIGNATURE_PREFIXES = {
+    "zh": "模型：",
+    "en": "Model: ",
+    "bilingual": "模型 / Model: ",
+}
+_UNKNOWN_MODEL_SIGNATURES = {
+    "zh": "Codex 账号默认（未记录具体模型）",
+    "en": "Codex account default (model not recorded)",
+    "bilingual": (
+        "Codex 账号默认（未记录具体模型） / "
+        "Codex account default (model not recorded)"
+    ),
+}
 
 
 class ManagedCommentService:
@@ -53,7 +66,11 @@ class ManagedCommentService:
                 f"Agent {context.current_agent} 缺少稳定的托管评论槽位"
             )
         if agent.managed_comment_model_signature:
-            body = await self._append_model_signature(context.run_id, body)
+            body = await self._append_model_signature(
+                context.run_id,
+                body,
+                language=agent.managed_comment_model_signature_language,
+            )
         snapshot = context.event.current_snapshot
         return await self.publish(
             repository_id=context.event.repository_id,
@@ -65,18 +82,30 @@ class ManagedCommentService:
             body=body,
         )
 
-    async def _append_model_signature(self, run_id: str, body: str) -> str:
+    async def _append_model_signature(
+        self,
+        run_id: str,
+        body: str,
+        *,
+        language: _SignatureLanguage = "zh",
+    ) -> str:
         """使用本轮固化的模型快照为非空评论正文追加签名。"""
 
         if not body.strip():
             return body
         run = await asyncio.to_thread(self.store.get_run, run_id)
         model_snapshot = run.get("model_snapshot") if run else None
-        signature = self._format_model_signature(model_snapshot)
-        return f"{body.rstrip()}\n\n---\n_模型：`{signature}`_"
+        signature = self._format_model_signature(model_snapshot, language=language)
+        # 仅切换服务端签名文案，正文和实际模型标识保持原样。
+        prefix = _MODEL_SIGNATURE_PREFIXES[language]
+        return f"{body.rstrip()}\n\n---\n_{prefix}`{signature}`_"
 
     @staticmethod
-    def _format_model_signature(model_snapshot: Any) -> str:
+    def _format_model_signature(
+        model_snapshot: Any,
+        *,
+        language: _SignatureLanguage = "zh",
+    ) -> str:
         """把可信模型快照规范为不会破坏 Markdown 的单行签名。"""
 
         snapshot = model_snapshot if isinstance(model_snapshot, dict) else {}
@@ -85,7 +114,7 @@ class ManagedCommentService:
             snapshot.get("reasoning_effort")
         )
         if not model:
-            return _UNKNOWN_MODEL_SIGNATURE
+            return _UNKNOWN_MODEL_SIGNATURES[language]
         if reasoning_effort:
             return f"{model} ({reasoning_effort})"
         return model

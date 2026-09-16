@@ -414,6 +414,8 @@ Agent 详情页可以开启“按源版本托管顶层评论”。开启后必�
 
 可同时开启“附加模型签名”。Teamwork 会读取本轮 Agent 启动时固化的模型快照，在 `publish_comment` 正文末尾自动追加如 `gpt-5.6-sol (high)` 或 `deepseek-v4-pro` 的签名；无法解析具体模型时明确显示账号默认且未记录型号。签名不依赖 Prompt，也不会附加到没有模型运行的 Preflight / CI 评论。
 
+签名开关旁可选择「中文 / English / 双语」，默认中文，对应 Agent 配置 `managed_comment_model_signature_language: zh / en / bilingual`。前缀分别为 `模型：`、`Model: `、`模型 / Model: `，未知模型提示也按所选语言显示，模型名称和推理强度不翻译、不重复。此配置与 Prompt 语言独立，只影响下一次实际发布或更新的签名，不会自动修改历史评论；关闭签名或托管评论时保留语言选项。
+
 `fail_closed: true` 是默认值。若当前平台不受支持、Codex CLI 版本没有 `codex sandbox --permission-profile`，或能力检查失败，运行会在模型启动前失败并写入诊断日志。只有显式改成 `false` 时，Codex CLI 驱动才回退到自己的同级内层沙盒；受限 Agent 永远不会自动回退为完全访问。权限档案目前是 Codex Beta 能力，可以在“全局配置与环境”页面查看当前平台、后端和能力状态，升级 Codex CLI 后应重新检查该诊断。
 
 ### Windows 沙盒内 Git HTTPS

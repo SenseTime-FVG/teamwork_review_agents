@@ -214,17 +214,32 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     assert set(provider_tokens) == {"repository-provider-token"}
 
 
+@pytest.mark.parametrize(
+    ("language", "prefix", "unknown_model"),
+    [
+        ("zh", "模型：", "Codex 账号默认（未记录具体模型）"),
+        ("en", "Model: ", "Codex account default (model not recorded)"),
+        (
+            "bilingual", "模型 / Model: ",
+            "Codex 账号默认（未记录具体模型） / Codex account default (model not recorded)",
+        ),
+    ],
+)
 async def test_agent_comment_model_signature_uses_persisted_run_snapshot(
     snapshot_factory,
     configured_app_factory,
     monkeypatch,
+    language,
+    prefix,
+    unknown_model,
 ) -> None:
-    """模型签名必须来自当前运行快照，并在开关关闭时保持原正文。"""
+    """三种语言的签名都取实际运行快照，关闭开关时保持原正文。"""
 
     config = configured_app_factory()
     agent = config.agents["security-reviewer"]
     agent.managed_comment = True
     agent.managed_comment_model_signature = True
+    agent.managed_comment_model_signature_language = language
     agent.managed_comment_slot = "stable-review-slot"
     agent.write_scopes = ["change_request"]
     store = StateStore(config.database.path)
@@ -278,29 +293,34 @@ async def test_agent_comment_model_signature_uses_persisted_run_snapshot(
     await service.publish_agent_comment(context, "不附加签名")
 
     assert published_bodies == [
-        "Codex 审核结果\n\n---\n_模型：`gpt-5.6-sol (high)`_",
-        "DeepSeek 审核结果\n\n---\n_模型：`deepseek-v4-pro`_",
-        "默认模型审核结果\n\n---\n_模型：`Codex 账号默认（未记录具体模型）`_",
+        f"Codex 审核结果\n\n---\n_{prefix}`gpt-5.6-sol (high)`_",
+        f"DeepSeek 审核结果\n\n---\n_{prefix}`deepseek-v4-pro`_",
+        f"默认模型审核结果\n\n---\n_{prefix}`{unknown_model}`_",
         "不附加签名",
     ]
+    assert agent.managed_comment_model_signature_language == language
 
 
-def test_model_signature_normalizes_untrusted_snapshot_text() -> None:
+@pytest.mark.parametrize("language", ["zh", "en", "bilingual"])
+def test_model_signature_normalizes_untrusted_snapshot_text(language) -> None:
     """模型快照中的空白和反引号不能破坏签名 Markdown。"""
 
     signature = ManagedCommentService._format_model_signature(
         {
             "model": "custom`model\nnext",
             "reasoning_effort": " very high ",
-        }
+        },
+        language=language,
     )
     assert signature == "customˋmodel next (very high)"
 
 
+@pytest.mark.parametrize("language", ["zh", "en", "bilingual"])
 async def test_model_signature_counts_toward_comment_size_limit(
     snapshot_factory,
     configured_app_factory,
     monkeypatch,
+    language,
 ) -> None:
     """签名必须计入远端评论的最终 60 KiB 限制。"""
 
@@ -308,6 +328,7 @@ async def test_model_signature_counts_toward_comment_size_limit(
     agent = config.agents["security-reviewer"]
     agent.managed_comment = True
     agent.managed_comment_model_signature = True
+    agent.managed_comment_model_signature_language = language
     agent.managed_comment_slot = "stable-review-slot"
     agent.write_scopes = ["change_request"]
     store = StateStore(config.database.path)
