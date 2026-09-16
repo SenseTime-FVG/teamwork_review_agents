@@ -40,6 +40,29 @@ def _as_bool(value: Any) -> bool:
     return value.strip().lower() == "true"
 
 
+def _prompt_language(agent_language: Any, global_language: Any = None) -> str:
+    """优先使用 Agent 专用语言，再回退全局语言，均为空时默认中文。"""
+
+    aliases = {
+        "中文": "中文", "zh": "中文", "zh-cn": "中文", "chinese": "中文",
+        "英文": "英文", "en": "英文", "en-us": "英文", "english": "英文",
+    }
+    for value in (agent_language, global_language):
+        if value is None or isinstance(value, Undefined):
+            continue
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                continue
+            if normalized in aliases:
+                return aliases[normalized]
+        # 不回显配置原值，避免把误填的凭证或指令带入异常与日志。
+        raise PromptRenderError(
+            "Prompt 语言配置无效：仅支持中文/英文、zh/en、zh-CN/en-US 或 Chinese/English"
+        )
+    return "中文"
+
+
 PROMPT_TEMPLATE_ENVIRONMENT = SandboxedEnvironment(
     autoescape=False,
     loader=None,
@@ -49,6 +72,7 @@ PROMPT_TEMPLATE_ENVIRONMENT = SandboxedEnvironment(
 # Prompt 不需要 Jinja 默认全局对象，只保留模板语法和安全过滤器。
 PROMPT_TEMPLATE_ENVIRONMENT.globals.clear()
 PROMPT_TEMPLATE_ENVIRONMENT.filters["as_bool"] = _as_bool
+PROMPT_TEMPLATE_ENVIRONMENT.filters["prompt_language"] = _prompt_language
 
 
 @dataclass(frozen=True)
