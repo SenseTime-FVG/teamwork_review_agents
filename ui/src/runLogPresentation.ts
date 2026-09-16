@@ -49,6 +49,9 @@ export function runMessageRepeatLabel(message: Pick<RunMessage, "eventType" | "r
 type JsonObject = Record<string, unknown>;
 
 const SYSTEM_TITLES: Record<string, string> = {
+  "workspace.cleanup.removed": "过期工作区已清理",
+  "workspace.cleanup.skipped": "工作区清理已跳过",
+  "workspace.cleanup.failed": "工作区清理失败",
   "workspace.git.started": "开始 Git 工作区操作",
   "workspace.git.progress": "Git 工作区操作进行中",
   "workspace.git.completed": "Git 工作区操作完成",

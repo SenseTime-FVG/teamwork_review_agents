@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
-from .config import ScheduledRuleConfig
+from .config import ScheduledRuleConfig, WorkspaceCleanupConfig
 from .models import stable_hash
 
 
@@ -16,6 +16,30 @@ _INTERVAL_SECONDS = {
     "hours": 3600,
     "days": 86400,
 }
+
+
+def next_workspace_cleanup_at(schedule: WorkspaceCleanupConfig, after: float) -> float:
+    """按主机本地日历计算下一次清理，跳过夏令时中不存在的时刻。"""
+
+    if schedule.kind == "interval":
+        return after + schedule.interval_value * _INTERVAL_SECONDS[schedule.interval_unit]
+    today = datetime.fromtimestamp(after).date()
+    candidates: list[float] = []
+    # 每周时刻落在夏令时缺口时，需要再找下一周，不能仅搜索未来七天。
+    for offset in range(15 if schedule.kind == "weekly" else 8):
+        day = today + timedelta(days=offset)
+        if schedule.kind == "weekly" and day.weekday() != schedule.weekday:
+            continue
+        hours = range(24) if schedule.kind == "hourly" else (schedule.hour,)
+        for hour in hours:
+            wall_time = datetime(day.year, day.month, day.day, hour, schedule.minute)
+            # 无时区日期按操作系统本地规则转换；fold=0 固定选择回拨前的一次，避免重复。
+            timestamp = wall_time.timestamp()
+            if timestamp > after and datetime.fromtimestamp(timestamp) == wall_time:
+                candidates.append(timestamp)
+    if not candidates:
+        raise ValueError("无法计算下一次本地工作区清理时间")
+    return min(candidates)
 
 
 def schedule_signature(rule: ScheduledRuleConfig) -> str:

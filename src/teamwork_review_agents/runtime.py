@@ -13,6 +13,7 @@ from .repository_migration import has_pending_repository_migration
 from .config_manager import ConfigManager
 from .orchestrator import CycleSummary, Orchestrator
 from .scheduler import next_scheduled_at, schedule_signature, schedule_summary
+from .workspace_cleanup import WorkspaceCleanupManager
 
 
 class BackgroundRuntime:
@@ -23,6 +24,8 @@ class BackgroundRuntime:
         self.curl_runtime = CurlRuntimeManager(lambda: manager.config)
         self.store = manager.store
         self.store.recover_interrupted_work()
+        self.workspace_cleanup = WorkspaceCleanupManager(lambda: manager.config, self.store)
+        self.workspace_cleanup.maintenance_check = lambda: self.repository_migrating
         self._stop_event = asyncio.Event()
         self._scan_wake_event = asyncio.Event()
         self._dispatch_event = asyncio.Event()
@@ -58,9 +61,10 @@ class BackgroundRuntime:
         self.last_schedule_error: str | None = None
 
     async def start(self) -> None:
-        """启动扫描与事件执行两个后台循环。"""
+        """启动扫描、Agent 调度与独立维护循环。"""
 
         self.curl_runtime.start()
+        self.workspace_cleanup.start()
         if self._scan_task is None:
             self._scan_task = asyncio.create_task(
                 self._scan_loop(),
@@ -81,6 +85,7 @@ class BackgroundRuntime:
         """停止新工作、取消活动 Agent，并等待全部子进程安全收尾。"""
 
         self._stop_event.set()
+        await self.workspace_cleanup.close()
         await self.curl_runtime.close()
         self._scan_wake_event.set()
         self._dispatch_event.set()
@@ -111,6 +116,7 @@ class BackgroundRuntime:
 
         self._scan_wake_event.set()
         self._schedule_wake_event.set()
+        self.workspace_cleanup.notify_config_changed()
 
     def scan_now(self) -> None:
         """请求尽快执行一次扫描，不与正在运行的周期重叠。"""
@@ -123,12 +129,13 @@ class BackgroundRuntime:
 
         if (
             self.repository_migrating
+            or self.workspace_cleanup.running
             or self.running_cycle
             or self.dispatching_events
             or self._active_orchestrators
             or any(not task.done() for task in self._scheduled_occurrence_tasks)
         ):
-            raise ValueError("后台正在扫描或执行任务，请等待当前工作完成后再迁移仓库")
+            raise ValueError("后台正在扫描、执行任务或清理工作区，请等待当前工作完成后再迁移仓库")
         self.repository_migrating = True
         self._repository_ready.clear()
         try:
@@ -177,6 +184,7 @@ class BackgroundRuntime:
                 recover_interrupted=False,
             )
             self._revision = config.revision
+            self.workspace_cleanup.notify_config_changed()
 
     def _persist_status(self) -> None:
         """保存可在重启后查看的最近服务状态。"""

@@ -788,6 +788,16 @@ tbody tr:last-child td { border-bottom: 0; }
 .run-message-rail span { position: relative; z-index: 1; width: 8px; height: 8px; margin-top: 10px; border: 2px solid #52647b; border-radius: 50%; background: #0b121c; }
 .run-message-card { min-width: 0; padding: 11px 13px; border: 1px solid #202d3d; border-radius: 9px; background: #0d1521; }
 .run-message-card.has-linked-run { border-color: #574477; }
+/* 清理配置沿用暗色表单，状态与长路径保持在卡片范围内。 */
+.workspace-cleanup-card { margin-bottom: 18px; }
+.workspace-cleanup-card input { color-scheme: dark; }
+.workspace-cleanup-card .form-grid { margin: 18px 0; }
+.workspace-cleanup-summary { display: flex; flex-wrap: wrap; gap: 20px 32px; margin: 20px 0; }
+.workspace-cleanup-summary dt { color: var(--muted); font-size: 12px; }
+.workspace-cleanup-summary dd { margin: 8px 0 0; }
+.workspace-cleanup-details summary { cursor: pointer; color: var(--muted); }
+.workspace-cleanup-result { display: grid; gap: 8px; padding: 14px 0; border-bottom: 1px solid var(--line-soft); }
+.workspace-cleanup-result code { overflow-wrap: anywhere; }
 .run-message-card header { display: flex; justify-content: space-between; align-items: center; gap: 14px; }
 .run-message-card header strong { color: #b8c5d5; font-size: 10px; }
 .run-message-meta { display: flex; align-items: center; gap: 8px; color: #59677a; font: 400 8px "SFMono-Regular", Consolas, monospace; }
