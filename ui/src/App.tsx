@@ -1466,7 +1466,7 @@ function EnvironmentEditor(props: {
         <div className="section-title-row">
           <div>
             <h2>{props.title}</h2>
-            <p>{props.description ?? "优先级由全局到仓库再到 Agent；同名变量由更具体的一层覆盖。"}</p>
+            <p>{props.description ?? "优先级从高到低：仓库 > Agent > 全局；同名变量按整项配置覆盖。"}</p>
           </div>
           <button
             type="button"
@@ -2522,7 +2522,7 @@ function GlobalEnvironment(props: {
       </section>
       <EnvironmentEditor
         title="全局环境变量"
-        description="普通变量可由仓库和 Agent 覆盖；Provider Token 可由仓库同名变量覆盖，默认进入运行进程但不进入 Prompt。"
+        description="优先级从高到低：仓库 > Agent > 全局；全局变量作为默认值。Provider Token 默认进入运行进程但不进入 Prompt。"
         value={props.document.environment.global}
         protectedNames={protectedNames}
         onChange={(global) => props.onChange({ ...props.document, environment: { global } })}
@@ -5253,8 +5253,8 @@ function RepositoryDetailEditor(props: {
             compact
             title="仓库环境变量"
             description={providerTokenName
-              ? `普通变量会覆盖全局配置；Provider Token 变量 ${providerTokenName} 配置在这里时，扫描、状态、评论和 Agent 进程优先使用此仓库的值。`
-              : "普通变量会覆盖全局配置；同名变量由更具体的一层覆盖。"}
+              ? `仓库环境变量会覆盖 Agent 和全局的同名变量，包括值、来源和暴露开关；Provider Token 变量 ${providerTokenName} 配置在这里时，扫描、状态、评论和 Agent 进程优先使用此仓库的值。`
+              : "仓库环境变量会覆盖 Agent 和全局的同名变量，包括值、来源和暴露开关。"}
             value={repository.environment ?? {}}
             protectedNames={protectedNames}
             onChange={(environment) => update({ environment })}
@@ -6887,7 +6887,7 @@ function AgentsEditor(props: {
               <EnvironmentEditor
                 compact
                 title="Agent 环境变量"
-                description="普通变量会覆盖全局和仓库配置；Provider Token 始终按 Secret 脱敏，默认进入进程但不进入 Prompt，两项范围仍可独立调整。"
+                description="Agent 环境变量覆盖全局默认，但会被仓库同名变量整项覆盖；Provider Token 始终按 Secret 脱敏，默认进入进程但不进入 Prompt，两项范围仍可独立调整。"
                 value={agent.environment ?? {}}
                 protectedNames={protectedNames}
                 onChange={(environment) => update(name, { environment })}

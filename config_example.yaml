@@ -183,7 +183,8 @@ web:
   # admin_token_env: TEAMWORK_ADMIN_TOKEN
 
 # 可选：全部仓库和 Agent 都会继承的环境变量。
-# 合并优先级为：全局 → 仓库 → Agent → 系统运行变量，后者覆盖前者。
+# 合并顺序为：全局 → Agent → 仓库 → 系统运行变量，后者整项覆盖前者。
+# 同名变量的值、来源、Secret 和暴露开关一起覆盖；空值不自动回退。
 # environment:
 #   global:
 #     # 简写等价于 value: Example Team；默认进入 Prompt 和 Codex 进程。
@@ -262,7 +263,7 @@ web:
 #     # 覆盖后仍受 allowed_skills 限制；未列出的 Agent 使用自身 skills。
 #     # agent_skills:
 #     #   general-reviewer: [security-review]
-#     # 可选：只覆盖当前仓库的环境变量。Provider Token 可按相同变量名覆盖，
+#     # 可选：当前仓库的同名变量覆盖 Agent 和全局配置。Provider Token 也适用，
 #     # 推荐引用每个仓库独立的宿主机变量；默认进入进程但不进入 Prompt，可分别调整开关。
 #     environment:
 #       REPOSITORY_TIER: production

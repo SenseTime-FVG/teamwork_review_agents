@@ -137,12 +137,13 @@ def resolve_environment(
     include_change_request: bool = True,
     schedule: ScheduledRunContext | None = None,
 ) -> ResolvedEnvironment:
-    """按全局、仓库、Agent、运行变量顺序合并。"""
+    """按全局、Agent、仓库、运行变量顺序合并，后者整项覆盖前者。"""
 
     definitions: dict[str, EnvironmentVariable] = {}
     definitions.update(config.environment.global_variables)
-    definitions.update(repository.environment)
     definitions.update(agent.environment)
+    # Agent 提供复用默认值，当前仓库统一覆盖值、来源及暴露开关。
+    definitions.update(repository.environment)
     provider_token_names = {
         provider.token_env for provider in config.providers.values()
     }

@@ -142,7 +142,7 @@ Codex 沙箱按 Agent 配置，默认 `read-only`。只有明确需要修改工�
 
 ## 12. 分层环境变量与模板
 
-环境变量依次合并：全局、仓库、Agent、系统运行变量。后者覆盖前者，系统运行变量不可被用户覆盖。
+环境变量依次合并：全局、Agent、仓库、系统运行变量。后者整项覆盖前者，包括值、来源、Secret 和暴露开关；空值不自动回退。系统运行变量不可被用户覆盖，Provider Token 仍强制脱敏。详见[仓库环境优先级设计](design-repository-environment-precedence.md)。
 
 每个变量支持字面值或显式引用宿主机环境变量，并可分别控制是否传给 Codex 进程、是否允许渲染进 Prompt。模板语法为 `${{ENV_NAME}}`，变量不存在或禁止向 Prompt 暴露时渲染为空字符串。
 
@@ -1073,7 +1073,7 @@ README 仅增加面向用户的流程、配置提示和排障入口，具体实�
 
 ## 117. 内置 Prompt 环境变量渲染
 
-内置 Prompt 中属于 Agent 环境配置的变量统一在 Teamwork 组装 Prompt 时通过 Jinja 原生语法 `{{ VARIABLE_NAME }}` 注入。模型收到的 Prompt 已包含本轮解析后的文本，不再通过 Bash、`printenv`、`env` 或其他命令再次读取同一环境变量，也不再要求把变量读取作为第一次工具操作。环境变量仍按全局、仓库、Agent 和系统运行变量的既有优先级解析；只有配置为 `expose_to_prompt` 的非 Provider 变量进入模板上下文，Provider Token、API Key 和其他 Secret 继续禁止渲染。
+内置 Prompt 中属于 Agent 环境配置的变量统一在 Teamwork 组装 Prompt 时通过 Jinja 原生语法 `{{ VARIABLE_NAME }}` 注入。模型收到的 Prompt 已包含本轮解析后的文本，不再通过 Bash、`printenv`、`env` 或其他命令再次读取同一环境变量，也不再要求把变量读取作为第一次工具操作。环境变量按全局、Agent、仓库和系统运行变量的顺序合并，后者覆盖前者；只有配置为 `expose_to_prompt` 的非 Provider 变量进入模板上下文，Provider Token、API Key 和其他 Secret 继续禁止渲染。
 
 通用审核 Prompt 直接渲染 `REVIEW_SKILLS`、`REVIEW_DESIGN_DOC_DIR` 和 `REVIEW_CHANGE_HISTORY_DIR`，在模型侧只对审核 Skill、设计文档目录和历史变更目录执行空值、路径和内容校验。文档更新入口直接提供文档更新 Agent 名称，模型只校验该名称并按其调用白名单中的 sub-agent。文档更新子 Agent 直接提供仓库根目录、排除目录和文档索引路径；空值 fallback、仓库内路径校验、默认排除目录和默认索引路径保持不变。三份 Prompt 只展示这些业务字段，不向模型说明环境变量名、模板引擎或注入过程。
 
@@ -1135,7 +1135,7 @@ Provider Token 无论来自仓库、全局还是宿主机，都继续强制标�
 
 Provider Token 继续强制按 Secret 处理，固定值在配置读取、配置历史、运行快照、日志和错误摘要中保持脱敏；Secret 身份本身不再等同于禁止运行使用。Provider Token 的 `expose_to_prompt` 与 `expose_to_process` 继续独立配置：Prompt 缺省关闭，进程缺省开启；用户明确配置的值保持不变。原生 Git 使用的临时凭证上下文不由 `expose_to_process` 控制。
 
-开启 `expose_to_prompt` 后，本轮按全局、仓库、Agent 优先级解析出的 Token 可以进入 Prompt 模板上下文，模型能够读取该明文，但持久化的 Prompt 快照和普通日志仍必须经 Secret 脱敏。开启 `expose_to_process` 后，Token 可以进入 Agent 的 Codex CLI 环境、模型基座工具命令环境和仓库 Preflight / CI 环境；关闭时上述进程都不得继承。Provider 服务侧扫描、状态和评论继续按阶段 122 的仓库、全局、宿主机优先级解析，不受暴露开关影响。
+开启 `expose_to_prompt` 后，本轮按仓库 > Agent > 全局优先级解析出的 Token 可以进入 Prompt 模板上下文，模型能够读取该明文，但持久化的 Prompt 快照和普通日志仍必须经 Secret 脱敏。开启 `expose_to_process` 后，Token 可以进入 Agent 的 Codex CLI 环境、模型基座工具命令环境和仓库 Preflight / CI 环境；关闭时上述进程都不得继承。Provider 服务侧扫描、状态和评论继续按阶段 122 的仓库、全局、宿主机优先级解析，不受暴露开关影响。
 
 管理界面识别到名称被任一 Provider 的 `token_env` 使用时，自动将变量设为 Secret，默认关闭 Prompt 并开启进程暴露。用户把 Prompt 或进程开关改为开启时，按原有风险确认流程处理；取消不改变开关。关闭进程暴露只移除普通 Agent、工具和 CI 环境中的变量，不影响 Teamwork 原生 Git 凭证。
 
