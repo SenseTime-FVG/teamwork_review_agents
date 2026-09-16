@@ -56,7 +56,7 @@ from .state import (
 from .workspace import (
     GitProgressEvent,
     change_request_ref,
-    cleanup_expired_worktrees,
+    workspace_usage_lock_key,
     cleanup_run_worktree,
     ensure_isolated_clone,
     ensure_isolated_worktree,
@@ -639,6 +639,12 @@ class AgentExecutor:
             configured_repository,
             schedule,
         )
+        # 整个运行持有使用租约，清理器不能在校验后与工作区创建或继承并发。
+        usage_workspace = (
+            parent_workspace if task is not None and inherit_workspace and parent_workspace is not None
+            else self.run_workspace_path(configured_repository, reservation.run_id)
+        )
+        keys.append(workspace_usage_lock_key(usage_workspace))
         lease = ResourceLease(
             self.store,
             keys,
@@ -870,12 +876,6 @@ class AgentExecutor:
                                 reservation.run_id,
                                 resolved_schedule.model_dump(mode="json"),
                             )
-                        await asyncio.to_thread(
-                            cleanup_expired_worktrees,
-                            configured_repository.workspace,
-                            active_workspace.parent,
-                            git_timeout_seconds=self.config.runtime.git_timeout_seconds,
-                        )
                         original_starting_head = await asyncio.to_thread(
                             worktree_starting_head,
                             active_workspace,

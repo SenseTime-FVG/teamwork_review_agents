@@ -39,8 +39,18 @@ database:
 #   # 事件或 Agent 失败后的额外重试次数；0 表示不重试。资源级短退避不会阻塞其他 PR / MR。
 #   event_retry_count: 2
 #   # 失败、超时、存在未提交文件或未推送提交的临时 Git 工作区保留天数。
-#   # 到期后会在下次准备同一仓库时强制清理；默认 7 天。
+#   # 到期后在定时检查中清理，包括遗留未提交修改；默认 7 天。
 #   worktree_retention_days: 7
+#   # 独立清理运行工作区，不删除基础仓库、安装快照或数据库。
+#   # 使用后台电脑本地时间；启动不立即清理，停机错过的周期不补跑。
+#   workspace_cleanup:
+#     enabled: true
+#     kind: daily  # interval / hourly / daily / weekly
+#     hour: 6
+#     minute: 0
+#     weekday: 0  # weekly 使用：0 为周一，6 为周日
+#     interval_value: 1  # interval 使用：每 N 小时或天
+#     interval_unit: days  # hours / days
 #   # Codex CLI 命令名，也可以配置为绝对路径。
 #   codex_binary: codex
 #   # 可选：为后台 Agent 使用独立的 Codex 配置目录，避免和桌面版或其他 CLI

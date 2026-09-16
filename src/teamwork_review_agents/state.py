@@ -2819,6 +2819,50 @@ class StateStore:
                 (path, status, reason, run_id),
             )
 
+    def workspace_cleanup_record(self, run_id: str) -> dict[str, Any] | None:
+        """仅返回清理归属核验需要的元数据，不读取 Prompt 或凭据。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT run_id, root_run_id, repository_id, status, workspace_path, "
+                "workspace_status, started_at, finished_at FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def active_workspace_users(self) -> list[dict[str, Any]]:
+        """活动父子任务与排队任务均可保护工作区，调用方在持锁后再次核对。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, root_run_id, workspace_path FROM agent_runs "
+                "WHERE status IN ('queued', 'preparing', 'running')",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_workspace_cleanup(self, run_id: str, path: str, outcome: dict[str, Any]) -> None:
+        """回写所有共享此目录的运行记录，并原子记录清理时间和原因。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM agent_runs WHERE run_id = ? OR workspace_path = ?",
+                (run_id, path),
+            ).fetchall()
+            for row in rows:
+                if outcome["status"] == "removed":
+                    connection.execute(
+                        "UPDATE agent_runs SET workspace_status = 'removed', workspace_reason = ? "
+                        "WHERE run_id = ?",
+                        ("保留期已到，定时清理完成", row["run_id"]),
+                    )
+                connection.execute(
+                    "INSERT INTO run_logs (run_id, created_at, stream, event_type, payload) "
+                    "VALUES (?, ?, 'system', ?, ?)",
+                    (row["run_id"], now, f"workspace.cleanup.{outcome['status']}",
+                     json.dumps({**outcome, "cleaned_at": now}, ensure_ascii=False)),
+                )
+
     def agent_run_failure(self, idempotency_key: str) -> dict[str, Any] | None:
         """供同一事件的其他分支重试时复用不可重试的失败分类。"""
 

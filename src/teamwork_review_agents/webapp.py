@@ -1331,6 +1331,12 @@ def create_app(
             manager.config.runtime.managed_sandbox,
         )
 
+    @app.get("/api/runtime/workspace-cleanup")
+    async def workspace_cleanup_status() -> dict[str, Any]:
+        """只查询已保存清理计划和结果，读取接口绝不触发删除。"""
+
+        return runtime.workspace_cleanup.snapshot()
+
     @app.get("/api/runtime/curl")
     async def curl_runtime_status() -> dict[str, Any]:
         """查询程序准备状态，不能通过 GET 触发下载或执行。"""

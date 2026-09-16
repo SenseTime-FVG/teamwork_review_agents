@@ -17,6 +17,8 @@ import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } f
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { gitBytesText, gitProgressText, presentRunLogs } from "./runLogPresentation";
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
+import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary } from "./workspaceCleanup";
+import type { WorkspaceCleanupSchedule, WorkspaceCleanupStatus } from "./workspaceCleanup";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
@@ -329,6 +331,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       agent_idle_timeout_seconds: 300,
       remote_ci_wait_timeout_seconds: 1800,
       ...runtimeInput,
+      workspace_cleanup: { ...DEFAULT_WORKSPACE_CLEANUP, ...(runtimeInput.workspace_cleanup ?? {}) },
       managed_sandbox: {
         enabled: true,
         fail_closed: true,
@@ -469,6 +472,8 @@ function Field(props: {
   value: string | number;
   onChange: (value: string) => void;
   type?: string;
+  min?: number;
+  max?: number;
   placeholder?: string;
   help?: string;
   disabled?: boolean;
@@ -479,6 +484,8 @@ function Field(props: {
       <span>{props.label}</span>
       <input
         type={props.type ?? "text"}
+        min={props.min}
+        max={props.max}
         value={props.value}
         placeholder={props.placeholder}
         disabled={props.disabled}
@@ -2540,7 +2547,6 @@ function GlobalEnvironment(props: {
           <Field label="Git 无进展超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} help="用于 fetch、运行 clone 和工作区操作；仓库锁等待另行计时。" />
           <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
           <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留 PR 和工作区，不自动重跑。与本地 CI 执行超时独立。" />
-          <Field label="异常工作区保留（天）" type="number" value={Number(props.document.runtime.worktree_retention_days ?? 7)} onChange={(value) => patchSection("runtime", "worktree_retention_days", Number(value))} help="失败、未提交文件或未推送提交默认保留 7 天；到期后会在下次准备同仓库时清理" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
           <Field label="管理员 Token 环境变量" value={String(props.document.web.admin_token_env ?? "")} onChange={(value) => patchSection("web", "admin_token_env", value || undefined)} help="非本机监听时必填" />
@@ -4169,6 +4175,89 @@ function CodexAccountCard(props: {
           )}
         </>
       )}
+    </section>
+  );
+}
+
+function WorkspaceCleanupPanel(props: {
+  document: ConfigDocument;
+  savedDocument: ConfigDocument | null;
+  editing: boolean;
+  revision: string;
+  onChange: (document: ConfigDocument) => void;
+}) {
+  const [status, setStatus] = useState<WorkspaceCleanupStatus | null>(null);
+  const [error, setError] = useState("");
+  const schedule = { ...DEFAULT_WORKSPACE_CLEANUP, ...props.document.runtime.workspace_cleanup };
+  const retention = props.document.runtime.worktree_retention_days ?? 7;
+  const savedRetention = props.savedDocument?.runtime.worktree_retention_days ?? 7;
+  const savedSchedule = { ...DEFAULT_WORKSPACE_CLEANUP, ...props.savedDocument?.runtime.workspace_cleanup };
+  const unsaved = retention !== savedRetention || JSON.stringify(schedule) !== JSON.stringify(savedSchedule);
+
+  useEffect(() => {
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const result = await api<WorkspaceCleanupStatus>("/api/runtime/workspace-cleanup");
+        if (!disposed) { setStatus(result); setError(""); }
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "清理状态加载失败");
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 10000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [props.revision]);
+
+  function updateSchedule(change: Partial<WorkspaceCleanupSchedule>) {
+    props.onChange({ ...props.document, runtime: { ...props.document.runtime, workspace_cleanup: { ...schedule, ...change } } });
+  }
+
+  const last = status?.last_run;
+  return (
+    <section className="section-card workspace-cleanup-card">
+      <div className="section-title-row"><div><h2>工作区清理</h2><p>只清理过期运行工作区，不删除基础仓库、依赖缓存或数据库。正在使用的目录会跳过。</p></div></div>
+      <fieldset className="config-editor-surface" disabled={!props.editing}>
+        <Toggle label="定时清理" checked={schedule.enabled} onChange={(enabled) => updateSchedule({ enabled })} />
+        <fieldset className="config-editor-surface" disabled={!schedule.enabled}>
+          <div className="form-grid three">
+            <SelectField label="清理方式" value={schedule.kind} onChange={(kind) => updateSchedule({ kind: kind as WorkspaceCleanupSchedule["kind"] })} options={[
+              { value: "interval", label: "固定间隔" }, { value: "hourly", label: "每小时" },
+              { value: "daily", label: "每天" }, { value: "weekly", label: "每周" },
+            ]} />
+            {schedule.kind === "interval" && <>
+              <Field label="每隔" type="number" min={1} value={schedule.interval_value} onChange={(value) => updateSchedule({ interval_value: Number(value) })} />
+              <SelectField label="间隔单位" value={schedule.interval_unit} onChange={(interval_unit) => updateSchedule({ interval_unit: interval_unit as "hours" | "days" })} options={[{ value: "hours", label: "小时" }, { value: "days", label: "天" }]} />
+            </>}
+            {schedule.kind === "hourly" && <Field label="每小时第几分" type="number" min={0} max={59} value={schedule.minute} onChange={(value) => updateSchedule({ minute: Number(value) })} />}
+            {schedule.kind === "weekly" && <SelectField label="星期" value={String(schedule.weekday)} onChange={(value) => updateSchedule({ weekday: Number(value) })} options={[..."一二三四五六日"].map((day, index) => ({ value: String(index), label: `周${day}` }))} />}
+            {(schedule.kind === "daily" || schedule.kind === "weekly") && <Field label="清理时间" type="time" value={`${String(schedule.hour).padStart(2, "0")}:${String(schedule.minute).padStart(2, "0")}`} onChange={(value) => {
+              if (!/^\d{2}:\d{2}$/.test(value)) return;
+              const [hour, minute] = value.split(":").map(Number);
+              updateSchedule({ hour, minute });
+            }} />}
+          </div>
+        </fieldset>
+        <Field label="工作区保留期（天）" type="number" min={1} value={retention} onChange={(value) => props.onChange({ ...props.document, runtime: { ...props.document.runtime, worktree_retention_days: Number(value) } })} help="默认 7 天，从运行结束或保留时间起算。超过保留期的工作区即使有未提交修改，也会在通过安全检查后删除。" />
+      </fieldset>
+      <p className="section-note">{workspaceCleanupSummary(schedule)} · 保留 {retention} 天。启动不立即清理，停机期间错过的计划不补跑。</p>
+      {props.editing && retention < savedRetention && <div className="alert error">保留期已缩短，保存后下次清理可能删除更多已有工作区，请确认需要保留的成果已保存。</div>}
+      {unsaved && <p className="section-note">配置尚未保存；下方时间与结果对应已保存计划。</p>}
+      {error && <div className="alert error">{error}</div>}
+      {status?.scheduler_error && <div className="alert error">{status.scheduler_error}</div>}
+      <dl className="workspace-cleanup-summary">
+        <div><dt>下次检查</dt><dd>{status ? status.next_run_text ?? "定时清理已停用" : "加载中…"}</dd></div>
+        <div><dt>最近检查</dt><dd>{last?.started_text ?? "尚未执行"}</dd></div>
+        <div><dt>执行结果</dt><dd>{last ? cleanupResultLabel(last.status) : "—"}</dd></div>
+        <div><dt>已清理</dt><dd>{last ? `${last.removed} 个工作区` : "—"}</dd></div>
+        <div><dt>释放空间（估算）</dt><dd>{last ? gitBytesText(last.reclaimed_bytes) : "—"}</dd></div>
+      </dl>
+      {last && <details className="workspace-cleanup-details"><summary>清理详情 · 跳过 {last.skipped} 个 · 失败 {last.failed} 个</summary>
+        {last.reason && <p>{last.reason}</p>}
+        {last.details.map((item, index) => <div className="workspace-cleanup-result" key={`${item.path}:${index}`}><strong>{cleanupResultLabel(item.status)}</strong><code>{item.path}</code><span>{item.reason}</span></div>)}
+        {last.scanned > last.details.length && <p>仅显示前 {last.details.length} 条；有关联运行的清理结果也保存在运行日志中。</p>}
+        {!last.details.length && !last.reason && <p>本次没有待检查的保留工作区。</p>}
+      </details>}
     </section>
   );
 }
@@ -10713,6 +10802,7 @@ export default function App() {
                     {tab === "environment" && <GlobalEnvironment document={document} codexOptions={codexOptions} onChange={changeDocument} />}
                     {tab === "skills" && <SkillsEditor document={document} onChange={changeDocument} />}
                   </fieldset>
+                  {tab === "environment" && <WorkspaceCleanupPanel document={document} savedDocument={savedDocument} editing={editing} revision={revision} onChange={changeDocument} />}
                   {tab === "environment" && <ConfigHistory />}
                 </>
               )}

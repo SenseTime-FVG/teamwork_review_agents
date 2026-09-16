@@ -131,6 +131,12 @@ def workspace_publish_lock_key(target_workspace: Path) -> str:
     return f"workspace_publish:{target_workspace.resolve()}"
 
 
+def workspace_usage_lock_key(workspace: Path) -> str:
+    """运行与定时清理共享此锁；父子 Agent 由根运行身份重入。"""
+
+    return f"workspace_usage:{os.path.normcase(str(workspace.resolve()))}"
+
+
 def change_request_ref(provider: ProviderConfig, number: int) -> tuple[str, str]:
     """返回平台变更请求源引用与本地稳定引用。"""
 
@@ -1046,6 +1052,29 @@ def _remove_run_workspace(
         workspace,
         timeout_seconds=timeout_seconds,
     )
+    remove_tree(target)
+    clear_retained_marker(target)
+
+
+def remove_expired_run_workspace(source_workspace: Path | None, workspace: Path) -> None:
+    """删除已由管理层核验归属的过期目录，旧 clone 的 alternates 不阻止回收。"""
+
+    target = workspace.resolve()
+    if (workspace / ".git").is_symlink():
+        raise WorkspaceError("工作区 Git 元数据是符号链接，拒绝清理")
+    if source_workspace is not None:
+        source = source_workspace.resolve()
+        if target == source or source in target.parents or target in source.parents:
+            raise WorkspaceError("运行工作区与基础仓库重叠，拒绝清理")
+    if run_workspace_kind(target) == "worktree":
+        if source_workspace is None:
+            raise WorkspaceError("无法确认 linked worktree 的基础仓库，保留目录")
+        _remove_worktree(source_workspace, target, timeout_seconds=30)
+        return
+    # 只删除自身 Git 元数据，不访问或改动 alternates 指向的基础对象库。
+    git_directory = target / ".git"
+    if _git_common_directory(target, timeout_seconds=30) != git_directory.resolve():
+        raise WorkspaceError("候选 clone 的 Git 元数据不在运行目录内")
     remove_tree(target)
     clear_retained_marker(target)
 

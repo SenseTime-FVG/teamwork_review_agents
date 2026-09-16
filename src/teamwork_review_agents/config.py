@@ -289,6 +289,18 @@ class ContextCompactionConfig(BaseModel):
         return self
 
 
+class WorkspaceCleanupConfig(BaseModel):
+    """按服务主机本地时间执行的工作区清理计划。"""
+
+    enabled: bool = True
+    kind: Literal["interval", "hourly", "daily", "weekly"] = "daily"
+    interval_value: PositiveInt = 1
+    interval_unit: Literal["hours", "days"] = "days"
+    hour: int = Field(default=6, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    weekday: int = Field(default=0, ge=0, le=6)
+
+
 class RuntimeConfig(BaseModel):
     """Agent 运行、重试与资源锁配置。"""
 
@@ -300,6 +312,7 @@ class RuntimeConfig(BaseModel):
     max_agent_runs_per_root: PositiveInt = 8
     event_retry_count: int = Field(default=2, ge=0)
     worktree_retention_days: PositiveInt = 7
+    workspace_cleanup: WorkspaceCleanupConfig = Field(default_factory=WorkspaceCleanupConfig)
     codex_binary: str = "codex"
     codex_home: Path | None = None
     expected_codex_version: str | None = None
