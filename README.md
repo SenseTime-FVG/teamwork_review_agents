@@ -203,6 +203,27 @@ Teamwork 启动的后台 Codex 会关闭原生项目指令发现，因此源分�
 
 Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` 等标准语法。布尔环境变量可以使用 `{% if REVIEW_AUTO_MERGE | as_bool %}`；已有 `${{ENV_NAME}}` 写法继续兼容，缺失变量仍渲染为空字符串。只有开启“Prompt”的非 Provider 变量才进入模板上下文，变量值不会作为 Jinja 模板再次执行。
 
+### Prompt 输出语言
+
+在「全局配置与环境」添加 `LANGUAGE` 可统一设置回复、报告和评论的语言；在对应 Agent 的环境变量中添加下表的专用变量可单独覆盖。变量需开启「Prompt」，不需要开启「进程」。
+
+语言选择顺序是 **Agent 专用变量 → `LANGUAGE` → 中文**。未配置、空字符串或只有空白时继续回退。支持 `中文` / `英文`、`zh` / `en`、`zh-CN` / `en-US`、`Chinese` / `English`，忽略首尾空白和英文大小写；非空但不支持的值会报 Prompt 配置错误，不会静默改用其他语言。
+
+| Prompt | Agent 专用变量 |
+| --- | --- |
+| `general-review.md` | `GENERAL_REVIEWER_LANGUAGE` |
+| `依赖review.md` | `DEPENDENCY_REVIEWER_LANGUAGE` |
+| `依赖review 入口.md`（本地独立入口） | `DEPENDENCY_REVIEW_RUNNER_LANGUAGE` |
+| `增量文档更新.md` | `INCREMENTAL_DOC_UPDATER_LANGUAGE` |
+| `增量文档更新入口.md`（本地独立入口） | `INCREMENTAL_DOC_UPDATE_RUNNER_LANGUAGE` |
+| `依赖review&增量文档更新 入口.md` | `DEPENDENCY_AND_INCREMENTAL_DOC_UPDATE_RUNNER_LANGUAGE` |
+
+例如全局 `LANGUAGE=英文`，依赖 Agent 设置 `DEPENDENCY_REVIEWER_LANGUAGE=中文`，则依赖 Agent 用中文，其他未单独配置的 Agent 用英文。主 Agent 与子 Agent 各自选择语言，不会把主 Agent 的专用语言当成子 Agent 的默认语言。
+
+模板通过 `{{ AGENT_LANGUAGE | prompt_language(LANGUAGE) }}` 渲染语言，`AGENT_LANGUAGE` 需换成该模板对应的专用变量。每份 Prompt 都有统一的「使用语言」章节；两级变量都为空时章节填入中文。固定状态值、命令及已有文档保留原语言等原有约束不变。两个本地独立入口不随示例配置分发。
+
+这不改变同名环境变量的「全局 → Agent → 仓库」覆盖规则；语言优先级是在合并后两个不同变量之间选择。未开启「Prompt」的值不参与选择，也不会隐式读取宿主机的 `LANGUAGE`；若使用宿主机变量，需显式配置 `from_system`。
+
 ## 首次启用
 
 1. 保持规则关闭，执行一次“立即扫描”。

@@ -205,12 +205,14 @@ web:
 #       secret: false
 #       expose_to_prompt: true
 #       expose_to_process: false
-#     # 完整写法：value 与 from_system 只能选择一个。
-#     DOCS_LANGUAGE:
-#       value: zh-CN
+#     # Prompt 全局语言：各 Agent 专用语言非空时优先；都为空时默认中文。
+#     # 支持中文/英文、zh/en、zh-CN/en-US、Chinese/English。
+#     # 完整写法：value 与 from_system 只能选择一个；只需传给 Prompt。
+#     LANGUAGE:
+#       value: 英文
 #       secret: false
 #       expose_to_prompt: true
-#       expose_to_process: true
+#       expose_to_process: false
 #     # 从启动服务的宿主机环境读取真实值，YAML 中不保存 Secret。
 #     INTERNAL_API_TOKEN:
 #       from_system: TEAMWORK_INTERNAL_API_TOKEN
@@ -368,6 +370,12 @@ agents:
     # skills: []
     # 可选：output_schema、skip_git_repo_check 和 extra_codex_args 仍可按需配置。
     environment:
+      # 可选：当前审核 Agent 的语言，留空或省略则使用 LANGUAGE，最后默认中文。
+      # GENERAL_REVIEWER_LANGUAGE:
+      #   value: 中文
+      #   secret: false
+      #   expose_to_prompt: true
+      #   expose_to_process: false
       REVIEW_AUTO_MERGE:
         value: 'false'
         secret: false
@@ -407,6 +415,12 @@ agents:
       - dependency-reviewer
       - incremental-doc-updater
     environment:
+      # 可选：只控制入口 Agent，不覆盖两个子 Agent 的语言选择。
+      # DEPENDENCY_AND_INCREMENTAL_DOC_UPDATE_RUNNER_LANGUAGE:
+      #   value: 英文
+      #   secret: false
+      #   expose_to_prompt: true
+      #   expose_to_process: false
       # Teamwork 会在模型启动前把 Agent 名称直接渲染到入口 Prompt，
       # 不需要入口 Agent 再通过 Bash、env 或 printenv 读取。
       DEPENDENCY_AUTO_UPDATE_AGENT_NAME:
@@ -422,6 +436,13 @@ agents:
 
   dependency-reviewer:
     prompt_file: ./prompts/依赖review.md
+    # 可选：专用语言优先于 LANGUAGE；需开启 Prompt，进程可关闭。
+    # environment:
+    #   DEPENDENCY_REVIEWER_LANGUAGE:
+    #     value: 中文
+    #     secret: false
+    #     expose_to_prompt: true
+    #     expose_to_process: false
     sandbox: workspace-write
     home_mode: temporary
     # 依赖扫描和 Git 推送需要访问远程仓库及依赖源。
@@ -461,6 +482,13 @@ agents:
     #   secret: false
     #   expose_to_prompt: true
     #   expose_to_process: false
+    # 可在下方环境配置中添加专用语言；留空或省略时回退 LANGUAGE，最后默认中文。
+    # environment:
+    #   INCREMENTAL_DOC_UPDATER_LANGUAGE:
+    #     value: 英文
+    #     secret: false
+    #     expose_to_prompt: true
+    #     expose_to_process: false
     environment: {}
 
 # 内置 MR/PR 触发规则模板。全部默认关闭，管理员检查后再从 UI 主动启用。
