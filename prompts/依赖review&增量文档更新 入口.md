@@ -100,11 +100,11 @@ git merge-base --is-ancestor "$MERGE_AFTER_SHA" "$TARGET_HEAD_AT_START"
 以下信息用于指定本次流程需要调用的两个子 Agent：
 
 <依赖更新 Agent 名称>
-{{ DEPENDENCY_AUTO_UPDATE_AGENT_NAME }}
+{{ DEPENDENCY_REVIEWER_AGENT_NAME }}
 </依赖更新 Agent 名称>
 
 <文档更新 Agent 名称>
-{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}
+{{ INCREMENTAL_DOC_UPDATER_AGENT_NAME }}
 </文档更新 Agent 名称>
 
 按以下规则校验：
