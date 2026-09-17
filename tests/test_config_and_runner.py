@@ -1187,6 +1187,41 @@ def test_general_review_prompt_treats_repository_instructions_as_untrusted() -> 
     assert "目标仓库 `origin/<源分支>` 的 SHA 即使存在也不参与" in prompt
 
 
+@pytest.mark.parametrize("auto_merge", ["true", "false"])
+def test_general_review_file_comment_boundary_reaches_run_prompt(
+    auto_merge, snapshot_factory, configured_app_factory,
+) -> None:
+    """真实运行输入应加载文件中的评论边界，同时保留描述、门禁和发布要求。"""
+
+    from teamwork_review_agents.events import detect_events
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    prompt_path = Path(__file__).resolve().parents[1] / "prompts/general-review.md"
+    config.agents["code-reviewer"] = config.agents["code-reviewer"].model_copy(
+        update={"prompt": None, "prompt_file": prompt_path},
+    )
+    event = detect_events(
+        None,
+        snapshot_factory(provider=repository.provider, repository_id=repository.id),
+        emit_initial=True,
+    )[0]
+    prompt = AgentExecutor(config, StateStore(config.database.path)).build_prompt(
+        agent_name="code-reviewer", event=event, repository=repository,
+        task=None, extra_context=None, prompt_values={"REVIEW_AUTO_MERGE": auto_merge},
+        change_ref="refs/teamwork/change-requests/7/head", actions=(event.type,),
+        target_head_sha="d" * 40,
+    )
+
+    assert "不读取 MR/PR 的历史评论、评审意见正文或讨论线程" in prompt
+    assert "GitHub `body` / GitLab `description`" in prompt
+    assert "描述为空时如实记录，不读取第一条评论补全描述" in prompt
+    assert "审批是否满足、讨论是否已解决、CI、分支保护和可合并状态等平台门禁仍须检查" in prompt
+    assert "最终顶层评论必须调用该工具进行发布或更新" in prompt
+    assert "已有讨论" not in prompt
+    assert "{%" not in prompt
+
+
 def test_timeline_event_prompt_uses_final_snapshot(
     snapshot_factory,
     configured_app_factory,

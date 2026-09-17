@@ -1,5 +1,6 @@
 """Prompt 的 Jinja 条件渲染与旧变量语法兼容测试。"""
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,46 @@ def test_general_review_renders_exclusive_final_policy() -> None:
         assert "## 仅审核结束" in rendered
         assert "## 合并方式" not in rendered
         assert "本轮操作模式：审核并自动合并" not in rendered
+
+
+@pytest.mark.parametrize("auto_merge", ["true", "false", None])
+def test_general_review_preserves_description_without_reading_comments(
+    auto_merge: str | None,
+) -> None:
+    """所有审核模式保留描述，禁止读取评论，并继续检查门禁和发布本轮结果。"""
+
+    template = (PROJECT_ROOT / "prompts/general-review.md").read_text(encoding="utf-8")
+    values = {} if auto_merge is None else {"REVIEW_AUTO_MERGE": auto_merge}
+    rendered = render_prompt(template, values)
+    boundary = rendered.split("## 审核材料边界", 1)[1].split("# 三、", 1)[0]
+
+    assert "GitHub `body` / GitLab `description`" in rendered
+    assert "正常读取 MR/PR 标题和描述正文" in boundary
+    assert "描述也不属于评论列表" in boundary
+    assert "描述为空时如实记录，不读取第一条评论补全描述" in boundary
+    assert "不读取任何人工或机器人顶层评论" in boundary
+    assert "历史自动审核结果、行内评审评论、评审意见正文及讨论线程" in boundary
+    assert "不保留按需读取人工讨论的例外" in boundary
+    assert "不得请求 `comments`、`notes`、讨论正文或完整评审正文" in boundary
+    assert "不使用 `--comments`" in boundary
+    assert "不将其作为审核证据、本轮执行事实或继续获取讨论的依据" in boundary
+    assert "已有讨论" not in rendered
+    assert "不因为历史评论声称已审核过就跳过当前任务" not in rendered
+
+    # 示例必须选择描述字段，不能通过完整 PR 输出重新带入评论或评审正文。
+    command = next(line.strip() for line in boundary.splitlines() if line.strip().startswith("gh pr view "))
+    arguments = shlex.split(command)
+    fields = set(arguments[arguments.index("--json") + 1].split(","))
+    assert {"title", "body", "commits", "reviewDecision", "statusCheckRollup"} <= fields
+    assert not fields.intersection({"comments", "reviews", "latestReviews", "reviewThreads", "timelineItems"})
+    assert "--comments" not in arguments
+
+    # 不读意见正文不能放宽审批、讨论解决状态或其他平台门禁。
+    assert "审批是否满足、讨论是否已解决、CI、分支保护和可合并状态等平台门禁仍须检查" in boundary
+    assert "无法可靠确认门禁时，按原有门禁规则处理，不得默认放行" in boundary
+    assert "项目要求的人工审批、讨论解决、分支保护和其他合并门禁均已满足" in rendered
+    assert "最终顶层评论必须调用该工具进行发布或更新" in rendered
+    assert "不得使用 `gh`、`glab` 或平台 API 另行发布顶层总结评论" in rendered
 
 
 def test_builtin_prompts_render_configured_environment_values_directly() -> None:
