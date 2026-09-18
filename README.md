@@ -193,13 +193,15 @@ Teamwork 启动的后台 Codex 会关闭原生项目指令发现，因此源分�
 | `REVIEW_DESIGN_DOC_DIR` | `docs/design` |
 | `REVIEW_CHANGE_HISTORY_DIR` | `docs/changes` |
 | `REVIEW_AUTO_MERGE` | `false` |
-| `DEPENDENCY_AUTO_UPDATE_AGENT_NAME` | `dependency-reviewer` |
-| `INCREMENTAL_DOC_UPDATE_AGENT_NAME` | `incremental-doc-updater` |
+| `DEPENDENCY_REVIEWER_AGENT_NAME` | `dependency-reviewer` |
+| `INCREMENTAL_DOC_UPDATER_AGENT_NAME` | `incremental-doc-updater` |
 | `DOC_UPDATE_REPOSITORY_ROOT` | `/workspace/project` |
 | `DOC_UPDATE_INDEX_PATH` | `docs/README.md` |
 | `DOC_UPDATE_EXCLUDE_DIRECTORIES` | `vendor,generated` |
 
 以上配置变量只需在对应 Agent 的环境变量中开启“传给 Prompt”；它们会在模型启动前直接渲染到内置 Prompt，不需要模型通过 Bash、`env` 或 `printenv` 再次读取。“传给进程”仅在确实需要让 Agent 启动的命令读取变量时开启。`REVIEW_AUTO_MERGE` 只有去除空白且不区分大小写等于 `true` 时，通用审核 Agent 才会在全部门禁通过后自动合并，缺失或其他值均只审核和评论。`REVIEW_SKILLS` 不是仓库路径；Skill 应导入本服务后再分配给 Agent。
+
+已有部署升级时，请将组合更新入口使用的 `DEPENDENCY_AUTO_UPDATE_AGENT_NAME` 改名为 `DEPENDENCY_REVIEWER_AGENT_NAME`，将 `INCREMENTAL_DOC_UPDATE_AGENT_NAME` 改名为 `INCREMENTAL_DOC_UPDATER_AGENT_NAME`。请检查配置这些变量的全局、Agent 和仓库环境，保留原值并开启“Prompt”；无需开启“进程”，但若原来有命令依赖它，也应同步检查命令中的变量引用。新入口不再读取旧名称，也不会自动改写已有配置；未迁移时子 Agent 名称会为空，入口将按既有校验规则停止。
 
 Prompt 使用沙盒化 Jinja2 渲染，支持 `{{ VARIABLE }}` 和 `{% if %}` 等标准语法。布尔环境变量可以使用 `{% if REVIEW_AUTO_MERGE | as_bool %}`；已有 `${{ENV_NAME}}` 写法继续兼容，缺失变量仍渲染为空字符串。只有开启“Prompt”的非 Provider 变量才进入模板上下文，变量值不会作为 Jinja 模板再次执行。
 

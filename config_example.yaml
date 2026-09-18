@@ -425,12 +425,12 @@ agents:
       #   expose_to_process: false
       # Teamwork 会在模型启动前把 Agent 名称直接渲染到入口 Prompt，
       # 不需要入口 Agent 再通过 Bash、env 或 printenv 读取。
-      DEPENDENCY_AUTO_UPDATE_AGENT_NAME:
+      DEPENDENCY_REVIEWER_AGENT_NAME:
         value: dependency-reviewer
         secret: false
         expose_to_prompt: true
         expose_to_process: false
-      INCREMENTAL_DOC_UPDATE_AGENT_NAME:
+      INCREMENTAL_DOC_UPDATER_AGENT_NAME:
         value: incremental-doc-updater
         secret: false
         expose_to_prompt: true

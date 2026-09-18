@@ -23,8 +23,8 @@ def ancestry_commands() -> list[list[str]]:
     rendered = render_prompt(
         PROMPT_PATH.read_text(encoding="utf-8"),
         {
-            "DEPENDENCY_AUTO_UPDATE_AGENT_NAME": "dependency-reviewer",
-            "INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater",
+            "DEPENDENCY_REVIEWER_AGENT_NAME": "dependency-reviewer",
+            "INCREMENTAL_DOC_UPDATER_AGENT_NAME": "incremental-doc-updater",
         },
     )
     return [

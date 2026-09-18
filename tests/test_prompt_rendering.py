@@ -7,7 +7,12 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from teamwork_review_agents.environment import PromptRenderError, render_prompt
+from teamwork_review_agents.config import RepositoryConfig, load_config
+from teamwork_review_agents.environment import (
+    PromptRenderError,
+    render_prompt,
+    resolve_environment,
+)
 from teamwork_review_agents.webapp import create_app
 
 
@@ -172,14 +177,14 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
     runner = render_prompt(
         runner_template,
         {
-            "DEPENDENCY_AUTO_UPDATE_AGENT_NAME": "dependency-reviewer",
-            "INCREMENTAL_DOC_UPDATE_AGENT_NAME": "incremental-doc-updater",
+            "DEPENDENCY_REVIEWER_AGENT_NAME": "dependency-reviewer",
+            "INCREMENTAL_DOC_UPDATER_AGENT_NAME": "incremental-doc-updater",
         },
     )
     assert "<依赖更新 Agent 名称>\ndependency-reviewer\n</依赖更新 Agent 名称>" in runner
     assert "<文档更新 Agent 名称>\nincremental-doc-updater\n</文档更新 Agent 名称>" in runner
-    assert "DEPENDENCY_AUTO_UPDATE_AGENT_NAME" not in runner
-    assert "INCREMENTAL_DOC_UPDATE_AGENT_NAME" not in runner
+    assert "DEPENDENCY_REVIEWER_AGENT_NAME" not in runner
+    assert "INCREMENTAL_DOC_UPDATER_AGENT_NAME" not in runner
 
     updater_template = (PROJECT_ROOT / "prompts/增量文档更新.md").read_text(
         encoding="utf-8"
@@ -201,6 +206,86 @@ def test_builtin_prompts_render_configured_environment_values_directly() -> None
     assert "DOC_UPDATE_REPOSITORY_ROOT" not in updater
     assert "DOC_UPDATE_EXCLUDE_DIRECTORIES" not in updater
     assert "DOC_UPDATE_INDEX_PATH" not in updater
+
+
+def test_example_config_renders_callable_sub_agent_names(tmp_path: Path) -> None:
+    """真实示例配置经环境解析后，必须渲染出已配置且允许调用的子 Agent。"""
+
+    config = load_config(PROJECT_ROOT / "config_example.yaml")
+    agent = config.agents["dependency&incremental-doc-update-runner"]
+    # 示例不预置仓库；这里只补充解析所需上下文，不访问网络或实际工作区。
+    repository = RepositoryConfig(
+        id="prompt-test",
+        provider="github",
+        project="example/prompt-test",
+        workspace=tmp_path / "workspace",
+    )
+    resolved = resolve_environment(config, repository, agent, None, "prompt-test")
+    assert agent.prompt_file is not None
+    rendered = render_prompt(
+        agent.prompt_file.read_text(encoding="utf-8"), resolved.prompt_values,
+    )
+
+    for variable, label, expected in (
+        ("DEPENDENCY_REVIEWER_AGENT_NAME", "依赖更新 Agent 名称", "dependency-reviewer"),
+        ("INCREMENTAL_DOC_UPDATER_AGENT_NAME", "文档更新 Agent 名称", "incremental-doc-updater"),
+    ):
+        assert resolved.prompt_values[variable] == expected
+        assert f"<{label}>\n{expected}\n</{label}>" in rendered
+        assert expected in config.agents
+        assert expected in agent.allowed_sub_agents
+        assert variable not in resolved.process_values
+
+    assert "DEPENDENCY_AUTO_UPDATE_AGENT_NAME" not in agent.environment
+    assert "INCREMENTAL_DOC_UPDATE_AGENT_NAME" not in agent.environment
+
+
+def test_combined_prompt_renders_custom_sub_agent_names() -> None:
+    """使用新变量的自定义值，不写死默认名称，也不受残留旧变量影响。"""
+
+    template = (PROJECT_ROOT / "prompts/依赖review&增量文档更新 入口.md").read_text(
+        encoding="utf-8"
+    )
+    rendered = render_prompt(template, {
+        "DEPENDENCY_REVIEWER_AGENT_NAME": "custom-dependency-agent",
+        "INCREMENTAL_DOC_UPDATER_AGENT_NAME": "custom-document-agent",
+        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME": "legacy-dependency-agent",
+        "INCREMENTAL_DOC_UPDATE_AGENT_NAME": "legacy-document-agent",
+    })
+
+    assert "<依赖更新 Agent 名称>\ncustom-dependency-agent\n</依赖更新 Agent 名称>" in rendered
+    assert "<文档更新 Agent 名称>\ncustom-document-agent\n</文档更新 Agent 名称>" in rendered
+    assert "legacy-dependency-agent" not in rendered
+    assert "legacy-document-agent" not in rendered
+
+
+@pytest.mark.parametrize("values", [
+    {},
+    {
+        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME": "legacy-dependency-agent",
+        "INCREMENTAL_DOC_UPDATE_AGENT_NAME": "legacy-document-agent",
+    },
+    {"DEPENDENCY_REVIEWER_AGENT_NAME": "custom-dependency-agent"},
+    {"INCREMENTAL_DOC_UPDATER_AGENT_NAME": "custom-document-agent"},
+    {"DEPENDENCY_REVIEWER_AGENT_NAME": "", "INCREMENTAL_DOC_UPDATER_AGENT_NAME": ""},
+])
+def test_combined_prompt_does_not_invent_missing_sub_agent_names(
+    values: dict[str, str],
+) -> None:
+    """缺失或为空的新变量保持空值，由入口校验停止，不回退旧名或默认值。"""
+
+    template = (PROJECT_ROOT / "prompts/依赖review&增量文档更新 入口.md").read_text(
+        encoding="utf-8"
+    )
+    rendered = render_prompt(template, values)
+
+    for variable, label in (
+        ("DEPENDENCY_REVIEWER_AGENT_NAME", "依赖更新 Agent 名称"),
+        ("INCREMENTAL_DOC_UPDATER_AGENT_NAME", "文档更新 Agent 名称"),
+    ):
+        assert f"<{label}>\n{values.get(variable, '')}\n</{label}>" in rendered
+    assert "任一名称为空，或者当前环境无法定位并调用对应 Agent 时，立即停止" in rendered
+    assert "不得写死、猜测、补全或使用默认 Agent 替代" in rendered
 
 
 def test_builtin_prompt_environment_values_default_to_empty() -> None:
