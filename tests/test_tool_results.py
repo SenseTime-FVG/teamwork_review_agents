@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from teamwork_review_agents.config import ContextCompactionConfig
-from teamwork_review_agents.context_compaction import SUMMARY_INSTRUCTIONS, estimate_tokens
+from teamwork_review_agents.context_compaction import SUMMARY_REQUEST, estimate_tokens
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.managed_sandbox import ProcessLaunch, permission_profile_override
 from teamwork_review_agents.model_tools import ModelToolExecutor
@@ -67,7 +67,7 @@ def test_artifact_keeps_every_byte_and_metadata(tmp_path, available):
     assert "中间证据" in json.loads(path.read_text(encoding="utf-8"))["stdout"]
     if os.name != "nt":
         assert path.stat().st_mode & 0o777 == 0o600
-    assert "工具结果文件路径" in SUMMARY_INSTRUCTIONS
+    assert "工具结果文件路径" in SUMMARY_REQUEST
 
 
 def test_small_window_uses_reference_instead_of_losing_result(tmp_path):

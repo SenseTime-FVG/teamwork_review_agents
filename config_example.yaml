@@ -103,13 +103,13 @@ database:
 #       model: example-model
 #       context_window_tokens: null
 #   # 仅作用于 Teamwork 自建模型循环；完整 Codex CLI 模式使用自身的压缩机制。
-#   # 摘要模型参考完整任务上下文，但只替换较早历史；原始任务、系统指令等原样保留。
+#   # 从完整原对话 fork 副本并追加交接请求，只替换较早历史；原始任务、系统指令等原样保留。
 #   context_compaction:
 #     enabled: true
 #     # 窗口在 Provider / 模型 / Agent 上配置；此处只保留压缩算法参数。
 #     reserved_output_tokens: 4096
-#     # 按完整窗口的 95% 触发；若输出预留使安全输入上限更低，则提前保护。
-#     trigger_ratio: 0.95
+#     # 默认按完整窗口的 90% 触发，并为输出和末尾交接提示预留空间；显式配置不覆盖。
+#     trigger_ratio: 0.90
 #     target_ratio: 0.5
 #     keep_recent_rounds: 2
 #     # 摘要软目标，不是失败上限；超过目标但完整请求能装下且已缩小时照常接受。

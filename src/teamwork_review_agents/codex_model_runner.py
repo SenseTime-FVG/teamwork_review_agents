@@ -32,6 +32,7 @@ from .context_compaction import (
     ContextCompactionError,
     ConversationContext,
     estimate_tokens,
+    summary_payload,
 )
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
 from .model_provider_credentials import ModelProviderCredentialStore
@@ -867,11 +868,7 @@ class CodexModelRunner:
                 "role": "user",
                 "content": [{"type": "input_text", "text": prompt}],
             }
-        ], self.config.runtime.context_compaction, runtime_identity={
-            "agent_name": agent_name, "run_id": run_id,
-            "root_run_id": root_run_id, "parent_run_id": parent_run_id,
-            "repository_id": repository.id, "workspace": str(repository.workspace),
-        })
+        ], self.config.runtime.context_compaction)
         usage: dict[str, Any] = {}
         events: list[dict[str, Any]] = []
         response_id: str | None = None
@@ -962,7 +959,8 @@ class CodexModelRunner:
             await emit("system", "context.compaction_started", {
                 "provider_id": current_selection.provider_id if current_selection else self.provider_id,
                 "model": model, "request_round": request_round,
-                "message": "正在参考完整任务上下文整理交接；原始任务和系统指令不变，摘要请求不执行工具。",
+                "summary_context_mode": "fork",
+                "message": "正在从原对话副本生成交接摘要；保留消息结构与系统指令，仅在副本末尾追加交接请求，不执行工具。",
             })
             try:
                 summary_response = await request_model(redactor.data(payload), summary_progress)
@@ -1315,13 +1313,23 @@ class CodexModelRunner:
                         redactor.data({"type": "item.completed", **completed_event})
                     )
                 await emit("stdout", "item.completed", completed_event)
-                # 只计算固定内容和当前完整工具回合；旧历史占用交给已有压缩机制。
+                # 工具结果也要为完整对话 fork 留出位置；大结果继续保存在可补读文件中。
                 result_shell = {"type": "function_call_output", "call_id": call_id, "output": ""}
-                fixed_request = {
+                result_request = {
                     **{key: value for key, value in payload.items() if key != "input"},
-                    "input": conversation.fixed_messages + round_items + [result_shell],
+                    "input": conversation.history() + round_items + [result_shell],
                 }
-                available = window - self.config.runtime.context_compaction.reserved_output_tokens - estimate_tokens(fixed_request) - 256
+                settings = self.config.runtime.context_compaction
+                request_cost = estimate_tokens(result_request)
+                if settings.enabled:
+                    fork = summary_payload(
+                        model, result_request["input"],
+                        {key: value for key, value in result_request.items() if key != "input"},
+                        settings.summary_target_bytes, shortening=True,
+                    )
+                    request_cost = max(request_cost, estimate_tokens(fork))
+                # 另留少量余量，避免文件引用的结构开销立即占满下一次摘要请求。
+                available = window - settings.reserved_output_tokens - request_cost - 512
                 # 同回合多工具给后续结果留出位置，不能让首个正文挤掉后续文件引用。
                 available //= len(calls) - call_index
                 model_output, reference = tool_results.prepare(

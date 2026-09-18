@@ -206,6 +206,9 @@ class ExternalModelClient:
         tools = [_anthropic_tool(item) for item in payload.get("tools", [])]
         if tools:
             body["tools"] = tools
+            if payload.get("tool_choice") == "none":
+                # 摘要 fork 保留工具定义与历史，但不能触发新的工具调用。
+                body["tool_choice"] = {"type": "none"}
         document = await self._post_json(
             _api_url(self.provider, "/v1/messages"),
             body,
@@ -265,6 +268,9 @@ class ExternalModelClient:
         declarations = [_gemini_tool(item) for item in payload.get("tools", [])]
         if declarations:
             body["tools"] = [{"functionDeclarations": declarations}]
+            if payload.get("tool_choice") == "none":
+                # 与 Responses 的禁用语义保持一致，不能只依靠摘要提示词。
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
         url = _gemini_url(self.provider, model)
         document = await self._post_json(
             url,
