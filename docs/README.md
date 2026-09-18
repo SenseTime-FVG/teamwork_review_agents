@@ -29,6 +29,7 @@
 | [`design-managed-skill-authoring.md`](design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 | `skill_files.py`、Skill 管理 API 与 UI | Skill 在线创建、编辑、元数据或受管目录边界变化 |
 | [`design-repository-skill-policy.md`](design-repository-skill-policy.md) | 仓库级 Skill 白名单设计 | 仓库配置、Agent Skill 交集与仓库详情 UI | `allowed_skills` 或运行时 Skill 选择语义变化 |
 | [`design-combined-update-dependency-failure-continuation.md`](design-combined-update-dependency-failure-continuation.md) | 组合更新中依赖失败后的文档续跑设计 | 组合更新 Runner Prompt 与两个子 Agent 的阶段契约 | 依赖失败恢复、文档续跑或部分完成语义变化 |
+| [`design-context-fork-compaction.md`](design-context-fork-compaction.md) | 原对话副本摘要与 90% 默认阈值设计 | 上下文管理、模型运行器与协议适配 | 压缩请求结构、预算或隔离语义变化 |
 | [`design-review-comment-isolation.md`](design-review-comment-isolation.md) | 通用审核的评论读取隔离设计 | 通用审核 Prompt | 描述、评论正文和平台门禁的读取边界变化 |
 
 ## 实施记录
@@ -48,4 +49,5 @@
 | [`implementation-plan-managed-skill-authoring.md`](implementation-plan-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑实施方案 | Skill 文件管理、API 和配置界面 | 该实施方案或验收记录更新 |
 | [`implementation-plan-repository-skill-policy.md`](implementation-plan-repository-skill-policy.md) | 仓库级 Skill 白名单实施方案 | 配置校验、运行器和仓库详情 UI | 该实施方案或验收记录更新 |
 | [`implementation-plan-combined-update-dependency-failure-continuation.md`](implementation-plan-combined-update-dependency-failure-continuation.md) | 组合更新中依赖失败后的文档续跑实施方案 | 组合更新 Runner Prompt 与协议测试 | 该实施方案或验收记录更新 |
+| [`implementation-plan-context-fork-compaction.md`](implementation-plan-context-fork-compaction.md) | 原对话副本压缩实施与回归范围 | 上下文管理与模型协议测试 | 该实施方案或验收记录更新 |
 | [`implementation-plan-review-comment-isolation.md`](implementation-plan-review-comment-isolation.md) | 通用审核的评论读取隔离实施方案 | 通用审核 Prompt 与渲染测试 | 该实施方案或验收记录更新 |

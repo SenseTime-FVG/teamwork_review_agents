@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from teamwork_review_agents.config import ContextCompactionConfig, ModelProviderConfig, ModelSelectionConfig
 from teamwork_review_agents.context_compaction import (
-    ConversationContext, ContextCompactionError, SUMMARY_INSTRUCTIONS, SUMMARY_PREFIX, SUMMARY_REQUEST,
+    ConversationContext, ContextCompactionError, SUMMARY_PREFIX, SUMMARY_REQUEST,
     estimate_tokens, summary_payload,
 )
 from teamwork_review_agents.codex_model_client import CodexResponsesClient, CodexUpstreamError
@@ -62,17 +62,16 @@ async def test_compaction_preserves_fixed_instructions_and_complete_recent_round
     original_fields = copy.deepcopy(fields)
     original_fixed = copy.deepcopy(context.fixed_messages)
     for index in range(4):
-        context.append_round(_turn(index))
+        context.append_round(_turn(index, 1300))
     requests = []
 
     async def summarize(payload):
         requests.append(payload)
-        assert payload["tools"] == [] and payload["tool_choice"] == "none"
+        assert payload["tools"] == original_fields["tools"] and payload["tool_choice"] == "none"
         assert "text" not in payload
-        source = json.loads(payload["input"][0]["content"][0]["text"])
-        assert source["reference_context"]["request_fields"] == original_fields
-        assert source["reference_context"]["original_task"] == original_fixed
-        assert payload["input"][-1]["content"][0]["text"] == SUMMARY_REQUEST
+        assert payload["instructions"] == original_fields["instructions"]
+        assert payload["input"][:-1] == context.history()
+        assert payload["input"][-1]["content"][0]["text"].startswith(SUMMARY_REQUEST)
         return "进展：已完成历史操作；SHA abc123；约束：禁止合并；待办：继续检查。"
 
     result = await context.ensure_budget(model="test", request_fields=fields, window=8192, summarize=summarize)
@@ -81,7 +80,7 @@ async def test_compaction_preserves_fixed_instructions_and_complete_recent_round
     assert context.history()[0] == original_fixed[0]
     assert context.history()[1]["role"] == "assistant"
     assert context.history()[1]["content"][0]["text"].startswith(SUMMARY_PREFIX)
-    assert context.rounds == [_turn(3)]
+    assert context.rounds == [_turn(3, 1300)]
     assert requests
 
 
@@ -90,7 +89,7 @@ async def test_failed_compaction_never_replaces_history(failure):
     """空摘要、超预算、异常或取消都保留原始活跃历史。"""
 
     context = _context()
-    context.append_round(_turn(0, 9000 if failure != "nonshrinking" else 1))
+    context.append_round(_turn(0, 4000 if failure != "nonshrinking" else 1))
     before = copy.deepcopy(context.history())
 
     async def summarize(payload):
@@ -117,8 +116,8 @@ async def test_chinese_summary_above_2048_bytes_is_accepted_when_full_request_fi
     summary = "摘要" * 400
 
     async def summarize(payload):
-        assert "软目标" in payload["instructions"]
-        assert "不得超过" not in payload["instructions"]
+        assert "软目标" in payload["input"][-1]["content"][0]["text"]
+        assert "不得超过" not in payload["input"][-1]["content"][0]["text"]
         return summary
 
     result = await context.ensure_budget(model="test", request_fields=fields, window=131072, summarize=summarize)
@@ -136,7 +135,7 @@ async def test_summary_above_soft_goal_keeps_complete_recent_round():
 
     context = _context(_settings(target_ratio=0.5))
     for index in range(4):
-        context.append_round(_turn(index))
+        context.append_round(_turn(index, 1300))
 
     async def summarize(payload):
         return "摘要" * 400
@@ -144,7 +143,7 @@ async def test_summary_above_soft_goal_keeps_complete_recent_round():
     result = await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
     assert result["after_estimated_tokens"] > result["input_budget"] * 0.5
     assert result["summary_above_target"] is True
-    assert context.rounds == [_turn(3)]
+    assert context.rounds == [_turn(3, 1300)]
 
 
 @pytest.mark.parametrize("recover", [True, False])
@@ -179,49 +178,31 @@ async def test_full_request_overflow_uses_bounded_rewrites(recover):
         assert caught.value.diagnostics["after_estimated_tokens"] > 32256
         assert context.history() == original
         assert len(requests) == 3
-    assert all(payload["input"] == requests[0]["input"] for payload in requests)
+    assert all(payload["input"][:-1] == requests[0]["input"][:-1] for payload in requests)
     assert diagnostics[0]["reason"] == "context_summary_context_overflow"
-    assert "进一步收短" in requests[1]["instructions"]
+    assert "进一步收短" in requests[1]["input"][-1]["content"][0]["text"]
 
 
-async def test_large_intermediate_draft_is_regenerated_without_truncating_source():
-    """中间草稿太大时不发送超限请求；重用完整上一片段，并保留全部后续材料。"""
-
-    context = _context()
-    context.append_round(_turn(0, 18000))
-    requests = []
-
-    async def summarize(payload):
-        requests.append(payload)
-        assert estimate_tokens(payload) + 256 <= 7680
-        return "z" * 10000 if len(requests) == 1 else "已记录前面的全部关键事实"
-
-    result = await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
-    assert result["summary_rewrites"] == 1
-    assert requests[0]["input"] == requests[1]["input"]
-    assert all("z" * 10000 not in json.dumps(payload) for payload in requests[1:])
-    # 忽略重复归纳的那次请求，按顺序拼回全部源材料，确认没有为控长丢掉片段。
-    sources = [json.loads(payload["input"][0]["content"][0]["text"]) for payload in [requests[0], *requests[2:]]]
-    original = json.loads("".join(item["history_fragment"] for item in sources))
-    assert original["completed_rounds"] == [_turn(0, 18000)]
-    assert context.summary == "已记录前面的全部关键事实"
-
-
-async def test_existing_summary_can_be_split_for_a_smaller_model():
-    """已有摘要超过新模型窗口时，作为完整材料分片处理，不能直接丢弃。"""
+@pytest.mark.parametrize("kind", ["large_round", "large_summary"])
+async def test_oversized_fork_is_rejected_without_splitting_or_truncating(kind):
+    """完整副本放不下时保留源历史，不再把消息或旧摘要切成 JSON 片段。"""
 
     context = _context()
-    context.summary = "旧摘要" * 2000
-    pieces = []
+    if kind == "large_round":
+        context.append_round(_turn(0, 18000))
+    else:
+        context.summary = "旧摘要" * 2000
+    original = context.history()
 
     async def summarize(payload):
-        assert estimate_tokens(payload) + 256 <= 7680
-        pieces.append(json.loads(payload["input"][0]["content"][0]["text"])["history_fragment"])
-        return "已保留旧摘要的关键事实"
+        pytest.fail("不得向模型发送超限的 fork 请求")
 
-    result = await context.ensure_budget(model="smaller", request_fields={}, window=8192, summarize=summarize)
-    assert result["summary_requests"] > 1
-    assert json.loads("".join(pieces))["previous_summary"] == "旧摘要" * 2000
+    with pytest.raises(ContextCompactionError) as caught:
+        await context.ensure_budget(model="smaller", request_fields={}, window=8192, summarize=summarize)
+    assert caught.value.error_code == "context_summary_request_too_large"
+    assert caught.value.diagnostics["summary_context_mode"] == "fork"
+    assert caught.value.diagnostics["summary_requests"] == 0
+    assert context.history() == original and context.compaction_count == 0
 
 
 @pytest.mark.parametrize("limit", ["rewrites", "requests", "cancel"])
@@ -230,7 +211,7 @@ async def test_rewrite_limits_and_cancellation_preserve_active_history(limit):
 
     settings = _settings(**({"max_summary_rewrites": 0} if limit == "rewrites" else {"max_compaction_requests": 1} if limit == "requests" else {}))
     context = _context(settings)
-    context.append_round(_turn(0, 2600))
+    context.append_round(_turn(0, 1600))
     original = context.history()
     requests = []
 
@@ -241,7 +222,7 @@ async def test_rewrite_limits_and_cancellation_preserve_active_history(limit):
         return "\\" * 2000
 
     with pytest.raises(asyncio.CancelledError if limit == "cancel" else ContextCompactionError) as caught:
-        await context.ensure_budget(model="test", request_fields={"instructions": "x" * 5000}, window=8192, summarize=summarize, force=True)
+        await context.ensure_budget(model="test", request_fields={"instructions": "x" * 3500}, window=8192, summarize=summarize, force=True)
     if limit == "requests":
         assert caught.value.error_code == "context_compaction_request_limit"
     assert len(requests) == (2 if limit == "cancel" else 1)
@@ -256,29 +237,6 @@ def test_legacy_summary_setting_is_a_soft_goal_and_serializes_new_name():
     assert "max_summary_tokens" not in settings.model_dump()
     assert settings.model_dump()["summary_target_bytes"] == 1000000
     assert ContextCompactionConfig(max_summary_tokens=500, summary_target_bytes=1000).summary_target_bytes == 1000
-
-
-async def test_summary_fragments_fit_budget_and_failure_is_atomic():
-    """超大片段被有界分片，后续分片失败不能提交前面的半份摘要。"""
-
-    context = _context()
-    context.append_round(_turn(0, 18000))
-    original = copy.deepcopy(context.history())
-    requests = []
-
-    async def summarize(payload):
-        requests.append(payload)
-        assert estimate_tokens(payload) + 256 <= 8192 - 512
-        if len(requests) == 2:
-            source = json.loads(payload["input"][0]["content"][0]["text"])
-            assert source["previous_summary"] == "已记录首段事实"
-            raise RuntimeError("第二片段失败")
-        return "已记录首段事实"
-
-    with pytest.raises(RuntimeError, match="第二片段失败"):
-        await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
-    assert len(requests) == 2
-    assert context.history() == original
 
 
 async def test_safe_short_history_is_kept_when_summary_is_larger():
@@ -303,18 +261,18 @@ async def test_summary_call_limit_and_fixed_content_failure():
     """不能为了压缩继续运行而删掉系统约束，也不能无限调用摘要模型。"""
 
     context = _context(_settings(max_compaction_requests=1))
-    context.append_round(_turn(0, 20000))
+    context.append_round(_turn(0, 4000))
     calls = []
 
     async def summarize(payload):
         calls.append(payload)
-        return "已记录"
+        return "x" * 12000
 
     with pytest.raises(ContextCompactionError, match="系统指令"):
         await context.ensure_budget(model="test", request_fields={"instructions": "x" * 10000}, window=8192, summarize=summarize)
     assert calls == []
     with pytest.raises(ContextCompactionError, match="本次上限"):
-        await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize)
+        await context.ensure_budget(model="test", request_fields={}, window=8192, summarize=summarize, force=True)
     assert len(calls) == 1
     assert len(context.rounds) == 1
 
@@ -376,9 +334,9 @@ async def test_builtin_prompts_remain_complete_summary_reference(configured_app_
 
     async def summarize(payload):
         assert estimate_tokens(payload) + 256 <= 131072 - 4096
-        source = json.loads(payload["input"][0]["content"][0]["text"])
-        assert source["reference_context"]["original_task"] == fixed
-        assert source["reference_context"]["request_fields"] == fields
+        assert payload["input"][:-1] == context.history()
+        assert payload["instructions"] == fields["instructions"]
+        assert payload["tools"] == fields["tools"]
         return "已读取本轮证据，原任务继续有效，尚未提交或推送。"
 
     result = await context.ensure_budget(model="test", request_fields=fields, window=131072, summarize=summarize, force=True)
@@ -432,6 +390,16 @@ def run_context(configured_app_factory, monkeypatch):
     return run
 
 
+def _is_summary(payload):
+    """通过副本末尾交接请求识别摘要，原系统指令仍与正常请求相同。"""
+
+    last = payload["input"][-1]
+    return last.get("role") == "user" and any(
+        part.get("text", "").startswith(SUMMARY_REQUEST)
+        for part in last.get("content", []) if isinstance(part, dict)
+    )
+
+
 def _response(text):
     """规范完成响应，并记录测试用的 Token 用量。"""
 
@@ -457,14 +425,13 @@ async def test_runner_compacts_without_changing_system_or_replaying_tools(run_co
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             summaries.append(body)
-            assert body["tools"] == [] and body["tool_choice"] == "none"
-            assert "TASK-ORIGINAL" in json.dumps(body)
-            reference = json.loads(body["input"][0]["content"][0]["text"])["reference_context"]
-            assert reference["runtime_identity"]["agent_name"] == "code-reviewer"
-            assert reference["runtime_identity"]["run_id"] == "context-run"
-            assert reference["request_fields"]["instructions"].startswith("SYSTEM-ORIGINAL")
+            assert body["tools"] == normal[0]["tools"] and body["tool_choice"] == "none"
+            assert body["instructions"] == normal[0]["instructions"]
+            assert body["input"][0] == normal[0]["input"][0]
+            assert any(item.get("type") == "function_call_output" for item in body["input"])
+            assert body["input"][-1]["content"][0]["text"].startswith(SUMMARY_REQUEST)
             return _response("进展：已审核部分文件，操作及 SHA abc123 已记录；待办：继续验证。")
         normal.append(body)
         return _tool(len(normal) - 1) if len(normal) <= 4 else _response("任务完成")
@@ -488,7 +455,7 @@ async def test_runner_accepts_long_summary_and_does_not_replay_tool(run_context)
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             return _response("摘要" * 400)
         normal.append(body)
         return _tool(0) if len(normal) == 1 else _overflow() if len(normal) == 2 else _response("完成")
@@ -511,7 +478,7 @@ async def test_context_error_retries_only_current_request_once(run_context, agai
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             summaries.append(body)
             return _response("已完成工具 call-0，剩余验证未完成。")
         normal.append(body)
@@ -537,7 +504,7 @@ async def test_summary_cannot_execute_tools_or_finish_task(run_context, kind):
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             if kind == "tool":
                 return _tool(999)
             if kind == "cancel":
@@ -563,14 +530,15 @@ async def test_summary_cannot_execute_tools_or_finish_task(run_context, kind):
         assert failure["provider_id"] == "a" and failure["request_round"] > 1
 
 
-async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(run_context):
-    """A 到小窗口 B 前压缩，下一轮恢复 A 时携带通用摘要与完整近期结果。"""
+@pytest.mark.parametrize("smaller_window", [8192, 6000])
+async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(run_context, smaller_window):
+    """小窗口能容纳 fork 才压缩；装不下明确停止，不拆片或重放工具。"""
 
     normal, summaries = [], []
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             summaries.append(body)
             return _response("已执行 call-0、call-1；待完成最终审核。")
         normal.append(body)
@@ -580,16 +548,51 @@ async def test_switch_to_smaller_model_rechecks_budget_and_keeps_plain_summary(r
             return httpx.Response(503, json={"error": {"code": "server_error"}})
         return _tool(2) if len(normal) == 4 else _response("完成")
 
-    outcome = await run_context(handler, settings=_settings(), fallback=True, windows={"a": 32000, "b": 6500})
-    assert outcome.result.status == "completed"
+    outcome = await run_context(handler, settings=_settings(), fallback=True, windows={"a": 32000, "b": smaller_window})
+    if smaller_window == 6000:
+        assert outcome.result.status == "failed"
+        assert outcome.result.error_code == "context_summary_request_too_large"
+        assert outcome.result.retryable is False
+        assert outcome.calls == [0, 1] and not summaries
+        assert all(body["model"] == "gpt-a" for body in normal)
+        return
+    assert outcome.result.status == "completed", outcome.result
     assert [body["model"] for body in normal] == ["gpt-a", "gpt-a", "gpt-a", "gpt-b", "gpt-a"]
     assert summaries and all(body["model"] == "gpt-b" for body in summaries)
     assert outcome.calls == [0, 1, 2]
     fallback_snapshots = [item for item in outcome.snapshots if item.get("provider_id") == "b"]
-    assert fallback_snapshots and all(item["context_window_tokens"] == 6500 for item in fallback_snapshots)
+    assert fallback_snapshots and all(item["context_window_tokens"] == 8192 for item in fallback_snapshots)
     assert outcome.snapshots[-1]["context_window_tokens"] == 32000
     assert all(item["window_source"] == "provider:b" for item in outcome.snapshots[-1]["context_compactions"])
     assert SUMMARY_PREFIX.splitlines()[0] in json.dumps(normal[-1], ensure_ascii=False)
+
+
+async def test_accumulated_history_leaves_room_for_full_fork_and_result_files(run_context):
+    """后续工具输出预算计入已有历史，保存完整文件后仍可发送原结构交接请求。"""
+
+    normal, summaries, paths = [], [], []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if _is_summary(body):
+            summaries.append(body)
+            assert estimate_tokens(body) + 256 <= 16000 - 512
+            assert body["instructions"] == normal[0]["instructions"]
+            outputs = [json.loads(item["output"]) for item in body["input"] if item.get("type") == "function_call_output"]
+            assert outputs[0]["stdout"] == "结果" + "x" * 10000
+            reference = next(output["output_file"] for output in outputs if "output_file" in output)
+            path = Path(reference["path"])
+            paths.append(path)
+            assert json.loads(path.read_text(encoding="utf-8"))["stdout"] == "结果" + "x" * 10000
+            return _response(f"已执行两次工具，第二次完整结果尚待补读：{path}")
+        normal.append(body)
+        return _tool(len(normal) - 1) if len(normal) <= 2 else _overflow() if len(normal) == 3 else _response("完成")
+
+    outcome = await run_context(handler, settings=_settings(trigger_ratio=0.90), output_size=10000, window=16000)
+    assert outcome.result.status == "completed", outcome.result
+    assert outcome.calls == [0, 1] and len(summaries) == 1
+    assert paths and all(not path.exists() for path in paths)
+    assert any(event == "context.tool_output_stored" for event, _ in outcome.logs)
 
 
 @pytest.mark.parametrize("quota", [True, False])
@@ -600,7 +603,7 @@ async def test_summary_provider_failure_uses_fallback_without_replaying_tools(ru
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             summaries.append(body)
             if body["model"] == "gpt-a":
                 return httpx.Response(429 if quota else 503, json={"error": {
@@ -628,7 +631,7 @@ async def test_large_tool_output_keeps_complete_readable_file(run_context, windo
 
     async def handler(request):
         body = json.loads(request.content)
-        assert not body["instructions"].startswith(SUMMARY_INSTRUCTIONS)
+        assert not _is_summary(body)
         normal.append(body)
         if len(normal) == 2:
             output = next(item["output"] for item in body["input"] if item.get("type") == "function_call_output")
@@ -655,7 +658,7 @@ async def test_normal_tool_output_reaches_model_in_full_with_legacy_config(run_c
 
     async def handler(request):
         body = json.loads(request.content)
-        assert not body["instructions"].startswith(SUMMARY_INSTRUCTIONS)
+        assert not _is_summary(body)
         normal.append(body)
         return _tool(0) if len(normal) == 1 else _response("完成")
 
@@ -673,7 +676,7 @@ async def test_multiple_large_outputs_share_round_budget(run_context):
 
     async def handler(request):
         body = json.loads(request.content)
-        if body["instructions"].startswith(SUMMARY_INSTRUCTIONS):
+        if _is_summary(body):
             return _response("工具都已完成，文件证据已经检查。")
         normal.append(body)
         if len(normal) == 1:
@@ -687,7 +690,7 @@ async def test_multiple_large_outputs_share_round_budget(run_context):
         return _response("完成")
 
     outcome = await run_context(handler, output_size=30000, settings=_settings(trigger_ratio=0.95))
-    assert outcome.result.status == "completed" and outcome.calls == [0, 1]
+    assert outcome.result.status == "completed" and outcome.calls == [0, 1], outcome.result
     assert len(paths) == 2 and all(not path.exists() for path in paths)
 
 
@@ -751,26 +754,43 @@ async def test_disabled_compaction_still_stops_deterministic_context_error(run_c
 
 @pytest.mark.parametrize("driver", ["openai_chat_completions", "anthropic_messages", "gemini_generate_content"])
 @pytest.mark.parametrize("complete", [False, True])
-async def test_summary_protocol_adapters_have_no_tools_and_preserve_stop_state(driver, complete):
-    """各协议不增加工具或任务 Schema，并保留截断状态供摘要拒绝。"""
+async def test_summary_protocol_adapters_disable_tools_and_preserve_stop_state(driver, complete):
+    """各协议保留 system、角色和工具配对，禁用新工具调用，并保留摘要结束状态。"""
+
+    tool = {"type": "function", "name": "execute_command", "parameters": {"type": "object"}}
+    history = [{"role": "user", "content": "原始任务"}, *_turn(0, 10)]
 
     async def handler(request):
         body = json.loads(request.content)
-        assert not body.get("tools") and "response_format" not in body
+        assert body.get("tools") and "response_format" not in body
         if driver == "openai_chat_completions":
-            assert body["messages"][0]["content"].startswith(SUMMARY_INSTRUCTIONS)
+            assert body["messages"][0] == {"role": "system", "content": "SYSTEM"}
+            assert body["messages"][-1]["content"].startswith(SUMMARY_REQUEST)
+            assert body["messages"][2]["tool_calls"][0]["id"] == "call-0"
+            assert body["messages"][3]["tool_call_id"] == "call-0"
+            assert body["tool_choice"] == "none"
             document = {"choices": [{"message": {"content": "摘要"}, "finish_reason": "stop" if complete else "length"}]}
         elif driver == "anthropic_messages":
-            assert body["system"].startswith(SUMMARY_INSTRUCTIONS)
+            assert body["system"] == "SYSTEM"
+            assert body["messages"][-1]["content"][-1]["text"].startswith(SUMMARY_REQUEST)
+            assert body["messages"][1]["content"][0]["id"] == "call-0"
+            assert body["messages"][2]["content"][0]["tool_use_id"] == "call-0"
+            assert body["tool_choice"] == {"type": "none"}
             document = {"content": [{"type": "text", "text": "摘要"}], "stop_reason": "end_turn" if complete else "max_tokens"}
         else:
-            assert body["systemInstruction"]["parts"][0]["text"].startswith(SUMMARY_INSTRUCTIONS)
+            assert body["systemInstruction"]["parts"][0]["text"] == "SYSTEM"
+            assert body["contents"][-1]["parts"][-1]["text"].startswith(SUMMARY_REQUEST)
+            assert body["contents"][1]["parts"][0]["functionCall"]["name"] == "execute_command"
+            assert body["contents"][2]["parts"][0]["functionResponse"]["name"] == "execute_command"
+            assert body["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}
             document = {"candidates": [{"content": {"parts": [{"text": "摘要"}]}, "finishReason": "STOP" if complete else "MAX_TOKENS"}]}
         return httpx.Response(200, json=document)
 
     provider = ModelProviderConfig(display_name="test", driver=driver, base_url="https://test.example.test", default_model="test")
     client = ExternalModelClient(provider, "key", timeout_seconds=10, idle_timeout_seconds=10, transport=httpx.MockTransport(handler))
-    response = await client.create_response(summary_payload("test", "已有摘要", "历史素材", 512))
+    response = await client.create_response(summary_payload("test", history, {
+        "instructions": "SYSTEM", "tools": [tool], "text": {"format": {"type": "json_object"}},
+    }, 512))
     assert response["status"] == ("completed" if complete else "incomplete")
 
 
