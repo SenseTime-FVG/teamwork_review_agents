@@ -24,7 +24,7 @@
 | --- | --- | --- | --- |
 | `general-reviewer` | 对 GitHub PR / GitLab MR 做完整代码审核，读取项目审核 Skill、设计文档和历史变更，校验源/目标 SHA、CI、可合并状态与平台门禁；最终发布一条顶层审核评论，只有全部通过才自动合并。 | **固定一对源/目标 SHA 作为不可变审核基准，以代码证据和平台门禁共同决定是否合并。** | 内置规则 `general-review` 在 `change_request.opened` 或 `change_request.reopened` 时直接触发；同轮事件对该 Agent 去重。标题精确为 `dependency(auto-update)`、`doc(auto-update)` 或 `auto-update` 时，Agent 自身会跳过。 |
 | `incremental-doc-update-runner` | 编排已合并 GitHub PR / GitLab MR 的文档自动更新：验证原始变更请求和合并前后 SHA，创建独立文档分支，调用文档子 Agent，核验其提交拓扑与远程状态，在同一平台创建 `doc(auto-update)` PR / MR，等待平台门禁、自动合并并清理分支。它不亲自判断或修改文档。 | **主 Agent 只管边界、分支、门禁与清理，把文档判断交给专职子 Agent。** | 内置规则 `增量文档更新` 在 `change_request.merged` 时直接触发，并设置 `inherit_workspace: true`。Prompt 根据仓库上下文中的 `provider_kind` 选择 GitHub 或 GitLab 路径；自动更新标题会被防循环逻辑跳过。 |
-| `incremental-doc-updater` | 在 Runner 指定的固定提交范围内，通过文档索引建立最小候选集，只更新确实受影响的文档和索引；有修改时仅创建一个题为 `doc(auto-update)` 的提交并推送，返回结构化状态。它不创建或合并 PR / MR。 | **用固定净差异和文档索引做增量路由，以最少读取完成最小必要更新。** | 没有内置规则直接触发；仅当 Runner 完成 PR / MR、SHA、分支和环境变量校验后，通过 MCP `invoke_agent` 委托。默认 Agent 名来自 `INCREMENTAL_DOC_UPDATE_AGENT_NAME=incremental-doc-updater`。 |
+| `incremental-doc-updater` | 在 Runner 指定的固定提交范围内，通过文档索引建立最小候选集，只更新确实受影响的文档和索引；有修改时仅创建一个题为 `doc(auto-update)` 的提交并推送，返回结构化状态。它不创建或合并 PR / MR。 | **用固定净差异和文档索引做增量路由，以最少读取完成最小必要更新。** | 没有内置规则直接触发；仅当 Runner 完成 PR / MR、SHA、分支和环境变量校验后，通过 MCP `invoke_agent` 委托。默认 Agent 名来自 `INCREMENTAL_DOC_UPDATER_AGENT_NAME=incremental-doc-updater`。 |
 
 ## 4. 关键运行流程
 

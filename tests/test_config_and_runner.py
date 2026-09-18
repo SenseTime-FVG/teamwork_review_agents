@@ -172,16 +172,16 @@ def test_example_config_is_valid() -> None:
         "dependency&incremental-doc-update-runner"
     ].environment
     assert runner_environment[
-        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME"
+        "DEPENDENCY_REVIEWER_AGENT_NAME"
     ].expose_to_prompt is True
     assert runner_environment[
-        "DEPENDENCY_AUTO_UPDATE_AGENT_NAME"
+        "DEPENDENCY_REVIEWER_AGENT_NAME"
     ].expose_to_process is False
     assert runner_environment[
-        "INCREMENTAL_DOC_UPDATE_AGENT_NAME"
+        "INCREMENTAL_DOC_UPDATER_AGENT_NAME"
     ].expose_to_prompt is True
     assert runner_environment[
-        "INCREMENTAL_DOC_UPDATE_AGENT_NAME"
+        "INCREMENTAL_DOC_UPDATER_AGENT_NAME"
     ].expose_to_process is False
     assert [rule.name for rule in config.rules] == [
         "general-review",
@@ -1145,8 +1145,8 @@ def test_combined_update_prompts_support_github_and_gitlab() -> None:
     assert "glab mr create" in runner_prompt
     assert "Pipeline / Job" in runner_prompt
     assert "输入中会提供一条已经合并的 GitLab Merge Request" not in runner_prompt
-    assert "{{ DEPENDENCY_AUTO_UPDATE_AGENT_NAME }}" in runner_prompt
-    assert "{{ INCREMENTAL_DOC_UPDATE_AGENT_NAME }}" in runner_prompt
+    assert "{{ DEPENDENCY_REVIEWER_AGENT_NAME }}" in runner_prompt
+    assert "{{ INCREMENTAL_DOC_UPDATER_AGENT_NAME }}" in runner_prompt
     assert (
         "- 返回 `FAILED` 或 `BLOCKED`：判定任务失败并执行清理，"
         "不调用文档子 Agent"
