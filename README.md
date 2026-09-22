@@ -107,6 +107,8 @@ Agent 权限与能力摘要：
 
 Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程宿主机环境变量”解析。不同仓库即使绑定同一个 Provider，也可以在仓库环境中用相同的 `token_env` 名称引用各自独立的宿主机 Token；仓库未配置时继续使用全局或宿主机默认值。Provider Token 始终按 Secret 脱敏，默认供扫描、Commit Status、托管评论以及 Agent、工具命令和仓库 CI 使用，但不进入 Prompt。基础仓库的原生 Git clone/fetch 会自动使用当前 Provider Token，不受环境变量“进程”选项影响；HTTPS Git 通过本轮临时 askpass 凭证认证，SSH 继续使用 SSH Agent。`gh` / `glab` 仍使用本机安装的 CLI，认证会优先采用当前仓库解析出的 Token；管理员可以单独关闭“进入进程”，关闭后 CLI 才回退到本机登录态。已有配置中明确关闭该开关的选择保持不变。
 
+GitLab 仓库会自动从 Provider 的 API 地址补齐进程变量 `GITLAB_HOST`（主机及端口），避免临时 HOME 中的 `glab api` 因缺少主机配置而访问 `gitlab.com`。已有显式环境配置优先，不修改 Token 暴露开关或本机登录态；说明与验收见 [平台 CLI 认证](docs/platform-cli-auth.md#gitlabglab)。
+
 本地 CI 当前仅支持 GitHub。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub 本地 CI 门禁](#github-本地-ci-门禁)。
 
 ### 仓库名称、ID 与目录

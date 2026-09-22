@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from jinja2 import Undefined
 from jinja2.exceptions import TemplateError
@@ -108,6 +109,35 @@ def resolve_provider_token(
     return os.getenv(provider.token_env, "")
 
 
+def _repository_cli_defaults(
+    config: AppConfig,
+    repository: RepositoryConfig,
+) -> dict[str, EnvironmentVariable]:
+    """为当前 GitLab 仓库补齐 CLI 主机默认值，不隐式开放任何凭据。"""
+
+    # Prompt 预览可使用尚未绑定 Provider 的仓库占位，不为它猜测平台主机。
+    provider = config.providers.get(repository.provider)
+    if provider is None or provider.kind != "gitlab":
+        return {}
+    try:
+        parsed = urlsplit(provider.base_url)
+        hostname = parsed.hostname
+        port = parsed.port
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            raise ValueError
+    except ValueError:
+        # URL 可能含用户信息，报错不能回显原始值。
+        raise ValueError("无法生成 GITLAB_HOST：GitLab Provider 的 API 地址必须是有效的 HTTP/HTTPS URL") from None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        host = f"{host}:{port}"
+    return {
+        "GITLAB_HOST": EnvironmentVariable(
+            value=host, expose_to_prompt=False, expose_to_process=True,
+        ),
+    }
+
+
 def runtime_variables(
     repository: RepositoryConfig,
     event: ChangeEvent | None,
@@ -161,7 +191,8 @@ def resolve_environment(
 ) -> ResolvedEnvironment:
     """按全局、Agent、仓库、运行变量顺序合并，后者整项覆盖前者。"""
 
-    definitions: dict[str, EnvironmentVariable] = {}
+    # 自动主机只作为默认值，显式配置仍整项覆盖，包括空值与暴露开关。
+    definitions = _repository_cli_defaults(config, repository)
     definitions.update(config.environment.global_variables)
     definitions.update(agent.environment)
     # Agent 提供复用默认值，当前仓库统一覆盖值、来源及暴露开关。
@@ -214,7 +245,7 @@ def resolve_repository_process_environment(
 ) -> ResolvedEnvironment:
     """为不隶属具体 Agent 或变更请求的仓库准备任务解析环境。"""
 
-    definitions: dict[str, EnvironmentVariable] = {}
+    definitions = _repository_cli_defaults(config, repository)
     definitions.update(config.environment.global_variables)
     definitions.update(repository.environment)
     provider_token_names = {
