@@ -20,6 +20,7 @@ import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary } from "./workspaceCleanup";
 import type { WorkspaceCleanupSchedule, WorkspaceCleanupStatus } from "./workspaceCleanup";
 import { QuickSetupWizard } from "./QuickSetupWizard";
+import { manualTriggerEvent, activitySourceLabel, platformActivityStatus } from "./changeRequestActivity";
 import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
@@ -2042,7 +2043,7 @@ function Overview(props: {
   const changeRequestTotal = stats.change_requests.total ?? 0;
   const pendingEvents = (stats.events.pending ?? 0) + (stats.events.processing ?? 0);
   const selectedItems = props.changeRequests.filter((item) => (
-    item.latest_event && props.selectedSnapshotKeys.includes(item.snapshot_key)
+    manualTriggerEvent(item) && props.selectedSnapshotKeys.includes(item.snapshot_key)
   ));
   const selectedEventItems = props.events.filter((event) => (
     props.selectedEventIds.includes(event.event_id)
@@ -2101,10 +2102,10 @@ function Overview(props: {
               ) : (
                 <button
                   className="button secondary compact"
-                  disabled={!props.changeRequests.some((item) => item.latest_event)}
-                  title={props.changeRequests.some((item) => item.latest_event)
+                  disabled={!props.changeRequests.some((item) => manualTriggerEvent(item))}
+                  title={props.changeRequests.some((item) => manualTriggerEvent(item))
                     ? "选择多个 MR / PR 批量手动触发"
-                    : "当前列表没有可手动触发的最新平台事件"}
+                    : "当前列表没有可重放的平台或系统检测事件"}
                   onClick={props.onBeginSelection}
                 >
                   选择
@@ -2154,8 +2155,8 @@ function Overview(props: {
                         type="checkbox"
                         aria-label={`选择 ${item.repository_id} #${item.number}`}
                         checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
-                        disabled={!item.latest_event || props.triggeringKeys.length > 0}
-                        title={item.latest_event ? "加入批量手动触发" : "尚无可触发的最新平台事件"}
+                        disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
+                        title={manualTriggerEvent(item) ? "加入批量手动触发" : "尚无可重放的事件"}
                         onClick={(event) => event.stopPropagation()}
                         onChange={() => props.onToggleSelection(item.snapshot_key)}
                       />
@@ -2188,29 +2189,25 @@ function Overview(props: {
                     )}
                   </td>
                   <td>
-                    {item.latest_event ? (
+                    {item.latest_event && !item.latest_event_error ? (
                       <span
                         className="latest-event-reference"
-                        title="按 Provider Timeline 原始顺序选取；显示时间仅为平台提供时间"
+                        title="平台提供的最新可识别活动；GitLab 按结构化事件时间归并"
                       >
                         <strong>{item.latest_event.event_type}</strong>
                         <small>{dateTimeText(item.latest_event.occurred_at)}</small>
                       </span>
                     ) : (
-                      <span className="latest-event-empty">
-                        {item.latest_event_supported === false
-                          ? "当前 Provider 不支持"
-                          : item.latest_event_checked
-                            ? "暂无可识别平台事件"
-                            : "等待扫描获取"}
+                      <span className="latest-event-empty" title={item.latest_event_error ?? undefined}>
+                        {platformActivityStatus(item)}
                       </span>
                     )}
                   </td>
                   <td>
                     <button
                       className="button secondary compact"
-                      disabled={!item.latest_event || props.triggeringKeys.includes(item.snapshot_key)}
-                      title={item.latest_event ? `手动发送最新平台事件 ${item.latest_event.event_type}` : "尚无可触发的最新平台事件"}
+                      disabled={!manualTriggerEvent(item) || props.triggeringKeys.includes(item.snapshot_key)}
+                      title={manualTriggerEvent(item) ? `重放${activitySourceLabel(manualTriggerEvent(item)!.source)}：${manualTriggerEvent(item)!.event_type}` : "尚无可重放的事件"}
                       onClick={(event) => {
                         event.stopPropagation();
                         props.onTriggerLatestEvent(item);
@@ -8768,11 +8765,8 @@ function ChangeRequestDetailDrawer(props: {
 
   if (!changeRequest) return null;
   const current = detail ?? changeRequest;
-  const latestEventUnavailableReason = current.latest_event_supported === false
-    ? "当前 Provider 不支持最新平台事件"
-    : current.latest_event_checked
-      ? "当前没有可识别的最新平台事件"
-      : "等待扫描获取最新平台事件";
+  const latestEventUnavailableReason = platformActivityStatus(current);
+  const manualEvent = manualTriggerEvent(current);
   return (
     <div className="run-drawer-layer" style={drawerLayerStyle(depth)} aria-hidden={!active}>
       <button type="button" className="run-drawer-backdrop" aria-label="关闭 MR/PR 详情" disabled={!active} onClick={onClose} />
@@ -8800,10 +8794,10 @@ function ChangeRequestDetailDrawer(props: {
             <button
               type="button"
               className="button secondary compact"
-              disabled={!current.latest_event || triggering}
-              title={current.latest_event
-                ? `手动触发最新平台事件 ${current.latest_event.event_type}`
-                : latestEventUnavailableReason}
+              disabled={!manualEvent || triggering}
+              title={manualEvent
+                ? `重放${activitySourceLabel(manualEvent.source)}：${manualEvent.event_type}`
+                : "尚无可重放的事件"}
               onClick={() => onTriggerLatestEvent(current)}
             >
               {triggering ? "触发中…" : "手动触发"}
@@ -8825,8 +8819,10 @@ function ChangeRequestDetailDrawer(props: {
                   <div><dt>远端更新</dt><dd>{dateTimeText(detail.updated_at)}</dd></div>
                   <div><dt>最近扫描</dt><dd>{timeText(detail.scanned_at)}</dd></div>
                   <div><dt>平台地址</dt><dd><a href={detail.web_url} target="_blank" rel="noreferrer">打开 MR / PR</a></dd></div>
-                  <div><dt>最新平台事件</dt><dd className="mono">{detail.latest_event?.event_type ?? latestEventUnavailableReason}</dd></div>
-                  <div><dt>平台提供时间</dt><dd>{detail.latest_event ? dateTimeText(detail.latest_event.occurred_at) : "—"}</dd></div>
+                  <div><dt>最新平台事件</dt><dd className="mono">{detail.latest_event_error ? latestEventUnavailableReason : detail.latest_event?.event_type ?? latestEventUnavailableReason}</dd></div>
+                  {detail.latest_event_error && <div><dt>读取错误</dt><dd>{detail.latest_event_error}</dd></div>}
+                  {manualEvent && <div><dt>手动触发候选</dt><dd>{activitySourceLabel(manualEvent.source)} · {manualEvent.event_type}</dd></div>}
+                  <div><dt>平台提供时间</dt><dd>{detail.latest_event && !detail.latest_event_error ? dateTimeText(detail.latest_event.occurred_at) : "—"}</dd></div>
                 </dl>
               </section>
               <section className="event-detail-section">
@@ -10199,7 +10195,7 @@ export default function App() {
   useEffect(() => {
     const availableKeys = new Set(
       changeRequests
-        .filter((item) => item.latest_event)
+        .filter((item) => manualTriggerEvent(item))
         .map((item) => item.snapshot_key),
     );
     setSelectedSnapshotKeys((current) => {
@@ -10387,7 +10383,7 @@ export default function App() {
   }
 
   function requestTriggerLatestEvent(item: ChangeRequestRecord) {
-    const latestEvent = item.latest_event;
+    const latestEvent = manualTriggerEvent(item);
     if (!latestEvent) return;
     const hasCandidateRule = Boolean(document?.rules.some((rule) => (
       rule.enabled !== false
@@ -10397,13 +10393,16 @@ export default function App() {
     setOverviewConfirmation({
       kind: "latest",
       changeRequests: [item],
-      eyebrow: "平台事件",
+      eyebrow: activitySourceLabel(latestEvent.source),
       title: "确认手动触发",
-      description: "将缓存的最新平台事件重新发送到当前规则引擎。",
+      description: latestEvent.source === "platform"
+        ? "将缓存的平台活动按当前快照重新发送到规则引擎。"
+        : "重放当前版本已记录的系统检测事件，保留其原始上下文，不伪造新的平台动作。",
       details: [
         { label: "目标", value: `${item.repository_id} · #${item.number} ${item.title}` },
-        { label: "平台事件", value: latestEvent.event_type, mono: true },
-        { label: "平台提供时间", value: dateTimeText(latestEvent.occurred_at) },
+        { label: "事件来源", value: activitySourceLabel(latestEvent.source) },
+        { label: "事件类型", value: latestEvent.event_type, mono: true },
+        { label: "原事件时间", value: dateTimeText(latestEvent.occurred_at) },
       ],
       impactTitle: hasCandidateRule ? "可能触发 Agent" : "当前没有候选规则",
       impact: hasCandidateRule
@@ -10416,15 +10415,19 @@ export default function App() {
   }
 
   function requestTriggerLatestEvents(items: ChangeRequestRecord[]) {
-    const targets = items.filter((item) => item.latest_event);
+    const targets = items.filter((item) => manualTriggerEvent(item));
     if (targets.length === 0) return;
 
     const repositoryCounts = new Map<string, number>();
     const eventCounts = new Map<string, number>();
+    const sourceCounts = new Map<string, number>();
     let candidateTargetCount = 0;
     for (const item of targets) {
-      const eventType = item.latest_event?.event_type;
+      const candidate = manualTriggerEvent(item);
+      const eventType = candidate?.event_type;
       if (!eventType) continue;
+      const sourceLabel = activitySourceLabel(candidate!.source);
+      sourceCounts.set(sourceLabel, (sourceCounts.get(sourceLabel) ?? 0) + 1);
       repositoryCounts.set(item.repository_id, (repositoryCounts.get(item.repository_id) ?? 0) + 1);
       eventCounts.set(eventType, (eventCounts.get(eventType) ?? 0) + 1);
       if (document?.rules.some((rule) => (
@@ -10441,13 +10444,14 @@ export default function App() {
     setOverviewConfirmation({
       kind: "latest-batch",
       changeRequests: targets,
-      eyebrow: "批量平台事件",
+      eyebrow: "批量重放事件",
       title: `确认触发 ${targets.length} 个 MR / PR`,
-      description: "每个目标将使用自己的缓存最新平台事件，分别发送到当前规则引擎。",
+      description: "每个目标重放自己的平台活动或当前版本的系统检测事件，分别发送到当前规则引擎。",
       details: [
         { label: "目标数量", value: `${targets.length} 个` },
         { label: "仓库分布", value: summarize(repositoryCounts) },
         { label: "事件分布", value: summarize(eventCounts), mono: true },
+        { label: "来源分布", value: summarize(sourceCounts) },
       ],
       impactTitle: candidateTargetCount > 0
         ? `${candidateTargetCount} 个目标可能触发 Agent`

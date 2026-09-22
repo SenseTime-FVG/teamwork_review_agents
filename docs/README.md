@@ -18,6 +18,7 @@
 
 | 文档 | 用途 | 关联代码/模块 | 更新触发条件 |
 | --- | --- | --- | --- |
+| [`design-gitlab-activities.md`](design-gitlab-activities.md) | GitLab 结构化活动、游标与手动重放来源 | Provider、事件、SQLite、Web 与概览 | 活动读取、降级、去重和手动触发行为变化；实施见 [`implementation-plan-gitlab-activities.md`](implementation-plan-gitlab-activities.md) |
 | [`design.md`](design.md) | 当前系统实现语义的权威设计记录 | `src/teamwork_review_agents/`、`ui/src/` | 已实现的配置、事件、运行时、API 或 UI 语义变化 |
 | [`design-quick-setup.md`](design-quick-setup.md) | 一键配置、规则范围和仓库级 Skill 隔离 | `quick_setup.py`、`QuickSetupWizard.tsx` | 向导步骤、规则适用性、凭据或保存语义变化 |
 | [`design-git-provider-credential-context.md`](design-git-provider-credential-context.md) | 原生 Git 临时凭据程序与错误脱敏 | `git_auth.py`、`workspace.py`、`sandbox_git.py` | Git 凭据传递、跨平台入口或故障展示变化 |

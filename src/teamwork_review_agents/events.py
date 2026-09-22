@@ -26,6 +26,7 @@ FIELD_EVENTS = {
 TARGET_COMMITS_CHANGED_EVENT = "change_request.target_commits_changed"
 
 ACTIVITY_EVENT_TYPES = {
+    "opened": "change_request.opened",
     "closed": "change_request.closed",
     "reopened": "change_request.reopened",
     "merged": "change_request.merged",
@@ -38,6 +39,7 @@ ACTIVITY_EVENT_TYPES = {
 }
 
 ACTIVITY_CHANGED_FIELDS = {
+    "opened": ("state",),
     "closed": ("state",),
     "reopened": ("state",),
     "merged": ("state",),
@@ -266,6 +268,9 @@ def _apply_activity(
         event_type = "change_request.labels_changed"
         changed_fields = ("labels",)
     else:
+        return None
+
+    if activity.data.get("skip_if_unchanged") and old_value == new_value:
         return None
 
     after = before.model_copy(update=updates)

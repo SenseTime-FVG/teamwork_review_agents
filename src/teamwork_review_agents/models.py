@@ -64,6 +64,8 @@ class ChangeRequestActivityBatch(BaseModel):
     latest_activity: ChangeRequestActivity | None = None
     cursor: dict[str, Any] = Field(default_factory=dict)
     baseline: bool = False
+    observed_head_sha: str | None = None
+    observed_state: str | None = None
 
 
 class ChangeEvent(BaseModel):

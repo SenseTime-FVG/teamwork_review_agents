@@ -489,6 +489,13 @@ export type ChangeRequestRecord = {
   discovered_event_emitted: boolean;
   latest_event_checked?: boolean;
   latest_event_supported?: boolean;
+  latest_event_error?: string | null;
+  manual_event?: {
+    event_type: string;
+    source: "platform" | "system";
+    source_event_id?: string;
+    occurred_at?: string | null;
+  } | null;
   latest_event?: {
     event_type: string;
     provider_event_type: string;

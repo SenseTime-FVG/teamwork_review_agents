@@ -27,7 +27,7 @@ from .models import (
     stable_hash,
 )
 from .preflight import PreflightExecutor
-from .providers import BaseProvider, create_provider
+from .providers import BaseProvider, ProviderError, create_provider
 from .rules import rule_matches
 from .state import (
     CANCEL_SOURCE_ADMINISTRATOR,
@@ -309,11 +309,16 @@ class Orchestrator:
             )
             if not snapshots:
                 return
+            activity_failed = False
             for snapshot in snapshots:
+                previous_cursor = await asyncio.to_thread(
+                    self.store.load_activity_cursor, snapshot.provider,
+                    snapshot.repository_id, snapshot.number,
+                )
                 activity_batch = await provider.list_change_request_activities(
                     repository,
                     snapshot.number,
-                    cursor=None,
+                    cursor=previous_cursor if (previous_cursor or {}).get("activity_error") else None,
                 )
                 if activity_batch is None:
                     return
@@ -324,7 +329,9 @@ class Orchestrator:
                     snapshot.number,
                     self._activity_cursor(activity_batch),
                 )
-            if len(snapshots) < self.config.scanner.max_items_per_repository:
+                activity_failed = activity_failed or bool(activity_batch.cursor.get("activity_error"))
+            # 失败项下轮再试，不能在同一扫描中无限重取；同批其他 MR 仍继续处理。
+            if activity_failed or len(snapshots) < self.config.scanner.max_items_per_repository:
                 return
 
     @staticmethod
@@ -425,6 +432,12 @@ class Orchestrator:
                     snapshot.number,
                     cursor=activity_cursor,
                 )
+            if activity_batch is not None and (
+                (activity_batch.observed_head_sha is not None and activity_batch.observed_head_sha != snapshot.head_sha)
+                or (activity_batch.observed_state is not None and activity_batch.observed_state != snapshot.state)
+            ):
+                # 快照与活动并非同一版本时保留原事务，下一轮读取一致视图后再生成事件。
+                raise ProviderError(f"MR !{snapshot.number} 在读取活动期间发生变化，等待下次扫描重试")
             if old is None:
                 events = detect_first_seen_events(
                     snapshot,
