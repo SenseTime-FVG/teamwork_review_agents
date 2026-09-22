@@ -21,6 +21,8 @@ from .base import BaseProvider, ProviderError, parse_datetime
 class GitHubProvider(BaseProvider):
     """将 GitHub Pull Request 规范化为统一快照。"""
 
+    supports_activities = True
+
     TIMELINE_EVENT_TYPES = {
         "closed",
         "reopened",

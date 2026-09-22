@@ -776,6 +776,7 @@ class StateStore:
                           ),
                           0
                       ) != 1
+                      OR json_extract(activity.cursor, '$.activity_error') IS NOT NULL
                   )
                 ORDER BY snapshot.updated_at ASC
                 LIMIT ?
@@ -1002,6 +1003,32 @@ class StateStore:
             ).fetchone()
         return row is not None
 
+    def load_latest_detected_event(self, snapshot: ChangeRequestSnapshot) -> ChangeEvent | None:
+        """只选当前源版本的真实扫描事件，不把手动重放再次当成检测结果。"""
+
+        generation = self.source_generation(snapshot.repository_id, snapshot.number)
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM event_inbox
+                WHERE repository_id = ? AND number = ?
+                  AND json_extract(payload, '$.provider') = ?
+                  AND COALESCE(json_extract(payload, '$.origin'), 'scanner') = 'scanner'
+                  AND COALESCE(json_extract(payload, '$.source_generation'), 1) = ?
+                  AND COALESCE(json_extract(payload, '$.current.head_sha'), json_extract(payload, '$.new.head_sha')) = ?
+                  AND COALESCE(json_extract(payload, '$.current.state'), json_extract(payload, '$.new.state')) = ?
+                  AND COALESCE(json_extract(payload, '$.current.target_head_sha'), json_extract(payload, '$.new.target_head_sha'), '') = ?
+                ORDER BY julianday(json_extract(payload, '$.occurred_at')) DESC,
+                         created_at DESC,
+                         CASE WHEN event_type = 'change_request.updated' THEN 1 ELSE 0 END,
+                         rowid DESC
+                LIMIT 1
+                """,
+                (snapshot.repository_id, snapshot.number, snapshot.provider,
+                 generation or 1, snapshot.head_sha, snapshot.state, snapshot.target_head_sha),
+            ).fetchone()
+        return ChangeEvent.model_validate_json(row["payload"]) if row is not None else None
+
     def list_snapshots(
         self,
         limit: int | None = 100,
@@ -1127,6 +1154,20 @@ class StateStore:
                     ),
                 }
             )
+            activity_error = (activity_cursor or {}).get("activity_error")
+            summary["latest_event_error"] = activity_error
+            # 平台事件列不混入系统事件；手动候选单独声明来源。
+            latest_event = summary["latest_event"]
+            manual_event = {**latest_event, "source": "platform"} if latest_event and not activity_error else None
+            if manual_event is None:
+                detected = self.load_latest_detected_event(snapshot)
+                if detected is not None:
+                    manual_event = {
+                        "event_type": detected.type, "source": "system",
+                        "source_event_id": detected.id,
+                        "occurred_at": detected.occurred_at.isoformat(),
+                    }
+            summary["manual_event"] = manual_event
             results.append(summary)
         return results
 

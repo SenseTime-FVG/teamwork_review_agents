@@ -20,6 +20,8 @@ class ProviderError(RuntimeError):
 class BaseProvider(ABC):
     """统一 Provider 异步接口。"""
 
+    supports_activities = False
+
     def __init__(
         self,
         name: str,
@@ -271,12 +273,16 @@ def create_provider(
 ) -> BaseProvider:
     """根据配置创建平台适配器。"""
 
-    if config.kind == "github":
-        from .github import GitHubProvider
+    return provider_class(config.kind)(name, config, scanner, token=token)
 
-        return GitHubProvider(name, config, scanner, token=token)
-    if config.kind == "gitlab":
-        from .gitlab import GitLabProvider
 
-        return GitLabProvider(name, config, scanner, token=token)
-    raise ProviderError(f"不支持的 Provider 类型：{config.kind}")
+def provider_class(kind: str) -> type[BaseProvider]:
+    """无须读取凭据或建立客户端即可查询适配器能力。"""
+
+    from .github import GitHubProvider
+    from .gitlab import GitLabProvider
+
+    adapters = {"github": GitHubProvider, "gitlab": GitLabProvider}
+    if kind not in adapters:
+        raise ProviderError(f"不支持的 Provider 类型：{kind}")
+    return adapters[kind]

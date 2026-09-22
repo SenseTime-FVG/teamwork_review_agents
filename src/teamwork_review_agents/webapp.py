@@ -36,6 +36,7 @@ from .environment import PromptRenderError, render_prompt
 from .events import (
     FIELD_EVENTS,
     TARGET_COMMITS_CHANGED_EVENT,
+    activity_event_type,
     create_manual_activity_event,
     create_manual_replay_event,
     detect_events,
@@ -48,6 +49,7 @@ from .model_provider_client import (
 )
 from .model_provider_credentials import ModelProviderCredentialStore
 from .preflight_manager import ManualPreflightManager
+from .providers.base import provider_class
 from .repository_initialization import RepositoryInitializationManager
 from .runtime import BackgroundRuntime
 from .skill_files import (
@@ -2031,7 +2033,7 @@ def create_app(
         for record in records:
             provider = provider_map.get(str(record.get("provider") or ""))
             record["latest_event_supported"] = bool(
-                provider is not None and provider.kind == "github"
+                provider is not None and provider_class(provider.kind).supports_activities
             )
         if page is None:
             return records
@@ -2059,7 +2061,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="MR/PR 快照不存在")
         provider = manager.config.providers.get(str(detail.get("provider") or ""))
         detail["latest_event_supported"] = bool(
-            provider is not None and provider.kind == "github"
+            provider is not None and provider_class(provider.kind).supports_activities
         )
         return detail
 
@@ -2105,27 +2107,32 @@ def create_app(
         repository = manager.config.repository_map().get(repository_id)
         if repository is None or not repository.enabled:
             raise HTTPException(status_code=409, detail="仓库未启用，不能手动触发事件")
-        activity = await asyncio.to_thread(
-            manager.store.load_latest_activity,
+        if snapshot.provider != repository.provider:
+            raise HTTPException(status_code=409, detail="仓库平台连接已变更，请重新扫描后触发")
+        cursor = await asyncio.to_thread(
+            manager.store.load_activity_cursor,
             snapshot.provider,
             repository_id,
             number,
         )
-        if activity is None:
-            raise HTTPException(
-                status_code=409,
-                detail="尚未取得可触发的最新 Provider 事件，请先完成一次扫描",
-            )
-        event = create_manual_activity_event(snapshot, activity)
-        return event, activity
+        activity = manager.store._latest_activity_from_cursor(cursor)
+        if activity is not None and activity_event_type(activity.type) and not (cursor or {}).get("activity_error"):
+            return create_manual_activity_event(snapshot, activity), "platform"
+        source = await asyncio.to_thread(manager.store.load_latest_detected_event, snapshot)
+        if source is not None:
+            return create_manual_replay_event(source), "system"
+        raise HTTPException(
+            status_code=409,
+            detail="暂无可触发的平台事件或当前版本的系统检测事件，请先完成一次扫描",
+        )
 
     @app.post(
         "/api/change-requests/{repository_id}/{number}/trigger-latest-event"
     )
     async def trigger_latest_event(repository_id: str, number: int):
-        """把已缓存的最新 Provider 活动作为新的手动事件送入规则引擎。"""
+        """把平台活动或当前版本的系统检测事件重放到规则引擎。"""
 
-        event, activity = await create_latest_manual_event(repository_id, number)
+        event, source = await create_latest_manual_event(repository_id, number)
         inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
         if not inserted:
             raise HTTPException(status_code=409, detail="手动事件未能写入，请重新操作")
@@ -2134,10 +2141,12 @@ def create_app(
             "created": True,
             "event_id": event.id,
             "event_type": event.type,
-            "source_activity_id": activity.id,
+            "source": source,
+            "source_event_id": event.source_event_id,
+            "source_activity_id": event.source_activity_id,
             "source_occurred_at": (
-                activity.occurred_at.isoformat()
-                if activity.occurred_at is not None
+                (event.source_event_occurred_at or event.source_occurred_at).isoformat()
+                if event.source_event_occurred_at or event.source_occurred_at
                 else None
             ),
             "reason": f"已手动发送 {event.type}",
@@ -2165,7 +2174,7 @@ def create_app(
                 continue
             seen.add(key)
             try:
-                event, activity = await create_latest_manual_event(*key)
+                event, source = await create_latest_manual_event(*key)
                 inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
                 if not inserted:
                     raise HTTPException(
@@ -2193,10 +2202,12 @@ def create_app(
                     "status_code": 200,
                     "event_id": event.id,
                     "event_type": event.type,
-                    "source_activity_id": activity.id,
+                    "source": source,
+                    "source_event_id": event.source_event_id,
+                    "source_activity_id": event.source_activity_id,
                     "source_occurred_at": (
-                        activity.occurred_at.isoformat()
-                        if activity.occurred_at is not None
+                        (event.source_event_occurred_at or event.source_occurred_at).isoformat()
+                        if event.source_event_occurred_at or event.source_occurred_at
                         else None
                     ),
                     "reason": f"已手动发送 {event.type}",
