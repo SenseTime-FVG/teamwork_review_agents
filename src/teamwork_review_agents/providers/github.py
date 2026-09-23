@@ -53,6 +53,8 @@ class GitHubProvider(BaseProvider):
         state: Literal["pending", "success", "failure", "error"],
         context: str,
         description: str,
+        ref: str | None = None,
+        source_project: str | None = None,
     ) -> None:
         """为 PR Head 写入可用于 GitHub Ruleset 的 Commit Status。"""
 

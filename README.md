@@ -86,7 +86,7 @@ Token 默认存为仓库级环境变量，Secret 开启、进程开启、Prompt 
 > 第一次使用建议直接按[首次配置图文指南](docs/first-time-setup.md)操作；下面只保留最短配置路径。
 
 1. 添加 GitHub / GitLab 连接，填写 API 地址和 Token 变量名。
-2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。仓库可配置“不额外限制”“仅允许所选”或“禁止所有 Skill”三态策略，默认不额外限制。GitHub 仓库还可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
+2. 添加目标仓库，填写远端地址和本地基础仓库目录并启用；目录不存在时会自动克隆。仓库可配置“不额外限制”“仅允许所选”或“禁止所有 Skill”三态策略，默认不额外限制。GitHub、GitLab 仓库均可按需启用“本地 CI 门禁”，配置要顺序执行的程序、参数和超时。
 3. 在“全局配置与环境”中引用宿主机的 `GITHUB_TOKEN` 或 `GITLAB_TOKEN`，并确认全局默认模型。
 4. 在“Provider”页检查不可删除的内置 Codex CLI；新增 API Provider 时填写 Base URL 和 API Key，点击“检测模型”后选择默认模型，也可以跳过检测手工维护模型目录。
 5. 如需项目专属能力，在“SKILL”页直接新建 `SKILL.md`、导入完整 Skill 文件夹或配置服务端已有目录，再为对应 Agent 选择允许装载的 Skill；仓库策略会在运行时进一步收窄该列表。`description` 会供 Codex 发现和匹配，Markdown 正文会在 Skill 被使用时作为完整指令读取。
@@ -109,7 +109,7 @@ Provider Token 按“仓库环境变量 → 全局环境变量 → 服务进程�
 
 GitLab 仓库会自动从 Provider 的 API 地址补齐进程变量 `GITLAB_HOST`（主机及端口），避免临时 HOME 中的 `glab api` 因缺少主机配置而访问 `gitlab.com`。已有显式环境配置优先，不修改 Token 暴露开关或本机登录态；说明与验收见 [平台 CLI 认证](docs/platform-cli-auth.md#gitlabglab)。
 
-本地 CI 当前仅支持 GitHub。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub 本地 CI 门禁](#github-本地-ci-门禁)。
+本地 CI 支持 GitHub 与 GitLab。仓库未启用或未配置 CI 时，即使规则选择执行 CI，也会跳过门禁并直接启动 Agent，不会报错；完整配置和执行语义见[GitHub / GitLab 本地 CI 门禁](#github--gitlab-本地-ci-门禁)。
 
 ### 仓库名称、ID 与目录
 
@@ -481,15 +481,15 @@ try {
 }
 ```
 
-## GitHub 本地 CI 门禁
+## GitHub / GitLab 本地 CI 门禁
 
-通用引擎负责轮询 PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和 GitHub Ruleset。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。GitHub Ruleset 只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
+通用引擎负责轮询 MR / PR、隔离检出、顺序执行、结果持久化、Commit Status 回写和 Agent 编排；接入仓库负责 CI 脚本、具体审核规则和平台合并门禁。仓库启用 CI 只是声明具备该能力，只有同时设置 `run_preflight: true` 的触发规则才会等待 Preflight 成功后启动 Review Agent。平台合并门禁只负责阻止不合格合并，不负责触发 CI；真正的触发器是持续运行的 `teamwork-review-agents` 服务。
 
 事件列表中 `processing` 统一显示为“处理中”，不只表示规则匹配，也可能正在准备工作区、执行本地 CI 或回写结果。同批次真正等待 CI 的事件在 CI 创建或复用时立即建立关联，具体阶段、步骤和输出可在事件详情中查看；未匹配规则或仅直接运行 Agent 的事件不会被额外挂到 CI。CI 失败、超时等终态仍单独显示，门禁未通过不会启动受该 CI 约束的 Agent。
 
 开启 `publish_failure_comment` 后，Preflight 以 `status_context` 作为独立槽位，并且同一 PR 只保留一条活动失败评论：每次真实 CI 再次失败或超时时先删除旧评论，再在时间线底部创建本轮评论；相同 CI 结果被多个事件复用时不反复刷新，映射缺失时才补建；当前最新源版本成功后会删除该槽位全部历史失败评论。Agent 托管评论仍按源版本代次保留审核历史，不受该策略影响。
 
-![GitHub 本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
+![本地 CI 的配置、触发与状态回写流程](docs/assets/local-ci-review-agent-flow.png)
 
 配置分为以下三部分：
 
@@ -497,7 +497,7 @@ try {
 | --- | --- | --- |
 | 接入仓库 | CI 脚本，例如 `ci/preflight.sh` | 安装依赖、编译、测试和构建；脚本随 PR Head 一起检出并执行 |
 | Teamwork 配置 | `repositories[].preflight`、Review Agent 和触发规则 | 指定扫描仓库、CI 命令、超时、状态名称以及成功后启动的 Agent |
-| GitHub 仓库设置 | Ruleset 中的 Required Status Check | 将与 `status_context` 同名的检查设为合并门禁 |
+| 平台仓库设置 | GitHub Ruleset 或 GitLab 合并请求的流水线门禁 | 将本地 CI 结果纳入平台合并条件 |
 
 下面是完整的最小配置。Prompt 可以继续放在本仓库，通过 `TEAMWORK_REVIEW_AGENTS_ROOT` 引用，不需要复制到接入仓库；启动服务前必须把该环境变量设置为本仓库的绝对路径：
 
@@ -516,7 +516,7 @@ repositories:
       enabled: true
       # 按仓库共享多语言依赖下载缓存，不按分支重复下载。
       cache_enabled: true
-      # 可选：失败时维护一条 PR 评论，后续通过后自动删除；默认关闭。
+      # 可选：失败时维护一条 MR / PR 评论，后续通过后自动删除；默认关闭。
       publish_failure_comment: false
       status_context: teamwork/local-ci
       timeout_seconds: 1800
@@ -573,7 +573,7 @@ uv run pytest tests/ -q --tb=short
 uv build
 ```
 
-完成配置后，在 GitHub Ruleset 中添加 Required Status Check `teamwork/local-ci`，其名称必须与 `status_context` 完全一致。然后校验配置并启动服务：
+GitHub 可在 Ruleset 中添加与 `status_context` 同名的 Required Status Check。GitLab 会把该状态显示为 MR 源提交对应流水线中的[同名外部作业](https://docs.gitlab.com/ci/ci_cd_for_external_repos/external_commit_statuses/)；若要用它阻止合并，请按项目需求启用[“Pipelines must succeed”](https://docs.gitlab.com/user/project/merge_requests/auto_merge/#require-a-successful-pipeline-for-merge)，并避免同一提交出现互相竞争的多种流水线。然后校验配置并启动服务：
 
 ```bash
 # 指向包含 prompts/general-review.md 的 Teamwork Review Agents 仓库。
@@ -586,7 +586,7 @@ teamwork-review-agents start -c /path/to/review.config.yaml
 teamwork-review-agents scan-once -c /path/to/review.config.yaml
 ```
 
-Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改基础仓库或 Agent 运行工作区。启用的仓库会在首次发现 PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且 PR 当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或 PR 已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，GitHub 回写失败只补发状态，不会重新执行命令。
+Preflight 在临时 detached worktree 中校验准确的 MR / PR Head SHA，不修改基础仓库或 Agent 运行工作区。启用的仓库会在首次发现 MR / PR 时自动产生 `change_request.discovered` 事件，不受全局开关影响。同一仓库、MR / PR、Head SHA 和配置版本只运行一次。规则要求 CI、仓库启用 CI 且变更请求当前打开时，代码失败或超时只阻断该类规则；未选择 CI 的规则不等待门禁。仓库没有配置 CI，或变更请求已关闭、合并时，规则会跳过 CI 并直接启动 Agent。Git、进程启动或首次状态发布等基础设施错误沿用要求 CI 的事件重试；本地命令已有终态后，平台回写失败只补发状态，不会重新执行命令。
 
 默认启用的 `cache_enabled` 会为每个仓库建立稳定缓存根目录，并把 uv、pip、Poetry、PDM、npm/pnpm/Yarn、Bun、Cargo、Go、Maven、Gradle、NuGet、Composer、Playwright、Puppeteer 和 Deno 等常见缓存定向到该目录。同一仓库跨分支、跨 PR 共享下载缓存，但临时 worktree、HOME 和安装产物仍按运行隔离。仓库详情中的“执行 CI / 预热缓存”会针对远端默认分支最新提交启动不限时、可取消的手动 CI；它不创建 MR / PR 事件、不触发 Agent，也不回写 Commit Status。运行概览、事件详情和运行与日志页使用同一个 CI 详情抽屉持续显示 Git 阶段、当前步骤与命令输出。
 
@@ -594,7 +594,7 @@ Preflight 在临时 detached worktree 中校验准确的 PR Head SHA，不修改
 
 每个 CI 步骤本质上是一条“执行程序 + 参数数组”，不是隐式拼接的一整段 Bash。简单检查可直接配置为 `python -m pytest`、`npm test` 等参数数组；复杂流程建议由目标仓库维护 `ci/preflight.sh`，再配置 `bash ci/preflight.sh`。仓库页提供相同的结构化步骤编辑器。
 
-Provider Token 需要读取 PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 PR Issue Comment 的权限。CI 子进程只隐式继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token 默认加入 CI 环境，管理员关闭对应变量的“进入进程”后才移除。CI 中的原生 Git 也会使用本轮临时 askpass 凭证。Codex/OpenAI 模型凭据始终不会通过该开关进入 CI。部署方应在 GitHub Ruleset 中把 `status_context` 配为 required status check。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
+Provider Token 需要读取 MR / PR 和写 Commit Status 的权限；开启失败评论时，还需要创建、更新和删除 GitHub PR Issue Comment 或 GitLab MR Note 的权限。CI 子进程只隐式继承工具所需的基础环境，`HOME` 会替换成一次性空目录；Provider Token 默认加入 CI 环境，管理员关闭对应变量的“进入进程”后才移除。CI 中的原生 Git 也会使用本轮临时 askpass 凭证。Codex/OpenAI 模型凭据始终不会通过该开关进入 CI。具体步骤、工具安装和目标仓库脚本由接入仓库维护。
 
 Preflight 的临时 worktree 和环境过滤不是容器或操作系统级安全边界。本方案的威胁模型是可信内部成员提交的 PR，建议使用专门的 WSL 用户运行服务，不在该账号下保存无关凭据。若未来需要检查 fork 或其他不可信代码，应先把执行器迁移到独立容器或虚拟机，并限制文件系统、进程和网络访问。
 
@@ -630,7 +630,7 @@ sub-agent，并终止对应 Codex 进程树。两类取消的业务语义不同�
 | [`config_example.yaml`](config_example.yaml) | 完整配置字段和默认值 |
 | [`docs/first-time-setup.md`](docs/first-time-setup.md) | 首次启动后的管理界面图文配置流程 |
 | [`docs/platform-cli-auth.md`](docs/platform-cli-auth.md) | 配置并验证本机 `gh` / `glab` 登录 |
-| [`docs/preflight-ci.md`](docs/preflight-ci.md) | GitHub Preflight 的执行、幂等与安全边界 |
+| [`docs/preflight-ci.md`](docs/preflight-ci.md) | GitHub / GitLab Preflight 的执行、幂等与安全边界 |
 | [`docs/operations.md`](docs/operations.md) | 部署、权限、启停和排障 |
 | [`docs/architecture.md`](docs/architecture.md) | 架构、Agent 边界和数据流 |
 | [`docs/design.md`](docs/design.md) | 精确实现语义 |

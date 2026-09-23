@@ -348,35 +348,36 @@ def test_enabled_repository_preflight_requires_executable_steps(
         )
 
 
-def test_enabled_repository_preflight_rejects_unsupported_provider(tmp_path) -> None:
-    """第一版门禁必须在配置阶段拒绝尚不能回写状态的 Provider。"""
+def test_enabled_repository_preflight_accepts_gitlab_provider(tmp_path) -> None:
+    """GitLab 仓库配置本地 CI 后应通过配置校验并保留命令步骤。"""
 
-    with pytest.raises(ValueError, match="GitHub"):
-        parse_config_data(
-            {
-                "database": {"path": "./state.db"},
-                "providers": {
-                    "gitlab-main": {
-                        "kind": "gitlab",
-                        "base_url": "https://gitlab.example.com/api/v4",
-                        "token_env": "GITLAB_TOKEN",
-                    }
-                },
-                "repositories": [
-                    {
-                        "id": "demo",
-                        "provider": "gitlab-main",
-                        "project": "owner/demo",
-                        "workspace": "./workspace",
-                        "preflight": {
-                            "enabled": True,
-                            "steps": [{"name": "test", "command": ["pytest"]}],
-                        },
-                    }
-                ],
+    config = parse_config_data(
+        {
+            "database": {"path": "./state.db"},
+            "providers": {
+                "gitlab-main": {
+                    "kind": "gitlab",
+                    "base_url": "https://gitlab.example.com/api/v4",
+                    "token_env": "GITLAB_TOKEN",
+                }
             },
-            tmp_path / "config.yaml",
-        )
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "gitlab-main",
+                    "project": "owner/demo",
+                    "workspace": "./workspace",
+                    "preflight": {
+                        "enabled": True,
+                        "steps": [{"name": "test", "command": ["pytest"]}],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    assert config.repositories[0].preflight.enabled is True
+    assert config.repositories[0].preflight.steps[0].command == ["pytest"]
 
 
 def test_runner_only_accepts_explicit_provider_token_environment(
