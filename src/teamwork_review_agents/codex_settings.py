@@ -24,6 +24,10 @@ from .managed_sandbox import inspect_managed_sandbox
 from .process_control import hidden_process_options
 
 
+# 基座模式已有的保底值，供运行器和只读展示共用，避免两者漂移。
+CODEX_MODEL_BASE_DEFAULT_REASONING_EFFORT = "medium"
+
+
 def toml_value(value: CodexConfigValue) -> str:
     """把受支持的 Python 配置值编码为 Codex 接受的 TOML 值。"""
 
@@ -587,6 +591,12 @@ def inspect_runtime_options(
     user_mcp_servers, user_mcp_error = read_user_mcp_servers(home)
     sandbox_settings = managed_sandbox or ManagedSandboxConfig()
     sandbox_inspection = inspect_managed_sandbox(codex_binary, configured_home)
+    user_settings, user_settings_error = read_user_inherited_settings(home)
+    model_base_reasoning = user_settings["model_reasoning_effort"]
+    if not model_base_reasoning["known"] and not user_settings_error:
+        model_base_reasoning = _inherited_setting(
+            CODEX_MODEL_BASE_DEFAULT_REASONING_EFFORT, "builtin", known=True,
+        )
     if effective_config is not None:
         inherited_settings = _inherited_settings_from_document(
             effective_config,
@@ -601,7 +611,7 @@ def inspect_runtime_options(
             else None
         )
     else:
-        inherited_settings, inherited_settings_error = read_user_inherited_settings(home)
+        inherited_settings, inherited_settings_error = user_settings, user_settings_error
         effective_model = None
     codex_model = effective_model or user_model
     codex_model_source = (
@@ -668,6 +678,7 @@ def inspect_runtime_options(
         "user_mcp_servers": user_mcp_servers,
         "user_mcp_error": user_mcp_error,
         "inherited_settings": inherited_settings,
+        "model_base_reasoning_effort": model_base_reasoning,
         "inherited_settings_error": inherited_settings_error,
         "effective_config_error": effective_config_error,
         "managed_sandbox": {

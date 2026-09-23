@@ -386,6 +386,8 @@ Teamwork 托管的模型循环每轮新请求都会重新从主模型开始尝�
 
 推理 effort 是具体模型能力，不是通用 Provider 参数。OpenAI Responses 和 Chat Completions 的 GPT 系列模型才会显示并发送 effort；Anthropic、Gemini、DeepSeek 等非 GPT 模型会省略该参数。节点配置优先于 Agent 配置，再回退到 Provider 默认值；切换到不支持的模型后，历史 effort 会安全忽略。
 
+全局默认模型和两级回退链的 effort 继承选项会显示具体值，并在下方注明当前解析来源；切换 Provider、模型或修改草稿会即时更新。Codex 基座模式与完整 CLI 模式按各自的默认来源展示，外部 Provider 未声明默认值时显示“上游默认（未知）”。保存时留空仍表示继承，不会将展示值固化；全局页面展示未被 Agent 覆盖时的值，仓库 CLI 配置或运行时兼容降级后的实际值以运行记录为准。
+
 外部 Provider 的 effort 候选包括 `low`、`medium`、`high`、`xhigh`、`max`，不再提供 `minimal`，候选不代表上游一定支持。Teamwork 托管的模型循环遇到明确的 effort 参数拒绝时，会在同一个模型内按 `max → xhigh → high → medium → low → 不传 effort` 逐级尝试；已有 `ultra` 从 `max` 开始降级，历史 `minimal` 或未知值被拒绝后直接省略。成功档位在本次候选的后续回合继续使用，不修改配置、不重建工作区、不重跑已执行工具。消息和运行详情会展示真实脱敏错误、配置/实际请求档位及降级轨迹；不传参数表示采用未知的上游默认值。无参数请求仍失败时，继续按原有错误分类决定是否切换模型。完整 Codex CLI 子进程模式不参与此自动降级。
 
 删除 API Provider 时，如果全局默认模型引用它，全局默认会先回退到 `codex-cli`；所有显式引用它的 Agent 会清除自己的 Provider 与模型并改为继承新的全局默认。停用与删除不同：停用会保留全部引用，新运行直接明确失败，不会悄悄改用其他模型。如果回退后的 Codex CLI 本身处于停用状态，配置迁移仍会完成，但需要重新启用或更换全局默认后才能运行。
