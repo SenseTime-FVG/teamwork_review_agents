@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from teamwork_review_agents.config import EnvironmentVariable, load_config
 from teamwork_review_agents.config_manager import ConfigManager, ConfigRevisionConflict
-from teamwork_review_agents.codex_account import CodexAccountError
+from teamwork_review_agents.codex_account import CodexRuntimeSnapshot
 from teamwork_review_agents.codex_settings import read_user_inherited_settings
 from teamwork_review_agents.environment import (
     MASK,
@@ -1869,7 +1869,7 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     )
 
     async def effective_config(*_args):
-        return {
+        return CodexRuntimeSnapshot(config={
             "model": "gpt-user",
             "model_reasoning_effort": "high",
             "service_tier": "priority",
@@ -1877,10 +1877,10 @@ def test_codex_runtime_options_report_catalog_and_user_model(
             "personality": "friendly",
             "web_search": "live",
             "credential": "不得返回的配置",
-        }
+        }, models_error="model/list 不可用")
 
     monkeypatch.setattr(
-        "teamwork_review_agents.webapp.read_codex_effective_config",
+        "teamwork_review_agents.webapp.read_codex_runtime_snapshot",
         effective_config,
     )
 
@@ -1923,11 +1923,46 @@ def test_codex_runtime_options_report_catalog_and_user_model(
     assert "不得返回的配置" not in str(result)
 
 
-def test_codex_runtime_options_prefer_visible_account_models(
+@pytest.mark.parametrize("models", [[], [{"model": "fresh-model", "displayName": "Fresh", "private": "不得返回"}]])
+def test_codex_runtime_options_live_catalog_does_not_change_config(tmp_path, monkeypatch, models):
+    """HTTP 目录刷新只读，成功空列表不回填旧缓存，不返回配置或模型的私密字段。"""
+
+    config_path = write_config(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    (home / "models_cache.json").write_text(
+        '{"models":[{"slug":"old","visibility":"list"}]}', encoding="utf-8",
+    )
+    from types import SimpleNamespace
+    from teamwork_review_agents import codex_settings
+    monkeypatch.setattr(codex_settings, "inspect_codex_binary", lambda *_: {})
+    monkeypatch.setattr(codex_settings, "inspect_managed_sandbox", lambda *_: SimpleNamespace(as_dict=lambda: {}))
+
+    async def snapshot(binary, selected_home):
+        assert selected_home == home
+        return CodexRuntimeSnapshot(config={"model": "keep-selected", "private": "不得返回"}, models=models)
+
+    monkeypatch.setattr("teamwork_review_agents.webapp.read_codex_runtime_snapshot", snapshot)
+    app = create_app(config_path, start_scheduler=False)
+    before = config_path.read_bytes()
+    with TestClient(app) as client:
+        response = client.get("/api/codex/runtime-options")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    result = response.json()
+    assert result["catalog_source"] == "app_server"
+    assert [item["slug"] for item in result["models"]] == (["fresh-model"] if models else [])
+    assert result["inherited_model"]["value"] == "keep-selected"
+    assert "不得返回" not in response.text
+    assert config_path.read_bytes() == before
+
+
+def test_codex_runtime_options_fall_back_to_visible_account_models(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """账号缓存存在时应优先返回可见模型，并过滤隐藏模型。"""
+    """实时查询失败才回退账号可见模型，并明确标记回退。"""
 
     config_path = write_config(tmp_path)
     codex_home = tmp_path / "codex-home"
@@ -1957,10 +1992,10 @@ def test_codex_runtime_options_prefer_visible_account_models(
     )
 
     async def effective_config(*_args):
-        return {}
+        return CodexRuntimeSnapshot(config={}, models_error="model/list 不可用")
 
     monkeypatch.setattr(
-        "teamwork_review_agents.webapp.read_codex_effective_config",
+        "teamwork_review_agents.webapp.read_codex_runtime_snapshot",
         effective_config,
     )
 
@@ -1969,7 +2004,8 @@ def test_codex_runtime_options_prefer_visible_account_models(
         result = client.get("/api/codex/runtime-options").json()
 
     assert result["catalog_source"] == "account_cache"
-    assert result["catalog_error"] is None
+    assert result["catalog_error"] == "model/list 不可用"
+    assert "可能已过期" in result["catalog_warning"]
     assert result["models"] == [
         {
             "slug": "gpt-5.3-codex-spark",
@@ -1990,7 +2026,7 @@ def test_codex_runtime_options_degrades_when_app_server_diagnostics_fail(
     config_path = write_config(tmp_path)
 
     async def effective_config(*_args):
-        raise CodexAccountError("Codex App Server 单条响应超过安全上限（8 MiB）")
+        return CodexRuntimeSnapshot(config_error="Codex App Server 单条响应超过安全上限（8 MiB）")
 
     def runtime_options(*args):
         return {
@@ -1999,7 +2035,7 @@ def test_codex_runtime_options_degrades_when_app_server_diagnostics_fail(
         }
 
     monkeypatch.setattr(
-        "teamwork_review_agents.webapp.read_codex_effective_config",
+        "teamwork_review_agents.webapp.read_codex_runtime_snapshot",
         effective_config,
     )
     monkeypatch.setattr(
@@ -2044,10 +2080,10 @@ def test_codex_runtime_options_use_known_defaults_and_unknown_markers(
     )
 
     async def effective_config(*_args):
-        return {}
+        return CodexRuntimeSnapshot(config={}, models=[])
 
     monkeypatch.setattr(
-        "teamwork_review_agents.webapp.read_codex_effective_config",
+        "teamwork_review_agents.webapp.read_codex_runtime_snapshot",
         effective_config,
     )
 

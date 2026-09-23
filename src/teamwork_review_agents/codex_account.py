@@ -18,6 +18,7 @@ from .codex_executable import CodexRuntimeError, resolve_codex_executable
 
 APP_SERVER_TIMEOUT_SECONDS = 10.0
 APP_SERVER_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
+MODEL_LIST_TIMEOUT_SECONDS = 20.0
 LOGIN_TIMEOUT_SECONDS = 600.0
 
 
@@ -265,6 +266,79 @@ async def read_codex_effective_config(
     if not isinstance(config, dict):
         raise CodexAccountError("Codex App Server 未返回有效配置")
     return config
+
+
+@dataclass
+class CodexRuntimeSnapshot:
+    """一次只读查询的独立结果，避免模型目录故障掩盖配置诊断。"""
+
+    config: dict[str, Any] | None = None
+    config_error: str | None = None
+    models: list[dict[str, Any]] | None = None
+    models_error: str | None = None
+
+
+async def _read_codex_models(server: CodexAppServer) -> list[dict[str, Any]]:
+    """完整读取可见目录；拒绝异常分页，不能把部分结果伪装为成功。"""
+
+    models: list[dict[str, Any]] = []
+    cursors: set[str] = set()
+    cursor: str | None = None
+    async with asyncio.timeout(MODEL_LIST_TIMEOUT_SECONDS):
+        for _ in range(50):
+            params: dict[str, Any] = {"limit": 100, "includeHidden": False}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await server.request("model/list", params)
+            data = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(data, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("model"), str)
+                or not item["model"].strip()
+                for item in data
+            ):
+                raise CodexAccountError("Codex model/list 返回的模型目录格式无效")
+            models.extend(item for item in data if not item.get("hidden", False))
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return models
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise CodexAccountError("Codex model/list 返回了无效或重复的分页游标")
+            cursors.add(cursor)
+    raise CodexAccountError("Codex model/list 分页数量超过安全上限")
+
+
+async def read_codex_runtime_snapshot(
+    codex_binary: str, home: Path,
+) -> CodexRuntimeSnapshot:
+    """通过当前 CLI/Home 查询目录与配置，不调用模型，也不修改选择。"""
+
+    snapshot = CodexRuntimeSnapshot()
+    server = CodexAppServer(
+        codex_binary, home,
+        working_directory=home if home.is_dir() else Path.home(),
+    )
+    try:
+        await server.start()
+        try:
+            result = await server.request("config/read", {"includeLayers": False})
+            config = result.get("config") if isinstance(result, dict) else None
+            if not isinstance(config, dict):
+                raise CodexAccountError("Codex App Server 未返回有效配置")
+            snapshot.config = config
+        except (CodexAccountError, OSError, TimeoutError):
+            snapshot.config_error = "Codex config/read 查询失败，已回退本地配置"
+        try:
+            snapshot.models = await _read_codex_models(server)
+        except (CodexAccountError, OSError, TimeoutError):
+            snapshot.models_error = "Codex model/list 查询失败或超时，请检查后台 CLI 与登录状态"
+    except (CodexAccountError, OSError, TimeoutError):
+        snapshot.config_error = "Codex App Server 启动失败，已回退本地配置"
+        snapshot.models_error = "Codex App Server 启动失败，无法查询模型目录"
+    finally:
+        # 初始化失败或请求取消时也必须关闭已经启动的子进程。
+        await server.close()
+    return snapshot
 
 
 def _safe_window(value: Any) -> dict[str, Any] | None:

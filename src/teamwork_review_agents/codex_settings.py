@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -417,6 +418,7 @@ def inspect_model_cache(home: Path) -> dict[str, Any]:
     return {
         "path": str(path),
         "client_version": str(version) if version else None,
+        "fetched_at": document.get("fetched_at") if isinstance(document, dict) else None,
         "error": None,
     }
 
@@ -492,6 +494,31 @@ def read_account_models(
     ), None
 
 
+def normalize_app_server_models(raw_models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """适配官方 model/list 字段，只发布 UI 所需能力，去重且过滤隐藏项。"""
+
+    converted = []
+    seen: set[str] = set()
+    for item in raw_models:
+        slug = item.get("model")
+        if not isinstance(slug, str) or not slug or slug in seen or item.get("hidden"):
+            continue
+        seen.add(slug)
+        reasoning = item.get("supportedReasoningEfforts", [])
+        converted.append({
+            "slug": slug,
+            "display_name": item.get("displayName") or slug,
+            "default_reasoning_level": item.get("defaultReasoningEffort"),
+            "supported_reasoning_levels": [
+                level.get("reasoningEffort")
+                for level in reasoning if isinstance(level, dict)
+            ] if isinstance(reasoning, list) else [],
+            "additional_speed_tiers": item.get("additionalSpeedTiers", []),
+            "service_tiers": item.get("serviceTiers", []),
+        })
+    return _normalize_model_catalog(converted)
+
+
 def read_bundled_models(
     codex_binary: str,
     home: Path | None = None,
@@ -528,21 +555,31 @@ def inspect_runtime_options(
     effective_config: dict[str, Any] | None = None,
     effective_config_error: str | None = None,
     managed_sandbox: ManagedSandboxConfig | None = None,
+    live_models: list[dict[str, Any]] | None = None,
+    live_models_error: str | None = None,
 ) -> dict[str, Any]:
     """组合模型目录与可验证的默认模型来源，供管理 UI 展示。"""
 
     home = codex_home(configured_home)
-    models, account_catalog_error = read_account_models(home)
-    if models:
-        catalog_source = "account_cache"
+    catalog_warning = None
+    if live_models is not None:
+        # 成功返回空目录也是有效结果，不能用旧缓存重新填入不可见模型。
+        models = normalize_app_server_models(live_models)
+        catalog_source = "app_server"
         catalog_error = None
     else:
-        models, catalog_error = read_bundled_models(codex_binary, home)
-        catalog_source = "bundled" if catalog_error is None else "unavailable"
-        if catalog_error and account_catalog_error:
-            catalog_error = (
-                f"账号模型缓存：{account_catalog_error}；"
-                f"Codex CLI 内置目录：{catalog_error}"
+        models, _ = read_account_models(home)
+        catalog_error = live_models_error or "尚未通过当前 CLI 查询模型目录"
+        if models:
+            catalog_source = "account_cache"
+            catalog_warning = "当前显示账号缓存，可能已过期；不代表本次查询成功"
+        else:
+            models, bundled_error = read_bundled_models(codex_binary, home)
+            catalog_source = "bundled" if bundled_error is None else "unavailable"
+            catalog_warning = (
+                "当前显示 CLI 内置参考目录，不保证账号可用；仍可手工填写模型"
+                if catalog_source == "bundled"
+                else "模型目录不可用；已有模型配置不变，仍可手工填写模型"
             )
     user_model, user_error, user_config_path = read_user_model(home)
     binary = inspect_codex_binary(codex_binary, home)
@@ -576,7 +613,11 @@ def inspect_runtime_options(
     if actual_version and cache_version and actual_version != cache_version:
         version_warning = (
             f"当前 CLI {actual_version} 与模型缓存客户端 {cache_version} 不一致；"
-            "建议为后台配置独立 CODEX_HOME，或固定所有调用方使用同一 Codex 版本"
+            + (
+                "本次目录使用当前 CLI 的 model/list 返回结果，未直接采用旧缓存"
+                if catalog_source == "app_server"
+                else "回退目录可能过期，请确认后台 CLI/Home 后重新刷新"
+            )
         )
     if expected_version and actual_version != expected_version:
         version_warning = (
@@ -610,6 +651,8 @@ def inspect_runtime_options(
     return {
         "models": models,
         "catalog_source": catalog_source,
+        "catalog_checked_at": datetime.now(timezone.utc).isoformat(),
+        "catalog_warning": catalog_warning,
         "inherited_model": inherited_model,
         "codex_model": codex_model,
         "codex_model_source": codex_model_source,
