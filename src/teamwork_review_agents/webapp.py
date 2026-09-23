@@ -21,7 +21,7 @@ from .codex_account import (
     CodexAccountError,
     CodexLoginManager,
     inspect_codex_account,
-    read_codex_effective_config,
+    read_codex_runtime_snapshot,
 )
 from .codex_connection import (
     CodexConnectionTestError,
@@ -1305,32 +1305,31 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/codex/runtime-options")
-    async def codex_runtime_options() -> dict[str, Any]:
+    async def codex_runtime_options(response: Response) -> dict[str, Any]:
         """返回本机 Codex 模型目录和当前可验证的继承模型来源。"""
 
-        effective_config = None
-        effective_config_error = None
-        try:
-            effective_config = await read_codex_effective_config(
-                manager.config.runtime.codex_binary,
-                codex_home(manager.config.runtime.codex_home),
-            )
-        except (CodexAccountError, OSError) as exc:
-            effective_config_error = str(exc)
-
-        codex_provider = manager.config.model_providers["codex-cli"]
-        codex_settings = manager.config.runtime.codex.model_copy(
+        # 整次查询绑定同一份已保存配置，防止等待期间的热更新混合不同 Home。
+        config = manager.config
+        response.headers["Cache-Control"] = "no-store"
+        snapshot = await read_codex_runtime_snapshot(
+            config.runtime.codex_binary,
+            codex_home(config.runtime.codex_home),
+        )
+        codex_provider = config.model_providers["codex-cli"]
+        codex_settings = config.runtime.codex.model_copy(
             update={"model": codex_provider.default_model}
         )
         return await asyncio.to_thread(
             inspect_runtime_options,
             codex_settings,
-            manager.config.runtime.codex_binary,
-            manager.config.runtime.codex_home,
-            manager.config.runtime.expected_codex_version,
-            effective_config,
-            effective_config_error,
-            manager.config.runtime.managed_sandbox,
+            config.runtime.codex_binary,
+            config.runtime.codex_home,
+            config.runtime.expected_codex_version,
+            snapshot.config,
+            snapshot.config_error,
+            config.runtime.managed_sandbox,
+            snapshot.models,
+            snapshot.models_error,
         )
 
     @app.get("/api/runtime/workspace-cleanup")

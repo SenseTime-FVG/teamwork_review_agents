@@ -17,6 +17,7 @@ from teamwork_review_agents.codex_account import (
     CodexLoginManager,
     inspect_codex_account,
     read_codex_effective_config,
+    read_codex_runtime_snapshot,
 )
 from teamwork_review_agents.webapp import create_app
 
@@ -66,6 +67,8 @@ for line in sys.stdin:
             "summary": {"lifetimeTokens": 1234, "private": "不得返回"},
             "unknown": "不得返回",
         }
+    elif method == "model/list":
+        result = {"data": [{"model": "gpt-catalog", "displayName": "Catalog"}], "nextCursor": None}
     elif method == "account/login/start":
         result = {"loginId": "login-test", "authUrl": "https://example.com/login"}
     elif method == "account/login/cancel":
@@ -132,6 +135,18 @@ async def test_inspect_codex_account_returns_only_safe_fields(tmp_path) -> None:
     }
     assert result["usage"] == {"summary": {"lifetimeTokens": 1234}}
     assert "accessToken" not in result["account"]
+
+
+async def test_read_runtime_snapshot_uses_stdio_protocol(tmp_path) -> None:
+    """真实子进程协议往返读取目录和配置，不建立模型会话。"""
+
+    fake_codex = _write_fake_codex(tmp_path / "fake-codex")
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    result = await read_codex_runtime_snapshot(str(fake_codex), home)
+    assert result.config["model"] == "gpt-effective"
+    assert result.models == [{"model": "gpt-catalog", "displayName": "Catalog"}]
+    assert result.models_error is None and result.config_error is None
 
 
 async def test_read_codex_effective_config_uses_app_server(tmp_path) -> None:

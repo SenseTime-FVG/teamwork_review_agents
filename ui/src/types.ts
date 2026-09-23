@@ -277,7 +277,9 @@ export type CodexRuntimeOptions = {
     supported_reasoning_levels: string[];
     supports_fast_mode: boolean;
   }>;
-  catalog_source: "account_cache" | "bundled" | "unavailable";
+  catalog_source: "app_server" | "account_cache" | "bundled" | "unavailable";
+  catalog_checked_at?: string | null;
+  catalog_warning?: string | null;
   inherited_model: {
     value?: string | null;
     source: "runtime" | "codex" | "user" | "builtin";
@@ -308,6 +310,7 @@ export type CodexRuntimeOptions = {
   model_cache: {
     path: string;
     client_version?: string | null;
+    fetched_at?: string | null;
     error?: string | null;
   };
   expected_version?: string | null;

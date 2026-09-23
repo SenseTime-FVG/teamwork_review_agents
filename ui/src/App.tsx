@@ -17,6 +17,7 @@ import type { ManagedPromptFile, ManagedSkillDirectory, ManagedSkillDocument } f
 import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { gitBytesText, gitProgressText, presentRunLogs } from "./runLogPresentation";
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
+import { createCodexCatalogRefresher, codexCatalogSourceLabel } from "./codexCatalogRefresh";
 import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary } from "./workspaceCleanup";
 import type { WorkspaceCleanupSchedule, WorkspaceCleanupStatus } from "./workspaceCleanup";
 import { QuickSetupWizard } from "./QuickSetupWizard";
@@ -268,23 +269,6 @@ const EMPTY_CODEX_OPTIONS: CodexRuntimeOptions = {
     error: "尚未读取运行时能力",
   },
 };
-
-async function loadCodexRuntimeOptions(): Promise<{
-  options: CodexRuntimeOptions;
-  error: string;
-}> {
-  try {
-    return {
-      options: await api<CodexRuntimeOptions>("/api/codex/runtime-options"),
-      error: "",
-    };
-  } catch (reason) {
-    return {
-      options: EMPTY_CODEX_OPTIONS,
-      error: `Codex 运行时诊断不可用：${reason instanceof Error ? reason.message : "加载失败"}`,
-    };
-  }
-}
 
 const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
@@ -2632,6 +2616,9 @@ function ModelProvidersEditor(props: {
   document: ConfigDocument;
   revision: string;
   codexOptions: CodexRuntimeOptions;
+  codexRefreshing: boolean;
+  codexRefreshError: string;
+  onRefreshCodex: () => Promise<void>;
   onSaved: (document: ConfigDocument, revision: string) => void;
   onError: (message: string) => void;
   onNotice: (message: string) => void;
@@ -2660,6 +2647,11 @@ function ModelProvidersEditor(props: {
   const [pendingAction, setPendingAction] = useState<ModelProviderPendingAction | null>(null);
 
   useBodyScrollLock(selectedId !== null);
+
+  useEffect(() => {
+    // 进入 Provider 页面或再次打开 Codex 详情时更新，共享正在进行的请求。
+    if (selectedId === null || selectedId === "codex-cli") void props.onRefreshCodex();
+  }, [selectedId, props.onRefreshCodex]);
 
   const reloadSnapshot = useCallback(async () => {
     try {
@@ -3349,6 +3341,9 @@ function ModelProvidersEditor(props: {
                   <CodexRuntimeEditor
                     document={activeDocument}
                     options={props.codexOptions}
+                    refreshing={props.codexRefreshing}
+                    refreshError={props.codexRefreshError}
+                    onRefresh={props.onRefreshCodex}
                     editable={editing && !busy}
                     onChange={setDraftDocument}
                   />
@@ -3776,6 +3771,9 @@ function CodexRuntimeEditor(props: {
   document: ConfigDocument;
   options: CodexRuntimeOptions;
   editable: boolean;
+  refreshing: boolean;
+  refreshError: string;
+  onRefresh: () => Promise<void>;
   onChange: (document: ConfigDocument) => void;
 }) {
   const codex = props.document.runtime.codex ?? {};
@@ -3811,7 +3809,23 @@ function CodexRuntimeEditor(props: {
             <h2>Codex CLI 配置</h2>
             <p>配置内置 Codex CLI 的命令、账号环境和驱动专属默认参数。</p>
           </div>
+          <button className="button secondary" type="button" disabled={props.refreshing} onClick={() => void props.onRefresh()}>
+            {props.refreshing ? "刷新中…" : "刷新模型"}
+          </button>
         </div>
+        <div className="agent-workspace-note" role="status" aria-live="polite">
+          <strong>模型目录</strong>
+          <span>
+            {codexCatalogSourceLabel(props.options)}
+            {props.options.catalog_checked_at ? ` · 最近查询 ${new Date(props.options.catalog_checked_at).toLocaleString()}` : ""}
+            。刷新使用已保存的 CLI 与 CODEX_HOME，不包含尚未保存的修改，不改变已选模型。
+          </span>
+        </div>
+        {(props.refreshError || props.options.catalog_error || props.options.catalog_warning) && (
+          <div className="alert error" role="status">
+            {[props.refreshError, props.options.catalog_error, props.options.catalog_warning].filter(Boolean).join("；")}
+          </div>
+        )}
         <fieldset className="config-editor-surface" disabled={!props.editable}>
         <div className="runtime-mode-stack">
           <div className="agent-workspace-note">
@@ -10055,7 +10069,26 @@ export default function App() {
   const [confirmingOverviewAction, setConfirmingOverviewAction] = useState(false);
   const [eventOptions, setEventOptions] = useState<string[]>([]);
   const [codexOptions, setCodexOptions] = useState<CodexRuntimeOptions>(EMPTY_CODEX_OPTIONS);
+  const [codexRefreshing, setCodexRefreshing] = useState(false);
+  const [codexRefreshError, setCodexRefreshError] = useState("");
   const [revision, setRevision] = useState("");
+  const codexCatalogRefresher = useMemo(() => createCodexCatalogRefresher(
+    EMPTY_CODEX_OPTIONS,
+    () => api<CodexRuntimeOptions>("/api/codex/runtime-options", { cache: "no-store" }),
+    (state) => {
+      setCodexOptions(state.options);
+      setCodexRefreshing(state.busy);
+      setCodexRefreshError(state.error);
+    },
+  ), []);
+  const refreshCodexCatalog = useCallback(
+    () => codexCatalogRefresher.refresh(revision),
+    [codexCatalogRefresher, revision],
+  );
+  useEffect(() => {
+    // 配置加载/保存后独立刷新，不阻塞概览，也不加入运行状态轮询。
+    if (revision) void refreshCodexCatalog();
+  }, [revision, refreshCodexCatalog]);
   const [editing, setEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [agentDetailDirty, setAgentDetailDirty] = useState(false);
@@ -10149,10 +10182,9 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const [config, options, codexResult] = await Promise.all([
+      const [config, options] = await Promise.all([
         api<{ revision: string; document: ConfigDocument; error?: string }>("/api/config"),
         api<{ events: string[] }>("/api/options"),
-        loadCodexRuntimeOptions(),
         refreshOperationalData(),
       ]);
       const normalized = normalizeDocument(config.document);
@@ -10160,15 +10192,13 @@ export default function App() {
       setSavedDocument(structuredClone(normalized));
       setRevision(config.revision);
       setEventOptions(options.events);
-      setCodexOptions(codexResult.options);
       setDirty(false);
       setEditing(false);
       setAgentDetailDirty(false);
       setRuleDetailDirty(false);
       setRepositoryDetailDirty(false);
       setRepositoryDetailOpen(false);
-      const diagnosticErrors = [config.error, codexResult.error].filter(Boolean);
-      if (diagnosticErrors.length > 0) setError(diagnosticErrors.join("；"));
+      if (config.error) setError(config.error);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
     } finally {
@@ -10279,16 +10309,9 @@ export default function App() {
       setDocument(normalized);
       setSavedDocument(structuredClone(normalized));
       setRevision(result.revision);
-      const codexResult = await loadCodexRuntimeOptions();
-      setCodexOptions(codexResult.options);
       setDirty(false);
       setEditing(false);
-      if (codexResult.error) setError(codexResult.error);
-      setNotice(
-        codexResult.error
-          ? "配置已校验、保存并通知后台热加载；Codex 运行时诊断刷新失败"
-          : "配置已校验、保存并通知后台热加载",
-      );
+      setNotice("配置已校验、保存并通知后台热加载");
       window.setTimeout(() => setNotice(""), 3500);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "保存失败");
@@ -10832,6 +10855,9 @@ export default function App() {
                   document={document}
                   revision={revision}
                   codexOptions={codexOptions}
+                  codexRefreshing={codexRefreshing}
+                  codexRefreshError={codexRefreshError}
+                  onRefreshCodex={refreshCodexCatalog}
                   onSaved={acceptItemConfig}
                   onError={setError}
                   onNotice={(message) => {
