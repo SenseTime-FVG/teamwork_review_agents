@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
@@ -212,6 +212,43 @@ class GitLabProvider(BaseProvider):
             "Accept": "application/json",
             "User-Agent": "teamwork-review-agents",
         }
+
+    async def set_commit_status(
+        self,
+        repository: RepositoryConfig,
+        sha: str,
+        *,
+        state: Literal["pending", "success", "failure", "error"],
+        context: str,
+        description: str,
+        ref: str | None = None,
+        source_project: str | None = None,
+    ) -> None:
+        """在 MR 源提交对应的流水线中写入 GitLab 外部作业状态。"""
+
+        project = quote(source_project or repository.project, safe="")
+        payload = {
+            "state": {"failure": "failed", "error": "failed"}.get(state, state),
+            "name": context,
+            "description": description[:255],
+        }
+        if ref:
+            payload["ref"] = ref
+        path = f"projects/{project}/statuses/{quote(sha, safe='')}"
+        for attempt in range(3):
+            try:
+                await self.post_json(path, payload)
+                return
+            except ProviderError as exc:
+                # GitLab 同一 SHA/ref 的状态更新可能短暂冲突，仅重试明确的 409。
+                cause = exc.__cause__
+                if (
+                    not isinstance(cause, httpx.HTTPStatusError)
+                    or cause.response.status_code != 409
+                    or attempt == 2
+                ):
+                    raise
+                await asyncio.sleep(0.2 * (attempt + 1))
 
     async def create_change_request_comment(
         self,

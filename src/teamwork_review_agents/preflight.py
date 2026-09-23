@@ -476,7 +476,7 @@ def _failure_comment_body(
     *,
     redactor: SecretRedactor,
 ) -> str:
-    """构造有界且脱敏的 GitHub PR 本地 CI 失败评论。"""
+    """构造有界且脱敏的 MR / PR 本地 CI 失败评论。"""
 
     status_label = {
         "failure": "未通过",
@@ -567,6 +567,8 @@ class PreflightExecutor:
         *,
         state: str,
         description: str,
+        ref: str | None = None,
+        source_project: str | None = None,
     ) -> None:
         """使用服务自身凭据发布状态，不把凭据交给被测命令。"""
 
@@ -583,6 +585,8 @@ class PreflightExecutor:
                 state=state,
                 context=repository.preflight.status_context,
                 description=description,
+                ref=ref,
+                source_project=source_project,
             )
 
     async def _sync_failure_comment(
@@ -689,6 +693,8 @@ class PreflightExecutor:
         result: PreflightResult,
         *,
         replace_existing_comment: bool = True,
+        ref: str | None = None,
+        source_project: str | None = None,
     ) -> PreflightResult:
         """只发布代码门禁终态；写回失败时保留本地真实结论。"""
 
@@ -707,6 +713,8 @@ class PreflightExecutor:
                 result.head_sha,
                 state=remote_state,
                 description=_status_description(result),
+                ref=ref,
+                source_project=source_project,
             )
         except Exception as exc:
             status_error = exc
@@ -728,7 +736,7 @@ class PreflightExecutor:
                 head_sha=result.head_sha,
                 source_generation=result.source_generation,
                 status="error",
-                error=f"本地 CI 已完成，但 GitHub 状态回写失败：{status_error}",
+                error=f"本地 CI 已完成，但提交状态回写失败：{status_error}",
             )
         return result.model_copy(update={"status_published": True})
 
@@ -764,6 +772,8 @@ class PreflightExecutor:
                 repository,
                 cached,
                 replace_existing_comment=False,
+                ref=snapshot.source_branch,
+                source_project=snapshot.source_project,
             )
             return published.model_copy(update={"reused": True})
 
@@ -901,6 +911,8 @@ class PreflightExecutor:
                     snapshot.head_sha,
                     state="pending",
                     description="本地 CI 正在运行",
+                    ref=snapshot.source_branch,
+                    source_project=snapshot.source_project,
                 )
                 cache_environment: dict[str, str] = {}
                 cache_path: str | None = None
@@ -997,4 +1009,9 @@ class PreflightExecutor:
         )
         if result.status == "superseded":
             return result
-        return await self._publish_terminal_result(repository, result)
+        return await self._publish_terminal_result(
+            repository,
+            result,
+            ref=snapshot.source_branch,
+            source_project=snapshot.source_project,
+        )

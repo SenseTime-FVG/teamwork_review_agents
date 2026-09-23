@@ -487,6 +487,8 @@ Windows CI 至少安装项目并在真实 Windows runner 上执行 CLI 导入、
 
 仓库管理页使用结构化步骤编辑器维护本地 CI。每个步骤包含名称、执行程序、参数数组和可选单步超时；命令继续直接以参数数组启动，不隐式经过 shell。复杂 CI 可以由目标仓库维护脚本，并把 `bash ci/preflight.sh` 表达为执行程序 `bash` 加参数 `ci/preflight.sh`。规则详情和规则列表同时显示是否使用仓库 CI，避免“仓库已启用”被误解为所有审核规则都会固定执行。
 
+GitHub 与 GitLab 仓库共用本地 CI 编排和失败评论生命周期。GitLab 使用 Commit Status API 写入 MR 源项目、源分支及 Head SHA，对外显示为同名外部作业；本地失败和超时映射为 GitLab 的 `failed`。状态写回失败沿用终态补发机制，不重跑已完成的 CI 步骤。GitLab 的平台合并门禁由项目流水线设置控制，服务不自动修改该设置。
+
 ## 50. 目标分支提交变化与轻量可靠事件
 
 统一快照增加 `target_head_sha`，表示扫描时从目标分支真实 Git ref 读取到的当前提交。Provider 必须通过 GitHub Git Ref API 或 GitLab Repository Branch API 获取该值，不能使用 PR / MR 详情中的历史差异基准字段。一次仓库扫描对相同目标分支只请求一次，并把结果复用于全部指向该分支的打开状态 PR / MR；已经关闭或合并的记录不持续跟踪目标分支。

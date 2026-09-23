@@ -4900,6 +4900,7 @@ function RepositoryDetailEditor(props: {
   const providerTokenName = String(
     props.document.providers[repository.provider]?.token_env ?? "",
   ).trim();
+  const preflightPlatform = props.document.providers[repository.provider]?.kind === "gitlab" ? "GitLab" : "GitHub";
 
   const preflight: Required<Omit<RepositoryPreflight, "steps">> & {
     steps: RepositoryPreflightStep[];
@@ -5241,7 +5242,7 @@ function RepositoryDetailEditor(props: {
           <div className="repository-preflight-head">
             <div>
               <strong>本地 CI 门禁</strong>
-              <p>声明此仓库可执行的本地 CI，当前仅支持 GitHub。只有明确选择“执行仓库 CI”的触发规则才会使用；未配置时对应 Agent 仍会直接运行。</p>
+              <p>声明此仓库可执行的本地 CI，支持 GitHub 和 GitLab。只有明确选择“执行仓库 CI”的触发规则才会使用；未配置时对应 Agent 仍会直接运行。</p>
             </div>
             <div className="repository-preflight-head-actions">
               {props.preflightAction}
@@ -5255,10 +5256,12 @@ function RepositoryDetailEditor(props: {
               <div className="repository-preflight-content">
                 <div className="form-grid three">
                   <Field
-                    label="GitHub 状态名称"
+                    label={`${preflightPlatform} 状态名称`}
                     value={preflight.status_context}
                     onChange={(status_context) => updatePreflight({ status_context })}
-                    help="建议同时配置为仓库 Ruleset 的 required status check"
+                    help={preflightPlatform === "GitLab"
+                      ? "GitLab 中显示为同名外部作业；如需阻止合并，请配置合并请求的流水线门禁"
+                      : "建议同时配置为仓库 Ruleset 的 required status check"}
                   />
                   <Field
                     label="CI 总超时（秒）"
@@ -5283,7 +5286,7 @@ function RepositoryDetailEditor(props: {
                 </div>
                 <div className="repository-preflight-cache-option">
                   <Toggle
-                    label="失败时发布 PR 评论"
+                    label={`失败时发布 ${preflightPlatform === "GitLab" ? "MR" : "PR"} 评论`}
                     checked={preflight.publish_failure_comment}
                     onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
                   />

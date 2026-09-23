@@ -183,6 +183,8 @@ class BaseProvider(ABC):
         state: Literal["pending", "success", "failure", "error"],
         context: str,
         description: str,
+        ref: str | None = None,
+        source_project: str | None = None,
     ) -> None:
         """写入提交状态；具体平台必须显式实现。"""
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
@@ -30,6 +32,7 @@ from teamwork_review_agents.preflight_cache import (
     repository_cache_root,
 )
 from teamwork_review_agents.preflight_manager import ManualPreflightManager
+from teamwork_review_agents.providers.gitlab import GitLabProvider
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.workspace import WorkspaceSnapshotSuperseded
 
@@ -558,6 +561,118 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
         "repository-provider-token",
         "repository-provider-token",
     ]
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_status", "expected_remote_state", "comment_count"),
+    [
+        (0, "success", "success", 0),
+        (7, "failure", "failed", 1),
+    ],
+)
+async def test_gitlab_preflight_runs_and_publishes_status_and_failure_comment(
+    tmp_path,
+    monkeypatch,
+    snapshot_factory,
+    exit_code: int,
+    expected_status: str,
+    expected_remote_state: str,
+    comment_count: int,
+) -> None:
+    """GitLab MR 本地 CI 应完成步骤、状态回写和可选失败评论。"""
+
+    config = parse_config_data(
+        {
+            "database": {"path": str(tmp_path / "state.db")},
+            "providers": {
+                "gitlab-main": {
+                    "kind": "gitlab",
+                    "base_url": "https://gitlab.example.com/api/v4",
+                    "token_env": "GITLAB_TOKEN",
+                }
+            },
+            "repositories": [
+                {
+                    "id": "demo",
+                    "provider": "gitlab-main",
+                    "project": "group/demo",
+                    "workspace": str(tmp_path / "workspace"),
+                    "preflight": {
+                        "enabled": True,
+                        "publish_failure_comment": True,
+                        "steps": [{
+                            "name": "test",
+                            "command": [
+                                sys.executable, "-c",
+                                f"print('CI 已执行'); raise SystemExit({exit_code})",
+                            ],
+                        }],
+                    },
+                }
+            ],
+        },
+        tmp_path / "config.yaml",
+    )
+    snapshot = snapshot_factory(
+        provider="gitlab-main",
+        repository_id="demo",
+        head_sha="b" * 40,
+    )
+    event = detect_events(None, snapshot, emit_initial=True)[0]
+
+    @contextmanager
+    def fake_worktree(*_args, **_kwargs):
+        yield tmp_path
+
+    status_payloads: list[dict[str, object]] = []
+    comment_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/statuses/{'b' * 40}"):
+            status_payloads.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": len(status_payloads)})
+        if request.url.path.endswith("/merge_requests/7/notes"):
+            comment_paths.append(request.url.path)
+            return httpx.Response(201, json={"id": 17})
+        raise AssertionError(f"意外的平台请求：{request.method} {request.url.path}")
+
+    def provider_factory(*_args, token: str, **_kwargs):
+        provider = GitLabProvider(
+            "gitlab-main", config.providers["gitlab-main"],
+            config.scanner, token=token,
+        )
+        provider.client = httpx.AsyncClient(
+            base_url="https://gitlab.example.com/api/v4/",
+            transport=httpx.MockTransport(handler),
+            headers=provider.headers(),
+        )
+        return provider
+
+    monkeypatch.setenv("GITLAB_TOKEN", "test-provider-token")
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.create_provider", provider_factory,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.managed_comments.create_provider", provider_factory,
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.preflight.temporary_change_request_worktree",
+        fake_worktree,
+    )
+    store = StateStore(config.database.path)
+    store.initialize()
+
+    result = await PreflightExecutor(config, store).ensure_passed(event)
+
+    assert result.status == expected_status
+    assert result.status_published is True
+    assert [payload["state"] for payload in status_payloads] == [
+        "pending", expected_remote_state,
+    ]
+    assert all(payload["ref"] == "feature/demo" for payload in status_payloads)
+    assert all(payload["name"] == "teamwork/local-ci" for payload in status_payloads)
+    assert len(comment_paths) == comment_count
+    assert store.get_preflight_run(result.run_id)["status"] == expected_status
 
 
 async def test_preflight_superseded_head_is_terminal_and_not_published(

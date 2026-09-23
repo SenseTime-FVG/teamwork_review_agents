@@ -11,7 +11,7 @@
 | [`first-time-setup.md`](first-time-setup.md) | 管理界面首次配置图文流程 | 平台连接、仓库、Agent 与规则配置 | 首次配置界面、步骤或截图变化 |
 | [`platform-cli-auth.md`](platform-cli-auth.md) | `gh` / `glab` 本机登录配置 | 平台 CLI 集成 | 登录前提、命令或所需权限变化 |
 | [`operations.md`](operations.md) | 部署、权限、启停与排障 | 服务进程、运行数据、认证和隔离 | 部署方式、运行生命周期、凭据边界或故障处理变化 |
-| [`preflight-ci.md`](preflight-ci.md) | GitHub Preflight CI 门禁语义 | Preflight 执行器、事件和状态回写 | CI 配置、执行、幂等或安全边界变化 |
+| [`preflight-ci.md`](preflight-ci.md) | GitHub / GitLab Preflight CI 门禁语义 | Preflight 执行器、事件和状态回写 | CI 配置、执行、幂等或安全边界变化 |
 | [`architecture.md`](architecture.md) | 当前系统分层、主链路与边界 | Provider、事件、执行器、SQLite 与内置 Agent | 架构、数据流、Agent 职责或平台支持变化 |
 
 ## 当前设计

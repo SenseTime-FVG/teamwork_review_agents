@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 
 from teamwork_review_agents.config import ProviderConfig, RepositoryConfig, ScannerConfig
 from teamwork_review_agents.providers.github import GitHubProvider
@@ -657,6 +658,119 @@ async def test_github_provider_publishes_bounded_commit_status() -> None:
     assert payload["state"] == "failure"
     assert payload["context"] == "teamwork/local-ci"
     assert len(payload["description"]) == 140
+
+
+@pytest.mark.parametrize(
+    ("state", "gitlab_state"),
+    [
+        ("pending", "pending"),
+        ("success", "success"),
+        ("failure", "failed"),
+    ],
+)
+async def test_gitlab_provider_publishes_commit_status(
+    state: str,
+    gitlab_state: str,
+) -> None:
+    """GitLab 状态回写必须定位 MR 源项目与分支，并转换失败状态。"""
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"id": 1})
+
+    provider = GitLabProvider(
+        "gitlab-main",
+        ProviderConfig(
+            kind="gitlab",
+            base_url="https://gitlab.example.com/api/v4",
+            token_env="GITLAB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="https://gitlab.example.com/api/v4/",
+        transport=httpx.MockTransport(handler),
+        headers=provider.headers(),
+    )
+    repository = RepositoryConfig(
+        id="demo",
+        provider="gitlab-main",
+        project="group/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    try:
+        await provider.set_commit_status(
+            repository,
+            "a" * 40,
+            state=state,
+            context="teamwork/local-ci",
+            description="失败" * 150,
+            ref="feature/demo",
+            source_project="fork-group/demo",
+        )
+    finally:
+        await provider.close()
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.raw_path.decode() == (
+        f"/api/v4/projects/fork-group%2Fdemo/statuses/{'a' * 40}"
+    )
+    assert requests[0].headers["PRIVATE-TOKEN"] == "test-token"
+    payload = json.loads(requests[0].content)
+    assert payload == {
+        "state": gitlab_state,
+        "name": "teamwork/local-ci",
+        "description": ("失败" * 150)[:255],
+        "ref": "feature/demo",
+    }
+
+
+async def test_gitlab_provider_retries_transient_commit_status_conflict(monkeypatch) -> None:
+    """GitLab 同一提交状态的临时冲突可重试，其他错误保持显式失败。"""
+
+    attempts = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(409 if attempts == 1 else 201, json={"id": 1})
+
+    async def skip_delay(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("teamwork_review_agents.providers.gitlab.asyncio.sleep", skip_delay)
+    provider = GitLabProvider(
+        "gitlab-main",
+        ProviderConfig(
+            kind="gitlab",
+            base_url="https://gitlab.example.com/api/v4",
+            token_env="GITLAB_TOKEN",
+        ),
+        ScannerConfig(),
+        token="test-token",
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="https://gitlab.example.com/api/v4/",
+        transport=httpx.MockTransport(handler),
+    )
+    repository = RepositoryConfig(
+        id="demo", provider="gitlab-main", project="group/demo",
+        workspace=Path("/tmp/demo"),
+    )
+    try:
+        await provider.set_commit_status(
+            repository, "a" * 40, state="success",
+            context="teamwork/local-ci", description="通过",
+        )
+    finally:
+        await provider.close()
+    assert attempts == 2
 
 
 async def test_github_provider_manages_pull_request_comments() -> None:
