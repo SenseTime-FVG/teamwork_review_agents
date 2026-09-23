@@ -21,6 +21,7 @@ from .codex_model_client import (
     CodexUpstreamError,
 )
 from .codex_settings import (
+    CODEX_MODEL_BASE_DEFAULT_REASONING_EFFORT,
     codex_home,
     read_user_inherited_settings,
     read_user_model,
@@ -1418,7 +1419,7 @@ class CodexModelRunner:
                 or inherited_value("model_reasoning_effort")
             )
         if reasoning is None and codex_provider:
-            reasoning = "medium"
+            reasoning = CODEX_MODEL_BASE_DEFAULT_REASONING_EFFORT
         fast_setting = agent.fast_mode
         if fast_setting == "inherit" and codex_provider:
             fast_setting = self.config.runtime.codex.fast_mode

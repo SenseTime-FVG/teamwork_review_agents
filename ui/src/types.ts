@@ -295,6 +295,7 @@ export type CodexRuntimeOptions = {
     web_search: CodexInheritedSetting;
   };
   inherited_settings_error?: string | null;
+  model_base_reasoning_effort?: CodexInheritedSetting;
   effective_config_error?: string | null;
   user_model?: string | null;
   user_config_path: string;

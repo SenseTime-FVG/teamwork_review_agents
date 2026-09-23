@@ -22,7 +22,7 @@ import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary 
 import type { WorkspaceCleanupSchedule, WorkspaceCleanupStatus } from "./workspaceCleanup";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { manualTriggerEvent, activitySourceLabel, platformActivityStatus } from "./changeRequestActivity";
-import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions } from "./reasoningEffort";
+import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions, modelSupportsReasoningEffort, reasoningEffortPresentation } from "./reasoningEffort";
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
@@ -2419,6 +2419,10 @@ function GlobalEnvironment(props: {
       : undefined);
   const resolvedDefaultModel = defaultSelection.model || defaultProviderFallbackModel;
   const defaultSupportsReasoning = modelSupportsReasoningEffort(defaultProvider, resolvedDefaultModel);
+  const defaultEffortDisplay = reasoningEffortPresentation(
+    props.document, props.codexOptions, defaultProvider,
+    resolvedDefaultModel, defaultSelection.reasoning_effort,
+  );
   const defaultModelPlaceholder = defaultProvider?.driver === "codex_cli"
     ? `${props.document.runtime.codex?.execution_mode === "cli" ? "CLI" : "基座"}默认模型（${resolvedDefaultModel ?? "暂未解析"}）`
     : `Provider 默认模型（${resolvedDefaultModel ?? "暂未解析"}）`;
@@ -2482,7 +2486,7 @@ function GlobalEnvironment(props: {
             })}
             options={defaultSupportsReasoning
               ? [
-                  { value: "", label: "跟随 Provider 默认" },
+                  { value: "", label: defaultEffortDisplay.inheritLabel },
                   ...reasoningLevelsForProvider(
                     props.codexOptions,
                     defaultProvider,
@@ -2490,8 +2494,8 @@ function GlobalEnvironment(props: {
                     defaultSelection.reasoning_effort,
                   ).map((value) => ({ value, label: value })),
                 ]
-              : [{ value: "", label: "不适用（非 GPT 模型）" }]}
-            help={defaultSupportsReasoning ? "仅 GPT 系列模型支持显式推理 effort" : "当前模型不支持推理 effort"}
+              : [{ value: "", label: defaultEffortDisplay.inheritLabel }]}
+            help={`${defaultEffortDisplay.help}；此处显示未被 Agent 覆盖时的值`}
           />
           <ContextWindowField
             value={defaultSelection.context_window_tokens}
@@ -3450,18 +3454,6 @@ function resolvedProviderModel(
   };
 }
 
-function modelSupportsReasoningEffort(
-  provider?: ModelProviderConfig,
-  model?: string | null,
-): boolean {
-  if (!provider || !model?.trim()) return false;
-  if (provider.driver === "codex_cli") return true;
-  return (
-    (provider.driver === "openai_responses" || provider.driver === "openai_chat_completions")
-    && model.trim().toLowerCase().startsWith("gpt-")
-  );
-}
-
 function reasoningLevelsForProvider(
   options: CodexRuntimeOptions,
   provider: ModelProviderConfig | undefined,
@@ -3499,6 +3491,7 @@ function ModelFallbackEditor(props: {
   idPrefix: string;
   title: string;
   description: string;
+  agentReasoningEffort?: string | null;
 }) {
   const providerOptions = Object.entries(props.document.model_providers).map(([id, provider]) => ({
     value: id,
@@ -3529,6 +3522,10 @@ function ModelFallbackEditor(props: {
             props.document,
             props.codexOptions,
             selection.provider,
+          );
+          const effortDisplay = reasoningEffortPresentation(
+            props.document, props.codexOptions, provider, resolved.model,
+            selection.reasoning_effort, props.agentReasoningEffort,
           );
           return (
             <div className="model-fallback-row" key={`${props.idPrefix}-${index}`}>
@@ -3571,7 +3568,7 @@ function ModelFallbackEditor(props: {
                 onChange={(reasoning_effort) => update(index, { reasoning_effort: reasoning_effort || undefined })}
                 options={modelSupportsReasoningEffort(provider, resolved.model)
                   ? [
-                      { value: "", label: "跟随 Provider 默认" },
+                      { value: "", label: effortDisplay.inheritLabel },
                       ...reasoningLevelsForProvider(
                         props.codexOptions,
                         provider,
@@ -3579,7 +3576,8 @@ function ModelFallbackEditor(props: {
                         selection.reasoning_effort,
                       ).map((value) => ({ value, label: value })),
                     ]
-                  : [{ value: "", label: "不适用（非 GPT 模型）" }]}
+                  : [{ value: "", label: effortDisplay.inheritLabel }]}
+                help={effortDisplay.help}
                 className="model-fallback-reasoning-field"
               />
               <ContextWindowField
@@ -6758,6 +6756,7 @@ function AgentsEditor(props: {
                 document={props.document}
                 codexOptions={props.codexOptions}
                 value={agent.model_fallbacks ?? []}
+                agentReasoningEffort={agent.model_reasoning_effort}
                 onChange={(model_fallbacks) => update(name, { model_fallbacks })}
                 idPrefix={`agent-model-fallback-${name.replace(/[^A-Za-z0-9_-]/g, "-")}`}
                 title="Agent 级模型回退链"

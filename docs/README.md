@@ -19,6 +19,7 @@
 | 文档 | 用途 | 关联代码/模块 | 更新触发条件 |
 | --- | --- | --- | --- |
 | [`design-codex-model-catalog-refresh.md`](design-codex-model-catalog-refresh.md) | 当前 CLI 的模型目录刷新与缓存回退 | App Server、运行时接口、Provider UI | 目录来源、刷新与降级语义变化；实施见 [`implementation-plan-codex-model-catalog-refresh.md`](implementation-plan-codex-model-catalog-refresh.md) |
+| [`design-effort-inheritance-display.md`](design-effort-inheritance-display.md) | effort 继承值和来源展示 | Codex 诊断、全局默认与两级回退链 UI | 默认值、模式和展示语义变化；实施见 [`implementation-plan-effort-inheritance-display.md`](implementation-plan-effort-inheritance-display.md) |
 | [`design-gitlab-activities.md`](design-gitlab-activities.md) | GitLab 结构化活动、游标与手动重放来源 | Provider、事件、SQLite、Web 与概览 | 活动读取、降级、去重和手动触发行为变化；实施见 [`implementation-plan-gitlab-activities.md`](implementation-plan-gitlab-activities.md) |
 | [`design-gitlab-cli-host.md`](design-gitlab-cli-host.md) | 自建 GitLab CLI 默认主机与临时 HOME 认证路由 | `environment.py`、Agent 与仓库进程 | CLI 主机默认值、分层覆盖或凭据传递变化；实施见 [`implementation-plan-gitlab-cli-host.md`](implementation-plan-gitlab-cli-host.md) |
 | [`design.md`](design.md) | 当前系统实现语义的权威设计记录 | `src/teamwork_review_agents/`、`ui/src/` | 已实现的配置、事件、运行时、API 或 UI 语义变化 |
