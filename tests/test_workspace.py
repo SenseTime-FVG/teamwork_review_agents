@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,6 @@ from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.workspace import (
     _run_git,
     _safe_git_command,
-    cleanup_expired_worktrees,
     cleanup_run_worktree,
     ensure_isolated_clone,
     ensure_isolated_worktree,
@@ -483,7 +483,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         change_ref,
         change_ref=change_ref,
     )
-    (retained_clone / "待恢复.txt").write_text("不要删除\n", encoding="utf-8")
+    (retained_clone / "待清理.txt").write_text("未提交内容随终态删除\n", encoding="utf-8")
     cleanup = cleanup_run_worktree(
         workspace,
         retained_clone,
@@ -491,14 +491,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "retained"
-    assert retained_clone.exists()
-    removed = cleanup_expired_worktrees(
-        workspace,
-        retained_clone.parent,
-        now=float("inf"),
-    )
-    assert retained_clone.resolve() in removed
+    assert cleanup.status == "removed"
     assert not retained_clone.exists()
 
     retained = ensure_isolated_worktree(
@@ -506,7 +499,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         tmp_path / "data" / "worktrees" / "retained",
         change_ref,
     )
-    (retained / "未提交.txt").write_text("需要恢复\n", encoding="utf-8")
+    (retained / "未提交.txt").write_text("终态清理\n", encoding="utf-8")
     cleanup = cleanup_run_worktree(
         workspace,
         retained,
@@ -514,16 +507,7 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
         starting_head=head_sha,
         retention_days=7,
     )
-    assert cleanup.status == "retained"
-    assert retained.exists()
-    assert retained_marker_path(retained).exists()
-
-    removed = cleanup_expired_worktrees(
-        workspace,
-        retained.parent,
-        now=float("inf"),
-    )
-    assert removed == [retained.resolve()]
+    assert cleanup.status == "removed"
     assert not retained.exists()
     assert not retained_marker_path(retained).exists()
 
@@ -532,6 +516,7 @@ async def test_root_agent_runs_in_its_own_temporary_worktree(
     tmp_path,
     snapshot_factory,
     configured_app_factory,
+    monkeypatch,
 ) -> None:
     """根 Agent 不应直接在基础仓库运行，干净结束后应删除临时目录。"""
 
@@ -653,11 +638,10 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     assert retained_result is not None
     retained_detail = store.get_run(retained_result.run_id)
     assert retained_detail is not None
-    assert retained_detail["workspace_status"] == "retained"
+    assert retained_detail["workspace_status"] == "removed"
     retained_workspace = Path(retained_detail["workspace_path"])
-    assert retained_workspace.exists()
-    assert (retained_workspace / ".git").is_dir()
-    assert "未提交" in retained_detail["workspace_reason"]
+    assert not retained_workspace.exists()
+    assert "已结束" in retained_detail["workspace_reason"]
     retained_prepared_payload = json.loads(
         next(
             item["payload"]
@@ -667,22 +651,40 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     )
     assert retained_prepared_payload["mode"] == "root-clone"
 
+    # 继承测试使用仍在运行的父目录，不能继续使用已结束且已清理的运行。
+    parent_reservation = store.begin_agent_run(
+        proposed_run_id=str(uuid.uuid4()), root_run_id=None, parent_run_id=None,
+        idempotency_key="active-parent", event_id=event.id, rule_name="review",
+        agent_name="code-reviewer", resource_key=event.resource_key, prompt="",
+        environment={}, config_revision=config.revision, max_attempts=1,
+        repository_id=repository.id,
+    )
+    assert parent_reservation is not None
+    parent_executor = AgentExecutor(config, store)
+    inherited_workspace = ensure_isolated_clone(
+        repository.workspace,
+        parent_executor.run_workspace_path(repository, parent_reservation.run_id),
+        "refs/teamwork/change-requests/7/head",
+        change_ref="refs/teamwork/change-requests/7/head",
+    )
+    store.update_agent_run_workspace(parent_reservation.run_id, path=str(inherited_workspace), status="active")
     inherited_result = await AgentExecutor(config, store).execute(
         agent_name="code-reviewer",
         event=event,
         idempotency_key="sub-agent-inherited-clone",
         task="继续检查父 Agent 的本地修改",
-        root_run_id=retained_result.root_run_id,
-        parent_run_id=retained_result.run_id,
+        root_run_id=parent_reservation.root_run_id,
+        parent_run_id=parent_reservation.run_id,
         depth=1,
         inherit_workspace=True,
-        parent_workspace=retained_workspace,
+        parent_workspace=inherited_workspace,
     )
     assert inherited_result is not None
     inherited_detail = store.get_run(inherited_result.run_id)
     assert inherited_detail is not None
     assert inherited_detail["workspace_status"] == "inherited"
-    assert inherited_detail["workspace_path"] == str(retained_workspace)
+    assert inherited_detail["workspace_path"] == str(inherited_workspace)
+    assert inherited_workspace.exists()
     inherited_prepared_payload = json.loads(
         next(
             item["payload"]
@@ -691,6 +693,34 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
         )
     )
     assert inherited_prepared_payload["mode"] == "inherited-clone"
+
+    from teamwork_review_agents.codex_runner import CodexRunner
+    from teamwork_review_agents.executor import AgentExecutionError
+    from teamwork_review_agents.models import AgentResult
+
+    for terminal_status in ["failed", "timed_out", "cancelled"]:
+        async def terminal_run(self, **kwargs):
+            """真实执行器收尾配合受控 Runner，验证失败、超时和取消都清理。"""
+
+            return AgentResult(
+                run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
+                agent_name=kwargs["agent_name"], status=terminal_status, error="测试终态",
+            )
+
+        monkeypatch.setattr(CodexRunner, "run", terminal_run)
+        with pytest.raises(AgentExecutionError):
+            await AgentExecutor(config, store).execute(
+                agent_name="code-reviewer", event=event,
+                idempotency_key=f"terminal-{terminal_status}", rule_name="review",
+            )
+        with store.connect() as connection:
+            record = connection.execute(
+                "SELECT status, workspace_status, workspace_path FROM agent_runs WHERE idempotency_key = ?",
+                (f"terminal-{terminal_status}",),
+            ).fetchone()
+        assert record["status"] == terminal_status
+        assert record["workspace_status"] == "removed"
+        assert not Path(record["workspace_path"]).exists()
 
 
 def test_temporary_change_request_worktree_isolated_and_removed(

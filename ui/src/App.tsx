@@ -2599,7 +2599,7 @@ function GlobalEnvironment(props: {
           <Field label="Git 无进展超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} help="用于 fetch、运行 clone 和工作区操作；仓库锁等待另行计时。" />
           <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
           <Field label="默认模型与工具交互轮数上限" type="number" value={Number(props.document.runtime.max_tool_rounds ?? 256)} onChange={(value) => patchSection("runtime", "max_tool_rounds", Number(value))} help="默认 256 轮，填写正整数。仅用于自研模型模式；同轮多个工具仍算一轮，摘要与模型回退不额外计数。耗尽后任务未完成，不从头自动重试。" />
-          <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留 PR 和工作区，不自动重跑。与本地 CI 执行超时独立。" />
+          <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留远端 PR，不自动重跑。临时工作区随任务树结束清理。与本地 CI 执行超时独立。" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
           <Field label="管理员 Token 环境变量" value={String(props.document.web.admin_token_env ?? "")} onChange={(value) => patchSection("web", "admin_token_env", value || undefined)} help="非本机监听时必填" />
@@ -4293,7 +4293,7 @@ function WorkspaceCleanupPanel(props: {
   const last = status?.last_run;
   return (
     <section className="section-card workspace-cleanup-card">
-      <div className="section-title-row"><div><h2>工作区清理</h2><p>只清理过期运行工作区，不删除基础仓库、依赖缓存或数据库。正在使用的目录会跳过。</p></div></div>
+      <div className="section-title-row"><div><h2>工作区清理</h2><p>任务树结束后统一清理临时工作区，包括未提交文件和未推送提交，运行记录与日志保留。以下计划仅兜底清理异常残留及旧工作区，不删除基础仓库、依赖缓存或数据库。正在使用的目录会跳过。</p></div></div>
       <fieldset className="config-editor-surface" disabled={!props.editing}>
         <Toggle label="定时清理" checked={schedule.enabled} onChange={(enabled) => updateSchedule({ enabled })} />
         <fieldset className="config-editor-surface" disabled={!schedule.enabled}>
@@ -4315,7 +4315,7 @@ function WorkspaceCleanupPanel(props: {
             }} />}
           </div>
         </fieldset>
-        <Field label="工作区保留期（天）" type="number" min={1} value={retention} onChange={(value) => props.onChange({ ...props.document, runtime: { ...props.document.runtime, worktree_retention_days: Number(value) } })} help="默认 7 天，从运行结束或保留时间起算。超过保留期的工作区即使有未提交修改，也会在通过安全检查后删除。" />
+        <Field label="工作区保留期（天）" type="number" min={1} value={retention} onChange={(value) => props.onChange({ ...props.document, runtime: { ...props.document.runtime, worktree_retention_days: Number(value) } })} help="仅用于异常残留及旧工作区，默认 7 天，从运行结束或保留时间起算。正常任务树结束即清理，不等待此保留期。" />
       </fieldset>
       <p className="section-note">{workspaceCleanupSummary(schedule)} · 保留 {retention} 天。启动不立即清理，停机期间错过的计划不补跑。</p>
       {props.editing && retention < savedRetention && <div className="alert error">保留期已缩短，保存后下次清理可能删除更多已有工作区，请确认需要保留的成果已保存。</div>}
@@ -9702,7 +9702,7 @@ function AgentRunDetailDrawer(props: {
                 <div key={wait.wait_key} className={`alert ci-wait-note ${wait.status === "timed_out" ? "error" : ""}`} role="status">
                   远端 CI · PR/MR #{wait.wait_key.split(":")[0]} · {wait.status === "waiting" ? "等待中" : wait.status === "timed_out" ? "等待超时，待处理" : "等待已结束"}
                   <br />开始：{timeText(wait.started_at)} · 截止：{timeText(wait.deadline)}（轮询不重置期限）
-                  {wait.status === "timed_out" && <p>已保留 PR、分支和工作区；不会自动从头重跑或合并。</p>}
+                  {wait.status === "timed_out" && <p>保留已发布的远端 PR 和分支；临时工作区随任务树结束清理，不会自动从头重跑或合并。</p>}
                 </div>
               ))}
               {detail && drawerTab === "messages" && (

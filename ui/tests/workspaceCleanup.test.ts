@@ -16,6 +16,14 @@ test("清理默认每天六点，本地时间不提供时区字段", () => {
   assert.match(panel, /worktree_retention_days \?\? 7/);
 });
 
+test("任务结束清理与异常残留保留期分别说明，不承诺保留超时现场", () => {
+  assert.match(panel, /任务树结束后统一清理临时工作区/);
+  assert.match(panel, /包括未提交文件和未推送提交/);
+  assert.match(panel, /仅用于异常残留及旧工作区/);
+  assert.match(panel, /运行记录与日志保留/);
+  assert.doesNotMatch(app, /超时保留 PR 和工作区|已保留 PR、分支和工作区/);
+});
+
 test("支持固定小时或天间隔及每小时、每天、每周定点计划", () => {
   assert.equal(workspaceCleanupSummary({ ...DEFAULT_WORKSPACE_CLEANUP, kind: "interval", interval_value: 3, interval_unit: "hours" }), "每 3 小时");
   assert.equal(workspaceCleanupSummary({ ...DEFAULT_WORKSPACE_CLEANUP, kind: "interval", interval_value: 2 }), "每 2 天");

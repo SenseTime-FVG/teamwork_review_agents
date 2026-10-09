@@ -2912,6 +2912,18 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def run_workspace_cleanup_records(self, root_run_id: str) -> list[dict[str, Any]]:
+        """只读取任务树自有工作区元数据，不加载 Prompt、环境或日志。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, repository_id, workspace_path FROM agent_runs "
+                "WHERE root_run_id = ? AND workspace_status IN ('active', 'retained') "
+                "AND workspace_path IS NOT NULL AND workspace_path != ''",
+                (root_run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def record_workspace_cleanup(self, run_id: str, path: str, outcome: dict[str, Any]) -> None:
         """回写所有共享此目录的运行记录，并原子记录清理时间和原因。"""
 
@@ -2926,7 +2938,7 @@ class StateStore:
                     connection.execute(
                         "UPDATE agent_runs SET workspace_status = 'removed', workspace_reason = ? "
                         "WHERE run_id = ?",
-                        ("保留期已到，定时清理完成", row["run_id"]),
+                        (outcome.get("reason") or "保留期已到，定时清理完成", row["run_id"]),
                     )
                 connection.execute(
                     "INSERT INTO run_logs (run_id, created_at, stream, event_type, payload) "
