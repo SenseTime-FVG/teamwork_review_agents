@@ -337,7 +337,7 @@ async def test_oauth_store_refreshes_existing_codex_login(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_responses_client_parses_sse_without_local_api(tmp_path) -> None:
+async def test_responses_client_parses_sse_without_local_api(tmp_path, mock_codex_client_version) -> None:
     """请求应直达 Codex 上游，并聚合标准 SSE completed 事件。"""
 
     codex_home = tmp_path / "codex-home"
@@ -400,7 +400,7 @@ async def test_responses_client_parses_sse_without_local_api(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_responses_client_exposes_nested_sse_failure_details(tmp_path) -> None:
+async def test_responses_client_exposes_nested_sse_failure_details(tmp_path, mock_codex_client_version) -> None:
     """response.failed 应保留上游错误字段，而不是只返回通用失败文案。"""
 
     codex_home = tmp_path / "codex-home"
@@ -453,7 +453,7 @@ async def test_responses_client_exposes_nested_sse_failure_details(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_responses_client_exposes_top_level_sse_error_details(tmp_path) -> None:
+async def test_responses_client_exposes_top_level_sse_error_details(tmp_path, mock_codex_client_version) -> None:
     """顶层 error 事件没有嵌套 response 时也应保留消息和代码。"""
 
     codex_home = tmp_path / "codex-home"
@@ -498,7 +498,7 @@ async def test_responses_client_exposes_top_level_sse_error_details(tmp_path) ->
 
 @pytest.mark.asyncio
 async def test_responses_client_exposes_http_error_and_redacts_sensitive_text(
-    tmp_path,
+    tmp_path, mock_codex_client_version,
 ) -> None:
     """非 2xx JSON 错误应展示原因，同时限制长度并脱敏凭据。"""
 

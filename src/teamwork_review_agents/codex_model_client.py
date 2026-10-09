@@ -14,7 +14,6 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -282,6 +281,8 @@ class CodexResponsesClient:
     ) -> dict[str, Any]:
         """发送一次请求并返回 completed response。"""
 
+        # 每次新请求吸收 CLI 升级；探测移到线程，避免阻塞调度与流式输出。
+        client_version = await asyncio.to_thread(_codex_client_version, self.codex_binary)
         last_error: Exception | None = None
         for attempt in range(3):
             emitted = False
@@ -290,7 +291,7 @@ class CodexResponsesClient:
                 text_deltas: list[str] = []
                 output_items: list[dict[str, Any]] = []
                 output_item_ids: set[str] = set()
-                async for event in self._stream_once(payload):
+                async for event in self._stream_once(payload, client_version=client_version):
                     emitted = True
                     if event_callback is not None:
                         await event_callback(event)
@@ -347,7 +348,7 @@ class CodexResponsesClient:
         assert last_error is not None
         raise last_error
 
-    async def _stream_once(self, payload: dict[str, Any]):
+    async def _stream_once(self, payload: dict[str, Any], *, client_version: str):
         """执行单次 SSE 请求，401 时重新吸收一次宿主登录状态。"""
 
         request_payload = dict(payload)
@@ -369,7 +370,7 @@ class CodexResponsesClient:
                         CODEX_RESPONSES_URL,
                         headers=_codex_headers(
                             credentials,
-                            codex_binary=self.codex_binary,
+                            client_version=client_version,
                         ),
                         json=request_payload,
                     ) as response:
@@ -465,18 +466,17 @@ class CodexResponsesClient:
 def _codex_headers(
     credentials: CodexOAuthCredentials,
     *,
-    codex_binary: str,
+    client_version: str,
 ) -> dict[str, str]:
     """构造与 Codex CLI 能力协商兼容的安全请求头。"""
 
-    version = _codex_client_version(codex_binary)
     headers = {
         "Authorization": f"Bearer {credentials.access_token}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "originator": "teamwork-review-agents",
-        "version": version,
-        "User-Agent": f"teamwork-review-agents/{version}",
+        "version": client_version,
+        "User-Agent": f"teamwork-review-agents/{client_version}",
     }
     if credentials.account_id:
         headers["ChatGPT-Account-Id"] = credentials.account_id
@@ -495,13 +495,13 @@ def _oauth_lock(path: Path) -> asyncio.Lock:
         return lock
 
 
-@lru_cache(maxsize=16)
 def _codex_client_version(codex_binary: str) -> str:
-    """读取本机 Codex CLI 版本供上游能力协商。"""
+    """重新读取本机 CLI 版本，失败时阻止携带未知版本请求上游。"""
 
+    command = resolve_executable(codex_binary)
     try:
         completed = subprocess.run(
-            [resolve_executable(codex_binary), "--version"],
+            [command, "--version"],
             check=False,
             capture_output=True,
             text=True,
@@ -510,10 +510,26 @@ def _codex_client_version(codex_binary: str) -> str:
             timeout=3,
             **hidden_process_options(),
         )
-    except (CodexRuntimeError, OSError, subprocess.SubprocessError):
-        return "unknown"
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodexRuntimeError(
+            f"Codex CLI 版本探测失败（{type(exc).__name__}），未发送模型请求",
+            error_code="codex_version_probe_failed",
+            details={"resolved_path": command, "failure_type": type(exc).__name__},
+        ) from exc
+    if completed.returncode != 0:
+        raise CodexRuntimeError(
+            f"Codex CLI 版本探测失败（退出码 {completed.returncode}），未发送模型请求",
+            error_code="codex_version_probe_failed",
+            details={"resolved_path": command, "exit_code": completed.returncode},
+        )
     match = re.search(r"\b(\d+\.\d+\.\d+)\b", f"{completed.stdout}\n{completed.stderr}")
-    return match.group(1) if match else "unknown"
+    if match is None:
+        raise CodexRuntimeError(
+            "Codex CLI 未返回可识别的版本号，未发送模型请求",
+            error_code="codex_version_probe_failed",
+            details={"resolved_path": command},
+        )
+    return match.group(1)
 
 
 def _retryable_error(error: Exception) -> bool:

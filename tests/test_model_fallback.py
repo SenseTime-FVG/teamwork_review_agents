@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from teamwork_review_agents.codex_model_client import CodexResponsesClient, CodexUpstreamError
+from teamwork_review_agents.codex_executable import CodexRuntimeError
 from teamwork_review_agents.codex_model_runner import CodexModelRunner
 from teamwork_review_agents.config import ModelProviderConfig, ModelSelectionConfig
 from teamwork_review_agents.environment import SecretRedactor
@@ -57,7 +58,7 @@ def test_quota_classification_requires_explicit_code_or_type(fields, expected):
     ({"message": "Quota exceeded"}, 429, False),
     ({"message": "payment required"}, 402, False),
 ])
-async def test_clients_preserve_quota_metadata(client_kind, fields, status, expected, monkeypatch):
+async def test_clients_preserve_quota_metadata(client_kind, fields, status, expected, monkeypatch, mock_codex_client_version):
     """HTTP、嵌套 SSE 及 JSON 同样识别额度，明确耗尽不做客户端内重试。"""
 
     class OAuth:
@@ -209,6 +210,24 @@ def fallback_harness(configured_app_factory, monkeypatch):
         return SimpleNamespace(run=run, config=config, tool_calls=tool_calls)
 
     return create
+
+
+async def test_runtime_version_failure_preserves_no_retry_and_no_fallback(fallback_harness):
+    """本地版本探测失败不触发模型回退，终态保留结构化错误和重试策略。"""
+
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        raise CodexRuntimeError("Codex CLI 版本探测失败", error_code="codex_version_probe_failed")
+
+    outcome = await fallback_harness(handler).run()
+    assert len(requests) == 1
+    assert outcome.result.status == "failed"
+    assert outcome.result.error_code == "codex_version_probe_failed"
+    assert outcome.result.retryable is False
+    assert not any(kind == "model.fallback" for kind, _ in outcome.logs)
+    assert any(kind == "run.runtime_unavailable" for kind, _ in outcome.logs)
 
 
 @pytest.mark.parametrize("failure", ["429", "503", "timeout"])

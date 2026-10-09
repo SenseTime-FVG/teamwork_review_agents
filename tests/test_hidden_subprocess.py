@@ -57,7 +57,6 @@ def test_synchronous_background_commands_apply_window_policy(
         monkeypatch.setattr(
             module, "resolve_executable", lambda command, *args: command
         )
-    codex_model_client._codex_client_version.cache_clear()
     managed_sandbox._inspect_cached.cache_clear()
     try:
         assert workspace_snapshot._run_git_paths(tmp_path, ignored=False) == {
@@ -72,7 +71,6 @@ def test_synchronous_background_commands_apply_window_policy(
         ).available
     finally:
         # 清除模拟诊断结果，避免后续测试复用虚假的全局缓存。
-        codex_model_client._codex_client_version.cache_clear()
         managed_sandbox._inspect_cached.cache_clear()
     assert len(captured) == 6
     for _, options in captured:
