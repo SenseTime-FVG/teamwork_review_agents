@@ -316,6 +316,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       repository_initialization_timeout_seconds: 1800,
       git_timeout_seconds: 600,
       agent_idle_timeout_seconds: 300,
+      max_tool_rounds: 256,
       remote_ci_wait_timeout_seconds: 1800,
       ...runtimeInput,
       workspace_cleanup: { ...DEFAULT_WORKSPACE_CLEANUP, ...(runtimeInput.workspace_cleanup ?? {}) },
@@ -2597,6 +2598,7 @@ function GlobalEnvironment(props: {
           <Field label="基础仓库初始化无进展超时（秒）" type="number" value={Number(props.document.runtime.repository_initialization_timeout_seconds ?? 1800)} onChange={(value) => patchSection("runtime", "repository_initialization_timeout_seconds", Number(value))} help="仅连续无有效进展才超时；持续下载不受总耗时限制。" />
           <Field label="Git 无进展超时（秒）" type="number" value={Number(props.document.runtime.git_timeout_seconds ?? 600)} onChange={(value) => patchSection("runtime", "git_timeout_seconds", Number(value))} help="用于 fetch、运行 clone 和工作区操作；仓库锁等待另行计时。" />
           <Field label="默认无进展超时（秒）" type="number" value={Number(props.document.runtime.agent_idle_timeout_seconds ?? 300)} onChange={(value) => patchSection("runtime", "agent_idle_timeout_seconds", Number(value))} />
+          <Field label="默认模型与工具交互轮数上限" type="number" value={Number(props.document.runtime.max_tool_rounds ?? 256)} onChange={(value) => patchSection("runtime", "max_tool_rounds", Number(value))} help="默认 256 轮，填写正整数。仅用于自研模型模式；同轮多个工具仍算一轮，摘要与模型回退不额外计数。耗尽后任务未完成，不从头自动重试。" />
           <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留 PR 和工作区，不自动重跑。与本地 CI 执行超时独立。" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
@@ -6817,6 +6819,7 @@ function AgentsEditor(props: {
                 />
                 <Field label="作为子 Agent 的总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} help="作为主 Agent 运行时无固定总时限，仍受无进展超时约束；等待子 Agent 或受控 CI 时单独计时。" />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
+                <Field label="模型与工具交互轮数上限（可选）" type="number" value={agent.max_tool_rounds ?? ""} placeholder={`继承全局 ${String(props.document.runtime.max_tool_rounds ?? 256)} 轮`} onChange={(value) => update(name, { max_tool_rounds: value ? Number(value) : undefined })} help={`当前有效：${agent.max_tool_rounds ?? props.document.runtime.max_tool_rounds ?? 256} 轮 · ${agent.max_tool_rounds == null ? "继承全局" : "此 Agent 显式配置"}；根 Agent 和子 Agent 独立计数。仅用于自研模型模式，留空继承。`} />
                 <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
                 <Field label="输出 Schema（可选）" value={agent.output_schema ?? ""} onChange={(output_schema) => update(name, { output_schema: output_schema || undefined })} />
               </div>

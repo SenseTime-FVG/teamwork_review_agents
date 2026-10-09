@@ -68,7 +68,7 @@ from .subprocess_utils import (
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
 ModelSnapshotCallback = Callable[[dict[str, Any]], Awaitable[None]]
 CancelSourceCheck = Callable[[], Awaitable[str | None]]
-_MAX_TOOL_ROUNDS = 64
+_TOOL_ROUND_WARNING_REMAINING = 32
 _BASE_ENVIRONMENT_NAMES = {
     "PATH",
     "HOME",
@@ -626,6 +626,10 @@ class CodexModelRunner:
         exhausted_models: set[tuple[str, str | None]] = set()
         downgraded_efforts: dict[tuple[str, str | None], str | None] = {}
         compactions: list[dict[str, Any]] = []
+        # 启动时固化预算，不因候选回退、历史压缩或运行中配置热加载而重置。
+        max_tool_rounds = agent.max_tool_rounds or self.config.runtime.max_tool_rounds
+        tool_round_limit_source = "agent" if agent.max_tool_rounds is not None else "runtime"
+        round_limit_warned = False
 
         def fallbackable_error(error: Exception) -> bool:
             """只把 Provider 暂时不可用类错误交给回退链。"""
@@ -843,6 +847,8 @@ class CodexModelRunner:
                     reasoning_downgrades=reasoning_downgrades,
                 )
                 snapshot["request_round"] = request_round
+                snapshot["max_tool_rounds"] = max_tool_rounds
+                snapshot["tool_round_limit_source"] = tool_round_limit_source
                 snapshot["context_compactions"] = redactor.data(compactions[-16:])
                 snapshot["quota_exhausted_models"] = [
                     {"provider_id": selection.provider_id, "model": selection.model}
@@ -1006,7 +1012,7 @@ class CodexModelRunner:
                 "request_round": request_round,
             }))
 
-        for round_index in range(_MAX_TOOL_ROUNDS):
+        for round_index in range(max_tool_rounds):
             check_stop()
             request_round = round_index + 1
             context_retried: set[tuple[str, str | None]] = set()
@@ -1015,6 +1021,24 @@ class CodexModelRunner:
             if round_index and not await activate(0):
                 await save_snapshot()
                 raise RuntimeError("本次运行的模型候选均已耗尽额度或不可用")
+            remaining_rounds = max_tool_rounds - round_index
+            round_budget_hint = ""
+            if remaining_rounds <= _TOOL_ROUND_WARNING_REMAINING:
+                round_budget_hint = (
+                    f"运行器轮数提醒：本次模型与工具交互最多 {max_tool_rounds} 轮，"
+                    f"含当前请求还剩 {remaining_rounds} 轮。请梳理已完成与未完成事项，"
+                    "避免重复读取已有充分证据且未变化的内容，优先完成必要工作。"
+                    "必要复查仍可执行；不要为了收尾而省略验证、冒充审核通过或把未完成任务宣称为已完成。"
+                    "若无法完成，请明确说明未完成范围和原因。"
+                )
+                if not round_limit_warned:
+                    round_limit_warned = True
+                    await emit("system", "run.tool_round_limit_warning", {
+                        "request_round": request_round, "max_tool_rounds": max_tool_rounds,
+                        "remaining_rounds": remaining_rounds,
+                        "tool_round_limit_source": tool_round_limit_source,
+                        "message": round_budget_hint,
+                    })
             await emit("system", "model.request_started", {
                 "request_round": request_round,
                 "provider_id": current_selection.provider_id if current_selection else self.provider_id,
@@ -1023,12 +1047,16 @@ class CodexModelRunner:
                 "message": "新请求按主链顺序选模，跳过本次运行已耗尽额度的候选。",
                 "context_window_tokens": current_selection.context_window_tokens if current_selection else None,
                 "context_window_source": current_selection.context_window_source if current_selection else None,
+                "max_tool_rounds": max_tool_rounds,
+                "remaining_rounds": remaining_rounds,
+                "tool_round_limit_source": tool_round_limit_source,
             })
             await save_snapshot()
             while True:
                 payload: dict[str, Any] = {
                     "model": model,
-                    "instructions": instructions,
+                    # 提醒仅作用于当前请求，不伪造用户消息或改写持久对话。
+                    "instructions": instructions + ("\n\n" + round_budget_hint if round_budget_hint else ""),
                     "input": conversation.history(),
                     "tools": tools,
                     "tool_choice": "auto",
@@ -1368,7 +1396,22 @@ class CodexModelRunner:
                 )
             conversation.append_round(round_items)
 
-        raise RuntimeError(f"Codex 模型工具调用超过 {_MAX_TOOL_ROUNDS} 轮")
+        # 预算耗尽是确定性未完成，不应丢失用量或自动从头重复执行工具。
+        check_stop()
+        await save_snapshot()
+        error = f"Agent 模型与工具交互已达到 {max_tool_rounds} 轮上限，任务未完成；已停止自动重试"
+        await emit("system", "run.tool_round_limit_reached", {
+            "request_round": request_round, "max_tool_rounds": max_tool_rounds,
+            "remaining_rounds": 0, "tool_round_limit_source": tool_round_limit_source,
+            "status": "failed", "error": error,
+            "error_code": "agent_tool_round_limit", "retryable": False,
+        })
+        return AgentResult(
+            run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+            agent_name=agent_name, status="failed", thread_id=response_id,
+            error=error, error_code="agent_tool_round_limit", retryable=False,
+            usage=usage, events=events,
+        )
 
     def _settings(
         self,

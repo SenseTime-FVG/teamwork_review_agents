@@ -157,6 +157,7 @@ export type Agent = {
   network_domains?: string[];
   timeout_seconds?: number;
   idle_timeout_seconds?: number;
+  max_tool_rounds?: number | null;
   max_concurrent_runs?: number;
   write_scopes?: Array<"change_request" | "workspace">;
   managed_comment?: boolean;
@@ -219,6 +220,7 @@ export type RuntimeConfig = Record<string, unknown> & {
   repository_initialization_timeout_seconds?: number;
   git_timeout_seconds?: number;
   agent_idle_timeout_seconds?: number;
+  max_tool_rounds?: number;
   managed_sandbox?: ManagedSandboxConfig;
   default_model?: {
     context_window_tokens?: number | null;
@@ -627,6 +629,8 @@ export type AgentModelSnapshot = {
   fallback_attempts?: Array<Record<string, unknown>>;
   fallback_used?: boolean;
   request_round?: number;
+  max_tool_rounds?: number;
+  tool_round_limit_source?: "agent" | "runtime";
   quota_exhausted_models?: Array<{ provider_id: string; model: string | null }>;
   context_compactions?: Array<Record<string, unknown>>;
 };

@@ -69,6 +69,9 @@ database:
 #   git_timeout_seconds: 600
 #   # Codex 连续多久没有输出新的 JSONL 进度就终止；和 Agent 总超时分别计算。
 #   agent_idle_timeout_seconds: 300
+#   # 自研模型模式的单次交互轮数上限；摘要和同轮回退不额外计数。
+#   # 剩余 32 轮提醒；耗尽时保留记录且不自动从头重试。完整 CLI 模式不适用。
+#   max_tool_rounds: 256
 #   # 远端 CI 等待默认 30 分钟，含排队与执行；不是本地 Preflight 执行超时。
 #   remote_ci_wait_timeout_seconds: 1800
 #   # 默认由 Teamwork 使用当前 Codex CLI 的原生平台执行器建立外层沙盒：
@@ -351,6 +354,9 @@ agents:
     timeout_seconds: 1200
     # 可选：覆盖 runtime.agent_idle_timeout_seconds；连续无进展时提前结束。
     # idle_timeout_seconds: 300
+    # 可选：覆盖 runtime.max_tool_rounds；留空继承全局默认 256 轮。
+    # 根 Agent 与 sub-agent 分别计数，必须是正整数。
+    # max_tool_rounds: null
     # 可选：限制此名称的根 Agent 与 sub-agent 并发；省略表示不额外限制。
     # max_concurrent_runs: 2
     # 写操作声明用于申请串行锁，不等同于平台账号授权。
