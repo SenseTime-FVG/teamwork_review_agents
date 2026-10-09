@@ -71,6 +71,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.started": "Agent 开始运行",
   "run.runtime_ready": "运行环境检查通过",
   "run.runtime_unavailable": "运行环境检查失败",
+  "runtime.codex_version_retry": "Codex CLI 版本探测等待重试",
+  "runtime.codex_version_recovered": "Codex CLI 版本探测已恢复",
   "run.git_https_started": "检查 Windows 沙盒 Git HTTPS",
   "run.git_https_ready": "沙盒 Git HTTPS 检查通过",
   "run.git_https_skipped": "已跳过沙盒 Git HTTPS 检查",
@@ -222,7 +224,7 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     || log.event_type === "run.tool_round_limit_reached"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   // 能力告警及单个模型额度耗尽不等于整个任务已经终止。
-  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated", "run.tool_round_limit_warning"].includes(log.event_type);
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated", "run.tool_round_limit_warning", "runtime.codex_version_retry"].includes(log.event_type);
   let body = "";
   let detail = "";
   if (log.event_type.startsWith("context.") && object) {
@@ -256,6 +258,11 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
       object.error_code ? `错误码：${textValue(object.error_code)}` : "",
       object.retryable === false ? "已停止整次任务自动重试；未完成不代表审核通过。" : "",
     ].filter(Boolean).join("\n");
+  } else if (log.event_type.startsWith("runtime.codex_version_") && object) {
+    body = log.event_type === "runtime.codex_version_retry"
+      ? `第 ${textValue(object.attempt)} / ${textValue(object.max_attempts)} 次探测失败，${textValue(object.delay_seconds)} 秒后进行第 ${textValue(object.next_attempt)} 次。仅重试版本探测，不重跑 Agent。`
+      : `第 ${textValue(object.attempt)} / ${textValue(object.max_attempts)} 次探测成功：${textValue(object.version)}。继续当前模型请求。`;
+    detail = [textValue(object.reason), object.model ? `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}` : ""].filter(Boolean).join("\n");
   } else if (log.event_type === "run.tool_output_failed" && object) {
     body = textValue(object.error);
     detail = `错误码：${textValue(object.error_code)}\n已停止整轮自动重试，避免重复执行有副作用的工具。`;
@@ -428,4 +435,17 @@ export function presentRunLogs(logs: RunLog[]): RunMessage[] {
     messages.push(message);
   }
   return messages;
+}
+
+// 倒计时只在当前等待中展示；旧日志和已结束运行不能冒充活动重试。
+export function codexVersionProbeWaitText(logs: RunLog[], running: boolean, now: number): string {
+  const latest = logs.at(-1);
+  if (!running || latest?.event_type !== "runtime.codex_version_retry") return "";
+  const payload = asObject(parsePayload(latest.payload));
+  if (!payload || typeof payload.retry_at !== "number" || !Number.isFinite(payload.retry_at)
+    || typeof payload.next_attempt !== "number" || typeof payload.max_attempts !== "number") return "";
+  const remaining = Math.max(0, Math.ceil(payload.retry_at - now));
+  return remaining > 0
+    ? `Codex CLI 版本探测：${remaining} 秒后进行第 ${payload.next_attempt} / ${payload.max_attempts} 次；可取消运行。`
+    : `正在进行第 ${payload.next_attempt} / ${payload.max_attempts} 次 Codex CLI 版本探测…`;
 }

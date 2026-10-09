@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +27,7 @@ from .codex_executable import CodexRuntimeError
 from .reasoning_effort import is_reasoning_effort_rejection
 from .model_quota import is_quota_exhausted
 from .context_compaction import is_context_length_exceeded
+from .run_control import active_run_control
 
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -32,6 +35,9 @@ OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_REFRESH_SKEW_MS = 60_000
 RETRYABLE_HTTP_STATUS = {502, 503, 504}
+_VERSION_PROBE_RETRY_DELAYS = (10, 20, 40, 80, 120)
+_VERSION_PROBE_TIMEOUT_SECONDS = 3
+_VERSION_PROBE_WAIT_BUDGET_SECONDS = 300
 _UPSTREAM_ERROR_MAX_CHARS = 2000
 _UPSTREAM_ERROR_FIELD_MAX_CHARS = 500
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -266,12 +272,14 @@ class CodexResponsesClient:
         timeout_seconds: float = 1200.0,
         idle_timeout_seconds: float = 300.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        diagnostic_callback: EventCallback | None = None,
     ) -> None:
         self.oauth = oauth
         self.codex_binary = codex_binary
         self.timeout_seconds = timeout_seconds
         self.idle_timeout_seconds = idle_timeout_seconds
         self.transport = transport
+        self.diagnostic_callback = diagnostic_callback
 
     async def create_response(
         self,
@@ -281,8 +289,8 @@ class CodexResponsesClient:
     ) -> dict[str, Any]:
         """发送一次请求并返回 completed response。"""
 
-        # 每次新请求吸收 CLI 升级；探测移到线程，避免阻塞调度与流式输出。
-        client_version = await asyncio.to_thread(_codex_client_version, self.codex_binary)
+        # 只重试当前请求的版本探测，不重放模型回合或已经执行的工具。
+        client_version = await self._version_with_retry()
         last_error: Exception | None = None
         for attempt in range(3):
             emitted = False
@@ -347,6 +355,66 @@ class CodexResponsesClient:
                 await asyncio.sleep(2**attempt)
         assert last_error is not None
         raise last_error
+
+    async def _version_with_retry(self) -> str:
+        """给 CLI 升级留出有限恢复窗口，等待支持取消且不伪造模型进展。"""
+
+        control = active_run_control.get()
+        waiting = (
+            control.waiting_for_runtime(_VERSION_PROBE_WAIT_BUDGET_SECONDS)
+            if control is not None else nullcontext()
+        )
+        max_attempts = len(_VERSION_PROBE_RETRY_DELAYS) + 1
+        attempt = 0
+        with waiting:
+            try:
+                async with asyncio.timeout(_VERSION_PROBE_WAIT_BUDGET_SECONDS):
+                    for attempt in range(1, max_attempts + 1):
+                        if control is not None:
+                            control.raise_if_stopped()
+                        try:
+                            version = await asyncio.to_thread(_codex_client_version, self.codex_binary)
+                        except CodexRuntimeError as exc:
+                            if not _retryable_version_probe(exc):
+                                raise
+                            if attempt == max_attempts:
+                                raise CodexRuntimeError(
+                                    f"{exc}；版本探测已尝试 {max_attempts} 次，停止本次运行",
+                                    error_code=exc.error_code,
+                                    details={**exc.details, "probe_attempts": attempt, "probe_retries_exhausted": True},
+                                ) from exc
+                            delay = _VERSION_PROBE_RETRY_DELAYS[attempt - 1]
+                            await self._version_diagnostic({
+                                "type": "runtime.codex_version_retry",
+                                "attempt": attempt, "next_attempt": attempt + 1,
+                                "max_attempts": max_attempts, "delay_seconds": delay,
+                                "retry_at": time.time() + delay, "reason": str(exc),
+                            })
+                            await asyncio.sleep(delay)
+                            continue
+                        if control is not None:
+                            control.raise_if_stopped()
+                        if attempt > 1:
+                            await self._version_diagnostic({
+                                "type": "runtime.codex_version_recovered",
+                                "attempt": attempt, "max_attempts": max_attempts,
+                                "version": version,
+                            })
+                        return version
+            except TimeoutError as exc:
+                raise CodexRuntimeError(
+                    "Codex CLI 版本探测恢复窗口已耗尽，未发送模型请求",
+                    error_code="codex_version_probe_failed",
+                    details={"probe_attempts": attempt, "probe_retries_exhausted": True,
+                             "wait_budget_seconds": _VERSION_PROBE_WAIT_BUDGET_SECONDS},
+                ) from exc
+        raise AssertionError("版本探测循环未返回结果")
+
+    async def _version_diagnostic(self, event: dict[str, Any]) -> None:
+        """本地等待独立记录，不混入上游 SSE 或传给模型。"""
+
+        if self.diagnostic_callback is not None:
+            await self.diagnostic_callback(event)
 
     async def _stream_once(self, payload: dict[str, Any], *, client_version: str):
         """执行单次 SSE 请求，401 时重新吸收一次宿主登录状态。"""
@@ -507,7 +575,7 @@ def _codex_client_version(codex_binary: str) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=3,
+            timeout=_VERSION_PROBE_TIMEOUT_SECONDS,
             **hidden_process_options(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -530,6 +598,20 @@ def _codex_client_version(codex_binary: str) -> str:
             details={"resolved_path": command},
         )
     return match.group(1)
+
+
+def _retryable_version_probe(error: CodexRuntimeError) -> bool:
+    """只有限重试版本探测故障，明确权限及配置错误立即停止。"""
+
+    if error.error_code != "codex_version_probe_failed":
+        return False
+    cause = error.__cause__
+    # Windows 更新时文件共享冲突属于暂时占用，不等于账户权限被拒绝。
+    if isinstance(cause, OSError) and getattr(cause, "winerror", None) in {32, 33}:
+        return True
+    if isinstance(cause, PermissionError):
+        return False
+    return not (isinstance(cause, OSError) and cause.errno in {errno.EACCES, errno.EPERM})
 
 
 def _retryable_error(error: Exception) -> bool:

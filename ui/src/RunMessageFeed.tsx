@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RunLog } from "./types";
-import { presentRunLogs, runMessageRepeatLabel } from "./runLogPresentation";
+import { codexVersionProbeWaitText, presentRunLogs, runMessageRepeatLabel } from "./runLogPresentation";
 
 function messageTime(value: number): string {
   return new Date(value * 1000).toLocaleTimeString("zh-CN", {
@@ -30,6 +30,7 @@ export function MarkdownMessage(props: { children: string }) {
 export function RunMessageFeed(props: {
   logs: RunLog[];
   active?: boolean;
+  running?: boolean;
   onOpenRun?: (runId: string) => void;
 }) {
   const messages = useMemo(() => presentRunLogs(props.logs), [props.logs]);
@@ -37,6 +38,17 @@ export function RunMessageFeed(props: {
   const previousLogCountRef = useRef(0);
   const [following, setFollowing] = useState(true);
   const [hasNewMessages, setHasNewMessages] = useState(false);
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  const latestLog = props.logs.at(-1);
+  const versionWaitText = codexVersionProbeWaitText(props.logs, props.running === true, now);
+
+  useEffect(() => {
+    if (!props.running || latestLog?.event_type !== "runtime.codex_version_retry") return;
+    // 每秒只刷新界面倒计时，不轮询后台或生成心跳日志。
+    setNow(Date.now() / 1000);
+    const timer = window.setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => window.clearInterval(timer);
+  }, [props.running, latestLog?.id, latestLog?.event_type]);
 
   function scrollToLatest(behavior: ScrollBehavior = "smooth") {
     const viewport = viewportRef.current;
@@ -73,6 +85,7 @@ export function RunMessageFeed(props: {
           if (nearBottom) setHasNewMessages(false);
         }}
       >
+        {versionWaitText && <div className="alert run-version-wait-note" role="status">{versionWaitText}</div>}
         {messages.map((message) => (
           <article key={message.id} className={`run-message message-${message.kind}`}>
             <div className="run-message-rail"><span /></div>

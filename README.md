@@ -364,6 +364,8 @@ Git 仓库识别、显式 Prompt 或 Skill 装载。
 
 ## 模型 Provider 与全局默认模型
 
+Codex 基座模式每次新请求会重新执行 `codex --version`，吸收同一路径上的 CLI 升级。运行中遇到短暂版本探测失败时，仅重试当前探测，最多 6 次（含首次），间隔为 10、20、40、80、120 秒；恢复后继续当前请求，不重放已经执行的工具或重跑整个 Agent。等待期间可取消，消息页显示次数与倒计时；有界等待暂不计入普通无进展超时，子 Agent 总时限仍有效。明确权限拒绝、版本不匹配或配置命令不存在不会等待重试。探测及退避恢复窗口最多 300 秒，耗尽后保留 `codex_version_probe_failed` 并停止整轮自动重试，不发送旧版本或 `unknown` 请求头；网络和 OAuth 重试继续复用本次成功探测的版本。
+
 “Provider”页管理 Agent 的模型执行后端。页面使用整列列表直接展示每个 Provider 的协议或模式、具体默认模型和状态，点击一行后在详情抽屉中单独查看、编辑、保存或测试该 Provider。`codex-cli` 是系统自动补齐的内置 Provider：可以停用，但不能删除，初始全局默认模型也指向它。API Provider 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 和 Gemini GenerateContent 协议，可分别配置 Base URL、默认模型、模型目录、超时和并发上限。API Key 与 `config.yaml`、配置历史分开保存；列表只显示掩码，管理员主动点击小眼睛时才通过受管理 API 临时读取明文，Key 不进入 Prompt、工具子进程、运行快照或日志。
 
 新建或编辑 API Provider 时，不需要先填写占位模型。填写 Base URL 和 API Key 后点击“检测模型”，Teamwork 会按所选协议读取模型目录，用户可在表单内选择默认模型；检测失败不会保存半成品，也可以改用手工模型目录。已保存 Provider 在未输入新 Key 时会复用受管凭据。检测和保存之外，详情抽屉还提供“连接测试”，只发送不带固定推理等级和工具声明的最小请求，用于验证凭据、地址和模型是否可用。

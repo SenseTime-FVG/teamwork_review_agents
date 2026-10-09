@@ -791,6 +791,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .detail-tabs summary .workspace-active, .detail-tabs summary .workspace-inherited { border: 1px solid #294f75; background: #101f33; color: #8eb8ff; }
 .run-message-feed { position: relative; height: 100%; min-height: 360px; }
 .run-message-viewport { height: 100%; overflow: auto; padding: 4px 5px 60px 0; overscroll-behavior: contain; }
+/* 倒计时固定在现有消息滚动区内，不额外挤占详情高度。 */
+.run-version-wait-note { position: sticky; top: 0; z-index: 2; }
 .run-message { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 9px; padding-bottom: 10px; }
 .run-message-rail { position: relative; display: flex; justify-content: center; }
 .run-message-rail::after { position: absolute; top: 13px; bottom: -11px; width: 1px; background: #223044; content: ""; }

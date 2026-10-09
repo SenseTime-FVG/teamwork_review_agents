@@ -9709,6 +9709,7 @@ function AgentRunDetailDrawer(props: {
                 <RunMessageFeed
                   logs={logs}
                   active={childRunId === null}
+                  running={detail.status === "running"}
                   onOpenRun={openRun}
                 />
               )}
