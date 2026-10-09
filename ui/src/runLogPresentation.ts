@@ -90,6 +90,8 @@ const SYSTEM_TITLES: Record<string, string> = {
   "model.request_started": "新一轮请求选模",
   "model.quota_exhausted": "额度耗尽，本次运行跳过该模型",
   "model.reasoning_downgraded": "推理强度自动降级",
+  "run.tool_round_limit_warning": "交互轮数即将耗尽",
+  "run.tool_round_limit_reached": "交互轮数已耗尽，任务未完成",
   "context.compaction_started": "正在压缩执行历史",
   "context.compacted": "上下文已压缩",
   "context.compaction_failed": "上下文无法安全压缩",
@@ -217,9 +219,10 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     ? "工作区所有权校验失败，已阻断运行"
     : SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
+    || log.event_type === "run.tool_round_limit_reached"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   // 能力告警及单个模型额度耗尽不等于整个任务已经终止。
-  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated"].includes(log.event_type);
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated", "run.tool_round_limit_warning"].includes(log.event_type);
   let body = "";
   let detail = "";
   if (log.event_type.startsWith("context.") && object) {
@@ -245,6 +248,14 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
       object.error_code ? `错误码：${textValue(object.error_code)}` : "",
       object.retryable === false ? "已停止整轮自动重试，避免重复执行已完成操作。" : "",
     ].filter(Boolean).join("\n");
+  } else if (["run.tool_round_limit_warning", "run.tool_round_limit_reached"].includes(log.event_type) && object) {
+    body = textValue(object.error ?? object.message);
+    detail = [
+      `第 ${textValue(object.request_round)} 轮 · 上限 ${textValue(object.max_tool_rounds)} 轮 · 剩余 ${textValue(object.remaining_rounds)} 轮`,
+      object.tool_round_limit_source === "agent" ? "轮数预算来源：Agent 配置" : "轮数预算来源：全局配置",
+      object.error_code ? `错误码：${textValue(object.error_code)}` : "",
+      object.retryable === false ? "已停止整次任务自动重试；未完成不代表审核通过。" : "",
+    ].filter(Boolean).join("\n");
   } else if (log.event_type === "run.tool_output_failed" && object) {
     body = textValue(object.error);
     detail = `错误码：${textValue(object.error_code)}\n已停止整轮自动重试，避免重复执行有副作用的工具。`;
@@ -259,6 +270,7 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     body = textValue(object.message);
     detail = [
       `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}`,
+      object.max_tool_rounds != null ? `交互轮数上限：${textValue(object.max_tool_rounds)} 轮；含当前请求剩余 ${textValue(object.remaining_rounds)} 轮` : "",
       textValue(object.reason),
     ].filter(Boolean).join("\n");
   } else if ((log.event_type.startsWith("run.curl_") || log.event_type === "run.http_tls_unavailable") && object) {

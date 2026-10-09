@@ -322,6 +322,8 @@ class RuntimeConfig(BaseModel):
     repository_initialization_timeout_seconds: PositiveInt = 1800
     git_timeout_seconds: PositiveInt = 600
     agent_idle_timeout_seconds: PositiveInt = 300
+    # 单次自研模型循环的请求轮数；同轮多工具、摘要及回退不额外计数。
+    max_tool_rounds: int = Field(default=256, gt=0, strict=True)
     # 远端 CI 排队与执行共用等待期限，与本地 Preflight 超时独立。
     remote_ci_wait_timeout_seconds: PositiveInt = 1800
     managed_sandbox: ManagedSandboxConfig = Field(
@@ -552,6 +554,8 @@ class AgentConfig(BaseModel):
     network_domains: list[str] = Field(default_factory=list)
     timeout_seconds: PositiveInt = 1200
     idle_timeout_seconds: PositiveInt | None = None
+    # 留空继承全局轮数预算，根 Agent 与子 Agent 各自计数。
+    max_tool_rounds: int | None = Field(default=None, gt=0, strict=True)
     max_concurrent_runs: PositiveInt | None = None
     write_scopes: list[Literal["change_request", "workspace"]] = Field(default_factory=list)
     managed_comment: bool = False
