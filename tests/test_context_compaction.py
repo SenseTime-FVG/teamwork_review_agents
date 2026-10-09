@@ -795,7 +795,7 @@ async def test_summary_protocol_adapters_disable_tools_and_preserve_stop_state(d
 
 
 @pytest.mark.parametrize("mode", ["external", "external_json", "codex_http", "codex_sse", "codex_json"])
-async def test_clients_preserve_context_length_error(mode, monkeypatch):
+async def test_clients_preserve_context_length_error(mode, monkeypatch, mock_codex_client_version):
     """各错误入口统一识别明确超限，不依赖格式化中文文本反向解析。"""
 
     class OAuth:

@@ -276,7 +276,7 @@ async def test_rejection_after_omission_does_not_loop(run_effort, effort):
 
 
 @pytest.mark.parametrize("mode", ["http", "sse", "json"])
-async def test_codex_client_marks_effort_rejection(mode, monkeypatch):
+async def test_codex_client_marks_effort_rejection(mode, monkeypatch, mock_codex_client_version):
     """内置模型客户端的 HTTP、SSE 和兼容 JSON 错误采用相同判定。"""
 
     class OAuth:

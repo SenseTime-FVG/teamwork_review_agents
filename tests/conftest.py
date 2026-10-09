@@ -12,6 +12,16 @@ from teamwork_review_agents.models import ChangeRequestSnapshot
 
 
 @pytest.fixture
+def mock_codex_client_version(monkeypatch):
+    """HTTP 协议测试使用固定版本，不执行宿主 CLI 或读取真实安装。"""
+
+    monkeypatch.setattr(
+        "teamwork_review_agents.codex_model_client._codex_client_version",
+        lambda command: "0.159.2",
+    )
+
+
+@pytest.fixture
 def verified_test_sandbox_python():
     """仅由模拟沙盒测试显式使用；真实 Windows 验收必须重新执行原生探针。"""
 

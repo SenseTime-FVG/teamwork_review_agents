@@ -14,6 +14,7 @@ from typing import Any
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from .agent_home import TemporaryAgentHome, cleanup_stale_agent_homes_once
+from .codex_executable import CodexRuntimeError
 from .codex_model_client import (
     CodexOAuthError,
     CodexOAuthStore,
@@ -534,6 +535,20 @@ class CodexModelRunner:
             await emit("system", "run.git_https_failed", {
                 "error": error, "error_code": exc.error_code, "retryable": exc.retryable,
             })
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status="failed", error=error,
+                error_code=exc.error_code, retryable=exc.retryable,
+            )
+        except CodexRuntimeError as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
+            # 本地程序故障保留重试策略，不能被包装成可重试的普通模型错误。
+            error = redactor.text(str(exc))
+            await emit("system", "run.runtime_unavailable", redactor.data({
+                **exc.details, "stage": "execution", "error": error,
+                "error_code": exc.error_code, "retryable": exc.retryable,
+            }))
             return AgentResult(
                 run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
                 agent_name=agent_name, status="failed", error=error,
