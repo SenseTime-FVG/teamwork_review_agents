@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -48,6 +49,7 @@ from .model_provider_client import (
     discover_provider_models,
 )
 from .model_provider_credentials import ModelProviderCredentialStore
+from .models import ChangeEvent
 from .preflight_manager import ManualPreflightManager
 from .providers.base import provider_class
 from .repository_initialization import RepositoryInitializationManager
@@ -1895,7 +1897,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="事件不存在")
         return detail
 
-    async def create_manual_event_replay(event_id: str):
+    async def create_manual_event_replay(event_id: str, *, batch_id: str | None = None):
         """校验来源事件并创建尚未入库的手动重放事件。"""
 
         source = await asyncio.to_thread(manager.store.load_event, event_id)
@@ -1904,7 +1906,21 @@ def create_app(
         repository = manager.config.repository_map().get(source.repository_id)
         if repository is None or not repository.enabled:
             raise HTTPException(status_code=409, detail="仓库未启用，不能手动触发事件")
-        return create_manual_replay_event(source), source
+        return create_manual_replay_event(source, batch_id=batch_id), source
+
+    async def enqueue_manual_batch(events: list[ChangeEvent]) -> int:
+        """合法项整体入队后再唤醒调度，避免调度器看到尚未完整写入的批次。"""
+
+        if not events:
+            return 0
+        try:
+            inserted = await asyncio.to_thread(
+                manager.store.enqueue_events, events, require_all=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        runtime.dispatch_events_now()
+        return inserted
 
     @app.post("/api/events/{event_id}/replay")
     async def replay_event(event_id: str):
@@ -1925,11 +1941,12 @@ def create_app(
 
     @app.post("/api/events/replay")
     async def replay_events(request: ManualEventReplayBatchRequest):
-        """逐项重放历史事件，并让单项失败不阻塞其他目标。"""
+        """逐项校验历史事件，合法项作为一个手动批次原子入队。"""
 
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
-        created_count = 0
+        batch_id = f"manual:{uuid.uuid4().hex}"
+        events: list[ChangeEvent] = []
         for event_id in request.event_ids:
             if event_id in seen:
                 results.append(
@@ -1943,13 +1960,7 @@ def create_app(
                 continue
             seen.add(event_id)
             try:
-                event, source = await create_manual_event_replay(event_id)
-                inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
-                if not inserted:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="手动事件未能写入，请重新操作",
-                    )
+                event, source = await create_manual_event_replay(event_id, batch_id=batch_id)
             except HTTPException as exc:
                 results.append(
                     {
@@ -1961,7 +1972,7 @@ def create_app(
                 )
                 continue
 
-            created_count += 1
+            events.append(event)
             results.append(
                 {
                     "source_event_id": source.id,
@@ -1973,8 +1984,7 @@ def create_app(
                 }
             )
 
-        if created_count:
-            runtime.dispatch_events_now()
+        created_count = await enqueue_manual_batch(events)
         failed_count = len(results) - created_count
         return {
             "requested": len(request.event_ids),
@@ -2095,7 +2105,9 @@ def create_app(
             "reason": "首次发现事件已补发" if inserted else "首次发现事件已经存在",
         }
 
-    async def create_latest_manual_event(repository_id: str, number: int):
+    async def create_latest_manual_event(
+        repository_id: str, number: int, *, batch_id: str | None = None,
+    ):
         """校验目标并创建尚未写入数据库的最新手动事件。"""
         snapshot = await asyncio.to_thread(
             manager.store.load_snapshot,
@@ -2116,10 +2128,10 @@ def create_app(
         )
         activity = manager.store._latest_activity_from_cursor(cursor)
         if activity is not None and activity_event_type(activity.type) and not (cursor or {}).get("activity_error"):
-            return create_manual_activity_event(snapshot, activity), "platform"
+            return create_manual_activity_event(snapshot, activity, batch_id=batch_id), "platform"
         source = await asyncio.to_thread(manager.store.load_latest_detected_event, snapshot)
         if source is not None:
-            return create_manual_replay_event(source), "system"
+            return create_manual_replay_event(source, batch_id=batch_id), "system"
         raise HTTPException(
             status_code=409,
             detail="暂无可触发的平台事件或当前版本的系统检测事件，请先完成一次扫描",
@@ -2153,11 +2165,12 @@ def create_app(
 
     @app.post("/api/change-requests/trigger-latest-events")
     async def trigger_latest_events(request: ManualLatestEventBatchRequest):
-        """逐项创建最新手动事件，并让单项失败不阻塞其他目标。"""
+        """逐项校验最新事件，平台与系统来源共同组成一个手动批次。"""
 
         results: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
-        created_count = 0
+        batch_id = f"manual:{uuid.uuid4().hex}"
+        events: list[ChangeEvent] = []
         for target in request.targets:
             key = (target.repository_id, target.number)
             if key in seen:
@@ -2173,13 +2186,7 @@ def create_app(
                 continue
             seen.add(key)
             try:
-                event, source = await create_latest_manual_event(*key)
-                inserted = await asyncio.to_thread(manager.store.enqueue_events, [event])
-                if not inserted:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="手动事件未能写入，请重新操作",
-                    )
+                event, source = await create_latest_manual_event(*key, batch_id=batch_id)
             except HTTPException as exc:
                 results.append(
                     {
@@ -2192,7 +2199,7 @@ def create_app(
                 )
                 continue
 
-            created_count += 1
+            events.append(event)
             results.append(
                 {
                     "repository_id": target.repository_id,
@@ -2213,8 +2220,7 @@ def create_app(
                 }
             )
 
-        if created_count:
-            runtime.dispatch_events_now()
+        created_count = await enqueue_manual_batch(events)
         failed_count = len(results) - created_count
         return {
             "requested": len(request.targets),

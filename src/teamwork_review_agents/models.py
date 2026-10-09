@@ -88,7 +88,21 @@ class ChangeEvent(BaseModel):
     source_occurred_at: datetime | None = None
     source_event_id: str | None = None
     source_event_occurred_at: datetime | None = None
+    deduplication_occurred_at: datetime | None = None
     source_generation: int = Field(default=1, ge=1)
+
+    @property
+    def deduplication_time(self) -> datetime:
+        """手动重放按原始时间去重，兼容旧载荷；扫描仍按事件产生时间。"""
+
+        if self.origin == "manual":
+            return (
+                self.deduplication_occurred_at
+                or self.source_event_occurred_at
+                or self.source_occurred_at
+                or self.occurred_at
+            )
+        return self.occurred_at
 
     @property
     def resource_key(self) -> str:

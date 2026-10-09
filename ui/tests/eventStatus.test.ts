@@ -38,3 +38,12 @@ test("状态回写失败和旧记录原因保持可见", () => {
   const unmatched = eventStatusPresentation(record({ status: "unmatched", unmatched_reason: "scan_deduplicated" }));
   assert.match(unmatched.details ?? "", /已被更新事件替代/);
 });
+
+test("手动批次去重显示未触发，不冒充扫描或关联运行", () => {
+  const result = eventStatusPresentation(record({ status: "unmatched", unmatched_reason: "manual_batch_deduplicated" }));
+  assert.equal(result.label, "未触发");
+  assert.equal(result.details, "本次手动批次内已被更新事件替代，未触发运行");
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(app, /不同次点击不合并，也不会记录为扫描/);
+  assert.match(app, /同一扫描周期或一次批量手动触发中/);
+});

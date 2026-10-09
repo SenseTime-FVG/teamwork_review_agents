@@ -7477,7 +7477,7 @@ function RulesEditor(props: {
                   checked={rule.deduplicate_per_scan ?? false}
                   onChange={(deduplicate_per_scan) => update(index, { deduplicate_per_scan })}
                 />
-                <p>开启后，本轮同一 MR / PR 的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
+                <p>开启后，同一扫描周期或一次批量手动触发中，同一 MR / PR 的匹配事件只保留原始时间最新的事件执行本规则。</p>
               </div>
               <div className="rule-option">
                 <Toggle
@@ -7485,7 +7485,7 @@ function RulesEditor(props: {
                   checked={rule.deduplicate_source_branch_per_scan ?? false}
                   onChange={(deduplicate_source_branch_per_scan) => update(index, { deduplicate_source_branch_per_scan })}
                 />
-                <p>开启后，本轮同一仓库源分支的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
+                <p>开启后，同一扫描周期或一次批量手动触发中，同一仓库源分支的匹配事件只保留原始时间最新的事件执行本规则。</p>
               </div>
               <div className="rule-option">
                 <Toggle
@@ -7493,7 +7493,7 @@ function RulesEditor(props: {
                   checked={rule.deduplicate_target_branch_per_scan ?? false}
                   onChange={(deduplicate_target_branch_per_scan) => update(index, { deduplicate_target_branch_per_scan })}
                 />
-                <p>开启后，本轮同一仓库目标分支的多个匹配事件只保留最新事件触发，较早事件记为未触发。</p>
+                <p>开启后，同一扫描周期或一次批量手动触发中，同一仓库目标分支的匹配事件只保留原始时间最新的事件执行本规则。</p>
               </div>
               <div className="rule-option">
                 <Toggle
@@ -10471,7 +10471,7 @@ export default function App() {
       changeRequests: targets,
       eyebrow: "批量重放事件",
       title: `确认触发 ${targets.length} 个 MR / PR`,
-      description: "每个目标重放自己的平台活动或当前版本的系统检测事件，分别发送到当前规则引擎。",
+      description: "所选目标组成一个手动批次，重放各自的平台活动或系统检测事件；按规则现有开关去重，只保留原始时间最新的匹配事件。不会记录为扫描。",
       details: [
         { label: "目标数量", value: `${targets.length} 个` },
         { label: "仓库分布", value: summarize(repositoryCounts) },
@@ -10542,7 +10542,7 @@ export default function App() {
       events: items,
       eyebrow: "批量历史事件",
       title: `确认触发 ${items.length} 条事件`,
-      description: "每条来源事件都会复制原始上下文，并分别创建新的独立手动事件。",
+      description: "复制所选事件的原始上下文，组成一个手动批次；按规则现有开关去重，只保留原始时间最新的匹配事件。不同次点击不合并，也不会记录为扫描。",
       details: [
         { label: "事件数量", value: `${items.length} 条` },
         { label: "仓库分布", value: summarize(repositoryCounts) },
