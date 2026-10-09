@@ -155,8 +155,8 @@ test("仓库选择区分整体与局部范围，清理跨仓库状态并隔离�
   assert.match(change, /setOverviewStatus\(null\)/);
   assert.match(change, /setChangeRequestFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
   assert.match(change, /setEventFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
-  assert.match(change, /setSelectedSnapshotKeys\(\[\]\)/);
-  assert.match(change, /setSelectedEventIds\(\[\]\)/);
+  assert.match(change, /setSelectedChangeRequests\(\[\]\)/);
+  assert.match(change, /setSelectedEvents\(\[\]\)/);
   assert.match(change, /setOverviewConfirmation\(null\)/);
   assert.match(app, /key=\{overviewRepositoryId\}/);
   assert.match(app, /requestSequence !== overviewRequestSequence.current\) return/);

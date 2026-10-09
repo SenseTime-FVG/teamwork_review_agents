@@ -1,3 +1,5 @@
+import type { OverviewFilter } from "./overviewScope";
+
 export type OverviewSelectionRow = { key: string; selectable: boolean };
 export type OverviewSelectionAnchor = { key: string; visibleKeys: string[] };
 
@@ -29,4 +31,43 @@ export function toggleOverviewSelection(current: readonly string[], target: stri
   const affected = new Set(keys);
   if (current.includes(target)) return current.filter((key) => !affected.has(key));
   return [...new Set([...current, ...keys])];
+}
+
+export function toggleOverviewRecords<T>(
+  current: T[],
+  visible: readonly T[],
+  keyOf: (item: T) => string,
+  target: string,
+  keys: readonly string[],
+): T[] {
+  // 仅保存已选记录，跨页切换时从原集合补齐不在当前页的目标。
+  const records = new Map([...current, ...visible].map((item) => [keyOf(item), item]));
+  const selectedKeys = toggleOverviewSelection(current.map(keyOf), target, keys);
+  return selectedKeys.flatMap((key) => {
+    const item = records.get(key);
+    return item === undefined ? [] : [item];
+  });
+}
+
+export function refreshOverviewSelection<T>(current: T[], visible: readonly T[], keyOf: (item: T) => string): T[] {
+  // 当前页响应只能更新已选快照，不能把未出现的其他页记录认定为删除。
+  const records = new Map(visible.map((item) => [keyOf(item), item]));
+  let changed = false;
+  const next = current.map((item) => {
+    const latest = records.get(keyOf(item));
+    if (latest === undefined || latest === item) return item;
+    changed = true;
+    return latest;
+  });
+  return changed ? next : current;
+}
+
+export function overviewSelectionScopeChanged(current: OverviewFilter, next: OverviewFilter): boolean {
+  // 排序、页码和每页条数不改变选择范围；多状态顺序不影响实际筛选。
+  const statuses = (filter: OverviewFilter) => [...new Set(
+    filter.statuses.length > 0 ? filter.statuses : filter.status ? [filter.status] : [],
+  )].sort().join("\u0000");
+  return current.repositoryId !== next.repositoryId
+    || current.number !== next.number
+    || statuses(current) !== statuses(next);
 }

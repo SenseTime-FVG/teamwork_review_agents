@@ -26,7 +26,7 @@ import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions, modelSupportsReasoni
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
-import { overviewSelectionRange, toggleOverviewSelection } from "./overviewSelection";
+import { overviewSelectionRange, toggleOverviewRecords, refreshOverviewSelection, overviewSelectionScopeChanged } from "./overviewSelection";
 import type { OverviewSelectionAnchor } from "./overviewSelection";
 import { fitOverlayToViewport } from "./overlayPlacement";
 import { DelayedTooltipButton } from "./DelayedTooltipButton";
@@ -1994,9 +1994,9 @@ function Overview(props: {
   triggeringKeys: string[];
   replayingEventIds: string[];
   selectionMode: boolean;
-  selectedSnapshotKeys: string[];
+  selectedChangeRequests: ChangeRequestRecord[];
   eventSelectionMode: boolean;
-  selectedEventIds: string[];
+  selectedEvents: EventRecord[];
   detailRefreshToken: number;
   confirmationOpen: boolean;
   onAction: (action: "scan" | "pause" | "resume") => void;
@@ -2028,12 +2028,11 @@ function Overview(props: {
   const eventTotal = Object.values(stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = stats.change_requests.total ?? 0;
   const pendingEvents = (stats.events.pending ?? 0) + (stats.events.processing ?? 0);
-  const selectedItems = props.changeRequests.filter((item) => (
-    manualTriggerEvent(item) && props.selectedSnapshotKeys.includes(item.snapshot_key)
-  ));
-  const selectedEventItems = props.events.filter((event) => (
-    props.selectedEventIds.includes(event.event_id)
-  ));
+  // 按完整已选集合统计和提交，当前页仅决定展示，不裁剪其他页的选择。
+  const selectedItems = props.selectedChangeRequests;
+  const selectedEventItems = props.selectedEvents;
+  const selectedSnapshotKeys = new Set(selectedItems.map((item) => item.snapshot_key));
+  const selectedEventIds = new Set(selectedEventItems.map((event) => event.event_id));
   return (
     <div className="page-stack">
       <section className="hero-card">
@@ -2125,7 +2124,7 @@ function Overview(props: {
               {props.changeRequests.map((item) => (
                 <tr
                   key={item.snapshot_key}
-                  className={`overview-detail-row ${props.selectedSnapshotKeys.includes(item.snapshot_key) ? "overview-row-selected" : ""}`}
+                  className={`overview-detail-row ${selectedSnapshotKeys.has(item.snapshot_key) ? "overview-row-selected" : ""}`}
                   tabIndex={0}
                   onClick={() => setSelectedChangeRequest(item)}
                   onKeyDown={(event) => {
@@ -2140,7 +2139,7 @@ function Overview(props: {
                   {props.selectionMode && (
                     <td
                       className="overview-selection-column overview-selection-target"
-                      aria-disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
+                      aria-disabled={(!manualTriggerEvent(item) && !selectedSnapshotKeys.has(item.snapshot_key)) || props.triggeringKeys.length > 0}
                       onClick={(event) => {
                         event.stopPropagation();
                         props.onToggleSelection(item.snapshot_key, event.shiftKey);
@@ -2149,9 +2148,9 @@ function Overview(props: {
                       <input
                         type="checkbox"
                         aria-label={`选择 ${item.repository_id} #${item.number}`}
-                        checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
-                        disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
-                        title={manualTriggerEvent(item) ? "加入批量手动触发" : "尚无可重放的事件"}
+                        checked={selectedSnapshotKeys.has(item.snapshot_key)}
+                        disabled={(!manualTriggerEvent(item) && !selectedSnapshotKeys.has(item.snapshot_key)) || props.triggeringKeys.length > 0}
+                        title={manualTriggerEvent(item) ? "加入批量手动触发" : selectedSnapshotKeys.has(item.snapshot_key) ? "取消选择（当前无可重放的事件）" : "尚无可重放的事件"}
                         onClick={(event) => {
                           event.stopPropagation();
                           props.onToggleSelection(item.snapshot_key, event.shiftKey);
@@ -2162,7 +2161,7 @@ function Overview(props: {
                   )}
                   <td
                     className={props.selectionMode ? "overview-selection-target" : undefined}
-                    aria-disabled={props.selectionMode && (!manualTriggerEvent(item) || props.triggeringKeys.length > 0)}
+                    aria-disabled={props.selectionMode && ((!manualTriggerEvent(item) && !selectedSnapshotKeys.has(item.snapshot_key)) || props.triggeringKeys.length > 0)}
                     onClick={props.selectionMode ? (event) => {
                       event.stopPropagation();
                       props.onToggleSelection(item.snapshot_key, event.shiftKey);
@@ -2173,7 +2172,7 @@ function Overview(props: {
                         type="button"
                         className="change-request-link overview-select-title"
                         aria-label={`选择 ${item.repository_id} #${item.number} ${item.title}`}
-                        disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
+                        disabled={(!manualTriggerEvent(item) && !selectedSnapshotKeys.has(item.snapshot_key)) || props.triggeringKeys.length > 0}
                       >
                         <strong>#{item.number} {item.title}</strong>
                         <small>{item.source_branch} → {item.target_branch}</small>
@@ -2316,7 +2315,7 @@ function Overview(props: {
               {props.events.map((event) => (
                 <tr
                   key={event.event_id}
-                  className={`overview-detail-row ${props.selectedEventIds.includes(event.event_id) ? "overview-row-selected" : ""}`}
+                  className={`overview-detail-row ${selectedEventIds.has(event.event_id) ? "overview-row-selected" : ""}`}
                   tabIndex={0}
                   onClick={() => setSelectedEvent(event)}
                   onKeyDown={(keyboardEvent) => {
@@ -2340,7 +2339,7 @@ function Overview(props: {
                       <input
                         type="checkbox"
                         aria-label={`选择事件 ${event.event_type}`}
-                        checked={props.selectedEventIds.includes(event.event_id)}
+                        checked={selectedEventIds.has(event.event_id)}
                         disabled={props.replayingEventIds.length > 0}
                         title="加入批量手动触发"
                         onClick={(clickEvent) => {
@@ -10129,9 +10128,9 @@ export default function App() {
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
   const [replayingEventIds, setReplayingEventIds] = useState<string[]>([]);
   const [changeRequestSelectionMode, setChangeRequestSelectionMode] = useState(false);
-  const [selectedSnapshotKeys, setSelectedSnapshotKeys] = useState<string[]>([]);
+  const [selectedChangeRequests, setSelectedChangeRequests] = useState<ChangeRequestRecord[]>([]);
   const [eventSelectionMode, setEventSelectionMode] = useState(false);
-  const [selectedEventIds, setSelectedEventIds] = useState<string[]>([]);
+  const [selectedEvents, setSelectedEvents] = useState<EventRecord[]>([]);
   // 两张表独立维护选择起点，不随相同顺序的三秒刷新丢失。
   const changeRequestSelectionAnchor = useRef<OverviewSelectionAnchor | null>(null);
   const eventSelectionAnchor = useRef<OverviewSelectionAnchor | null>(null);
@@ -10243,9 +10242,9 @@ export default function App() {
     setChangeRequestFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
     setEventFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
     setChangeRequestSelectionMode(false);
-    setSelectedSnapshotKeys([]);
+    setSelectedChangeRequests([]);
     setEventSelectionMode(false);
-    setSelectedEventIds([]);
+    setSelectedEvents([]);
     changeRequestSelectionAnchor.current = null;
     eventSelectionAnchor.current = null;
     setOverviewConfirmation(null);
@@ -10296,22 +10295,10 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refreshOverviewData]);
   useEffect(() => {
-    const availableKeys = new Set(
-      changeRequests
-        .filter((item) => manualTriggerEvent(item))
-        .map((item) => item.snapshot_key),
-    );
-    setSelectedSnapshotKeys((current) => {
-      const next = current.filter((key) => availableKeys.has(key));
-      return next.length === current.length ? current : next;
-    });
+    setSelectedChangeRequests((current) => refreshOverviewSelection(current, changeRequests, (item) => item.snapshot_key));
   }, [changeRequests]);
   useEffect(() => {
-    const availableIds = new Set(events.map((event) => event.event_id));
-    setSelectedEventIds((current) => {
-      const next = current.filter((eventId) => availableIds.has(eventId));
-      return next.length === current.length ? current : next;
-    });
+    setSelectedEvents((current) => refreshOverviewSelection(current, events, (event) => event.event_id));
   }, [events]);
 
   function changeDocument(next: ConfigDocument) {
@@ -10406,46 +10393,55 @@ export default function App() {
   function cancelChangeRequestSelection() {
     changeRequestSelectionAnchor.current = null;
     setChangeRequestSelectionMode(false);
-    setSelectedSnapshotKeys([]);
+    setSelectedChangeRequests([]);
   }
 
   function cancelEventSelection() {
     eventSelectionAnchor.current = null;
     setEventSelectionMode(false);
-    setSelectedEventIds([]);
+    setSelectedEvents([]);
   }
 
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
     overviewRequestSequence.current += 1;
-    cancelChangeRequestSelection();
+    changeRequestSelectionAnchor.current = null;
+    if (overviewSelectionScopeChanged(changeRequestFilter, filter)) cancelChangeRequestSelection();
     setChangeRequestFilter({ ...filter, page: 1 });
   }
 
   function changeOverviewEventFilter(filter: OverviewFilter) {
     overviewRequestSequence.current += 1;
-    cancelEventSelection();
+    eventSelectionAnchor.current = null;
+    if (overviewSelectionScopeChanged(eventFilter, filter)) cancelEventSelection();
     setEventFilter({ ...filter, page: 1 });
   }
 
   function changeOverviewChangeRequestPage(page: number) {
-    cancelChangeRequestSelection();
+    // 翻页只重置区间起点，立即隔离迟到响应，已选记录保持不变。
+    overviewRequestSequence.current += 1;
+    changeRequestSelectionAnchor.current = null;
     setChangeRequestFilter((current) => ({ ...current, page }));
   }
 
   function changeOverviewEventPage(page: number) {
-    cancelEventSelection();
+    overviewRequestSequence.current += 1;
+    eventSelectionAnchor.current = null;
     setEventFilter((current) => ({ ...current, page }));
   }
 
   function toggleChangeRequestSelection(snapshotKey: string, shiftKey: boolean) {
     if (!changeRequestSelectionMode || triggeringKeys.length > 0) return;
     const range = overviewSelectionRange(
-      changeRequests.map((item) => ({ key: item.snapshot_key, selectable: Boolean(manualTriggerEvent(item)) })),
+      changeRequests.map((item) => ({
+        key: item.snapshot_key,
+        // 已选目标即使暂时不可触发，也允许用户主动取消。
+        selectable: Boolean(manualTriggerEvent(item)) || selectedChangeRequests.some((selected) => selected.snapshot_key === item.snapshot_key),
+      })),
       snapshotKey, changeRequestSelectionAnchor.current, shiftKey,
     );
     if (!range) return;
     changeRequestSelectionAnchor.current = range.anchor;
-    setSelectedSnapshotKeys((current) => toggleOverviewSelection(current, snapshotKey, range.keys));
+    setSelectedChangeRequests((current) => toggleOverviewRecords(current, changeRequests, (item) => item.snapshot_key, snapshotKey, range.keys));
   }
 
   function toggleEventSelection(eventId: string, shiftKey: boolean) {
@@ -10456,7 +10452,7 @@ export default function App() {
     );
     if (!range) return;
     eventSelectionAnchor.current = range.anchor;
-    setSelectedEventIds((current) => toggleOverviewSelection(current, eventId, range.keys));
+    setSelectedEvents((current) => toggleOverviewRecords(current, events, (event) => event.event_id, eventId, range.keys));
   }
 
   function requestEmitDiscovered(item: ChangeRequestRecord) {
@@ -10519,7 +10515,8 @@ export default function App() {
   }
 
   function requestTriggerLatestEvents(items: ChangeRequestRecord[]) {
-    const targets = items.filter((item) => manualTriggerEvent(item));
+    // 提交完整已选目标，后台按当前快照校验，不能默默跳过已失效的选择。
+    const targets = items;
     if (targets.length === 0) return;
 
     const repositoryCounts = new Map<string, number>();
@@ -10527,12 +10524,15 @@ export default function App() {
     const sourceCounts = new Map<string, number>();
     let candidateTargetCount = 0;
     for (const item of targets) {
+      repositoryCounts.set(item.repository_id, (repositoryCounts.get(item.repository_id) ?? 0) + 1);
       const candidate = manualTriggerEvent(item);
       const eventType = candidate?.event_type;
-      if (!eventType) continue;
+      if (!eventType) {
+        eventCounts.set("当前无可重放事件", (eventCounts.get("当前无可重放事件") ?? 0) + 1);
+        continue;
+      }
       const sourceLabel = activitySourceLabel(candidate!.source);
       sourceCounts.set(sourceLabel, (sourceCounts.get(sourceLabel) ?? 0) + 1);
-      repositoryCounts.set(item.repository_id, (repositoryCounts.get(item.repository_id) ?? 0) + 1);
       eventCounts.set(eventType, (eventCounts.get(eventType) ?? 0) + 1);
       if (document?.rules.some((rule) => (
         rule.enabled !== false
@@ -10550,7 +10550,7 @@ export default function App() {
       changeRequests: targets,
       eyebrow: "批量重放事件",
       title: `确认触发 ${targets.length} 个 MR / PR`,
-      description: "所选目标组成一个手动批次，重放各自的平台活动或系统检测事件；按规则现有开关去重，只保留原始时间最新的匹配事件。不会记录为扫描。",
+      description: "全部页的所选目标组成一个手动批次，后台按当前快照重新校验并重放各自的事件；按规则现有开关去重，只保留原始时间最新的匹配事件。失败项保留选择，不会记录为扫描。",
       details: [
         { label: "目标数量", value: `${targets.length} 个` },
         { label: "仓库分布", value: summarize(repositoryCounts) },
@@ -10714,10 +10714,9 @@ export default function App() {
           const failedKeys = new Set(
             failed.map((entry) => `${entry.repository_id}:${entry.number}`),
           );
-          setSelectedSnapshotKeys(
+          setSelectedChangeRequests(
             changeRequestItems
-              .filter((target) => failedKeys.has(`${target.repository_id}:${target.number}`))
-              .map((target) => target.snapshot_key),
+              .filter((target) => failedKeys.has(`${target.repository_id}:${target.number}`)),
           );
           setError(
             `有 ${failed.length} 项触发失败：${failed
@@ -10731,7 +10730,8 @@ export default function App() {
         if (failed.length === 0) {
           cancelEventSelection();
         } else {
-          setSelectedEventIds(failed.map((entry) => entry.source_event_id));
+          const failedIds = new Set(failed.map((entry) => entry.source_event_id));
+          setSelectedEvents(eventItems.filter((event) => failedIds.has(event.event_id)));
           setError(
             `有 ${failed.length} 项触发失败：${failed
               .map((entry) => `${entry.source_event_id.slice(0, 12)}（${entry.reason}）`)
@@ -10893,9 +10893,9 @@ export default function App() {
                   triggeringKeys={triggeringKeys}
                   replayingEventIds={replayingEventIds}
                   selectionMode={changeRequestSelectionMode}
-                  selectedSnapshotKeys={selectedSnapshotKeys}
+                  selectedChangeRequests={selectedChangeRequests}
                   eventSelectionMode={eventSelectionMode}
-                  selectedEventIds={selectedEventIds}
+                  selectedEvents={selectedEvents}
                   detailRefreshToken={detailRefreshToken}
                   confirmationOpen={overviewConfirmation !== null}
                   onAction={control}
