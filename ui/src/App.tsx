@@ -26,6 +26,8 @@ import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions, modelSupportsReasoni
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
+import { overviewSelectionRange, toggleOverviewSelection } from "./overviewSelection";
+import type { OverviewSelectionAnchor } from "./overviewSelection";
 import { fitOverlayToViewport } from "./overlayPlacement";
 import { DelayedTooltipButton } from "./DelayedTooltipButton";
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, formatContextWindow, providerContextWindow, inheritedProviderWindow, inheritedAgentWindow, contextWindowSourceLabel } from "./contextWindow";
@@ -2002,12 +2004,12 @@ function Overview(props: {
   onTriggerLatestEvent: (item: ChangeRequestRecord) => void;
   onBeginSelection: () => void;
   onCancelSelection: () => void;
-  onToggleSelection: (snapshotKey: string) => void;
+  onToggleSelection: (snapshotKey: string, shiftKey: boolean) => void;
   onTriggerSelected: (items: ChangeRequestRecord[]) => void;
   onReplayEvent: (event: EventRecord) => void;
   onBeginEventSelection: () => void;
   onCancelEventSelection: () => void;
-  onToggleEventSelection: (eventId: string) => void;
+  onToggleEventSelection: (eventId: string, shiftKey: boolean) => void;
   onReplaySelectedEvents: (events: EventRecord[]) => void;
   onChangeRequestFilterChange: (filter: OverviewFilter) => void;
   onEventFilterChange: (filter: OverviewFilter) => void;
@@ -2127,6 +2129,8 @@ function Overview(props: {
                   tabIndex={0}
                   onClick={() => setSelectedChangeRequest(item)}
                   onKeyDown={(event) => {
+                    // 复选框及名称按钮自行处理键盘，不能顺带打开行详情。
+                    if (event.target !== event.currentTarget) return;
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       setSelectedChangeRequest(item);
@@ -2134,23 +2138,52 @@ function Overview(props: {
                   }}
                 >
                   {props.selectionMode && (
-                    <td className="overview-selection-column">
+                    <td
+                      className="overview-selection-column overview-selection-target"
+                      aria-disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        props.onToggleSelection(item.snapshot_key, event.shiftKey);
+                      }}
+                    >
                       <input
                         type="checkbox"
                         aria-label={`选择 ${item.repository_id} #${item.number}`}
                         checked={props.selectedSnapshotKeys.includes(item.snapshot_key)}
                         disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
                         title={manualTriggerEvent(item) ? "加入批量手动触发" : "尚无可重放的事件"}
-                        onClick={(event) => event.stopPropagation()}
-                        onChange={() => props.onToggleSelection(item.snapshot_key)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          props.onToggleSelection(item.snapshot_key, event.shiftKey);
+                        }}
+                        onChange={() => { /* 点击统一处理 Shift，避免 change 重复切换。 */ }}
                       />
                     </td>
                   )}
-                  <td>
-                    <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
-                      <strong>#{item.number} {item.title}</strong>
-                      <small>{item.source_branch} → {item.target_branch}</small>
-                    </a>
+                  <td
+                    className={props.selectionMode ? "overview-selection-target" : undefined}
+                    aria-disabled={props.selectionMode && (!manualTriggerEvent(item) || props.triggeringKeys.length > 0)}
+                    onClick={props.selectionMode ? (event) => {
+                      event.stopPropagation();
+                      props.onToggleSelection(item.snapshot_key, event.shiftKey);
+                    } : undefined}
+                  >
+                    {props.selectionMode ? (
+                      <button
+                        type="button"
+                        className="change-request-link overview-select-title"
+                        aria-label={`选择 ${item.repository_id} #${item.number} ${item.title}`}
+                        disabled={!manualTriggerEvent(item) || props.triggeringKeys.length > 0}
+                      >
+                        <strong>#{item.number} {item.title}</strong>
+                        <small>{item.source_branch} → {item.target_branch}</small>
+                      </button>
+                    ) : (
+                      <a className="change-request-link" href={item.web_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+                        <strong>#{item.number} {item.title}</strong>
+                        <small>{item.source_branch} → {item.target_branch}</small>
+                      </a>
+                    )}
                   </td>
                   <td><RepositoryName id={item.repository_id} /></td>
                   <td><StatusPill value={item.state} /></td>
@@ -2287,6 +2320,8 @@ function Overview(props: {
                   tabIndex={0}
                   onClick={() => setSelectedEvent(event)}
                   onKeyDown={(keyboardEvent) => {
+                    // 避免名称按钮和复选框的键盘操作冒泡打开详情。
+                    if (keyboardEvent.target !== keyboardEvent.currentTarget) return;
                     if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
                       keyboardEvent.preventDefault();
                       setSelectedEvent(event);
@@ -2294,23 +2329,54 @@ function Overview(props: {
                   }}
                 >
                   {props.eventSelectionMode && (
-                    <td className="overview-selection-column">
+                    <td
+                      className="overview-selection-column overview-selection-target"
+                      aria-disabled={props.replayingEventIds.length > 0}
+                      onClick={(clickEvent) => {
+                        clickEvent.stopPropagation();
+                        props.onToggleEventSelection(event.event_id, clickEvent.shiftKey);
+                      }}
+                    >
                       <input
                         type="checkbox"
                         aria-label={`选择事件 ${event.event_type}`}
                         checked={props.selectedEventIds.includes(event.event_id)}
                         disabled={props.replayingEventIds.length > 0}
                         title="加入批量手动触发"
-                        onClick={(clickEvent) => clickEvent.stopPropagation()}
-                        onChange={() => props.onToggleEventSelection(event.event_id)}
+                        onClick={(clickEvent) => {
+                          clickEvent.stopPropagation();
+                          props.onToggleEventSelection(event.event_id, clickEvent.shiftKey);
+                        }}
+                        onChange={() => { /* 点击统一处理 Shift，避免 change 重复切换。 */ }}
                       />
                     </td>
                   )}
-                  <td className="mono">
-                    <span className="event-type-with-origin">
-                      {event.event_type}
-                      {event.origin === "manual" && <small>手动</small>}
-                    </span>
+                  <td
+                    className={`mono ${props.eventSelectionMode ? "overview-selection-target" : ""}`}
+                    aria-disabled={props.eventSelectionMode && props.replayingEventIds.length > 0}
+                    onClick={props.eventSelectionMode ? (clickEvent) => {
+                      clickEvent.stopPropagation();
+                      props.onToggleEventSelection(event.event_id, clickEvent.shiftKey);
+                    } : undefined}
+                  >
+                    {props.eventSelectionMode ? (
+                      <button
+                        type="button"
+                        className="overview-select-title"
+                        aria-label={`选择事件 ${event.repository_id} #${event.number} ${event.event_type}`}
+                        disabled={props.replayingEventIds.length > 0}
+                      >
+                        <span className="event-type-with-origin">
+                          {event.event_type}
+                          {event.origin === "manual" && <small>手动</small>}
+                        </span>
+                      </button>
+                    ) : (
+                      <span className="event-type-with-origin">
+                        {event.event_type}
+                        {event.origin === "manual" && <small>手动</small>}
+                      </span>
+                    )}
                   </td>
                   <td><RepositoryName id={event.repository_id} /></td>
                   <td>#{event.number}</td>
@@ -10066,6 +10132,9 @@ export default function App() {
   const [selectedSnapshotKeys, setSelectedSnapshotKeys] = useState<string[]>([]);
   const [eventSelectionMode, setEventSelectionMode] = useState(false);
   const [selectedEventIds, setSelectedEventIds] = useState<string[]>([]);
+  // 两张表独立维护选择起点，不随相同顺序的三秒刷新丢失。
+  const changeRequestSelectionAnchor = useRef<OverviewSelectionAnchor | null>(null);
+  const eventSelectionAnchor = useRef<OverviewSelectionAnchor | null>(null);
   const [detailRefreshToken, setDetailRefreshToken] = useState(0);
   const [overviewConfirmation, setOverviewConfirmation] = useState<OverviewConfirmation | null>(null);
   const [confirmingOverviewAction, setConfirmingOverviewAction] = useState(false);
@@ -10177,6 +10246,8 @@ export default function App() {
     setSelectedSnapshotKeys([]);
     setEventSelectionMode(false);
     setSelectedEventIds([]);
+    changeRequestSelectionAnchor.current = null;
+    eventSelectionAnchor.current = null;
     setOverviewConfirmation(null);
   }, []);
 
@@ -10333,11 +10404,13 @@ export default function App() {
   }
 
   function cancelChangeRequestSelection() {
+    changeRequestSelectionAnchor.current = null;
     setChangeRequestSelectionMode(false);
     setSelectedSnapshotKeys([]);
   }
 
   function cancelEventSelection() {
+    eventSelectionAnchor.current = null;
     setEventSelectionMode(false);
     setSelectedEventIds([]);
   }
@@ -10364,20 +10437,26 @@ export default function App() {
     setEventFilter((current) => ({ ...current, page }));
   }
 
-  function toggleChangeRequestSelection(snapshotKey: string) {
-    setSelectedSnapshotKeys((current) => (
-      current.includes(snapshotKey)
-        ? current.filter((key) => key !== snapshotKey)
-        : [...current, snapshotKey]
-    ));
+  function toggleChangeRequestSelection(snapshotKey: string, shiftKey: boolean) {
+    if (!changeRequestSelectionMode || triggeringKeys.length > 0) return;
+    const range = overviewSelectionRange(
+      changeRequests.map((item) => ({ key: item.snapshot_key, selectable: Boolean(manualTriggerEvent(item)) })),
+      snapshotKey, changeRequestSelectionAnchor.current, shiftKey,
+    );
+    if (!range) return;
+    changeRequestSelectionAnchor.current = range.anchor;
+    setSelectedSnapshotKeys((current) => toggleOverviewSelection(current, snapshotKey, range.keys));
   }
 
-  function toggleEventSelection(eventId: string) {
-    setSelectedEventIds((current) => (
-      current.includes(eventId)
-        ? current.filter((selectedId) => selectedId !== eventId)
-        : [...current, eventId]
-    ));
+  function toggleEventSelection(eventId: string, shiftKey: boolean) {
+    if (!eventSelectionMode || replayingEventIds.length > 0) return;
+    const range = overviewSelectionRange(
+      events.map((event) => ({ key: event.event_id, selectable: true })),
+      eventId, eventSelectionAnchor.current, shiftKey,
+    );
+    if (!range) return;
+    eventSelectionAnchor.current = range.anchor;
+    setSelectedEventIds((current) => toggleOverviewSelection(current, eventId, range.keys));
   }
 
   function requestEmitDiscovered(item: ChangeRequestRecord) {

@@ -557,6 +557,12 @@ tbody tr:last-child td { border-bottom: 0; }
 .overview-selection-column { width: 46px; min-width: 46px; text-align: center; }
 .overview-selection-column input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .overview-selection-column input:disabled { cursor: not-allowed; opacity: .38; }
+/* 选择模式扩大命中区域到相邻名称列，Shift 点击不选中文字。 */
+.overview-selection-target { cursor: pointer; user-select: none; }
+.overview-selection-target[aria-disabled="true"] { cursor: not-allowed; }
+.overview-select-title { width: 100%; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: inherit; }
+.overview-select-title:disabled { opacity: .5; cursor: not-allowed; }
+.overview-select-title:focus-visible { outline: 2px solid #5488c8; outline-offset: 4px; }
 .overview-detail-row { cursor: pointer; }
 .overview-detail-row:hover td { background: rgba(59, 103, 79, .08); }
 .overview-detail-row:focus-visible { outline: 2px solid #5488c8; outline-offset: -2px; }
