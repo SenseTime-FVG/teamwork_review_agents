@@ -60,7 +60,7 @@ class CycleSummary:
 
 @dataclass(frozen=True)
 class RuleInvocation:
-    """一条规则在一个扫描批次中计划出的 Agent 调用。"""
+    """一条规则在一个扫描或手动批次中计划出的 Agent 调用。"""
 
     rule: RuleConfig
     agent_name: str
@@ -85,7 +85,7 @@ class RuleInvocation:
 
 
 def _event_batch_key(event: ChangeEvent) -> str:
-    """返回事件所属扫描批次；缺少批次时禁止跨事件猜测合并。"""
+    """返回事件所属批次；缺少批次时禁止跨事件猜测合并。"""
 
     return event.batch_id or f"event:{event.id}"
 
@@ -108,14 +108,14 @@ def _event_dedup_keys(rule: RuleConfig, event: ChangeEvent) -> tuple[str, ...]:
 def _event_order_key(event: ChangeEvent) -> tuple[datetime, str]:
     """返回用于选择最新事件的稳定排序键。"""
 
-    return event.occurred_at, event.id
+    return event.deduplication_time, event.id
 
 
 def _deduplicated_matches(
     rule: RuleConfig,
     events: list[ChangeEvent],
 ) -> list[ChangeEvent]:
-    """先按扫描批次分组，再保留每个连通去重组中时间最新的事件。"""
+    """先按批次分组，再保留每个连通去重组中时间最新的事件。"""
 
     if not (
         rule.deduplicate_per_scan
@@ -713,6 +713,8 @@ class Orchestrator:
             self.store.pending_events_for_dedup,
             max_attempts,
         )
+        # 手动批次在资源调度时按完整历史规划，不能只按待处理子集预结算。
+        events = [event for event in events if event.origin != "manual"]
         if not events:
             return
         try:
@@ -829,7 +831,19 @@ class Orchestrator:
                 tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
             ] = []
             try:
-                invocations = plan_rule_invocations(self.config.rules, claimed_events)
+                candidates = claimed_events
+                if claimed_events[0].origin == "manual" and claimed_events[0].batch_id:
+                    # 分支去重可跨 PR；已完成候选也必须保留，避免分页和重试复活旧事件。
+                    candidates = await asyncio.to_thread(
+                        self.store.manual_events_for_batch,
+                        claimed_events[0].batch_id,
+                    )
+                claimed_ids = {event.id for event in claimed_events}
+                invocations = [
+                    invocation
+                    for invocation in plan_rule_invocations(self.config.rules, candidates)
+                    if invocation.events[0].id in claimed_ids
+                ]
                 planned_matched_event_ids = {
                     event.id
                     for invocation in invocations
@@ -839,10 +853,17 @@ class Orchestrator:
                     if event.id in planned_matched_event_ids:
                         continue
                     # 同批次其他事件的 Agent 或 CI 不应延迟本事件的未匹配结论。
+                    manually_deduplicated = event.origin == "manual" and any(
+                        rule.enabled and rule.agents and rule_matches(rule, event)
+                        for rule in self.config.rules
+                    )
                     await asyncio.to_thread(
                         self.store.finish_event,
                         event.id,
                         status="unmatched",
+                        unmatched_reason=(
+                            "manual_batch_deduplicated" if manually_deduplicated else None
+                        ),
                     )
                     settled_unmatched_event_ids.add(event.id)
                     await asyncio.to_thread(

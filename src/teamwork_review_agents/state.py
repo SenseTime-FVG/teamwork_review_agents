@@ -100,6 +100,10 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_event_inbox_change_request
                 ON event_inbox(repository_id, number, created_at DESC);
 
+                CREATE INDEX IF NOT EXISTS idx_event_inbox_manual_batch
+                ON event_inbox(json_extract(payload, '$.batch_id'))
+                WHERE json_extract(payload, '$.origin') = 'manual';
+
                 CREATE TABLE IF NOT EXISTS event_agent_dispatches (
                     event_id TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
@@ -946,7 +950,9 @@ class StateStore:
             )
         return generation
 
-    def enqueue_events(self, events: Iterable[ChangeEvent]) -> int:
+    def enqueue_events(
+        self, events: Iterable[ChangeEvent], *, require_all: bool = False,
+    ) -> int:
         """不改写快照，幂等追加管理员补发或其他外部产生的事件。"""
 
         now = time.time()
@@ -969,8 +975,28 @@ class StateStore:
                     event.model_copy(update={"source_generation": generation})
                 )
             inserted = self._insert_events(connection, annotated, now)
+            if require_all and inserted != len(pending):
+                # 批量手动触发必须整体可见，冲突时回滚，不能让半个批次参与去重。
+                raise ValueError("手动批次未能完整写入，请重新操作")
             connection.commit()
         return inserted
+
+    def manual_events_for_batch(self, batch_id: str) -> list[ChangeEvent]:
+        """读取完整手动批次，保留已结束候选，防止旧事件在重试或分页时补触发。"""
+
+        if not batch_id:
+            return []
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM event_inbox
+                WHERE json_extract(payload, '$.batch_id') = ?
+                  AND json_extract(payload, '$.origin') = 'manual'
+                ORDER BY created_at, event_id
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [ChangeEvent.model_validate_json(row["payload"]) for row in rows]
 
     def load_event(self, event_id: str) -> ChangeEvent | None:
         """按事件 ID 读取完整事件载荷。"""
@@ -1585,6 +1611,7 @@ class StateStore:
         status: str | None = None,
         retryable: bool = True,
         error_code: str | None = None,
+        unmatched_reason: str | None = None,
     ) -> None:
         """将事件标记为指定的终态，默认根据错误选择完成或失败。"""
 
@@ -1595,10 +1622,14 @@ class StateStore:
                 """
                 UPDATE event_inbox
                 SET status = ?, error = ?, retryable = ?, error_code = ?, queue_reason = NULL,
-                    unmatched_reason = NULL, updated_at = ?
+                    unmatched_reason = ?, updated_at = ?
                 WHERE event_id = ?
                 """,
-                (final_status, error, int(retryable), error_code, time.time(), event_id),
+                (
+                    final_status, error, int(retryable), error_code,
+                    unmatched_reason if final_status == "unmatched" else None,
+                    time.time(), event_id,
+                ),
             )
 
     def release_event_after_service_shutdown(self, event_id: str) -> bool:
@@ -3914,7 +3945,7 @@ class StateStore:
         *,
         max_attempts: int,
     ) -> int:
-        """删除超过保留期的终态目标分支事件，活动事件必须继续保留。"""
+        """删除过期终态目标事件，活动事件及其手动批次的去重依据继续保留。"""
 
         with self.connect() as connection:
             cursor = connection.execute(
@@ -3926,7 +3957,22 @@ class StateStore:
                       OR (status = 'failed' AND (attempts >= ? OR retryable = 0))
                   )
                   AND updated_at < ?
+                  AND NOT (
+                      COALESCE(json_extract(payload, '$.origin'), '') = 'manual'
+                      AND COALESCE(json_extract(payload, '$.batch_id'), '') != ''
+                      AND EXISTS (
+                          SELECT 1 FROM event_inbox AS member
+                          WHERE json_extract(member.payload, '$.origin') = 'manual'
+                            AND json_extract(member.payload, '$.batch_id') =
+                                json_extract(event_inbox.payload, '$.batch_id')
+                            AND (
+                                member.status IN ('pending', 'processing', 'triggered')
+                                OR (member.status = 'failed' AND member.attempts < ?
+                                    AND member.retryable = 1)
+                            )
+                      )
+                  )
                 """,
-                (TARGET_COMMITS_CHANGED_EVENT, max_attempts, older_than),
+                (TARGET_COMMITS_CHANGED_EVENT, max_attempts, older_than, max_attempts),
             )
         return cursor.rowcount

@@ -61,6 +61,8 @@ def activity_event_type(activity_type: str) -> str | None:
 def create_manual_activity_event(
     snapshot: ChangeRequestSnapshot,
     activity: ChangeRequestActivity,
+    *,
+    batch_id: str | None = None,
 ) -> ChangeEvent:
     """使用当前快照重放一条 Provider 活动，并保留原始活动审计引用。"""
 
@@ -86,17 +88,20 @@ def create_manual_activity_event(
         old=snapshot,
         new=snapshot,
         current=snapshot,
-        batch_id=f"manual:{request_id}",
+        batch_id=batch_id or f"manual:{request_id}",
         changed_fields=ACTIVITY_CHANGED_FIELDS[activity.type],
         occurred_at=occurred_at,
         origin="manual",
         source_activity_id=activity.id,
         source_activity_type=activity.type,
         source_occurred_at=activity.occurred_at,
+        deduplication_occurred_at=activity.occurred_at,
     )
 
 
-def create_manual_replay_event(source: ChangeEvent) -> ChangeEvent:
+def create_manual_replay_event(
+    source: ChangeEvent, *, batch_id: str | None = None,
+) -> ChangeEvent:
     """复制历史事件上下文，创建可独立调度的手动重放事件。"""
 
     request_id = uuid.uuid4().hex
@@ -117,7 +122,7 @@ def create_manual_replay_event(source: ChangeEvent) -> ChangeEvent:
         old=source.old,
         new=source.new,
         current=source.current_snapshot,
-        batch_id=f"manual-replay:{request_id}",
+        batch_id=batch_id or f"manual-replay:{request_id}",
         changed_fields=source.changed_fields,
         occurred_at=datetime.now(UTC),
         origin="manual",
@@ -126,6 +131,7 @@ def create_manual_replay_event(source: ChangeEvent) -> ChangeEvent:
         source_occurred_at=source.source_occurred_at,
         source_event_id=source.id,
         source_event_occurred_at=source.occurred_at,
+        deduplication_occurred_at=source.deduplication_time,
         source_generation=source.source_generation,
     )
 

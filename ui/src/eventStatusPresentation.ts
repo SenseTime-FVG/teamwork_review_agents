@@ -15,6 +15,7 @@ export function unmatchedReasonLabel(reason?: string | null): string | null {
   if (!reason) return null;
   const labels: Record<string, string> = {
     scan_deduplicated: "本扫描周期内已被更新事件替代",
+    manual_batch_deduplicated: "本次手动批次内已被更新事件替代，未触发运行",
   };
   return labels[reason] ?? reason;
 }
