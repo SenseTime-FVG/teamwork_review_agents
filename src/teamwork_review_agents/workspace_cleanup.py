@@ -20,7 +20,13 @@ from .locks import LockCancelledError, LockTimeoutError, ResourceLease
 from .models import stable_hash
 from .scheduler import next_workspace_cleanup_at
 from .state import StateStore
-from .workspace import WorkspaceError, remove_expired_run_workspace, workspace_usage_lock_key
+from .workspace import (
+    WorkspaceError,
+    cleanup_run_worktree,
+    remove_expired_run_workspace,
+    repository_git_lock_key,
+    workspace_usage_lock_key,
+)
 
 
 STATE_KEY = "workspace_cleanup"
@@ -156,6 +162,64 @@ def _directory_bytes(target: Path) -> int:
             if not path.is_symlink():
                 total += path.stat().st_size
     return total
+
+
+async def cleanup_terminal_run_workspaces(config: AppConfig, store: StateStore, root_run_id: str) -> None:
+    """最后结束的父子任务回收整棵任务树目录，异常只记日志不篡改运行结论。"""
+
+    try:
+        users = await asyncio.to_thread(store.active_workspace_users)
+        if any(user["root_run_id"] == root_run_id for user in users):
+            return
+        records = await asyncio.to_thread(store.run_workspace_cleanup_records, root_run_id)
+    except Exception as exc:
+        LOGGER.warning("终态工作区清理元数据不可用（%s）", type(exc).__name__)
+        return
+    root = config.database.path.parent.resolve() / "worktrees"
+    for candidate in records:
+        run_id = candidate["run_id"]
+        outcome: dict[str, Any] = {"path": candidate["workspace_path"]}
+        try:
+            repository = next((repo for repo in config.repositories if repo.id == candidate["repository_id"]), None)
+            if repository is None:
+                raise CleanupSkipped("仓库配置已变化，交由定时清理核验")
+            marker = root / stable_hash(repository.id)[:16] / f".{run_id}.retained.json"
+            target, payload, record = await asyncio.to_thread(_inspect_marker, root, marker, store)
+            keys = [workspace_usage_lock_key(target), repository_git_lock_key(repository)]
+            # 不使用根运行身份重入，仍持有租约的父子任务必须阻止删除。
+            async with ResourceLease(
+                store, keys, f"terminal-cleanup:{uuid.uuid4()}",
+                ttl_seconds=config.runtime.lock_ttl_seconds, timeout_seconds=0,
+            ) as lease:
+                def perform() -> dict[str, Any]:
+                    """取得互斥租约后再次校验，避免使用旧快照删除活动目录。"""
+
+                    target, payload, record = _inspect_marker(root, marker, store)
+                    if record["root_run_id"] != root_run_id or lease.lost:
+                        raise CleanupSkipped("任务归属或工作区租约已变化，暂不清理")
+                    _check_inactive(store, target, record)
+                    result = cleanup_run_worktree(
+                        repository.workspace, target, run_status=record["status"],
+                        starting_head=str(payload.get("starting_head") or ""),
+                        retention_days=config.runtime.worktree_retention_days,
+                        git_timeout_seconds=config.runtime.git_timeout_seconds,
+                    )
+                    return {"path": str(target), "status": result.status, "reason": result.reason}
+
+                outcome = await asyncio.to_thread(perform)
+                # 共享目录的所有记录在持锁期间同步，避免新尝试创建后被旧结果覆盖。
+                await asyncio.to_thread(store.record_workspace_cleanup, run_id, outcome["path"], outcome)
+            continue
+        except (CleanupSkipped, LockTimeoutError, LockCancelledError) as exc:
+            reason = str(exc) if isinstance(exc, CleanupSkipped) else "工作区资源正在使用，暂不清理"
+            outcome.update(status="skipped", reason=reason)
+        except Exception as exc:
+            outcome.update(status="failed", reason=f"终态工作区清理失败（{type(exc).__name__}），等待定时检查")
+        try:
+            await asyncio.to_thread(store.append_run_log, run_id, stream="system",
+                                    event_type=f"workspace.cleanup.{outcome['status']}", payload=outcome)
+        except Exception as exc:
+            LOGGER.warning("终态工作区清理日志写入失败（%s）", type(exc).__name__)
 
 
 class WorkspaceCleanupManager:

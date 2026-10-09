@@ -57,7 +57,6 @@ from .workspace import (
     GitProgressEvent,
     change_request_ref,
     workspace_usage_lock_key,
-    cleanup_run_worktree,
     ensure_isolated_clone,
     ensure_isolated_worktree,
     mark_active_worktree,
@@ -72,6 +71,7 @@ from .workspace import (
     worktree_ref_head,
     worktree_starting_head,
 )
+from .workspace_cleanup import cleanup_terminal_run_workspaces
 
 
 class AgentExecutionError(RuntimeError):
@@ -1265,7 +1265,7 @@ class AgentExecutor:
                 finally:
                     git_credentials.close()
 
-        # 运行阶段超时保留成果，不能让事件调度器用新会话重放整个任务。
+        # 运行阶段超时保留已发布的远端成果，不能用新会话重放整个任务。
         if result.status == "timed_out" and workspace_prepared:
             result.retryable = False
 
@@ -1281,50 +1281,13 @@ class AgentExecutor:
                 result.error_code = stop.error_code
 
         if owned_workspace and active_workspace is not None:
-            try:
-                cleanup_lease = ResourceLease(
-                    self.store,
-                    [self.git_admin_lock_key(configured_repository)],
-                    reservation.run_id,
-                    ttl_seconds=self.config.runtime.lock_ttl_seconds,
-                    timeout_seconds=self.config.runtime.lock_timeout_seconds,
-                )
-                async with cleanup_lease:
-                    cleanup = await asyncio.to_thread(
-                        cleanup_run_worktree,
-                        configured_repository.workspace,
-                        active_workspace,
-                        run_status=result.status,
-                        starting_head=starting_head,
-                        retention_days=self.config.runtime.worktree_retention_days,
-                        git_timeout_seconds=self.config.runtime.git_timeout_seconds,
-                    )
-                await asyncio.to_thread(
-                    self.store.update_agent_run_workspace,
-                    reservation.run_id,
-                    path=str(active_workspace),
-                    status=cleanup.status,
-                    reason=cleanup.reason,
-                )
-                await persist_log(
-                    "system",
-                    f"workspace.{cleanup.status}",
-                    {"path": str(active_workspace), "reason": cleanup.reason},
-                )
-            except Exception as exc:
-                cleanup_error = redactor.text(f"工作区清理检查失败：{exc}")
-                await asyncio.to_thread(
-                    self.store.update_agent_run_workspace,
-                    reservation.run_id,
-                    path=str(active_workspace),
-                    status="retained",
-                    reason=cleanup_error,
-                )
-                await persist_log(
-                    "system",
-                    "workspace.retained",
-                    {"path": str(active_workspace), "reason": cleanup_error},
-                )
+            await asyncio.to_thread(
+                self.store.update_agent_run_workspace,
+                reservation.run_id,
+                path=str(active_workspace),
+                status="retained",
+                reason="运行已结束，等待父子任务释放工作区后清理",
+            )
         elif not workspace_prepared:
             await asyncio.to_thread(
                 self.store.update_agent_run_workspace,
@@ -1347,6 +1310,7 @@ class AgentExecutor:
             },
         )
         await asyncio.to_thread(self.store.finish_agent_run, result)
+        await cleanup_terminal_run_workspaces(self.config, self.store, reservation.root_run_id)
         if interruption is not None:
             raise interruption
         if result.status != "completed":

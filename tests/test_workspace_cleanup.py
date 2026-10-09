@@ -19,7 +19,7 @@ from teamwork_review_agents.codex_executable import CodexRuntimeError
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
 from teamwork_review_agents.locks import ResourceLease
-from teamwork_review_agents.models import stable_hash
+from teamwork_review_agents.models import AgentResult, stable_hash
 from teamwork_review_agents.scheduler import next_workspace_cleanup_at
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.webapp import create_app
@@ -76,6 +76,138 @@ def cleanup_world(configured_app_factory):
         return target
 
     return config, store, manager, create
+
+
+@pytest.fixture
+def terminal_world(cleanup_world):
+    """普通运行 clone 与基础仓库使用同一远端，只在临时路径测试清理。"""
+
+    config, store, manager, create = cleanup_world
+    base = config.repositories[0].workspace
+    git(base, "remote", "add", "origin", str(base))
+    return config, store, manager, create
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "timed_out", "cancelled"])
+@pytest.mark.parametrize("linked", [False, True])
+async def test_terminal_cleanup_discards_local_changes_and_preserves_history(terminal_world, status, linked, monkeypatch):
+    """所有终态都清理未推送提交及脏文件，不等待保留期或定时开关。"""
+
+    config, store, _, create = terminal_world
+    config.runtime.workspace_cleanup.enabled = False
+    target = create(days=0, status=status, linked=linked)
+    git(target, "add", "unsaved.txt")
+    git(target, "commit", "-m", "仅本地测试提交")
+    (target / "dirty.txt").write_text("未提交也要清理", encoding="utf-8")
+    store.append_run_log(target.name, stream="system", event_type="test.saved", payload="保留日志")
+    before = store.workspace_cleanup_record(target.name)
+    from teamwork_review_agents import workspace as workspace_module
+    run_git = workspace_module._run_git
+
+    def local_git_only(arguments, **kwargs):
+        """终态清理不应 fetch 或 push，也不需要确认远端是否包含本地提交。"""
+        assert "fetch" not in arguments and "push" not in arguments
+        return run_git(arguments, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_run_git", local_git_only)
+
+    await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+
+    assert not target.exists()
+    assert not retained_marker_path(target).exists()
+    after = store.workspace_cleanup_record(target.name)
+    assert after["workspace_status"] == "removed"
+    assert after["status"] == before["status"]
+    assert after["finished_at"] == before["finished_at"]
+    assert store.get_run(target.name) is not None
+    logs = store.list_run_logs(target.name)
+    assert any(row["event_type"] == "test.saved" for row in logs)
+    assert any(row["event_type"] == "workspace.cleanup.removed" for row in logs)
+    assert config.repositories[0].workspace.exists()
+
+
+async def test_terminal_cleanup_waits_for_shared_and_independent_children(terminal_world):
+    """父任务先结束不删除子任务目录，最后一个共享子任务结束后统一回收。"""
+
+    config, store, _, create = terminal_world
+    parent = create(days=0)
+    independent = create(days=0, status="running", root_run_id=parent.name)
+    other = create(days=0)
+    shared = store.begin_agent_run(
+        proposed_run_id=str(uuid.uuid4()), root_run_id=parent.name, parent_run_id=parent.name,
+        idempotency_key="shared-child", event_id=None, rule_name=None, agent_name="test",
+        resource_key="test", prompt="", environment={}, config_revision=config.revision,
+        max_attempts=1, repository_id="demo",
+    )
+    store.update_agent_run_workspace(shared.run_id, path=str(parent), status="inherited")
+    await cleanup.cleanup_terminal_run_workspaces(config, store, parent.name)
+    assert parent.exists() and independent.exists()
+    store.finish_agent_run(AgentResult(run_id=independent.name, root_run_id=parent.name, agent_name="test", status="failed"))
+    await cleanup.cleanup_terminal_run_workspaces(config, store, parent.name)
+    assert parent.exists() and independent.exists()
+    store.finish_agent_run(AgentResult(run_id=shared.run_id, root_run_id=parent.name, parent_run_id=parent.name, agent_name="test", status="completed"))
+    await cleanup.cleanup_terminal_run_workspaces(config, store, parent.name)
+    assert not parent.exists() and not independent.exists()
+    assert other.exists()
+    assert store.workspace_cleanup_record(shared.run_id)["workspace_status"] == "removed"
+
+
+async def test_terminal_cleanup_respects_existing_usage_lease(terminal_world):
+    """终态写入不代表使用租约已经释放，清理身份不能重入根运行租约。"""
+
+    config, store, _, create = terminal_world
+    target = create(days=0)
+    async with ResourceLease(store, [workspace_usage_lock_key(target)], target.name, ttl_seconds=60, timeout_seconds=0):
+        await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+        assert target.exists()
+    await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+    assert not target.exists()
+
+
+async def test_terminal_cleanup_rechecks_activity_after_acquiring_lock(terminal_world, monkeypatch):
+    """候选扫描后出现活动任务时，锁内复核必须拒绝清理。"""
+
+    config, store, _, create = terminal_world
+    target = create(days=0)
+    original = store.active_workspace_users
+    calls = 0
+
+    def users():
+        """模拟第一次预检后同一任务树开始新的尝试。"""
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return [{"run_id": target.name, "root_run_id": target.name, "workspace_path": str(target)}]
+        return original()
+
+    monkeypatch.setattr(store, "active_workspace_users", users)
+    await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+    assert calls >= 2 and target.exists()
+
+
+async def test_terminal_cleanup_rejects_unconfirmed_paths_and_keeps_failures(terminal_world, monkeypatch):
+    """不可信归属和删除异常都不能破坏基础仓库或改变真实运行结论。"""
+
+    config, store, _, create = terminal_world
+    target = create(days=0)
+    marker = retained_marker_path(target)
+    original = marker.read_text(encoding="utf-8")
+    payload = json.loads(original)
+    payload["workspace"] = str(config.repositories[0].workspace)
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+    await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+    assert target.exists() and config.repositories[0].workspace.exists()
+    marker.write_text(original, encoding="utf-8")
+
+    def fail(*args, **kwargs):
+        """模拟目录占用，不访问真实运行目录。"""
+        raise PermissionError("测试删除失败")
+
+    monkeypatch.setattr(cleanup, "cleanup_run_worktree", fail)
+    await cleanup.cleanup_terminal_run_workspaces(config, store, target.name)
+    assert target.exists() and marker.exists()
+    assert store.workspace_cleanup_record(target.name)["status"] == "failed"
+    assert any(row["event_type"] == "workspace.cleanup.failed" for row in store.list_run_logs(target.name))
 
 
 def test_default_and_schedule_validation():

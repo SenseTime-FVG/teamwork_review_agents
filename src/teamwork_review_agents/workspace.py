@@ -1088,7 +1088,7 @@ def cleanup_run_worktree(
     retention_days: int,
     git_timeout_seconds: int = 600,
 ) -> WorkspaceCleanupResult:
-    """仅在没有丢失本地工作的风险时删除本次运行 Git 工作区。"""
+    """终态统一删除临时目录；活动任务与使用租约由调用方核验。"""
 
     target = workspace.resolve()
     try:
@@ -1103,70 +1103,14 @@ def cleanup_run_worktree(
             f"工作区归属校验失败，为避免误删而保留：{exc}",
             retention_days,
         )
-    if run_status != "completed":
+    if run_status not in {"completed", "failed", "timed_out", "cancelled"}:
         return _retain_worktree(
             target,
-            f"Agent 运行状态为 {run_status}，保留现场用于排查或恢复",
+            f"Agent 尚未结束（{run_status}），暂不清理工作区",
             retention_days,
         )
 
-    status = _run_git(
-        ["-C", str(target), "status", "--porcelain", "--untracked-files=all"],
-        check=False,
-        timeout_seconds=git_timeout_seconds,
-    )
-    if status.returncode != 0:
-        return _retain_worktree(
-            target,
-            "无法读取 Git 工作区状态，为避免误删而保留",
-            retention_days,
-        )
-    if status.stdout.strip():
-        return _retain_worktree(
-            target,
-            "工作区存在未提交或未跟踪文件",
-            retention_days,
-        )
-
-    head_result = _run_git(
-        ["-C", str(target), "rev-parse", "HEAD"],
-        check=False,
-        timeout_seconds=git_timeout_seconds,
-    )
-    if head_result.returncode != 0:
-        return _retain_worktree(
-            target,
-            "无法确认当前提交，为避免误删而保留",
-            retention_days,
-        )
-    current_head = head_result.stdout.strip()
-    if current_head != starting_head:
-        source = source_workspace.resolve()
-        _run_git(
-            ["-C", str(source), "fetch", "--prune", "origin"],
-            check=False,
-            timeout_seconds=git_timeout_seconds,
-        )
-        remote_refs = _run_git(
-            [
-                "-C",
-                str(source),
-                "for-each-ref",
-                "--format=%(refname)",
-                "--contains",
-                current_head,
-                "refs/remotes/origin",
-            ],
-            check=False,
-            timeout_seconds=git_timeout_seconds,
-        )
-        if remote_refs.returncode != 0 or not remote_refs.stdout.strip():
-            return _retain_worktree(
-                target,
-                "工作区包含尚未确认已推送到 origin 的提交",
-                retention_days,
-            )
-
+    # 基线参数保留调用兼容；未提交文件及未推送提交不再阻止终态清理。
     try:
         _remove_run_workspace(
             source_workspace,
@@ -1179,11 +1123,7 @@ def cleanup_run_worktree(
             f"自动清理失败：{exc}",
             retention_days,
         )
-    reason = (
-        "运行未产生本地修改，临时工作区已删除"
-        if current_head == starting_head
-        else "新增提交已存在于 origin，临时工作区已删除"
-    )
+    reason = f"Agent 已结束（{run_status}），临时工作区已删除；运行记录与日志保留"
     return WorkspaceCleanupResult(status="removed", reason=reason)
 
 
