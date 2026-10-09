@@ -480,6 +480,7 @@ class CodexModelRunner:
                     control.stop is None
                     and not control.waiting_children
                     and not control.waiting_ci
+                    and not control.runtime_wait_active(now)
                     and now - control.last_progress_at >= idle_timeout
                 ):
                     control.stop = RunStop(
@@ -664,6 +665,16 @@ class CodexModelRunner:
 
             return f"{selection.provider_id}/{selection.model or 'provider-default'}"
 
+        async def runtime_diagnostic(event: dict[str, Any]) -> None:
+            """普通请求与摘要共用本地诊断，不续期 SSE 进展计时。"""
+
+            check_stop()
+            await emit("system", str(event["type"]), redactor.data({
+                **event, "request_round": request_round,
+                "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                "model": model,
+            }))
+
         async def activate(index: int) -> bool:
             """切换到下一个可用候选，并为其创建协议客户端。"""
 
@@ -791,6 +802,7 @@ class CodexModelRunner:
                             agent.idle_timeout_seconds
                             or self.config.runtime.agent_idle_timeout_seconds
                         ),
+                        diagnostic_callback=runtime_diagnostic,
                     )
                 else:
                     try:

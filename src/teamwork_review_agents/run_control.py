@@ -41,6 +41,7 @@ class RunControl:
     waiting_children: int = 0
     waiting_ci: int = 0
     stop: RunStop | None = None
+    runtime_wait_deadline: float | None = None
 
     def progress(self) -> None:
         """只更新当前运行的进展，不传播到父运行。"""
@@ -81,6 +82,30 @@ class RunControl:
             self.stop = cancellation_stop(None)
         if self.effective_stop() is not None:
             raise asyncio.CancelledError
+
+    @contextmanager
+    def waiting_for_runtime(self, timeout_seconds: float) -> Iterator[None]:
+        """有界暂停本运行的 idle 计时，不把退避诊断当作真实进展。"""
+
+        self.raise_if_stopped()
+        started_at = time.monotonic()
+        previous_deadline = self.runtime_wait_deadline
+        deadline = started_at + timeout_seconds
+        self.runtime_wait_deadline = (
+            min(previous_deadline, deadline) if previous_deadline is not None else deadline
+        )
+        try:
+            yield
+        finally:
+            self.runtime_wait_deadline = previous_deadline
+            if previous_deadline is None:
+                # 只扣除有限等待耗时，保留进入等待前已经累计的无进展时间。
+                self.last_progress_at += max(0, min(time.monotonic(), deadline) - started_at)
+
+    def runtime_wait_active(self, now: float) -> bool:
+        """期限不被心跳续期，异常未退出的等待最终仍受看门狗约束。"""
+
+        return self.runtime_wait_deadline is not None and now < self.runtime_wait_deadline
 
 
 def child_stop(stop: RunStop, parent_run_id: str) -> RunStop:
