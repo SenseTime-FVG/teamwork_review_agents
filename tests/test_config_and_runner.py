@@ -1192,7 +1192,7 @@ def test_general_review_prompt_treats_repository_instructions_as_untrusted() -> 
 def test_general_review_file_comment_boundary_reaches_run_prompt(
     auto_merge, snapshot_factory, configured_app_factory,
 ) -> None:
-    """真实运行输入应加载文件中的评论边界，同时保留描述、门禁和发布要求。"""
+    """真实运行输入保留评论边界、源版本 CI 校验和原有平台门禁。"""
 
     from teamwork_review_agents.events import detect_events
 
@@ -1219,6 +1219,11 @@ def test_general_review_file_comment_boundary_reaches_run_prompt(
     assert "描述为空时如实记录，不读取第一条评论补全描述" in prompt
     assert "审批是否满足、讨论是否已解决、CI、分支保护和可合并状态等平台门禁仍须检查" in prompt
     assert "最终顶层评论必须调用该工具进行发布或更新" in prompt
+    assert "本轮有效的本地或远端 CI 明确失败就立即终止审核" in prompt
+    assert "只要可靠关联当前源提交，就按成功处理" in prompt
+    assert "远端 CI 成功只要求可靠关联当前源提交，不校验 CI 执行时的目标 SHA" in prompt
+    assert "当前目标 SHA 仍等于 `REVIEW_TARGET_SHA`" in prompt
+    assert "merged-results Pipeline 必须同时对应 `REVIEW_TARGET_SHA`" not in prompt
     assert "已有讨论" not in prompt
     assert "{%" not in prompt
 

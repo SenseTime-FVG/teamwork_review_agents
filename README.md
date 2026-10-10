@@ -349,6 +349,8 @@ Agent 使用 `runtime.agent_idle_timeout_seconds`（默认 `300` 秒，可由 Ag
 
 远端 CI 等待使用 `wait_for_ci(number, expected_head_sha)` 工具，仅查询当前仓库的 GitHub/GitLab CI，不执行合并、删除或取消远端任务。全局 `runtime.remote_ci_wait_timeout_seconds` 默认 `1800` 秒，仓库可设置同名字段覆盖；UI 以分钟显示。首次进入等待时开始计时，包含排队和执行，轮询不刷新期限，期间不触发普通无进展超时。空检查、权限错误或未知状态不能当作通过；工具成功返回后仍须核验审批、分支保护、当前源与目标 SHA 等合并条件。到期标记“等待远端 CI 超时，待处理”，保留 PR 和分支，不自动合并或重跑。该等待与本地 Preflight CI 执行超时独立。自定义 Prompt 也收到统一工具说明，但既有 shell 轮询无法被可靠识别为 CI 等待，需改用该工具。升级后新启动的运行生效，不热切换已运行的任务。
 
+通用审核统一采用“本地或远端 CI 明确失败就终止，成功只校验当前源提交”的规则。合并结果类 CI 不追查执行时的目标 SHA，不因目标分支更新把成功结果判为过期，也不要求为最新组合补跑 CI；其他源提交的成功不能复用。CI 通过不代表最新源、目标组合已运行测试，仍须完成代码、设计与目标分支语义一致性审核，并遵守平台实际合并门禁。审核期间源或目标 SHA 漂移的保护不变，详情见 [审核 CI 源提交校验设计](docs/design-review-ci-head-only.md)。
+
 Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktree，所以 Git、测试
 和平台 CLI 都会作用于正确仓库。Teamwork 会在每次 `codex exec` 最后强制设置
 `project_doc_max_bytes=0`，只关闭仓库 `AGENTS.md` 的自动指令注入，不改变工作目录、

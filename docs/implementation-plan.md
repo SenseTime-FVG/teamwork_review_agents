@@ -471,7 +471,7 @@
 - 明确禁止使用 GitHub `base.sha`、`baseRefOid` 或语义等价的变更请求基准字段判断目标分支是否更新；这些字段只可作为历史和差异诊断信息。
 - 补充目标 ref 解析、根 Agent 上下文、工作区准备后取值以及 Prompt 禁止错误字段的回归测试。
 
-验收：目标分支在 Agent 启动前未变化时，PR/MR 的旧 base SHA 不会导致审核误终止；传入的 `target_head_sha` 与工作区 fetch 后的远端跟踪 ref 完全一致；目标 ref 无效时 Codex 不启动；审核期间真实目标 ref 变化仍会阻止使用旧审核和旧 CI 结果执行评论或合并。
+验收：目标分支在 Agent 启动前未变化时，PR/MR 的旧 base SHA 不会导致审核误终止；传入的 `target_head_sha` 与工作区 fetch 后的远端跟踪 ref 完全一致；目标 ref 无效时 Codex 不启动；审核期间真实目标 ref 变化仍会阻止使用旧审核结果执行评论或合并。CI 另按 [源提交校验方案](implementation-plan-review-ci-head-only.md) 处理：源版本匹配的成功结果不受测试时目标版本影响，不额外检查 CI 新鲜度。
 
 ## 阶段四十五：原生 Windows 运行支持
 

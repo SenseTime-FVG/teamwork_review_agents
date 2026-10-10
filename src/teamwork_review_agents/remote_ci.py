@@ -15,6 +15,7 @@ from .run_waits import CI_TIMEOUT_MESSAGE, RunWaits
 
 CI_TOOL_DESCRIPTION = (
     "等待当前仓库指定 PR/MR 的远端 CI，必须提供期望源提交完整 SHA。"
+    "只校验当前源提交关联，不检查 CI 执行时的目标 SHA，不因目标分支更新将成功 CI 判为过期。"
     "使用此工具代替 shell 长轮询；超时由后台停止运行并保留 PR，不自动重跑。"
     "success 只代表观察到的 CI 通过，不代表分支保护、审批或合并授权通过。"
 )
@@ -29,6 +30,7 @@ CI_TOOL_PARAMETERS = {
 }
 CI_RUNTIME_INSTRUCTIONS = (
     "远端 CI 等待必须使用 wait_for_ci(number, expected_head_sha)，不要用 shell sleep 长轮询。"
+    "远端 CI 成功只要求可靠关联当前源提交，不校验 CI 执行时的目标 SHA，不因目标分支更新判定过期或要求重跑。"
     "该工具不授予合并权限；返回 success 后仍须核验最新源/目标 SHA、审批与全部平台门禁。"
     "CI 超时或运行超时是待处理终态：保留已发布的远端 PR、分支和提交，不删除远端成果或从头重跑。"
     "任务树结束后 Teamwork 会清理临时工作区，包括未提交文件和未推送提交；所需成果应在结束前推送。"
@@ -62,6 +64,22 @@ async def _pages(provider, path: str, field: str) -> list[dict]:
                 raise ValueError("平台 CI 分页未完整返回，不能确认全部通过")
             return result
     raise ValueError("平台 CI 检查项超过分页保护上限，不能确认全部通过")
+
+
+async def _gitlab_pipeline_matches_head(provider, project: str, pipeline: dict, sha: str) -> bool:
+    """合并结果流水线仅核验源父提交，不追查目标父提交是否为最新版本。"""
+
+    pipeline_sha = str(pipeline.get("sha", "")).lower()
+    if pipeline_sha == sha:
+        return True
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pipeline_sha):
+        return False
+    commit = await provider.get_json(f"projects/{project}/repository/commits/{pipeline_sha}")
+    if not isinstance(commit, dict) or str(commit.get("id", "")).lower() != pipeline_sha:
+        return False
+    parents = commit.get("parent_ids")
+    # GitLab MR 合并结果的第二个父提交是源版本，仅目标父节点匹配不能替代源关联。
+    return isinstance(parents, list) and len(parents) == 2 and str(parents[1]).lower() == sha
 
 
 async def ci_snapshot(provider, repository, number: int, sha: str) -> dict:
@@ -112,8 +130,8 @@ async def ci_snapshot(provider, repository, number: int, sha: str) -> dict:
         if not isinstance(pipeline, dict):
             return {"status": "pending", "pipeline_count": 0}
         state = pipeline.get("status")
-        # 源提交发生变化而 head_pipeline 尚未刷新时，不能复用旧流水线的成功结果。
-        matching_sha = str(pipeline.get("sha", "")).lower() == sha
+        # 普通流水线直接匹配源 SHA；合并结果 SHA 不同，仅校验其源父提交，旧源仍不能复用。
+        matching_sha = await _gitlab_pipeline_matches_head(provider, project, pipeline, sha)
         status = ("success" if matching_sha and state == "success" else "failure" if matching_sha and state in {"failed", "canceled"} else "pending")
         return {"status": status, "pipeline_count": 1}
     raise ValueError("当前 Provider 不支持远端 CI 等待")
