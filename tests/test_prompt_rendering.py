@@ -106,6 +106,49 @@ def test_general_review_renders_exclusive_final_policy() -> None:
 
 
 @pytest.mark.parametrize("auto_merge", ["true", "false", None])
+def test_general_review_ci_only_binds_current_source_commit(
+    auto_merge: str | None,
+) -> None:
+    """两种审核模式均终止真实 CI 失败，但不要求成功 CI 绑定当前目标版本。"""
+
+    template = (PROJECT_ROOT / "prompts/general-review.md").read_text(encoding="utf-8")
+    values = {} if auto_merge is None else {"REVIEW_AUTO_MERGE": auto_merge}
+    rendered = render_prompt(template, values)
+    ci_policy = rendered.split("# 四、CI 门禁及等待策略", 1)[1].split("# 五、", 1)[0]
+
+    assert "本轮有效的本地或远端 CI 明确失败就立即终止审核" in rendered
+    assert "本地或远端任一有效结果明确失败，立即结束" in ci_policy
+    assert "本地 CI 失败不能被远端成功抵消，远端 CI 失败也不能被本地成功抵消" in ci_policy
+    assert "非必要检查的明确失败也必须终止审核" in ci_policy
+    assert "merged-results、test merge commit、merge queue" in ci_policy
+    assert "合并结果 CI 的执行提交 SHA 可以不同于源 SHA" in ci_policy
+    assert "不检查远端 CI 执行时的目标 SHA" in ci_policy
+    assert "只要可靠关联当前源提交，就按成功处理" in ci_policy
+    assert "不自行增加“目标分支变化后必须重跑 CI”的条件" in ci_policy
+    assert "不另列“CI 过期”或“当前合并基准缺少 CI”作为阻断原因" in rendered
+
+    # 只放宽 CI 测试时的目标版本，不放宽源版本、完整审核或平台合并门禁。
+    assert "不得把其他源提交的 Pipeline、Check 或 Commit Status" in rendered
+    assert "无法可靠确认源提交关联时，不得默认通过" in ci_policy
+    assert "代码和目标分支语义一致性仍须完整审核" in ci_policy
+    assert "源或目标 SHA 变化：立即结束，不评论、不合并" in ci_policy
+    assert "当前目标 SHA 仍等于 `REVIEW_TARGET_SHA`" in rendered
+    assert "项目要求的人工审批、讨论解决、分支保护和其他合并门禁均已满足" in rendered
+    if auto_merge == "true":
+        assert "不得使用管理员覆盖、绕过分支保护、跳过 CI、强制合并" in rendered
+    else:
+        assert "不得调用合并 API" in rendered
+
+    for previous_rule in (
+        "合并结果类 CI 还必须对应该对源、目标 SHA",
+        "还必须能证明它对应 `REVIEW_HEAD_SHA` 与 `REVIEW_TARGET_SHA`",
+        "merged-results Pipeline 必须同时对应 `REVIEW_TARGET_SHA`",
+        "test merge commit 检查必须同时对应 `REVIEW_TARGET_SHA`",
+    ):
+        assert previous_rule not in rendered
+
+
+@pytest.mark.parametrize("auto_merge", ["true", "false", None])
 def test_general_review_preserves_description_without_reading_comments(
     auto_merge: str | None,
 ) -> None:

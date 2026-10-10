@@ -465,7 +465,7 @@ SQLite 状态存储保持“每次方法调用独立连接”的并发模型，�
 
 执行器在创建隔离工作区前更新基础仓库；可写 clone 创建时从基础仓库复制刚更新的远端跟踪引用。服务端最终从本次运行工作区的目标远端跟踪 ref 解析提交，并把结果作为 `mr.target_head_sha` 与已有的 `mr.target_ref` 一起传给根 Agent。解析失败时不得启动 Codex，也不能回退到 PR/MR 元数据中的 base SHA。该值在工作区准备结束、Codex 启动之前生成，避免扫描快照排队期间的目标分支变化被错误固化为本轮审核基准。
 
-通用审核 Prompt 明确令 `REVIEW_HEAD_SHA = mr.head_sha`、`REVIEW_TARGET_SHA = mr.target_head_sha`。后续关键状态刷新仍须查询目标分支真实 ref，并与同一个 `REVIEW_TARGET_SHA` 比较；可以使用平台 Git refs API、`git ls-remote` 或语义等价的实时分支查询，但禁止使用 `base.sha`、`baseRefOid` 判断目标分支是否变化。PR/MR 的 base SHA 只可作为历史、差异或平台诊断信息，不能参与当前目标分支竞态判断。合并结果类 CI 继续要求其合并提交父节点明确对应 `REVIEW_TARGET_SHA` 与 `REVIEW_HEAD_SHA`。
+通用审核 Prompt 明确令 `REVIEW_HEAD_SHA = mr.head_sha`、`REVIEW_TARGET_SHA = mr.target_head_sha`。后续关键状态刷新仍须查询目标分支真实 ref，并与同一个 `REVIEW_TARGET_SHA` 比较；可以使用平台 Git refs API、`git ls-remote` 或语义等价的实时分支查询，但禁止使用 `base.sha`、`baseRefOid` 判断目标分支是否变化。PR/MR 的 base SHA 只可作为历史、差异或平台诊断信息，不能参与当前目标分支竞态判断。本地和远端 CI 只要求可靠关联 `REVIEW_HEAD_SHA`，合并结果类 CI 不再要求绑定 `REVIEW_TARGET_SHA`；本轮任一有效 CI 明确失败就终止，成功后继续完整审核，不因目标版本更新将成功 CI 判为过期，也不额外要求当前组合重跑。平台实际合并门禁和审核期间的源、目标漂移保护不变，详见 [审核 CI 源提交校验设计](design-review-ci-head-only.md)。
 
 ## 48. 原生 Windows 进程与服务管理
 

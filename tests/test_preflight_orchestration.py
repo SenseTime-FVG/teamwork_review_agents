@@ -303,17 +303,23 @@ def test_rule_can_request_preflight_without_repository_ci_configuration(
     assert config.repositories[0].preflight.enabled is False
 
 
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+@pytest.mark.parametrize("status", ["failure", "timed_out"])
 async def test_failed_preflight_completes_event_without_starting_review_agent(
     tmp_path,
     snapshot_factory,
+    kind,
+    status,
 ) -> None:
-    """代码测试失败是终态门禁结果，不得启动 Agent 或周期性重试同一 SHA。"""
+    """两平台的本地 CI 失败或超时均阻断审核，不启动 Agent 或重试同一 SHA。"""
 
-    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
+    config = preflight_config(tmp_path)
+    config.providers["github-main"].kind = kind
+    orchestrator = Orchestrator(config, recover_interrupted=False)
     enqueue_discovered(orchestrator, snapshot_factory)
     agents = FakeAgentExecutor()
     orchestrator.executor = agents
-    orchestrator.preflight = FakePreflightExecutor(result("failure"))
+    orchestrator.preflight = FakePreflightExecutor(result(status))
     summary = CycleSummary()
 
     await orchestrator.process_events(summary)

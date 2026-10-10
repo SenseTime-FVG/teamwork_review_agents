@@ -14,7 +14,10 @@ from teamwork_review_agents.config import EnvironmentVariable
 from teamwork_review_agents.codex_runner import CodexRunner
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.models import AgentResult, InvocationContext
-from teamwork_review_agents.remote_ci import RemoteCIWaiter, ci_snapshot, validate_ci_arguments
+from teamwork_review_agents.remote_ci import (
+    CI_RUNTIME_INSTRUCTIONS, CI_TOOL_DESCRIPTION,
+    RemoteCIWaiter, ci_snapshot, validate_ci_arguments,
+)
 from teamwork_review_agents.run_waits import RunWaits, mcp_wait_timeout
 from teamwork_review_agents.state import StateStore
 from teamwork_review_agents.codex_model_runner import CodexModelRunner
@@ -108,6 +111,121 @@ async def test_ci_platform_states(ci_case, kind, state, expected):
     config, _, _ = ci_case
     result = await ci_snapshot(Platform(kind, state=state), config.repositories[0], 123, SHA)
     assert result["status"] == expected
+
+
+@pytest.mark.parametrize("kind,state,expected", [
+    ("github", "success", "success"), ("github", "failure", "failure"),
+    ("gitlab", "success", "success"), ("gitlab", "failed", "failure"),
+])
+async def test_ci_does_not_query_target_version_or_merge_checks(ci_case, kind, state, expected):
+    """同一源版本的结果不受目标更新影响，明确失败仍终止且不追查目标或合并日志。"""
+
+    config, _, _ = ci_case
+    platform = Platform(kind, state=state)
+    original_get_json = platform.get_json
+
+    async def get_json(path, **kwargs):
+        """模拟目标已更新，但没有为当前合并提交重新生成 CI 的平台响应。"""
+
+        payload = await original_get_json(path, **kwargs)
+        if "/pulls/" in path:
+            payload.update({"base": {"sha": "b" * 40}, "merge_commit_sha": "c" * 40})
+        if "/merge_requests/" in path:
+            payload["head_pipeline"]["target_sha"] = "d" * 40
+        return payload
+
+    platform.get_json = get_json
+    result = await ci_snapshot(platform, config.repositories[0], 123, SHA)
+    assert result["status"] == expected
+    project = config.repositories[0].project
+    expected_paths = (
+        [f"repos/{project}/pulls/123", f"repos/{project}/commits/{SHA}/check-runs", f"repos/{project}/commits/{SHA}/status"]
+        if kind == "github" else [f"projects/{project.replace('/', '%2F')}/merge_requests/123"]
+    )
+    assert [path for path, _ in platform.calls] == expected_paths
+
+
+async def test_failed_github_check_is_not_overridden_by_successful_status(ci_case):
+    """远端检查失败不能被本地成功状态抵消，也不按必需检查名称过滤失败。"""
+
+    config, _, _ = ci_case
+    platform = Platform(state="failure")
+    original_get_json = platform.get_json
+
+    async def get_json(path, **kwargs):
+        """为同一源提交追加成功的本地 CI 状态，保留失败的远端检查。"""
+
+        payload = await original_get_json(path, **kwargs)
+        if path.endswith("/status"):
+            payload.update({"total_count": 1, "state": "success"})
+        return payload
+
+    platform.get_json = get_json
+    assert (await ci_snapshot(platform, config.repositories[0], 123, SHA))["status"] == "failure"
+
+
+@pytest.mark.parametrize("state,expected", [("success", "success"), ("failed", "failure"), ("canceled", "failure")])
+async def test_gitlab_merged_pipeline_only_matches_source_parent(ci_case, state, expected):
+    """GitLab 合并结果关联当前源版本即可，不因目标父版本较旧而忽略成功或失败。"""
+
+    config, _, _ = ci_case
+    merge_sha = "b" * 40
+    old_target = "c" * 40
+    calls = []
+    platform = Platform("gitlab")
+
+    async def get_json(path, **kwargs):
+        """只返回 MR 及其流水线提交父节点，不提供目标 ref 或其他流水线。"""
+
+        calls.append(path)
+        if "/merge_requests/" in path:
+            return {"state": "opened", "sha": SHA, "head_pipeline": {"sha": merge_sha, "status": state}}
+        assert path.endswith(f"/repository/commits/{merge_sha}")
+        return {"id": merge_sha, "parent_ids": [old_target, SHA]}
+
+    platform.get_json = get_json
+    assert (await ci_snapshot(platform, config.repositories[0], 123, SHA))["status"] == expected
+    project = config.repositories[0].project.replace("/", "%2F")
+    assert calls == [f"projects/{project}/merge_requests/123", f"projects/{project}/repository/commits/{merge_sha}"]
+
+
+@pytest.mark.parametrize("pipeline_sha,commit", [
+    ("b" * 40, {"id": "b" * 40, "parent_ids": ["c" * 40, "d" * 40]}),
+    ("b" * 40, {"id": "b" * 40, "parent_ids": [SHA, "d" * 40]}),
+    ("b" * 40, {"id": "b" * 40, "parent_ids": [SHA]}),
+    ("b" * 40, {"id": "b" * 40, "parent_ids": ["c" * 40, "d" * 40, SHA]}),
+    ("b" * 40, {"id": "d" * 40, "parent_ids": ["c" * 40, SHA]}),
+    ("b" * 40, {"id": "b" * 40, "parent_ids": "invalid"}),
+    ("../../other-project", None),
+])
+async def test_gitlab_merged_pipeline_without_source_proof_cannot_pass(ci_case, pipeline_sha, commit):
+    """旧源、仅目标父节点匹配、单父提交和错误元数据均不能冒充当前源版本成功。"""
+
+    config, _, _ = ci_case
+    platform = Platform("gitlab")
+    calls = []
+
+    async def get_json(path, **kwargs):
+        """非法提交路径必须在网络查询前拒绝。"""
+
+        calls.append(path)
+        if "/merge_requests/" in path:
+            return {"state": "opened", "sha": SHA, "head_pipeline": {"sha": pipeline_sha, "status": "success"}}
+        assert commit is not None
+        return commit
+
+    platform.get_json = get_json
+    assert (await ci_snapshot(platform, config.repositories[0], 123, SHA))["status"] == "pending"
+    assert len(calls) == (1 if commit is None else 2)
+
+
+@pytest.mark.parametrize("description", [CI_TOOL_DESCRIPTION, CI_RUNTIME_INSTRUCTIONS])
+def test_shared_ci_instructions_do_not_require_target_freshness(description):
+    """CLI 和内嵌模型的共享说明不得重新引入成功 CI 的目标版本绑定。"""
+
+    assert "目标 SHA" in description
+    assert "不因目标分支更新" in description
+    assert "必须同时对应" not in description
 
 
 async def test_pagination_and_sha_guard(ci_case):
