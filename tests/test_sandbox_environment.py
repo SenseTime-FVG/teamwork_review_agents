@@ -152,22 +152,37 @@ async def test_tool_launch_uses_paired_environment_and_transparent_streams(tool,
     assert tool.environment == original
 
 
-@pytest.mark.parametrize("finish", ["timeout", "cancel", "cancel-with-read-contention"])
+@pytest.mark.parametrize("finish", [
+    "timeout", "cancel", "cancel-with-read-contention", "cancel-with-publication-race",
+])
 async def test_bridge_descendants_stop_with_tool(tool, simulated_outer, finish, monkeypatch):
     """新增桥不创建脱离的进程组，超时与取消都必须终止真正命令及其子进程。"""
 
     marker = tool.repository.workspace / "pids.json"
+    simulate_read_contention = finish in {"cancel-with-read-contention", "cancel-with-publication-race"}
     denied_reads = 0
     original_read = Path.read_text
+
+    if finish == "cancel-with-publication-race":
+        original_exists = Path.exists
+
+        def marker_not_visible(path):
+            """固定存在性预检查的过期结果，真实读取仍能取得原子发布的标记。"""
+
+            return False if path == marker else original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", marker_not_visible)
 
     def read_marker(path, *args, **kwargs):
         """模拟 Windows 发布标记刚出现时的短暂共享冲突，不跳过进程存活断言。"""
 
         nonlocal denied_reads
-        if finish == "cancel-with-read-contention" and path == marker and path.exists() and denied_reads < 2:
+        # 先真实读取再模拟冲突，避免存在性检查与原子发布竞态；真实异常不消耗次数。
+        content = original_read(path, *args, **kwargs)
+        if simulate_read_contention and path == marker and denied_reads < 2:
             denied_reads += 1
             raise PermissionError("模拟标记文件暂时不可读")
-        return original_read(path, *args, **kwargs)
+        return content
 
     monkeypatch.setattr(Path, "read_text", read_marker)
     code = (
@@ -190,7 +205,7 @@ async def test_bridge_descendants_stop_with_tool(tool, simulated_outer, finish, 
                 except (FileNotFoundError, PermissionError):
                     # Windows 上出现目录项不代表文件已可读；仍受原有十秒时限约束。
                     await asyncio.sleep(0.05)
-        if finish == "cancel-with-read-contention":
+        if simulate_read_contention:
             assert denied_reads == 2
         if finish != "timeout":
             task.cancel()
