@@ -28,6 +28,7 @@
 | [`design-background-startup-confirmation.md`](design-background-startup-confirmation.md) | 后台启动等待与健康检查诊断 | `process_manager.py`、`cli.py` | 启动时限、健康探测或启动确认语义变化 |
 | [`design-model-runtime-log-normalization.md`](design-model-runtime-log-normalization.md) | 模型基座运行日志语义设计 | 模型基座运行时与日志 | 模型基座日志事件或展示语义变化 |
 | [`design-agent-workspace-preparation.md`](design-agent-workspace-preparation.md) | Agent 工作区准备与仓库级依赖缓存设计 | `agent_workspace.py`、缓存与仓库配置 | `agent_workspace`、准备步骤、缓存、沙盒或相关 UI 变化 |
+| [`design-workspace-python-environment.md`](design-workspace-python-environment.md) | 通用工作区 Python 环境接入与有界恢复 | 准备器、执行器、仓库配置与日志 | 虚拟环境、模块校验或快照恢复语义变化 |
 | [`design-agent-workspace-snapshot-warmup.md`](design-agent-workspace-snapshot-warmup.md) | 工作区依赖快照与手动预热设计 | `workspace_snapshot.py`、工作区预热 API 与 UI | 快照指纹、归档恢复、容量策略、预热流程或状态变化 |
 | [`design-managed-comment-model-signature.md`](design-managed-comment-model-signature.md) | 托管评论模型签名设计 | `managed_comments.py`、Agent 配置与评论 UI | 签名开关、模型快照来源、评论格式或生命周期变化 |
 | [`design-managed-skill-authoring.md`](design-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑设计 | `skill_files.py`、Skill 管理 API 与 UI | Skill 在线创建、编辑、元数据或受管目录边界变化 |
@@ -48,6 +49,7 @@
 | [`implementation-plan-background-startup-confirmation.md`](implementation-plan-background-startup-confirmation.md) | 后台启动确认实施与验收范围 | 进程管理与 CLI 测试 | 该实施方案或验收记录更新 |
 | [`implementation-plan-model-runtime-log-normalization.md`](implementation-plan-model-runtime-log-normalization.md) | 模型基座运行日志语义实施方案 | 模型基座运行时与日志 | 该实施方案本身或其验收记录更新 |
 | [`implementation-plan-agent-workspace-preparation.md`](implementation-plan-agent-workspace-preparation.md) | 工作区准备与依赖缓存实施方案 | 工作区准备、缓存和管理界面 | 该实施方案或验收记录更新 |
+| [`implementation-plan-workspace-python-environment.md`](implementation-plan-workspace-python-environment.md) | Python 测试环境接入实施与验收 | 准备器、执行器、配置与前端 | 该实施方案或验收记录更新 |
 | [`implementation-plan-agent-workspace-snapshot-warmup.md`](implementation-plan-agent-workspace-snapshot-warmup.md) | 工作区依赖快照与预热实施方案 | 快照、预热 API 和管理界面 | 该实施方案或验收记录更新 |
 | [`implementation-plan-managed-comment-model-signature.md`](implementation-plan-managed-comment-model-signature.md) | 托管评论模型签名实施方案 | 托管评论、模型快照和 Agent 配置 | 该实施方案或验收记录更新 |
 | [`implementation-plan-managed-skill-authoring.md`](implementation-plan-managed-skill-authoring.md) | 受管 Skill 在线新建与编辑实施方案 | Skill 文件管理、API 和配置界面 | 该实施方案或验收记录更新 |

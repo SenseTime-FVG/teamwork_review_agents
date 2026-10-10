@@ -335,6 +335,8 @@ GitHub 合并 PR 时 Timeline 可能同时返回 `merged` 和由合并自动产�
 
 Agent 先显示“排队中”，表示等待并发额度或资源锁；开始克隆、fetch 和创建隔离 Git 工作区后显示“准备工作区”，所选模型 Provider 真正启动后才显示“执行中”。可写 Agent 的运行目录是自带独立 `.git` 的本地 clone，Teamwork 外层沙盒会允许该 clone 及其独立 `.git` 写入，因此 Agent 可以执行 fetch、建分支和提交；Codex 的工作区权限档案还允许系统临时目录写入，用于每轮临时 HOME 和工具缓存，但基础仓库不在可写范围内。只读 Agent 使用轻量 linked worktree。工作区准备日志会定期记录当前 Git 操作和已耗时秒数，但不会记录完整远端 URL。
 
+仓库详情“Agent 工作区准备”可配置安装步骤、可选的 Python 虚拟环境路径（如 `.venv`）和启动前校验模块（如 `pytest`）。安装与校验都在本次隔离工作区及原有沙盒中执行，不向宿主 Python 安装依赖；校验成功后为全部 Agent 和运行器接入对应 `PATH`、`VIRTUAL_ENV`，并提供明确的 `python -m pytest` 入口。快照恢复后仍校验环境，失效时最多重新执行一次已配置的准备命令；继承父工作区的子 Agent 不重复安装。缺依赖导致的收集中断属于环境未就绪，相关测试未执行，不能当成已确认的代码测试失败或通过。配置和边界见 [Python 测试环境设计](docs/design-workspace-python-environment.md)。
+
 不同 PR / MR 的事件批次和不同定时周期可以并发调度，同一 PR / MR 的后续批次仍按时间顺序等待。扫描期间新产生的其他 PR / MR 事件会及时填补空闲额度，不需要等待某个长时间 Agent 结束。“全局配置与环境”页的 `runtime.max_concurrent_agents` 和 `runtime.agent_concurrency_limit` 默认均为 `5`，根 Agent 实际总并发取两者较小值。每个 Agent 还可以填写 `max_concurrent_runs`；留空表示不增加同名 Agent 限制，填写后同时约束该名称的根 Agent 与 sub-agent。sub-agent 复用父根任务的全局额度，避免父任务等待子任务时产生额度死锁。
 
 排队记录会说明当前是在等待全局/运行时额度、此 Agent 额度、同一 PR / MR 前序批次、前序事件重试、业务资源锁还是基础仓库锁。前序事件发生可重试失败时只短暂延迟当前 PR / MR，其他变更请求继续使用空闲额度；达到重试上限后，该失败事件保留终态并立即继续同一 PR / MR 的后续批次。修改并发配置只影响尚未取得额度的新运行，不会强制终止已经开始准备或执行的任务。

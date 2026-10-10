@@ -4987,6 +4987,8 @@ function RepositoryDetailEditor(props: {
     timeout_seconds: repository.agent_workspace?.timeout_seconds ?? 1800,
     max_output_bytes: repository.agent_workspace?.max_output_bytes ?? 1_000_000,
     prepare_steps: repository.agent_workspace?.prepare_steps ?? [],
+    python_venv: repository.agent_workspace?.python_venv ?? null,
+    python_check_modules: repository.agent_workspace?.python_check_modules ?? [],
   };
 
   function update(patch: Partial<Repository>) {
@@ -5180,7 +5182,7 @@ function RepositoryDetailEditor(props: {
           <div className="repository-preflight-head">
             <div>
               <strong>Agent 工作区准备</strong>
-              <p>在模型启动前，于本次隔离工作区中执行用户定义的安装命令；不会修改 Prompt，也不会自动猜测包管理器。</p>
+              <p>在模型启动前，于本次隔离工作区中执行用户定义的安装命令；不会自动猜测包管理器或向宿主 Python 安装依赖。</p>
             </div>
             <div className="repository-preflight-head-actions">
               {props.agentWorkspaceAction}
@@ -5209,6 +5211,26 @@ function RepositoryDetailEditor(props: {
                   onChange={(cache_enabled) => updateAgentWorkspace({ cache_enabled })}
                 />
                 <p>同一仓库跨分支共享包管理器下载缓存；准备成功后还会按命令、依赖清单和运行平台保存最多 3 份工作区快照，总上限 5 GiB。</p>
+              </div>
+              <div className="form-grid two">
+                <Field
+                  label="Python 虚拟环境路径（可选）"
+                  value={agentWorkspace.python_venv ?? ""}
+                  placeholder=".venv"
+                  onChange={(value) => updateAgentWorkspace({
+                    python_venv: value || null,
+                    ...(!value.trim() ? { python_check_modules: [] } : {}),
+                  })}
+                  help="只允许工作区内相对目录；准备或快照恢复后校验并接入 Agent 命令环境，留空保持原行为"
+                />
+                <Field
+                  label="启动前校验 Python 模块（可选）"
+                  value={agentWorkspace.python_check_modules.join(", ")}
+                  placeholder="pytest"
+                  disabled={!agentWorkspace.python_venv?.trim()}
+                  onChange={(value) => updateAgentWorkspace({ python_check_modules: value.split(/[,，\s]+/).filter(Boolean) })}
+                  help="模块名用逗号或空格分隔；只做导入校验，不自动安装。校验成功不代表测试已通过"
+                />
               </div>
               {props.agentWorkspaceWarmup && (
                 <div className={`repository-workspace-warmup status-${props.agentWorkspaceWarmup.status}`}>

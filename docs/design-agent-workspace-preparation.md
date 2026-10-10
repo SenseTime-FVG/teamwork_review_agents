@@ -4,7 +4,7 @@
 
 Agent 运行使用独立的临时 Git 工作区，基础仓库或其他运行中已经存在的 `node_modules`、虚拟环境等安装结果不会被复制进来。即使本地 Preflight / CI 已经拥有下载缓存，Agent 自主执行 `npm run build` 等命令时仍可能因为工作区没有安装依赖而失败。
 
-本功能不修改 Agent Prompt，也不推断仓库使用 npm、uv 或其他包管理器。仓库管理员显式配置模型启动前需要执行的准备步骤，Teamwork 只负责在当前 Agent 工作区中按顺序执行这些参数数组命令，并为它们和后续 Agent 命令注入同一个仓库级下载缓存环境。
+本功能不改变具体 Agent 的任务指令，也不推断仓库使用 npm、uv 或其他包管理器。仓库管理员显式配置模型启动前需要执行的准备步骤，Teamwork 在当前 Agent 工作区中按顺序执行这些参数数组命令，并为它们和后续 Agent 命令注入同一个仓库级下载缓存环境。配置 `python_venv` 时还会校验并接入该虚拟环境，向运行上下文追加实际解释器与测试入口；详见 [Python 环境接入设计](design-workspace-python-environment.md)。
 
 ## 配置模型
 

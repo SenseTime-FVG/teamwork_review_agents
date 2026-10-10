@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import json
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 
-from .config import AgentConfig, AppConfig, RepositoryConfig
+from .config import (
+    AgentConfig,
+    AgentWorkspacePrepareStepConfig,
+    AppConfig,
+    RepositoryConfig,
+)
 from .environment import SecretRedactor
 from .filesystem import temporary_directory
 from .managed_sandbox import inspect_managed_sandbox, wrap_managed_sandbox_command
-from .sandbox_environment import sandbox_executable_environment, windows_environment_separation
+from .sandbox_environment import (
+    sandbox_executable_environment,
+    windows_environment_separation,
+)
 from .subprocess_utils import ProcessLaunch, remove_environment_names
 from .preflight import (
     PreflightStepUpdate,
@@ -32,6 +43,15 @@ from .workspace_snapshot import (
     restore_workspace_snapshot,
     workspace_snapshot_fingerprint,
 )
+from .workspace_python import (
+    PYTHON_PROBE,
+    apply_workspace_python_environment,
+    check_python_script_paths,
+    python_probe_metadata,
+    workspace_python_environment,
+    workspace_python_paths,
+    workspace_python_runtime_hint,
+)
 
 
 LogCallback = Callable[[str, str, str | dict[str, Any]], Awaitable[None]]
@@ -40,7 +60,7 @@ CancelCheck = Callable[[], bool]
 
 @dataclass(frozen=True)
 class AgentWorkspacePreparationResult:
-    """工作区准备结果以及应继续注入 Agent 的缓存环境。"""
+    """工作区准备结果及应继续注入 Agent 的缓存和 Python 环境。"""
 
     outcome: StepExecutionOutcome
     cache_environment: dict[str, str]
@@ -48,6 +68,93 @@ class AgentWorkspacePreparationResult:
     snapshot_status: str = "disabled"
     snapshot_fingerprint: str | None = None
     snapshot_metadata: dict[str, Any] | None = None
+    execution_environment: dict[str, str] | None = None
+    runtime_hint: str = ""
+    error_code: str | None = None
+    retryable: bool = True
+
+
+@contextmanager
+def _preparation_process_context(
+    config: AppConfig,
+    agent: AgentConfig,
+    process_environment: dict[str, str],
+    cache_environment: dict[str, str],
+) -> Iterator[tuple[dict[str, str], Callable[[list[str], Path], ProcessLaunch]]]:
+    """准备与启动校验共用临时 HOME、凭据过滤和原生沙盒边界。"""
+
+    restricted = agent.sandbox != "danger-full-access"
+    with temporary_directory(prefix="teamwork-agent-prepare-home-") as home:
+        environment = build_preflight_environment(
+            home=home, cache_environment=cache_environment
+        )
+        environment.update(process_environment)
+        locked = build_preflight_environment(
+            home=home, cache_environment=cache_environment
+        )
+        for name in {
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            *cache_environment,
+        }:
+            if name in locked:
+                remove_environment_names(environment, {name})
+                environment[name] = locked[name]
+        preparation_codex_home = None
+        if restricted and windows_environment_separation():
+            # 校验进程与安装进程都不能借临时 HOME 获得宿主 Codex 登录信息。
+            preparation_codex_home = home / "codex-home"
+            preparation_codex_home.mkdir(mode=0o700)
+            remove_environment_names(environment, {"CODEX_HOME"})
+            environment["CODEX_HOME"] = str(preparation_codex_home.resolve())
+        elif config.runtime.codex_home is not None:
+            environment["CODEX_HOME"] = str(
+                config.runtime.codex_home.expanduser().resolve()
+            )
+        preparation_agent = (
+            agent.model_copy(update={"sandbox": "workspace-write"})
+            if restricted
+            else agent
+        )
+
+        def wrap_command(command: list[str], step_cwd: Path) -> ProcessLaunch:
+            """按步骤实际目录构造启动对象，不放宽正式 Agent 权限。"""
+
+            if not restricted:
+                return ProcessLaunch(command, dict(environment))
+            return wrap_managed_sandbox_command(
+                codex_binary=resolve_codex_executable(
+                    config.runtime.codex_binary,
+                    sandbox_executable_environment(environment),
+                ),
+                workspace=step_cwd,
+                agent=preparation_agent,
+                inner_command=command,
+                environment=environment,
+                codex_runtime_directory=preparation_codex_home,
+                codex_home=config.runtime.codex_home,
+            )
+
+        yield environment, wrap_command
+
+
+def _preparation_sandbox_error(config: AppConfig, agent: AgentConfig) -> str | None:
+    """缓存命中后的真实校验同样必须满足已有沙盒要求。"""
+
+    if agent.sandbox == "danger-full-access":
+        return None
+    if not config.runtime.managed_sandbox.enabled:
+        return "Agent 工作区准备或仓库级缓存必须使用 Teamwork 外层沙盒，但运行时已关闭该能力"
+    inspection = inspect_managed_sandbox(
+        config.runtime.codex_binary, config.runtime.codex_home
+    )
+    if not inspection.available:
+        return f"Agent 工作区准备或仓库级缓存无法启用 Teamwork 外层沙盒：{inspection.error or '当前平台能力不可用'}"
+    return None
 
 
 def agent_repository_cache_environment(
@@ -62,7 +169,7 @@ def agent_repository_cache_environment(
     return root, build_repository_cache_environment(root)
 
 
-async def prepare_agent_workspace(
+async def _prepare_workspace_artifacts(
     *,
     config: AppConfig,
     repository: RepositoryConfig,
@@ -72,6 +179,8 @@ async def prepare_agent_workspace(
     log_callback: LogCallback,
     cancel_check: CancelCheck,
     inherited_workspace: bool = False,
+    restore_snapshot: bool = True,
+    deadline: float | None = None,
 ) -> AgentWorkspacePreparationResult:
     """在模型启动前通过外层沙盒执行仓库声明的准备步骤。"""
 
@@ -122,12 +231,16 @@ async def prepare_agent_workspace(
                 "workspace.snapshot.lookup",
                 {"fingerprint": snapshot_fingerprint},
             )
-            metadata = await asyncio.to_thread(
-                restore_workspace_snapshot,
-                config,
-                repository,
-                snapshot_fingerprint,
-                cancel_check=cancel_check,
+            metadata = (
+                await asyncio.to_thread(
+                    restore_workspace_snapshot,
+                    config,
+                    repository,
+                    snapshot_fingerprint,
+                    cancel_check=cancel_check,
+                )
+                if restore_snapshot
+                else None
             )
             if metadata is not None:
                 await log_callback(
@@ -201,38 +314,13 @@ async def prepare_agent_workspace(
                         },
                     )
 
-    restricted = agent.sandbox != "danger-full-access"
-    if restricted:
-        if not config.runtime.managed_sandbox.enabled:
-            outcome = StepExecutionOutcome(
-                status="error",
-                error=(
-                    "Agent 工作区准备或仓库级缓存必须使用 Teamwork 外层沙盒，"
-                    "但运行时已关闭该能力"
-                ),
-            )
-            return AgentWorkspacePreparationResult(
-                outcome=outcome,
-                cache_environment=cache_environment,
-                cache_root=cache_root,
-            )
-        inspection = inspect_managed_sandbox(
-            config.runtime.codex_binary,
-            config.runtime.codex_home,
+    sandbox_error = _preparation_sandbox_error(config, agent)
+    if sandbox_error:
+        return AgentWorkspacePreparationResult(
+            outcome=StepExecutionOutcome(status="error", error=sandbox_error),
+            cache_environment=cache_environment,
+            cache_root=cache_root,
         )
-        if not inspection.available:
-            outcome = StepExecutionOutcome(
-                status="error",
-                error=(
-                    "Agent 工作区准备或仓库级缓存无法启用 Teamwork 外层沙盒："
-                    f"{inspection.error or '当前平台能力不可用'}"
-                ),
-            )
-            return AgentWorkspacePreparationResult(
-                outcome=outcome,
-                cache_environment=cache_environment,
-                cache_root=cache_root,
-            )
 
     if not steps:
         if cache_root is not None:
@@ -261,72 +349,15 @@ async def prepare_agent_workspace(
         },
     )
 
-    with temporary_directory(prefix="teamwork-agent-prepare-home-") as home:
-        environment = build_preflight_environment(
-            home=home,
-            cache_environment=cache_environment,
-        )
-        environment.update(process_environment)
-        # HOME 与缓存路径属于运行时安全边界，仓库或 Agent 环境不能覆盖。
-        locked_environment = build_preflight_environment(
-            home=home,
-            cache_environment=cache_environment,
-        )
-        for name in {
-            "HOME",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "TEMP",
-            "TMP",
-            *cache_environment.keys(),
-        }:
-            if name in locked_environment:
-                environment[name] = locked_environment[name]
-        preparation_codex_home = None
-        if restricted and windows_environment_separation():
-            # 准备命令只使用空临时目录，不能因外层使用宿主登录目录而获得宿主凭据。
-            preparation_codex_home = home / "codex-home"
-            preparation_codex_home.mkdir(mode=0o700)
-            remove_environment_names(environment, {"CODEX_HOME"})
-            environment["CODEX_HOME"] = str(preparation_codex_home.resolve())
-        elif config.runtime.codex_home is not None:
-            environment["CODEX_HOME"] = str(
-                config.runtime.codex_home.expanduser().resolve()
-            )
-
-        preparation_agent = agent
-        if restricted:
-            # 安装依赖需要写当前工作区，但不会扩大正式 Agent 的文件权限。
-            preparation_agent = agent.model_copy(
-                update={"sandbox": "workspace-write"},
-            )
-
-        def wrap_command(command: list[str], step_cwd: Path) -> ProcessLaunch:
-            """为每个步骤按其工作目录生成同一套原生沙盒边界。"""
-
-            if not restricted:
-                return ProcessLaunch(command, dict(environment))
-            return wrap_managed_sandbox_command(
-                codex_binary=resolve_codex_executable(
-                    config.runtime.codex_binary,
-                    sandbox_executable_environment(environment),
-                ),
-                workspace=step_cwd,
-                agent=preparation_agent,
-                inner_command=command,
-                environment=environment,
-                codex_runtime_directory=preparation_codex_home,
-                codex_home=config.runtime.codex_home,
-            )
+    with _preparation_process_context(
+        config, agent, process_environment, cache_environment
+    ) as (environment, wrap_command):
 
         async def on_step_update(update: PreflightStepUpdate) -> None:
             """把结构化步骤状态映射到当前 Agent 运行时间线。"""
 
             step = steps[update.step_index]
-            suffix = (
-                "started" if update.status == "running" else "completed"
-            )
+            suffix = "started" if update.status == "running" else "completed"
             await log_callback(
                 "system",
                 f"workspace.prepare.step_{suffix}",
@@ -354,7 +385,11 @@ async def prepare_agent_workspace(
             )
 
         outcome = await execute_preflight_steps(
-            settings,
+            settings.model_copy(
+                update={"timeout_seconds": max(0.001, deadline - time.monotonic())}
+            )
+            if deadline
+            else settings,
             cwd=repository.workspace,
             environment=environment,
             on_step_update=on_step_update,
@@ -451,3 +486,258 @@ async def prepare_agent_workspace(
         snapshot_fingerprint=snapshot_fingerprint,
         snapshot_metadata=snapshot_metadata,
     )
+
+
+async def _validate_workspace_python(
+    *,
+    config: AppConfig,
+    repository: RepositoryConfig,
+    agent: AgentConfig,
+    process_environment: dict[str, str],
+    result: AgentWorkspacePreparationResult,
+    redactor: SecretRedactor,
+    log_callback: LogCallback,
+    cancel_check: CancelCheck,
+    deadline: float,
+) -> AgentWorkspacePreparationResult:
+    """使用实际虚拟环境解释器，在同一沙盒边界内校验环境与显式模块。"""
+
+    source = result.snapshot_status
+    await log_callback(
+        "system",
+        "workspace.python.check_started",
+        {
+            "source": source,
+            "venv": repository.agent_workspace.python_venv,
+            "checked_modules": repository.agent_workspace.python_check_modules,
+        },
+    )
+    metadata: dict[str, object] | None = None
+    overrides: dict[str, str] | None = None
+    try:
+        if cancel_check():
+            outcome = StepExecutionOutcome(
+                status="cancelled", error="Agent 工作区准备已取消"
+            )
+        elif time.monotonic() >= deadline:
+            outcome = StepExecutionOutcome(
+                status="timed_out", error="Agent 工作区准备总运行时间超时"
+            )
+        else:
+            sandbox_error = _preparation_sandbox_error(config, agent)
+            if sandbox_error:
+                raise ValueError(sandbox_error)
+            venv, scripts, python = workspace_python_paths(
+                repository.workspace, repository.agent_workspace.python_venv
+            )
+            check_python_script_paths(scripts)
+            with _preparation_process_context(
+                config, agent, process_environment, result.cache_environment
+            ) as (environment, wrap_command):
+                overrides = workspace_python_environment(
+                    venv, scripts, python, environment
+                )
+                apply_workspace_python_environment(environment, overrides)
+                settings = repository.agent_workspace.model_copy(
+                    update={
+                        "timeout_seconds": max(0.001, deadline - time.monotonic()),
+                        "prepare_steps": [
+                            AgentWorkspacePrepareStepConfig(
+                                name="校验工作区 Python 环境",
+                                command=[
+                                    str(python),
+                                    "-I",
+                                    "-c",
+                                    PYTHON_PROBE,
+                                    str(venv),
+                                    json.dumps(
+                                        repository.agent_workspace.python_check_modules
+                                    ),
+                                ],
+                            )
+                        ],
+                    }
+                )
+
+                def wrap_probe(command: list[str], cwd: Path) -> ProcessLaunch:
+                    """通用程序解析会解引用链接，此处必须保留虚拟环境的 Python 入口。"""
+
+                    return wrap_command([str(python), *command[1:]], cwd)
+
+                outcome = await execute_preflight_steps(
+                    settings,
+                    cwd=repository.workspace,
+                    environment=environment,
+                    cancel_check=cancel_check,
+                    command_wrapper=wrap_probe,
+                    operation_name="工作区 Python 环境校验",
+                    cancellation_message="Agent 工作区准备已取消",
+                )
+            if outcome.status == "success":
+                metadata = python_probe_metadata(outcome.output)
+    except (OSError, ValueError) as exc:
+        outcome = StepExecutionOutcome(status="error", error=str(exc))
+    if outcome.status == "success" and metadata is not None:
+        await log_callback(
+            "system",
+            "workspace.python.ready",
+            redactor.data({**metadata, "source": source}),
+        )
+        return replace(
+            result,
+            execution_environment=overrides,
+            runtime_hint=workspace_python_runtime_hint(metadata),
+        )
+    if outcome.status == "failure":
+        # 导入校验失败是环境准备失败，不是已经执行过的代码测试失败。
+        outcome = replace(outcome, status="error")
+    detail = outcome.error or "Python 环境校验失败"
+    if outcome.output:
+        # 错误摘要保留具体缺失模块，但不把完整大型输出复制进运行终态。
+        detail += "\n" + outcome.output[-4000:]
+    outcome = replace(outcome, error=f"环境未就绪，相关测试未执行：{detail}")
+    await log_callback(
+        "stderr",
+        "workspace.python.failed",
+        redactor.data(
+            {
+                "source": source,
+                "status": outcome.status,
+                "error": outcome.error,
+                "exit_code": outcome.exit_code,
+                "output": outcome.output,
+                "error_code": "workspace_python_environment_unavailable",
+            }
+        ),
+    )
+    return replace(
+        result,
+        outcome=outcome,
+        error_code="workspace_python_environment_unavailable",
+        retryable=False,
+    )
+
+
+async def prepare_agent_workspace(
+    *,
+    config: AppConfig,
+    repository: RepositoryConfig,
+    agent: AgentConfig,
+    process_environment: dict[str, str],
+    redactor: SecretRedactor,
+    log_callback: LogCallback,
+    cancel_check: CancelCheck,
+    inherited_workspace: bool = False,
+) -> AgentWorkspacePreparationResult:
+    """编排准备、环境校验与一次快照恢复，禁止静默降级到宿主 Python。"""
+
+    deadline = time.monotonic() + repository.agent_workspace.timeout_seconds
+
+    def should_stop() -> bool:
+        """安装、解包、校验与重建共用一个总期限。"""
+
+        return cancel_check() or time.monotonic() >= deadline
+
+    async def prepare(*, restore: bool) -> AgentWorkspacePreparationResult:
+        """恢复失效时只重跑一次声明的准备步骤，不额外猜测安装命令。"""
+
+        prepared = await _prepare_workspace_artifacts(
+            config=config,
+            repository=repository,
+            agent=agent,
+            process_environment=process_environment,
+            redactor=redactor,
+            log_callback=log_callback,
+            cancel_check=should_stop,
+            inherited_workspace=inherited_workspace,
+            restore_snapshot=restore,
+            deadline=deadline,
+        )
+        if (
+            prepared.outcome.status == "cancelled"
+            and not cancel_check()
+            and time.monotonic() >= deadline
+        ):
+            prepared = replace(
+                prepared,
+                outcome=replace(
+                    prepared.outcome,
+                    status="timed_out",
+                    error="Agent 工作区准备总运行时间超时",
+                ),
+            )
+        if prepared.outcome.status != "success":
+            return replace(
+                prepared, error_code="workspace_environment_preparation_failed"
+            )
+        if repository.agent_workspace.python_venv is None:
+            return prepared
+        return await _validate_workspace_python(
+            config=config,
+            repository=repository,
+            agent=agent,
+            process_environment=process_environment,
+            result=prepared,
+            redactor=redactor,
+            log_callback=log_callback,
+            cancel_check=cancel_check,
+            deadline=deadline,
+        )
+
+    result = await prepare(restore=True)
+    if (
+        result.error_code != "workspace_python_environment_unavailable"
+        or result.outcome.status in {"cancelled", "timed_out"}
+    ):
+        return result
+    if result.snapshot_fingerprint is not None:
+        try:
+            await asyncio.to_thread(
+                invalidate_workspace_snapshot,
+                config,
+                repository,
+                result.snapshot_fingerprint,
+            )
+        except OSError as exc:
+            await log_callback(
+                "stderr",
+                "workspace.snapshot.invalidate_failed",
+                {"error": redactor.text(str(exc))},
+            )
+    if (
+        result.snapshot_status == "restored"
+        and not inherited_workspace
+        and repository.agent_workspace.prepare_steps
+        and not should_stop()
+    ):
+        await log_callback(
+            "system",
+            "workspace.python.rebuilding",
+            {
+                "reason": "恢复的 Python 环境不可用，重新执行一次准备步骤",
+                "max_attempts": 1,
+            },
+        )
+        rebuilt = await prepare(restore=False)
+        if rebuilt.outcome.status != "success":
+            # 一次恢复额度已经耗尽，不能让事件重试从头重复同样的修复流程。
+            rebuilt = replace(rebuilt, retryable=False)
+        if (
+            rebuilt.error_code == "workspace_python_environment_unavailable"
+            and rebuilt.snapshot_fingerprint is not None
+        ):
+            try:
+                await asyncio.to_thread(
+                    invalidate_workspace_snapshot,
+                    config,
+                    repository,
+                    rebuilt.snapshot_fingerprint,
+                )
+            except OSError as exc:
+                await log_callback(
+                    "stderr",
+                    "workspace.snapshot.invalidate_failed",
+                    {"error": redactor.text(str(exc))},
+                )
+        return rebuilt
+    return result

@@ -285,6 +285,16 @@ web:
 #       REPOSITORY_TIER: production
 #       GITHUB_TOKEN:
 #         from_system: GITHUB_TOKEN_EXAMPLE_REPOSITORY
+#     # 可选：模型启动前在隔离工作区安装依赖，并校验、接入工作区 Python。
+#     # 不自动猜测包管理器；此例要求项目已有与 pyproject.toml 一致的 uv.lock。
+#     agent_workspace:
+#       cache_enabled: true
+#       python_venv: .venv
+#       # 校验成功只代表这些模块能导入，不代表测试已经执行或通过。
+#       python_check_modules: [pytest]
+#       prepare_steps:
+#         - name: 准备 Python 项目和测试依赖
+#           command: [uv, sync, --locked, --extra, dev, --no-default-groups]
 #     # 可选：声明此仓库具备确定性本地 CI 能力。只有同时在触发规则中选择
 #     # run_preflight 的 Agent 才会等待门禁；具体命令和 CI 脚本由目标仓库维护。
 #     preflight:
