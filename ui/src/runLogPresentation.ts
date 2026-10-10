@@ -65,6 +65,10 @@ const SYSTEM_TITLES: Record<string, string> = {
   "workspace.prepare.step_completed": "准备步骤已结束",
   "workspace.prepare.completed": "Agent 工作区准备完成",
   "workspace.prepare.failed": "Agent 工作区准备失败",
+  "workspace.python.check_started": "校验工作区 Python 环境",
+  "workspace.python.ready": "工作区 Python 环境已接入",
+  "workspace.python.failed": "环境未就绪，相关测试未执行",
+  "workspace.python.rebuilding": "快照环境失效，重新准备一次",
   "run.home_prepared": "临时 HOME 已准备",
   "run.home_cleaned": "临时 HOME 已清理",
   "run.home_cleanup_failed": "临时 HOME 清理失败",
@@ -152,15 +156,22 @@ function itemMessage(log: RunLog, item: JsonObject): RunMessage {
   }
   if (itemType === "command_execution") {
     const exitCode = item.exit_code;
+    const output = prettyValue(item.aggregated_output ?? item.output);
+    // 只识别收集阶段的缺模块错误；普通断言失败仍保留原有命令失败语义。
+    const missingDependency = exitCode !== undefined && exitCode !== null && exitCode !== 0
+      && /ModuleNotFoundError:\s*No module named/.test(output)
+      && /(?:errors? during collection|ERROR collecting)/.test(output);
     const title = exitCode === undefined || exitCode === null
       ? "运行命令"
       : `命令已结束 · 退出码 ${textValue(exitCode)}`;
     return {
       ...base,
       kind: exitCode === 0 || exitCode === undefined || exitCode === null ? "command" : "error",
-      title,
+      title: missingDependency ? "测试环境未就绪 · 收集阶段缺少依赖" : title,
       body: textValue(item.command),
-      detail: prettyValue(item.aggregated_output ?? item.output),
+      detail: missingDependency
+        ? `相关测试在收集阶段被中断，未实际执行；不能据此认定代码测试失败或测试通过。\n\n${output}`
+        : output,
     };
   }
   if (itemType === "mcp_tool_call") {
@@ -351,6 +362,16 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
       object.status ? `状态：${textValue(object.status)}` : "",
       object.exit_code !== undefined && object.exit_code !== null ? `退出码：${textValue(object.exit_code)}` : "",
       object.error ? `错误：${textValue(object.error)}` : "",
+    ].filter(Boolean).join("\n");
+  } else if (log.event_type.startsWith("workspace.python.") && object) {
+    body = textValue(object.reason ?? object.error ?? object.venv ?? object.prefix);
+    detail = [
+      object.executable ? `解释器：${textValue(object.executable)}` : "",
+      object.version ? `Python：${textValue(object.version)}` : "",
+      object.source ? `环境来源：${({ restored: "快照恢复", inherited: "继承父工作区", created: "准备步骤生成", disabled: "当前工作区", empty: "准备步骤完成" } as Record<string, string>)[textValue(object.source)] ?? textValue(object.source)}` : "",
+      Array.isArray(object.checked_modules) ? `校验模块：${object.checked_modules.map(textValue).join("、") || "仅检查解释器"}` : "",
+      object.exit_code != null ? `退出码：${textValue(object.exit_code)}` : "",
+      object.output ? textValue(object.output) : "",
     ].filter(Boolean).join("\n");
   } else if (log.event_type.startsWith("run.home_") && object) {
     body = object.path ? `路径：${textValue(object.path)}` : "";

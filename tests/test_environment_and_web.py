@@ -913,6 +913,8 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
                         "cache_enabled": True,
                         "timeout_seconds": 1200,
                         "max_output_bytes": 500000,
+                        "python_venv": ".venv",
+                        "python_check_modules": ["pytest"],
                         "prepare_steps": [
                             {
                                 "name": "安装前端依赖",
@@ -936,6 +938,8 @@ def test_web_api_saves_repositories_independently_and_blocks_references(
             "cache_enabled": True,
             "timeout_seconds": 1200,
             "max_output_bytes": 500000,
+            "python_venv": ".venv",
+            "python_check_modules": ["pytest"],
             "prepare_steps": [
                 {
                     "name": "安装前端依赖",

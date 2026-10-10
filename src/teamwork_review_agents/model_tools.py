@@ -696,7 +696,9 @@ def shell_command(
     script = command
     if workdir is not None:
         script = f"cd -- {shlex.quote(str(workdir))} && {command}"
-    return [shell, "-lc", script]
+    # 已接入工作区 Python 时不加载登录配置，避免用户 profile 把 PATH 改回宿主环境。
+    workspace_python = environment and environment.get("TEAMWORK_WORKSPACE_PYTHON")
+    return [shell, "-c" if workspace_python else "-lc", script]
 
 
 def _first_resolved_executable(

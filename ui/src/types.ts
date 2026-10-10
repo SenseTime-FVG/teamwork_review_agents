@@ -36,6 +36,8 @@ export type RepositoryAgentWorkspace = {
   timeout_seconds?: number;
   max_output_bytes?: number;
   prepare_steps?: RepositoryAgentWorkspacePrepareStep[];
+  python_venv?: string | null;
+  python_check_modules?: string[];
 };
 
 export type Repository = {

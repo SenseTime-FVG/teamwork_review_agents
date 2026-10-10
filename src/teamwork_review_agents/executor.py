@@ -72,6 +72,7 @@ from .workspace import (
     worktree_starting_head,
 )
 from .workspace_cleanup import cleanup_terminal_run_workspaces
+from .workspace_python import apply_workspace_python_environment
 
 
 class AgentExecutionError(RuntimeError):
@@ -86,9 +87,18 @@ class AgentExecutionError(RuntimeError):
 class AgentWorkspacePreparationError(RuntimeError):
     """表示模型启动前的仓库工作区准备未成功。"""
 
-    def __init__(self, message: str, *, status: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        retryable: bool = True,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.error_code = error_code
+        self.retryable = retryable
 
 
 def _action_name(event_type: str) -> str:
@@ -441,6 +451,11 @@ class AgentExecutor:
         return (
             f"{role_prompt}\n\n"
             f"# 运行时等待与超时边界\n\n{CI_RUNTIME_INSTRUCTIONS}\n\n"
+            "# 测试环境与证据边界\n\n"
+            "测试前使用仓库声明的依赖环境与测试入口，不向宿主 Python 安装依赖。"
+            "缺依赖导致的导入或收集中断应报告环境未就绪、相关测试未执行，"
+            "不能据此认定已确认的代码测试失败或测试通过；"
+            "已经实际执行的其他测试结果应分别如实记录。\n\n"
             "# 本次运行上下文\n\n"
             f"```json\n{json.dumps(context, ensure_ascii=False, indent=2)}\n```\n\n"
             f"{managed_comment_instruction}"
@@ -1055,8 +1070,24 @@ class AgentExecutor:
                             f"{detail}，退出码 {preparation.outcome.exit_code}"
                         )
                     raise AgentWorkspacePreparationError(
-                        detail,
+                        f"Agent 工作区环境准备失败，相关测试未执行：{detail}",
                         status=preparation.outcome.status,
+                        error_code=preparation.error_code,
+                        retryable=preparation.retryable,
+                    )
+                if preparation.execution_environment:
+                    apply_workspace_python_environment(
+                        process_environment, preparation.execution_environment
+                    )
+                if preparation.runtime_hint:
+                    # 通用运行上下文同时覆盖模型基座和完整 CLI，不改某个 Agent 的 Prompt。
+                    prompt += "\n\n" + preparation.runtime_hint
+                    await asyncio.to_thread(
+                        self.store.update_agent_run_inputs,
+                        reservation.run_id,
+                        prompt=redactor.text(prompt),
+                        environment=audit_environment,
+                        config_revision=self.config.revision,
                     )
                 workspace_prepared = True
                 await persist_log(
@@ -1206,6 +1237,8 @@ class AgentExecutor:
                 agent_name=agent_name,
                 status=mapped_status,
                 error=redactor.text(str(exc)),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
             )
         except WorkspaceCancelled as exc:
             source = await cancellation_source()

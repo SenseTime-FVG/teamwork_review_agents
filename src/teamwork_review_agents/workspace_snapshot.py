@@ -149,6 +149,8 @@ def workspace_preparation_signature(
     return stable_hash(
         SNAPSHOT_FORMAT_VERSION,
         _step_payload(repository),
+        repository.agent_workspace.python_venv,
+        repository.agent_workspace.python_check_modules,
         platform.system(),
         platform.machine(),
         platform.release(),

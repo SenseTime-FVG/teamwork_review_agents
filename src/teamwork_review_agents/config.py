@@ -473,6 +473,44 @@ class AgentWorkspaceConfig(BaseModel):
     prepare_steps: list[AgentWorkspacePrepareStepConfig] = Field(
         default_factory=list,
     )
+    python_venv: str | None = None
+    python_check_modules: list[str] = Field(default_factory=list)
+
+    @field_validator("python_venv")
+    @classmethod
+    def validate_python_venv(cls, value: str | None) -> str | None:
+        """虚拟环境只能位于当前运行工作区内，留空保持原行为。"""
+
+        if value is None or not value.strip():
+            return None
+        normalized = AgentWorkspacePrepareStepConfig.validate_relative_cwd(value)
+        if normalized == ".":
+            raise ValueError("Python 虚拟环境必须是工作区内的独立目录")
+        return normalized
+
+    @field_validator("python_check_modules")
+    @classmethod
+    def validate_python_check_modules(cls, values: list[str]) -> list[str]:
+        """只接受模块名，不把配置文本作为 Python 代码执行。"""
+
+        modules: list[str] = []
+        for value in values:
+            name = value.strip()
+            if not name or not all(
+                part.isascii() and part.isidentifier() for part in name.split(".")
+            ):
+                raise ValueError("Python 校验模块必须是有效模块名，例如 pytest")
+            if name not in modules:
+                modules.append(name)
+        return modules
+
+    @model_validator(mode="after")
+    def validate_python_checks_have_venv(self) -> "AgentWorkspaceConfig":
+        """模块检查不能隐式落到宿主 Python 环境。"""
+
+        if self.python_check_modules and self.python_venv is None:
+            raise ValueError("配置 Python 校验模块时必须指定工作区虚拟环境")
+        return self
 
 
 class RepositoryConfig(BaseModel):

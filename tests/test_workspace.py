@@ -512,11 +512,13 @@ def test_workspace_is_cloned_and_change_request_ref_is_fetched(
     assert not retained_marker_path(retained).exists()
 
 
+@pytest.mark.parametrize("python_mode", ["disabled", "ready"])
 async def test_root_agent_runs_in_its_own_temporary_worktree(
     tmp_path,
     snapshot_factory,
     configured_app_factory,
     monkeypatch,
+    python_mode,
 ) -> None:
     """根 Agent 不应直接在基础仓库运行，干净结束后应删除临时目录。"""
 
@@ -544,9 +546,11 @@ async def test_root_agent_runs_in_its_own_temporary_worktree(
     fake_codex.write_text(
         f"""#!{sys.executable}
 import json
+import os
 import sys
-sys.stdin.read()
-print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "完成"}}}}, ensure_ascii=False), flush=True)
+prompt = sys.stdin.read()
+message = json.dumps({{"venv": os.environ.get("VIRTUAL_ENV"), "python": os.environ.get("TEAMWORK_WORKSPACE_PYTHON"), "prompt": prompt}}, ensure_ascii=False)
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": message}}}}, ensure_ascii=False), flush=True)
 """,
         encoding="utf-8",
     )
@@ -559,6 +563,25 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
     repository = config.repositories[0]
     repository.clone_url = str(origin)
     repository.workspace = tmp_path / "base-repository"
+    if python_mode == "ready":
+        from teamwork_review_agents.config import (
+            AgentWorkspaceConfig,
+            AgentWorkspacePrepareStepConfig,
+        )
+
+        config.agents["code-reviewer"].sandbox = "danger-full-access"
+        repository.agent_workspace = AgentWorkspaceConfig(
+            python_venv=".venv",
+            python_check_modules=["json"],
+            prepare_steps=[
+                AgentWorkspacePrepareStepConfig(
+                    name="准备测试环境",
+                    command=[
+                        sys.executable, "-m", "venv", "--copies", "--without-pip", ".venv"
+                    ],
+                )
+            ],
+        )
     snapshot = snapshot_factory(
         provider=repository.provider,
         repository_id=repository.id,
@@ -613,6 +636,37 @@ print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", 
         )
     )
     assert prepared_payload["mode"] == "root-worktree"
+
+    if python_mode == "ready":
+        from teamwork_review_agents.executor import AgentExecutionError
+
+        payload = json.loads(result.final_message)
+        assert payload["venv"] == str(Path(detail["workspace_path"]) / ".venv")
+        assert payload["python"].startswith(payload["venv"])
+        assert "-m pytest" in payload["prompt"]
+        assert "-m pytest" in detail["prompt"]
+        # 新运行没有虚拟环境时不能启动 CLI，也不能从头重试确定性环境错误。
+        repository.agent_workspace.prepare_steps = []
+        with pytest.raises(AgentExecutionError) as raised:
+            await AgentExecutor(config, store).execute(
+                agent_name="code-reviewer",
+                event=event,
+                idempotency_key="missing-python-environment",
+                rule_name="review",
+            )
+        assert raised.value.retryable is False
+        assert raised.value.error_code == "workspace_python_environment_unavailable"
+        with store.connect() as connection:
+            failed = connection.execute(
+                "SELECT run_id, status FROM agent_runs WHERE idempotency_key = ?",
+                ("missing-python-environment",),
+            ).fetchone()
+        assert failed["status"] == "failed"
+        assert not any(
+            item["event_type"] == "run.started"
+            for item in store.list_run_logs(failed["run_id"])
+        )
+        return
 
     config.agents["code-reviewer"].sandbox = "workspace-write"
     config.agents["code-reviewer"].write_scopes = ["workspace"]
