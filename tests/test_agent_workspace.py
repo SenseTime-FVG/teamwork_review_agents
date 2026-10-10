@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -47,11 +49,30 @@ def test_prepare_step_normalizes_repository_relative_directory() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output_chunk_bytes", [None, 8, 1],
+    ids=["default-output", "split-output", "bytewise-output"],
+)
 async def test_prepare_agent_workspace_runs_in_configured_directory_and_reuses_cache(
     tmp_path: Path,
     configured_app_factory,
+    monkeypatch,
+    output_chunk_bytes: int | None,
 ) -> None:
     """用户参数应直接执行，并向不同分支工作区注入同一仓库缓存。"""
+
+    if output_chunk_bytes is not None:
+        original_read = asyncio.StreamReader.read
+        chunk_bytes = output_chunk_bytes
+
+        async def read_in_chunks(stream: asyncio.StreamReader, size: int = -1) -> bytes:
+            """在测试内固定输出分块，保留真实子进程和读取到结束的语义。"""
+
+            return await original_read(
+                stream, min(size, chunk_bytes) if size > 0 else size,
+            )
+
+        monkeypatch.setattr(asyncio.StreamReader, "read", read_in_chunks)
 
     config = configured_app_factory()
     repository = config.repositories[0]
@@ -113,17 +134,41 @@ async def test_prepare_agent_workspace_runs_in_configured_directory_and_reuses_c
         result.cache_root.resolve()
     )
     event_types = [event_type for _, event_type, _ in events]
-    assert event_types == [
+    # 输出块数取决于管道调度；生命周期事件仍须严格按原顺序各出现一次。
+    lifecycle_events = [event_type for event_type in event_types if event_type != "workspace.prepare.output"]
+    assert lifecycle_events == [
         "workspace.snapshot.lookup",
         "workspace.snapshot.missed",
         "workspace.prepare.started",
-        "workspace.prepare.output",
         "workspace.prepare.step_started",
-        "workspace.prepare.output",
         "workspace.prepare.step_completed",
         "workspace.prepare.completed",
         "workspace.snapshot.created",
     ]
+    prepare_started_index = event_types.index("workspace.prepare.started")
+    step_started_index = event_types.index("workspace.prepare.step_started")
+    step_completed_index = event_types.index("workspace.prepare.step_completed")
+    output_events: list[tuple[int, str]] = []
+    for index, (stream, event_type, payload) in enumerate(events):
+        if event_type != "workspace.prepare.output":
+            continue
+        assert stream == "stdout"
+        assert isinstance(payload, str)
+        assert prepare_started_index < index < step_completed_index
+        output_events.append((index, payload))
+    heading_output = "".join(
+        payload for index, payload in output_events if index < step_started_index
+    )
+    step_chunks = [payload for index, payload in output_events if index > step_started_index]
+    # 拼接完整正文能发现丢失或重复输出，而不依赖一次读取恰好得到一整行。
+    assert heading_output == "\n[准备前端依赖]\n"
+    assert "".join(step_chunks) == "prepared" + os.linesep
+    assert result.outcome.output == heading_output + "".join(step_chunks)
+    if output_chunk_bytes is not None:
+        assert len(step_chunks) > 1
+        assert all(
+            len(chunk.encode("utf-8")) <= output_chunk_bytes for chunk in step_chunks
+        )
     assert result.snapshot_status == "created"
 
     (step_directory / "prepared.txt").unlink()
