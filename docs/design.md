@@ -51,6 +51,8 @@ flowchart LR
 
 平台原始字段保存在 `raw` 中，便于提示词使用和后续兼容。
 
+GitLab Provider 在客户端内共用一次只读版本探测，`raw.gitlab_instance.enterprise` 只接受平台返回的真实布尔值，失败保持未知且不影响 MR 扫描。执行器只为 GitLab 根输入补充白名单 `mr.approval_context`，区分社区版可选审批、明确必需要求与未知能力；`approved: false` 在已确认社区版仅表示无人批准，不能自行新增强制门禁。平台 `not_approved` 或正数审批要求等矛盾证据仍优先处理，企业版和未知版本不套用社区版例外。该元数据不参与规范化快照比较、不产生额外事件，也不修改真实批准人数。详见 [GitLab 可选审批兼容设计](design-gitlab-optional-approvals.md)。
+
 ## 5. 事件模型
 
 支持以下事件：

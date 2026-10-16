@@ -29,6 +29,7 @@ from .environment import (
     resolve_environment,
 )
 from .git_auth import GitCredentialContext
+from .gitlab_approvals import gitlab_approval_context
 from .sandbox_git import SandboxGitContext, SandboxGitError, classify_git_failure, windows_sandbox_git_enabled
 from .sandbox_curl import SandboxCurlContext
 from .curl_distribution import curl_runtime_root
@@ -156,6 +157,8 @@ def _mr_payload(
     }
     if snapshot.source_project:
         payload["source_project"] = snapshot.source_project
+    if provider.kind == "gitlab":
+        payload["approval_context"] = gitlab_approval_context(snapshot)
     return payload
 
 

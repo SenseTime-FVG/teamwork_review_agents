@@ -156,7 +156,10 @@ async def test_gitlab_snapshot_only_resolves_cross_project_source() -> None:
         await provider.close()
 
     assert same_project.source_project == ""
-    assert same_project_paths == ["projects/group%2Fdemo/merge_requests/7/approvals"]
+    assert same_project_paths == [
+        "projects/group%2Fdemo/merge_requests/7/approvals",
+        "version",
+    ]
     assert cross_project.source_project == "fork-group/demo"
     assert optional_paths == [
         "projects/group%2Fdemo/merge_requests/7/approvals",
