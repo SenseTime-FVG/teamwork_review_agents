@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ..config import RepositoryConfig
+from ..config import ProviderConfig, RepositoryConfig, ScannerConfig
 from ..models import ChangeRequestActivity, ChangeRequestActivityBatch, ChangeRequestSnapshot
 from .base import BaseProvider, ProviderError, parse_datetime
 
@@ -20,6 +20,34 @@ class GitLabProvider(BaseProvider):
     supports_activities = True
     ACTIVITY_PAGE_SIZE = 100
     MAX_ACTIVITY_PAGES = 100
+
+    def __init__(
+        self,
+        name: str,
+        config: ProviderConfig,
+        scanner: ScannerConfig,
+        *,
+        token: str | None = None,
+    ) -> None:
+        super().__init__(name, config, scanner, token=token)
+        self._instance_info: dict[str, bool] | None = None
+        self._instance_info_lock = asyncio.Lock()
+
+    async def _instance_metadata(self) -> dict[str, bool]:
+        """并发扫描共用版本证据；非关键接口失败时保留未知，不猜测社区版。"""
+
+        if self._instance_info is None:
+            async with self._instance_info_lock:
+                if self._instance_info is None:
+                    try:
+                        result = await self.get_optional_json("version", {})
+                    except ProviderError:
+                        result = {}
+                    enterprise = result.get("enterprise") if isinstance(result, dict) else None
+                    self._instance_info = (
+                        {"enterprise": enterprise} if type(enterprise) is bool else {}
+                    )
+        return dict(self._instance_info)
 
     async def _activity_pages(self, path: str) -> list[dict[str, Any]]:
         """完整读取结构化活动；分页不完整时不提交游标，也不读取 Notes。"""
@@ -379,15 +407,16 @@ class GitLabProvider(BaseProvider):
         project: str,
         item: dict[str, Any],
     ) -> ChangeRequestSnapshot:
-        """并行读取单个 MR 的详情与审批。"""
+        """并行读取 MR 详情、审批和客户端共用的实例版本证据。"""
 
         iid = int(item["iid"])
-        detail_result, approvals_result = await asyncio.gather(
+        detail_result, approvals_result, instance_info = await asyncio.gather(
             self.get_json(f"projects/{project}/merge_requests/{iid}"),
             self.get_optional_json(
                 f"projects/{project}/merge_requests/{iid}/approvals",
                 {},
             ),
+            self._instance_metadata(),
         )
         if not isinstance(detail_result, dict):
             raise ProviderError(f"GitLab MR !{iid} 详情返回格式异常")
@@ -453,5 +482,9 @@ class GitLabProvider(BaseProvider):
             ),
             updated_at=parse_datetime(detail.get("updated_at")),
             web_url=str(detail.get("web_url") or ""),
-            raw={"merge_request": detail, "approvals": approvals},
+            raw={
+                "merge_request": detail,
+                "approvals": approvals,
+                "gitlab_instance": instance_info,
+            },
         )

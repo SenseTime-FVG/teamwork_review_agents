@@ -351,6 +351,8 @@ Agent 使用 `runtime.agent_idle_timeout_seconds`（默认 `300` 秒，可由 Ag
 
 通用审核统一采用“本地或远端 CI 明确失败就终止，成功只校验当前源提交”的规则。合并结果类 CI 不追查执行时的目标 SHA，不因目标分支更新把成功结果判为过期，也不要求为最新组合补跑 CI；其他源提交的成功不能复用。CI 通过不代表最新源、目标组合已运行测试，仍须完成代码、设计与目标分支语义一致性审核，并遵守平台实际合并门禁。审核期间源或目标 SHA 漂移的保护不变，详情见 [审核 CI 源提交校验设计](docs/design-review-ci-head-only.md)。
 
+GitLab 审批按实例实际版本解释：平台版本 API 明确确认社区版且无强制审批证据时，无人点击可选批准（`approved: false`）不会阻断审核；企业版仍核验实际必需审批，未知版本或规则接口 404 不能默认视为无需审批。冲突、Draft、讨论解决和分支保护等真实门禁不变，详见 [GitLab 可选审批兼容设计](docs/design-gitlab-optional-approvals.md)。
+
 Codex 的当前目录仍是本次 PR / MR 的临时 Git clone 或 linked worktree，所以 Git、测试
 和平台 CLI 都会作用于正确仓库。Teamwork 会在每次 `codex exec` 最后强制设置
 `project_doc_max_bytes=0`，只关闭仓库 `AGENTS.md` 的自动指令注入，不改变工作目录、
