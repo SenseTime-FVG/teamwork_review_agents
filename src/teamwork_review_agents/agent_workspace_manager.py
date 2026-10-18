@@ -23,6 +23,8 @@ from .environment import (
 )
 from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, LockTimeoutError, ResourceLease
+from .dependency_cache import RepositoryCacheUsage
+from .preflight_cache import repository_cache_root
 from .preflight import build_preflight_environment
 from .runtime_readiness import check_runtime_readiness
 from .sandbox_environment import windows_environment_separation
@@ -271,7 +273,10 @@ class AgentWorkspaceWarmupManager:
         ).start()
         try:
             operation.append_log("system", "workspace.warmup.waiting", "正在等待仓库 Git 资源锁")
-            async with lease:
+            async with lease, RepositoryCacheUsage(
+                repository_cache_root(config, repository) if repository.agent_workspace.cache_enabled else None,
+                timeout_seconds=config.runtime.lock_timeout_seconds, cancel_check=operation.cancel_event.is_set,
+            ):
                 warmup_agent = AgentConfig(
                     prompt="仓库工作区预热", sandbox="workspace-write",
                     network_access=True, write_scopes=["workspace"],

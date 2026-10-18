@@ -18,6 +18,7 @@
 
 | 文档 | 用途 | 关联代码/模块 | 更新触发条件 |
 | --- | --- | --- | --- |
+| [`design-dependency-cache-cleanup.md`](design-dependency-cache-cleanup.md) | 依赖缓存闲置回收、共享使用保护与独立保留期 | 缓存、Agent / CI / 预热、清理计划与 UI | 缓存使用、保留期、删除或结果展示变化；实施见 [`implementation-plan-dependency-cache-cleanup.md`](implementation-plan-dependency-cache-cleanup.md) |
 | [`design-codex-model-catalog-refresh.md`](design-codex-model-catalog-refresh.md) | 当前 CLI 的模型目录刷新与缓存回退 | App Server、运行时接口、Provider UI | 目录来源、刷新与降级语义变化；实施见 [`implementation-plan-codex-model-catalog-refresh.md`](implementation-plan-codex-model-catalog-refresh.md) |
 | [`design-effort-inheritance-display.md`](design-effort-inheritance-display.md) | effort 继承值和来源展示 | Codex 诊断、全局默认与两级回退链 UI | 默认值、模式和展示语义变化；实施见 [`implementation-plan-effort-inheritance-display.md`](implementation-plan-effort-inheritance-display.md) |
 | [`design-gitlab-activities.md`](design-gitlab-activities.md) | GitLab 结构化活动、游标与手动重放来源 | Provider、事件、SQLite、Web 与概览 | 活动读取、降级、去重和手动触发行为变化；实施见 [`implementation-plan-gitlab-activities.md`](implementation-plan-gitlab-activities.md) |

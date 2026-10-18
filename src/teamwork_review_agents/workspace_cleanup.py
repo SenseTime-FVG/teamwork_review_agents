@@ -1,4 +1,4 @@
-"""按主机本地时间回收过期受管工作区，不触碰基础仓库和依赖缓存。"""
+"""按主机本地时间回收过期工作区与闲置依赖缓存，不触碰基础仓库。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Any, Callable
 import uuid
 
 from .config import AppConfig
+from .dependency_cache import cleanup_dependency_caches
 from .filesystem import _is_junction
 from .locks import LockCancelledError, LockTimeoutError, ResourceLease
 from .models import stable_hash
@@ -381,7 +382,19 @@ class WorkspaceCleanupManager:
                 self._persist()
                 await asyncio.sleep(0)
             if report["status"] == "running":
-                report["status"] = "partial" if report["failed"] else "completed"
+                cache_report = await cleanup_dependency_caches(
+                    config, self.store, get_config=self.get_config,
+                    should_stop=lambda: self._stop.is_set() or batch_lease.lost,
+                    maintenance_check=self.maintenance_check, measure_bytes=_directory_bytes,
+                )
+                report["dependency_cache"] = cache_report
+                report["status"] = (
+                    "interrupted" if cache_report.get("interrupted")
+                    else "partial" if report["failed"] or cache_report["failed"] else "completed"
+                )
+        except asyncio.CancelledError:
+            report["status"] = "interrupted"
+            raise
         except CleanupSkipped as exc:
             report.update(status="skipped", reason=str(exc))
         except Exception as exc:

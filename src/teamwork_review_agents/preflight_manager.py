@@ -13,6 +13,7 @@ from .environment import resolve_provider_token, resolve_repository_process_envi
 from .filesystem import temporary_directory
 from .git_auth import GitCredentialContext
 from .locks import LockCancelledError, ResourceLease
+from .dependency_cache import RepositoryCacheUsage
 from .models import PreflightResult
 from .preflight import (
     PreflightStepUpdate,
@@ -196,7 +197,10 @@ class ManualPreflightManager:
                 timeout_seconds=config.runtime.lock_timeout_seconds,
                 cancel_check=cancel_event.is_set,
             )
-            async with lease:
+            async with lease, RepositoryCacheUsage(
+                repository_cache_root(config, repository) if repository.preflight.cache_enabled else None,
+                timeout_seconds=config.runtime.lock_timeout_seconds, cancel_check=cancel_event.is_set,
+            ):
                 await asyncio.to_thread(store.set_preflight_phase, run_id, "preparing")
                 await self._append_log(run_id, "正在更新基础仓库并准备默认分支\n")
 

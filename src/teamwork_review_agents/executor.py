@@ -30,6 +30,8 @@ from .environment import (
 )
 from .git_auth import GitCredentialContext
 from .gitlab_approvals import gitlab_approval_context
+from .dependency_cache import RepositoryCacheUsage
+from .preflight_cache import repository_cache_root
 from .sandbox_git import SandboxGitContext, SandboxGitError, classify_git_failure, windows_sandbox_git_enabled
 from .sandbox_curl import SandboxCurlContext
 from .curl_distribution import curl_runtime_root
@@ -727,7 +729,12 @@ class AgentExecutor:
                     reservation.run_id,
                     "resource_lock",
                 )
-            async with lease:
+            async with lease, RepositoryCacheUsage(
+                repository_cache_root(self.config, configured_repository)
+                if configured_repository.agent_workspace.cache_enabled else None,
+                timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                cancel_check=lambda: self._cancel_requested(reservation.run_id),
+            ):
                 if isinstance(runner, (CodexRunner, CodexModelRunner)):
                     readiness_environment = resolve_environment(
                         self.config, configured_repository, agent, event, reservation.run_id,

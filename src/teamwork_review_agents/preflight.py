@@ -19,6 +19,8 @@ from .environment import (
 )
 from .git_auth import GitCredentialContext
 from .filesystem import temporary_directory
+from .dependency_cache import RepositoryCacheUsage
+from .locks import LockCancelledError
 from .managed_comments import ManagedCommentService
 from .models import ChangeEvent, PreflightResult, stable_hash
 from .preflight_cache import (
@@ -904,7 +906,13 @@ class PreflightExecutor:
                 else None
             )
             checkout: Path | None = None
+            cache_usage = RepositoryCacheUsage(
+                repository_cache_root(self.config, repository) if repository.preflight.cache_enabled else None,
+                timeout_seconds=self.config.runtime.lock_timeout_seconds,
+                cancel_check=lambda: self.store.preflight_cancel_requested(reservation.run_id),
+            )
             try:
+                await cache_usage.__aenter__()
                 checkout = await asyncio.to_thread(manager.__enter__)
                 await self._set_remote_status(
                     repository,
@@ -948,9 +956,12 @@ class PreflightExecutor:
                         on_output=record_output,
                     )
             finally:
-                if checkout is not None:
-                    await asyncio.to_thread(manager.__exit__, None, None, None)
-                git_credentials.close()
+                try:
+                    if checkout is not None:
+                        await asyncio.to_thread(manager.__exit__, None, None, None)
+                finally:
+                    await cache_usage.__aexit__()
+                    git_credentials.close()
             result = PreflightResult(
                 run_id=reservation.run_id,
                 repository_id=repository.id,
@@ -962,6 +973,12 @@ class PreflightExecutor:
                 exit_code=outcome.exit_code,
                 output=outcome.output,
                 error=outcome.error,
+            )
+        except LockCancelledError:
+            result = PreflightResult(
+                run_id=reservation.run_id, repository_id=repository.id, number=event.number,
+                head_sha=snapshot.head_sha, source_generation=event.source_generation,
+                status="cancelled", error="用户取消了等待依赖缓存的 Preflight",
             )
         except WorkspaceSnapshotSuperseded as exc:
             await self._append_log(
