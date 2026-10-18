@@ -18,7 +18,7 @@ import { MarkdownMessage, RunMessageFeed } from "./RunMessageFeed";
 import { gitBytesText, gitProgressText, presentRunLogs } from "./runLogPresentation";
 import { CurlRuntimePanel } from "./CurlRuntimePanel";
 import { createCodexCatalogRefresher, codexCatalogSourceLabel } from "./codexCatalogRefresh";
-import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary } from "./workspaceCleanup";
+import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, cleanupReleasedBytes, workspaceCleanupSummary } from "./workspaceCleanup";
 import type { WorkspaceCleanupSchedule, WorkspaceCleanupStatus } from "./workspaceCleanup";
 import { QuickSetupWizard } from "./QuickSetupWizard";
 import { manualTriggerEvent, activitySourceLabel, platformActivityStatus } from "./changeRequestActivity";
@@ -310,6 +310,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
       max_agent_runs_per_root: 8,
       event_retry_count: 2,
       worktree_retention_days: 7,
+      dependency_cache_retention_days: 7,
       codex_binary: "codex",
       inherit_user_mcp_servers: false,
       allowed_user_mcp_servers: [],
@@ -4268,8 +4269,10 @@ function WorkspaceCleanupPanel(props: {
   const schedule = { ...DEFAULT_WORKSPACE_CLEANUP, ...props.document.runtime.workspace_cleanup };
   const retention = props.document.runtime.worktree_retention_days ?? 7;
   const savedRetention = props.savedDocument?.runtime.worktree_retention_days ?? 7;
+  const cacheRetention = props.document.runtime.dependency_cache_retention_days ?? 7;
+  const savedCacheRetention = props.savedDocument?.runtime.dependency_cache_retention_days ?? 7;
   const savedSchedule = { ...DEFAULT_WORKSPACE_CLEANUP, ...props.savedDocument?.runtime.workspace_cleanup };
-  const unsaved = retention !== savedRetention || JSON.stringify(schedule) !== JSON.stringify(savedSchedule);
+  const unsaved = retention !== savedRetention || cacheRetention !== savedCacheRetention || JSON.stringify(schedule) !== JSON.stringify(savedSchedule);
 
   useEffect(() => {
     let disposed = false;
@@ -4293,7 +4296,7 @@ function WorkspaceCleanupPanel(props: {
   const last = status?.last_run;
   return (
     <section className="section-card workspace-cleanup-card">
-      <div className="section-title-row"><div><h2>工作区清理</h2><p>任务树结束后统一清理临时工作区，包括未提交文件和未推送提交，运行记录与日志保留。以下计划仅兜底清理异常残留及旧工作区，不删除基础仓库、依赖缓存或数据库。正在使用的目录会跳过。</p></div></div>
+      <div className="section-title-row"><div><h2>工作区与依赖缓存清理</h2><p>任务树结束后统一清理临时工作区，包括未提交文件和未推送提交，运行记录与日志保留。以下计划兜底清理异常残留、旧工作区和闲置依赖缓存，不删除基础仓库、凭据或数据库。正在使用的目录会跳过，已清理的缓存可在后续任务中重新下载。</p></div></div>
       <fieldset className="config-editor-surface" disabled={!props.editing}>
         <Toggle label="定时清理" checked={schedule.enabled} onChange={(enabled) => updateSchedule({ enabled })} />
         <fieldset className="config-editor-surface" disabled={!schedule.enabled}>
@@ -4316,9 +4319,11 @@ function WorkspaceCleanupPanel(props: {
           </div>
         </fieldset>
         <Field label="工作区保留期（天）" type="number" min={1} value={retention} onChange={(value) => props.onChange({ ...props.document, runtime: { ...props.document.runtime, worktree_retention_days: Number(value) } })} help="仅用于异常残留及旧工作区，默认 7 天，从运行结束或保留时间起算。正常任务树结束即清理，不等待此保留期。" />
+        <Field label="依赖缓存闲置保留期（天）" type="number" min={1} value={cacheRetention} onChange={(value) => props.onChange({ ...props.document, runtime: { ...props.document.runtime, dependency_cache_retention_days: Number(value) } })} help="独立于工作区保留期，默认 7 天，从任务最后使用结束起算，包含缓存中的依赖快照。无使用记录的旧缓存首次检查仅登记并给予完整保留期；清理后可重新下载或预热。" />
       </fieldset>
-      <p className="section-note">{workspaceCleanupSummary(schedule)} · 保留 {retention} 天。启动不立即清理，停机期间错过的计划不补跑。</p>
+      <p className="section-note">{workspaceCleanupSummary(schedule)} · 工作区保留 {retention} 天 · 缓存闲置保留 {cacheRetention} 天。启动不立即清理，停机期间错过的计划不补跑。</p>
       {props.editing && retention < savedRetention && <div className="alert error">保留期已缩短，保存后下次清理可能删除更多已有工作区，请确认需要保留的成果已保存。</div>}
+      {props.editing && cacheRetention < savedCacheRetention && <div className="alert error">缓存闲置保留期已缩短，下次清理可能删除更多旧缓存；后续任务可能需要重新下载依赖或预热。</div>}
       {unsaved && <p className="section-note">配置尚未保存；下方时间与结果对应已保存计划。</p>}
       {error && <div className="alert error">{error}</div>}
       {status?.scheduler_error && <div className="alert error">{status.scheduler_error}</div>}
@@ -4327,13 +4332,19 @@ function WorkspaceCleanupPanel(props: {
         <div><dt>最近检查</dt><dd>{last?.started_text ?? "尚未执行"}</dd></div>
         <div><dt>执行结果</dt><dd>{last ? cleanupResultLabel(last.status) : "—"}</dd></div>
         <div><dt>已清理</dt><dd>{last ? `${last.removed} 个工作区` : "—"}</dd></div>
-        <div><dt>释放空间（估算）</dt><dd>{last ? gitBytesText(last.reclaimed_bytes) : "—"}</dd></div>
+        <div><dt>已清理依赖缓存</dt><dd>{last ? `${last.dependency_cache?.removed ?? 0} 个缓存` : "—"}</dd></div>
+        <div><dt>释放空间（估算）</dt><dd>{last ? gitBytesText(cleanupReleasedBytes(last)) : "—"}</dd></div>
       </dl>
       {last && <details className="workspace-cleanup-details"><summary>清理详情 · 跳过 {last.skipped} 个 · 失败 {last.failed} 个</summary>
         {last.reason && <p>{last.reason}</p>}
         {last.details.map((item, index) => <div className="workspace-cleanup-result" key={`${item.path}:${index}`}><strong>{cleanupResultLabel(item.status)}</strong><code>{item.path}</code><span>{item.reason}</span></div>)}
         {last.scanned > last.details.length && <p>仅显示前 {last.details.length} 条；有关联运行的清理结果也保存在运行日志中。</p>}
         {!last.details.length && !last.reason && <p>本次没有待检查的保留工作区。</p>}
+      </details>}
+      {last?.dependency_cache && <details className="workspace-cleanup-details"><summary>依赖缓存详情 · 跳过 {last.dependency_cache.skipped} 个 · 失败 {last.dependency_cache.failed} 个</summary>
+        {last.dependency_cache.details.map((item, index) => <div className="workspace-cleanup-result" key={`${item.path}:${index}`}><strong>{cleanupResultLabel(item.status)}</strong><code>{item.path}</code><span>{item.reason}</span></div>)}
+        {last.dependency_cache.scanned > last.dependency_cache.details.length && <p>仅显示前 {last.dependency_cache.details.length} 条缓存结果。</p>}
+        {!last.dependency_cache.details.length && <p>本次没有待检查的依赖缓存。</p>}
       </details>}
     </section>
   );

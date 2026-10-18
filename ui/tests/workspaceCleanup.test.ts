@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, workspaceCleanupSummary } from "../src/workspaceCleanup.ts";
+import { DEFAULT_WORKSPACE_CLEANUP, cleanupResultLabel, cleanupReleasedBytes, workspaceCleanupSummary } from "../src/workspaceCleanup.ts";
 
 // 验证纯配置逻辑及组件接线，不连接真实后台、不执行清理。
 const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
@@ -53,4 +53,19 @@ test("状态只读查询，直接展示服务端时间且保留失败详情", ()
   assert.equal(cleanupResultLabel("partial"), "部分清理失败");
   assert.equal(cleanupResultLabel("interrupted"), "已中断");
   assert.match(styles, /\.workspace-cleanup-card input\s*\{[^}]*color-scheme: dark/);
+});
+
+test("依赖缓存使用独立保留期并区分两类清理结果", () => {
+  assert.match(panel, /dependency_cache_retention_days \?\? 7/);
+  assert.match(panel, /label="依赖缓存闲置保留期（天）"/);
+  assert.match(panel, /cacheRetention < savedCacheRetention/);
+  assert.match(panel, /cacheRetention !== savedCacheRetention/);
+  assert.match(panel, /last.dependency_cache\?\.removed \?\? 0/);
+  assert.match(panel, /last.dependency_cache.details.map/);
+  assert.match(panel, /cleanupReleasedBytes\(last\)/);
+  assert.match(panel, /无使用记录的旧缓存首次检查仅登记并给予完整保留期/);
+  assert.equal(cleanupReleasedBytes(null), 0);
+  const old = { status: "completed", scanned: 1, removed: 1, skipped: 0, failed: 0, reclaimed_bytes: 100, details: [] };
+  assert.equal(cleanupReleasedBytes(old), 100);
+  assert.equal(cleanupReleasedBytes({ ...old, dependency_cache: { ...old, reclaimed_bytes: 200 } }), 300);
 });

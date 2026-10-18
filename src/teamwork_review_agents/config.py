@@ -312,6 +312,7 @@ class RuntimeConfig(BaseModel):
     max_agent_runs_per_root: PositiveInt = 8
     event_retry_count: int = Field(default=2, ge=0)
     worktree_retention_days: PositiveInt = 7
+    dependency_cache_retention_days: PositiveInt = 7
     workspace_cleanup: WorkspaceCleanupConfig = Field(default_factory=WorkspaceCleanupConfig)
     codex_binary: str = "codex"
     codex_home: Path | None = None

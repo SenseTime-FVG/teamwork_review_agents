@@ -211,6 +211,7 @@ export type CodexInheritedSetting = {
 export type RuntimeConfig = Record<string, unknown> & {
   workspace_cleanup?: Partial<import("./workspaceCleanup").WorkspaceCleanupSchedule>;
   worktree_retention_days?: number;
+  dependency_cache_retention_days?: number;
   remote_ci_wait_timeout_seconds?: number;
   max_concurrent_agents?: number;
   agent_concurrency_limit?: number;

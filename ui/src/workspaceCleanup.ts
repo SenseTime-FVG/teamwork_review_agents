@@ -30,8 +30,21 @@ export type WorkspaceCleanupStatus = {
     reclaimed_bytes: number;
     reason?: string;
     details: Array<{ path: string; status: string; reason: string; size_bytes?: number }>;
+    dependency_cache?: {
+      scanned: number;
+      removed: number;
+      skipped: number;
+      failed: number;
+      reclaimed_bytes: number;
+      details: Array<{ path: string; status: string; reason: string; size_bytes?: number }>;
+    };
   } | null;
 };
+
+// 旧结果没有缓存统计时按零处理，避免把缓存数量误报为工作区数量。
+export function cleanupReleasedBytes(last: WorkspaceCleanupStatus["last_run"]): number {
+  return (last?.reclaimed_bytes ?? 0) + (last?.dependency_cache?.reclaimed_bytes ?? 0);
+}
 
 // 文案只描述当前输入；下次执行时间必须来自后台，不能按浏览器时区推算。
 export function workspaceCleanupSummary(schedule: WorkspaceCleanupSchedule): string {

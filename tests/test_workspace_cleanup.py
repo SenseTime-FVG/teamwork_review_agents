@@ -503,12 +503,14 @@ def test_status_api_is_read_only_and_configuration_roundtrips(cleanup_world):
         document = client.get("/api/config").json()["document"]
         assert WorkspaceCleanupConfig(**document["runtime"].get("workspace_cleanup", {})).hour == 6
         assert document["runtime"].get("worktree_retention_days", 7) == 7
+        assert document["runtime"].get("dependency_cache_retention_days", 7) == 7
         schedule = WorkspaceCleanupConfig(kind="weekly", weekday=5, hour=11, minute=20).model_dump()
-        document["runtime"].update(workspace_cleanup=schedule, worktree_retention_days=3)
+        document["runtime"].update(workspace_cleanup=schedule, worktree_retention_days=3, dependency_cache_retention_days=14)
         saved = client.put("/api/config", json={"document": document})
         assert saved.status_code == 200, saved.text
         assert saved.json()["document"]["runtime"]["workspace_cleanup"] == schedule
         assert client.get("/api/config").json()["document"]["runtime"]["worktree_retention_days"] == 3
+        assert client.get("/api/config").json()["document"]["runtime"]["dependency_cache_retention_days"] == 14
         due = client.get("/api/runtime/workspace-cleanup").json()["next_run_at"]
         assert datetime.fromtimestamp(due).weekday() == 5
         document["runtime"]["workspace_cleanup"]["minute"] = 60
