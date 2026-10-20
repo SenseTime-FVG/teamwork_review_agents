@@ -13,6 +13,7 @@ from ..models import (
     ChangeRequestActivity,
     ChangeRequestActivityBatch,
     ChangeRequestSnapshot,
+    CommitStatusTarget,
     stable_hash,
 )
 from .base import BaseProvider, ProviderError, parse_datetime
@@ -50,22 +51,26 @@ class GitHubProvider(BaseProvider):
         repository: RepositoryConfig,
         sha: str,
         *,
-        state: Literal["pending", "success", "failure", "error"],
+        state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
         ref: str | None = None,
         source_project: str | None = None,
-    ) -> None:
+        number: int | None = None,
+        target: CommitStatusTarget | None = None,
+    ) -> CommitStatusTarget:
         """为 PR Head 写入可用于 GitHub Ruleset 的 Commit Status。"""
 
         await self.post_json(
             f"repos/{repository.project}/statuses/{sha}",
             {
-                "state": state,
+                # GitHub Commit Status 没有运行中和取消枚举，沿用其原生兼容值。
+                "state": {"running": "pending", "cancelled": "error"}.get(state, state),
                 "context": context,
                 "description": description[:140],
             },
         )
+        return CommitStatusTarget(project=repository.project, sha=sha, ref=ref)
 
     async def create_change_request_comment(
         self,

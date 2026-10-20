@@ -10,7 +10,7 @@ from typing import Literal
 import httpx
 
 from ..config import ProviderConfig, RepositoryConfig, ScannerConfig
-from ..models import ChangeRequestActivityBatch, ChangeRequestSnapshot
+from ..models import ChangeRequestActivityBatch, ChangeRequestSnapshot, CommitStatusTarget
 
 
 class ProviderError(RuntimeError):
@@ -180,12 +180,14 @@ class BaseProvider(ABC):
         repository: RepositoryConfig,
         sha: str,
         *,
-        state: Literal["pending", "success", "failure", "error"],
+        state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
         ref: str | None = None,
         source_project: str | None = None,
-    ) -> None:
+        number: int | None = None,
+        target: CommitStatusTarget | None = None,
+    ) -> CommitStatusTarget:
         """写入提交状态；具体平台必须显式实现。"""
 
         raise ProviderError(f"Provider {self.name} 不支持提交状态回写")

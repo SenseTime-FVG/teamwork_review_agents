@@ -22,7 +22,7 @@ from .filesystem import temporary_directory
 from .dependency_cache import RepositoryCacheUsage
 from .locks import LockCancelledError
 from .managed_comments import ManagedCommentService
-from .models import ChangeEvent, PreflightResult, stable_hash
+from .models import ChangeEvent, CommitStatusTarget, PreflightResult, stable_hash
 from .preflight_cache import (
     build_repository_cache_environment,
     repository_cache_root,
@@ -460,6 +460,10 @@ def _status_description(result: PreflightResult) -> str:
         return f"步骤 {result.failed_step or 'unknown'} 超时"
     if result.status == "superseded":
         return "事件 Head 已更新，本地 CI 已跳过"
+    if result.status == "error":
+        return "本地 CI 基础设施异常"
+    if result.status == "cancelled":
+        return "本地 CI 已取消"
     raise ValueError("基础设施异常没有可发布的 Commit Status")
 
 
@@ -571,7 +575,9 @@ class PreflightExecutor:
         description: str,
         ref: str | None = None,
         source_project: str | None = None,
-    ) -> None:
+        number: int | None = None,
+        target: CommitStatusTarget | None = None,
+    ) -> CommitStatusTarget:
         """使用服务自身凭据发布状态，不把凭据交给被测命令。"""
 
         provider_config = self.config.providers[repository.provider]
@@ -581,7 +587,7 @@ class PreflightExecutor:
             self.config.scanner,
             token=resolve_provider_token(self.config, provider_config, repository),
         ) as remote:
-            await remote.set_commit_status(
+            return await remote.set_commit_status(
                 repository,
                 sha,
                 state=state,
@@ -589,6 +595,8 @@ class PreflightExecutor:
                 description=description,
                 ref=ref,
                 source_project=source_project,
+                number=number,
+                target=target,
             )
 
     async def _sync_failure_comment(
@@ -700,24 +708,33 @@ class PreflightExecutor:
     ) -> PreflightResult:
         """只发布代码门禁终态；写回失败时保留本地真实结论。"""
 
-        if result.status in {"error", "superseded"}:
+        if result.status == "superseded" or (
+            result.status in {"error", "cancelled"} and result.remote_status_target is None
+        ):
             return result
 
         remote_state = {
             "success": "success",
             "failure": "failure",
             "timed_out": "failure",
+            "error": "error",
+            "cancelled": "cancelled",
         }[result.status]
         status_error: Exception | None = None
         try:
-            await self._set_remote_status(
+            target = await self._set_remote_status(
                 repository,
                 result.head_sha,
                 state=remote_state,
                 description=_status_description(result),
                 ref=ref,
                 source_project=source_project,
+                number=result.number,
+                target=result.remote_status_target,
             )
+            if target is not None:
+                result = result.model_copy(update={"remote_status_target": target})
+                await asyncio.to_thread(self.store.set_preflight_status_target, result.run_id, target)
         except Exception as exc:
             status_error = exc
         else:
@@ -731,15 +748,9 @@ class PreflightExecutor:
             replace_existing=replace_existing_comment,
         )
         if status_error is not None:
-            return PreflightResult(
-                run_id=result.run_id,
-                repository_id=result.repository_id,
-                number=result.number,
-                head_sha=result.head_sha,
-                source_generation=result.source_generation,
-                status="error",
-                error=f"本地 CI 已完成，但提交状态回写失败：{status_error}",
-            )
+            return result.model_copy(update={
+                "status": "error", "error": f"本地 CI 已完成，但提交状态回写失败：{status_error}",
+            })
         return result.model_copy(update={"status_published": True})
 
     async def ensure_passed(
@@ -817,6 +828,7 @@ class PreflightExecutor:
             )
 
         result: PreflightResult
+        remote_status_target: CommitStatusTarget | None = None
         try:
             await asyncio.to_thread(
                 self.store.set_preflight_phase,
@@ -914,14 +926,22 @@ class PreflightExecutor:
             try:
                 await cache_usage.__aenter__()
                 checkout = await asyncio.to_thread(manager.__enter__)
-                await self._set_remote_status(
+                remote_status_target = await self._set_remote_status(
                     repository,
                     snapshot.head_sha,
                     state="pending",
-                    description="本地 CI 正在运行",
+                    description="本地 CI 等待执行",
                     ref=snapshot.source_branch,
                     source_project=snapshot.source_project,
+                    number=event.number,
                 )
+                if remote_status_target is not None:
+                    await asyncio.to_thread(
+                        self.store.set_preflight_status_target, reservation.run_id, remote_status_target,
+                    )
+                    await self._append_log(
+                        reservation.run_id, remote_status_target.model_dump(), event_type="remote_status_target",
+                    )
                 cache_environment: dict[str, str] = {}
                 cache_path: str | None = None
                 if repository.preflight.cache_enabled:
@@ -944,6 +964,11 @@ class PreflightExecutor:
                 with temporary_directory(
                     prefix="teamwork-preflight-home-"
                 ) as home:
+                    await self._set_remote_status(
+                        repository, snapshot.head_sha, state="running", description="本地 CI 正在运行",
+                        ref=snapshot.source_branch, source_project=snapshot.source_project,
+                        number=event.number, target=remote_status_target,
+                    )
                     outcome = await execute_preflight_steps(
                         repository.preflight,
                         cwd=checkout,
@@ -1013,6 +1038,7 @@ class PreflightExecutor:
                 error=str(exc),
             )
 
+        result = result.model_copy(update={"remote_status_target": remote_status_target})
         await asyncio.to_thread(self.store.finish_preflight_run, result)
         await self._append_log(
             reservation.run_id,

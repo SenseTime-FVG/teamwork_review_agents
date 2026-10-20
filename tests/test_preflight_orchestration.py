@@ -143,7 +143,7 @@ async def test_all_ci_events_are_linked_before_preparation_and_while_steps_run(t
     agents = FakeAgentExecutor()
     orchestrator.executor = agents
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    monkeypatch.setattr(orchestrator.preflight, "_set_remote_status", AsyncMock())
+    monkeypatch.setattr(orchestrator.preflight, "_set_remote_status", AsyncMock(return_value=None))
     monkeypatch.setattr(orchestrator.preflight, "_sync_failure_comment_safely", AsyncMock())
 
     def assert_linked(phase):

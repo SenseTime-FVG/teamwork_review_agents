@@ -556,8 +556,9 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
     assert second.reused is True
     assert second.run_id == first.run_id
     assert counter.read_text(encoding="utf-8") == "run\n"
-    assert statuses == ["pending", "success"]
+    assert statuses == ["pending", "running", "success"]
     assert provider_tokens == [
+        "repository-provider-token",
         "repository-provider-token",
         "repository-provider-token",
     ]
@@ -628,6 +629,8 @@ async def test_gitlab_preflight_runs_and_publishes_status_and_failure_comment(
     comment_paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/merge_requests/7"):
+            return httpx.Response(200, json={"head_pipeline": None})
         if request.url.path.endswith(f"/statuses/{'b' * 40}"):
             status_payloads.append(json.loads(request.content))
             return httpx.Response(201, json={"id": len(status_payloads)})
@@ -667,7 +670,7 @@ async def test_gitlab_preflight_runs_and_publishes_status_and_failure_comment(
     assert result.status == expected_status
     assert result.status_published is True
     assert [payload["state"] for payload in status_payloads] == [
-        "pending", expected_remote_state,
+        "pending", "running", expected_remote_state,
     ]
     assert all(payload["ref"] == "feature/demo" for payload in status_payloads)
     assert all(payload["name"] == "teamwork/local-ci" for payload in status_payloads)
@@ -955,7 +958,7 @@ async def test_manual_event_restarts_exhausted_infrastructure_error(
     assert recovered.reused is False
     assert recovered.run_id != failed.run_id
     assert worktree_attempts == 2
-    assert statuses == ["pending", "success"]
+    assert statuses == ["pending", "running", "success"]
     old_detail = store.get_preflight_run(failed.run_id)
     assert old_detail is not None
     assert old_detail["status"] == "error"
@@ -1074,7 +1077,7 @@ async def test_preflight_uses_final_snapshot_for_deduplicated_commit_batch(
     assert reused.reused is True
     assert reused.run_id == first.run_id
     assert [snapshot.head_sha for snapshot in prepared_snapshots] == ["c" * 40]
-    assert statuses == [("c" * 40, "pending"), ("c" * 40, "success")]
+    assert statuses == [("c" * 40, state) for state in ("pending", "running", "success")]
     detail = store.get_preflight_run(first.run_id)
     assert detail is not None
     assert detail["head_sha"] == "c" * 40
@@ -1171,7 +1174,7 @@ async def test_preflight_retries_only_final_status_delivery(
     assert first.status == "error"
     assert second.status == "success"
     assert counter.read_text(encoding="utf-8") == "run\n"
-    assert statuses == ["pending", "success", "success"]
+    assert statuses == ["pending", "running", "success", "success"]
 
 
 async def test_preflight_failure_comment_is_rotated_preserved_and_deleted_on_success(

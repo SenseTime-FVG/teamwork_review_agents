@@ -136,6 +136,15 @@ class AgentResult(BaseModel):
     retryable: bool = True
 
 
+class CommitStatusTarget(BaseModel):
+    """一次 CI 固定的状态写回位置，不随并发创建的流水线切换。"""
+
+    project: str = Field(min_length=1)
+    sha: str = Field(min_length=1)
+    ref: str | None = None
+    pipeline_id: int | None = Field(default=None, gt=0)
+
+
 class PreflightResult(BaseModel):
     """一次确定性 CI 前置检查的最终结果。"""
 
@@ -158,6 +167,7 @@ class PreflightResult(BaseModel):
     output: str = ""
     error: str | None = None
     status_published: bool = False
+    remote_status_target: CommitStatusTarget | None = None
     reused: bool = False
 
 
