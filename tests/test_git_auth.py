@@ -56,7 +56,10 @@ def git_environment(tmp_path, monkeypatch):
 def git_http_server():
     """只在本地接受虚构 Basic 凭据，提供 Git 可读取的最小远端引用。"""
 
-    state = SimpleNamespace(require_auth=True, accepted=[], challenged=0)
+    state = SimpleNamespace(
+        require_auth=True, accepted=[], challenged=0,
+        block_requests=False, request_started=threading.Event(), release_request=threading.Event(),
+    )
     allowed = {
         "Basic " + base64.b64encode(f"{username}:{TEST_TOKEN}".encode()).decode(): username
         for username in ("x-access-token", "oauth2")
@@ -68,6 +71,11 @@ def git_http_server():
         def do_GET(self):
             """返回哑协议引用；未知地址拒绝，禁止调用任何远端服务。"""
 
+            if state.block_requests:
+                # 就绪信号证明真实 Git 已进入请求，显式释放前不返回，避免快速退出竞态。
+                state.request_started.set()
+                state.release_request.wait()
+                return
             authorization = self.headers.get("Authorization", "")
             if state.require_auth and authorization not in allowed:
                 state.challenged += 1
@@ -99,6 +107,7 @@ def git_http_server():
         try:
             yield f"http://127.0.0.1:{server.server_port}/repo.git", state
         finally:
+            state.release_request.set()
             server.shutdown()
             worker.join(timeout=5)
 
@@ -168,15 +177,36 @@ def test_rejected_credentials_are_cleaned(git_environment, git_http_server):
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "cancel"])
-def test_interrupted_git_cleans_helper(git_environment, outcome):
-    """超时和取消不遗留临时凭据文件，不依赖慢网络或长等待。"""
+def test_interrupted_git_cleans_helper(git_environment, git_http_server, outcome):
+    """先确认真实 Git 被本地服务阻塞，再验证超时和取消后的凭据清理。"""
 
-    with pytest.raises(WorkspaceError):
+    remote, state = git_http_server
+    state.block_requests = True
+    progress = []
+    ready = []
+
+    def wait_until_request_started(event):
+        """执行器启动回调等待就绪后才进入监控循环，不受 Git 启动速度影响。"""
+
+        progress.append(event)
+        if event.state == "started":
+            ready.append(state.request_started.wait(timeout=10))
+
+    expected_state = "timed_out" if outcome == "timeout" else "cancelled"
+    expected_error = "连续无有效进展" if outcome == "timeout" else "准备期间取消"
+    with pytest.raises(WorkspaceError, match=expected_error) as captured:
         with git_credential_context(TEST_TOKEN, provider_kind="github") as context:
             directory = Path(context.environment["GIT_ASKPASS"]).parent
-            _run_git(["--version"], timeout_seconds=0 if outcome == "timeout" else 10,
-                     cancel_check=(lambda: True) if outcome == "cancel" else None)
+            _run_git(
+                ["ls-remote", remote, "HEAD"], timeout_seconds=1 if outcome == "timeout" else 10,
+                cancel_check=(lambda: True) if outcome == "cancel" else None,
+                progress_callback=wait_until_request_started,
+            )
+    assert ready == [True]
+    assert progress[-1].state == expected_state
     assert not directory.exists() and current_git_environment() is None
+    assert not list(git_environment.iterdir())
+    assert TEST_TOKEN not in str(captured.value) + str(progress)
 
 
 @pytest.mark.parametrize("stage", ["write_askpass_helper", "write_askpass_launcher"])
