@@ -54,6 +54,7 @@ class GitHubProvider(BaseProvider):
         state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
+        target_url: str | None = None,
         ref: str | None = None,
         source_project: str | None = None,
         number: int | None = None,
@@ -68,6 +69,8 @@ class GitHubProvider(BaseProvider):
                 "state": {"running": "pending", "cancelled": "error"}.get(state, state),
                 "context": context,
                 "description": description[:140],
+                # 未确定访问地址时保持原状态协议，不发布不可用的详情入口。
+                **({"target_url": target_url} if target_url else {}),
             },
         )
         return CommitStatusTarget(project=repository.project, sha=sha, ref=ref)

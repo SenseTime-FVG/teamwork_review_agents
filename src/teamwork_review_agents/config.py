@@ -347,8 +347,35 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     admin_token_env: str | None = None
+    public_url: str | None = None
     config_poll_seconds: PositiveInt = 2
     log_retention_days: PositiveInt = 30
+
+    @field_validator("public_url")
+    @classmethod
+    def validate_public_url(cls, value: str | None) -> str | None:
+        """对外链接只接受无凭据、查询参数及片段的 HTTP(S) 基础地址。"""
+
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+            valid = (
+                parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+                and parsed.username is None and parsed.password is None
+                and "?" not in value and "#" not in value
+                and parsed.hostname not in {"0.0.0.0", "::"}
+                and (port is None or 1 <= port <= 65535)
+                and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+                and "\\" not in value
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("对外访问地址必须是无凭据、查询参数和片段的 HTTP(S) 地址，不能使用通配监听地址")
+        return value.rstrip("/")
 
 
 class EnvironmentVariable(BaseModel):

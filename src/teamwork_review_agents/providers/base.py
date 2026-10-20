@@ -183,6 +183,7 @@ class BaseProvider(ABC):
         state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
+        target_url: str | None = None,
         ref: str | None = None,
         source_project: str | None = None,
         number: int | None = None,

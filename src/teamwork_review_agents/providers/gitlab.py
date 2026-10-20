@@ -290,6 +290,7 @@ class GitLabProvider(BaseProvider):
         state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
+        target_url: str | None = None,
         ref: str | None = None,
         source_project: str | None = None,
         number: int | None = None,
@@ -308,6 +309,9 @@ class GitLabProvider(BaseProvider):
             "name": context,
             "description": description[:255],
         }
+        if target_url:
+            # 外部阶段中的作业可直接跳转到对应本地 CI 的实时日志。
+            payload["target_url"] = target_url
         if target.ref:
             payload["ref"] = target.ref
         if target.pipeline_id is not None:
