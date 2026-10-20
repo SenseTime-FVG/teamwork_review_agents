@@ -587,7 +587,9 @@ uv run pytest tests/ -q --tb=short
 uv build
 ```
 
-GitHub 可在 Ruleset 中添加与 `status_context` 同名的 Required Status Check。GitLab 会把该状态显示为 MR 源提交对应流水线中的[同名外部作业](https://docs.gitlab.com/ci/ci_cd_for_external_repos/external_commit_statuses/)；若要用它阻止合并，请按项目需求启用[“Pipelines must succeed”](https://docs.gitlab.com/user/project/merge_requests/auto_merge/#require-a-successful-pipeline-for-merge)，并避免同一提交出现互相竞争的多种流水线。然后校验配置并启动服务：
+GitHub 可在 Ruleset 中添加与 `status_context` 同名的 Required Status Check。GitLab 优先将[同名外部作业](https://docs.gitlab.com/ci/ci_cd_for_external_repos/external_commit_statuses/)写入 MR 当前展示、且 SHA 与本次源提交一致的 MR 流水线；不存在匹配项时才回退到源项目的分支流水线，不会把旧结果写到新提交或拟合并提交上。每次本地 CI 固定并持久化所选流水线的项目、引用和 ID，依次回写 `pending → running → success/failed`，取消时回写 `canceled`；终态补发也不会切换流水线或重跑已完成的命令。GitHub 继续把运行阶段映射为原生 `pending`。
+
+GitLab 若要用它阻止合并，请按项目需求启用[“Pipelines must succeed”](https://docs.gitlab.com/user/project/merge_requests/auto_merge/#require-a-successful-pipeline-for-merge)；同一提交存在分支、MR 双流水线时，本地 CI 只影响固定选中的那条。升级后新运行生效，不改写已完成历史运行的归属。然后校验配置并启动服务：
 
 ```bash
 # 指向包含 prompts/general-review.md 的 Teamwork Review Agents 仓库。

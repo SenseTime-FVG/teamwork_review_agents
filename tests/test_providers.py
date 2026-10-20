@@ -667,8 +667,11 @@ async def test_github_provider_publishes_bounded_commit_status() -> None:
     ("state", "gitlab_state"),
     [
         ("pending", "pending"),
+        ("running", "running"),
         ("success", "success"),
         ("failure", "failed"),
+        ("error", "failed"),
+        ("cancelled", "canceled"),
     ],
 )
 async def test_gitlab_provider_publishes_commit_status(

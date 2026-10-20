@@ -10,7 +10,9 @@ from urllib.parse import quote
 import httpx
 
 from ..config import ProviderConfig, RepositoryConfig, ScannerConfig
-from ..models import ChangeRequestActivity, ChangeRequestActivityBatch, ChangeRequestSnapshot
+from ..models import (
+    ChangeRequestActivity, ChangeRequestActivityBatch, ChangeRequestSnapshot, CommitStatusTarget,
+)
 from .base import BaseProvider, ProviderError, parse_datetime
 
 
@@ -241,32 +243,86 @@ class GitLabProvider(BaseProvider):
             "User-Agent": "teamwork-review-agents",
         }
 
+    async def _commit_status_target(
+        self,
+        repository: RepositoryConfig,
+        sha: str,
+        *,
+        number: int | None,
+        ref: str | None,
+        source_project: str | None,
+    ) -> CommitStatusTarget:
+        """优先使用 MR 正在展示且源 SHA 相同的流水线，绝不把旧结果写给新提交。"""
+
+        fallback = CommitStatusTarget(
+            project=source_project or repository.project, sha=sha, ref=ref,
+        )
+        if number is None:
+            return fallback
+        project = quote(repository.project, safe="")
+        detail = await self.get_json(f"projects/{project}/merge_requests/{number}")
+        if not isinstance(detail, dict):
+            raise ProviderError("GitLab MR 状态回写定位返回格式异常")
+        pipeline = detail.get("head_pipeline")
+        if not isinstance(pipeline, dict):
+            return fallback
+        pipeline_id = pipeline.get("id")
+        pipeline_ref = pipeline.get("ref")
+        if (
+            pipeline.get("sha") != sha
+            or pipeline.get("source") != "merge_request_event"
+            or type(pipeline_id) is not int or pipeline_id <= 0
+            or not isinstance(pipeline_ref, str) or not pipeline_ref
+        ):
+            # MR 尚无对应流水线、拟合并 SHA 或旧 Head 都只回退到本次准确的源提交。
+            return fallback
+        project_id = pipeline.get("project_id")
+        return CommitStatusTarget(
+            project=str(project_id) if type(project_id) is int and project_id > 0 else repository.project,
+            sha=sha, ref=pipeline_ref, pipeline_id=pipeline_id,
+        )
+
     async def set_commit_status(
         self,
         repository: RepositoryConfig,
         sha: str,
         *,
-        state: Literal["pending", "success", "failure", "error"],
+        state: Literal["pending", "running", "success", "failure", "error", "cancelled"],
         context: str,
         description: str,
         ref: str | None = None,
         source_project: str | None = None,
-    ) -> None:
+        number: int | None = None,
+        target: CommitStatusTarget | None = None,
+    ) -> CommitStatusTarget:
         """在 MR 源提交对应的流水线中写入 GitLab 外部作业状态。"""
 
-        project = quote(source_project or repository.project, safe="")
+        target = target or await self._commit_status_target(
+            repository, sha, number=number, ref=ref, source_project=source_project,
+        )
+        if target.sha != sha:
+            raise ProviderError("GitLab 状态回写目标与本次提交 SHA 不一致")
+        project = quote(target.project, safe="")
         payload = {
-            "state": {"failure": "failed", "error": "failed"}.get(state, state),
+            "state": {"failure": "failed", "error": "failed", "cancelled": "canceled"}.get(state, state),
             "name": context,
             "description": description[:255],
         }
-        if ref:
-            payload["ref"] = ref
+        if target.ref:
+            payload["ref"] = target.ref
+        if target.pipeline_id is not None:
+            payload["pipeline_id"] = target.pipeline_id
         path = f"projects/{project}/statuses/{quote(sha, safe='')}"
         for attempt in range(3):
             try:
-                await self.post_json(path, payload)
-                return
+                response = await self.post_json(path, payload)
+                # 回退时也固化 GitLab 实际选中的流水线，后续状态及补发不能重新选址。
+                if isinstance(response, dict) and type(response.get("pipeline_id")) is int:
+                    actual_pipeline_id = response["pipeline_id"]
+                    if actual_pipeline_id <= 0 or target.pipeline_id not in (None, actual_pipeline_id):
+                        raise ProviderError("GitLab 返回了与固定状态目标不一致的流水线")
+                    target = target.model_copy(update={"pipeline_id": actual_pipeline_id})
+                return target
             except ProviderError as exc:
                 # GitLab 同一 SHA/ref 的状态更新可能短暂冲突，仅重试明确的 409。
                 cause = exc.__cause__

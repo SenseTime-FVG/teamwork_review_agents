@@ -16,6 +16,7 @@ from .models import (
     ChangeEvent,
     ChangeRequestActivity,
     ChangeRequestSnapshot,
+    CommitStatusTarget,
     PreflightResult,
 )
 
@@ -199,6 +200,7 @@ class StateStore:
                     output TEXT NOT NULL DEFAULT '',
                     error TEXT,
                     status_published INTEGER NOT NULL DEFAULT 0,
+                    remote_status_target TEXT,
                     started_at REAL NOT NULL,
                     finished_at REAL
                 );
@@ -432,6 +434,7 @@ class StateStore:
                 "TEXT NOT NULL DEFAULT 'queued'",
             )
             self._ensure_column(connection, "preflight_runs", "cache_path", "TEXT")
+            self._ensure_column(connection, "preflight_runs", "remote_status_target", "TEXT")
             self._ensure_column(
                 connection,
                 "preflight_runs",
@@ -1797,6 +1800,7 @@ class StateStore:
                     source_generation = ?,
                     trigger_source = 'event', phase = 'preparing',
                     branch = NULL, cache_path = NULL, cancel_requested = 0,
+                    remote_status_target = NULL, status_published = 0,
                     failed_step = NULL, exit_code = NULL, output = '', error = NULL,
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
@@ -2025,7 +2029,7 @@ class StateStore:
                 """
                 SELECT run_id, repository_id, number, head_sha, status,
                        source_generation, failed_step, exit_code, output, error,
-                       status_published
+                       status_published, remote_status_target
                 FROM preflight_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -2044,7 +2048,20 @@ class StateStore:
             output=str(row["output"] or ""),
             error=row["error"],
             status_published=bool(row["status_published"]),
+            remote_status_target=(
+                CommitStatusTarget.model_validate_json(row["remote_status_target"])
+                if row["remote_status_target"] else None
+            ),
         )
+
+    def set_preflight_status_target(self, run_id: str, target: CommitStatusTarget) -> None:
+        """在命令执行前保存远端状态位置，支持重启后的准确终态补发。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE preflight_runs SET remote_status_target = ? WHERE run_id = ?",
+                (target.model_dump_json(), run_id),
+            )
 
     def finish_preflight_run(self, result: PreflightResult) -> None:
         """保存一次 CI 运行的终态与有界输出。"""
@@ -2057,7 +2074,7 @@ class StateStore:
                 UPDATE preflight_runs
                 SET status = ?, failed_step = ?, exit_code = ?, output = ?,
                     error = ?, status_published = ?, phase = 'finished',
-                    finished_at = ?
+                    finished_at = ?, remote_status_target = COALESCE(?, remote_status_target)
                 WHERE run_id = ?
                 """,
                 (
@@ -2068,6 +2085,7 @@ class StateStore:
                     result.error,
                     int(result.status_published),
                     finished_at,
+                    result.remote_status_target.model_dump_json() if result.remote_status_target else None,
                     result.run_id,
                 ),
             )
