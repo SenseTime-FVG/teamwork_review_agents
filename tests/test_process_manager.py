@@ -419,6 +419,31 @@ def test_startup_timeout_reports_cause_and_reaps_own_child(
     state.process.wait.assert_called_once_with(timeout=3)
 
 
+@pytest.mark.parametrize("child_exits", [True, False])
+def test_occupied_health_rejects_both_child_exit_and_startup_timeout(
+    simulated_start, monkeypatch, child_exits,
+) -> None:
+    """固定覆盖立即退出与超时两条路径，不依赖平台的真实启动速度。"""
+
+    state = simulated_start
+    monkeypatch.setattr(process_manager, "_check_health", lambda *args, **kwargs: (999999, None))
+    state.process.poll.side_effect = lambda: 1 if child_exits and state.clock.seconds >= 0.2 else None
+
+    result = start_background(state.config, host="127.0.0.1", port=8080, startup_timeout_seconds=1)
+
+    assert result.exit_code == 1
+    assert result.record is None
+    assert "健康接口 PID 不匹配：期望 12345，实际 999999" in result.message
+    if child_exits:
+        assert "后台服务启动失败，退出码 1" in result.message
+        state.terminate.assert_not_called()
+        state.process.wait.assert_not_called()
+    else:
+        assert "后台服务未在 1 秒内完成启动" in result.message
+        state.terminate.assert_called_once_with(12345, force=False, tree=True)
+        state.process.wait.assert_called_once_with(timeout=3)
+
+
 @pytest.fixture
 def health_server():
     """提供可指定状态和响应内容的真实本机 HTTP 服务。"""
@@ -492,7 +517,7 @@ def test_health_probe_failures_remain_diagnostic(failure, expected, monkeypatch)
     opener.open.assert_called_once_with("http://[::1]:8080/api/health", timeout=0.2)
 
 
-def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> None:
+def test_start_rejects_health_response_from_existing_port_owner(tmp_path, monkeypatch) -> None:
     """旧服务占用端口时不能把新子进程误报为启动成功。"""
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OccupiedHealthHandler)
@@ -500,21 +525,54 @@ def test_start_rejects_health_response_from_existing_port_owner(tmp_path) -> Non
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     config_path = _write_config(tmp_path, port)
+    children: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def track_child(*args, **kwargs):
+        """记录本次真实启动的子进程，避免仅凭管理记录判断没有进程残留。"""
+
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(process_manager.subprocess, "Popen", track_child)
     try:
+        assert _check_health("127.0.0.1", port) == (999999, None)
         result = start_background(
             config_path,
             host="127.0.0.1",
             port=port,
             startup_timeout_seconds=5,
         )
+        assert result.exit_code == 1
+        assert result.record is None
+        # Windows 慢启动可能先到截止时间；两条拒绝路径都不能被误判为启动成功。
+        assert (
+            "后台服务启动失败" in result.message
+            or (
+                "后台服务未在 5 秒内完成启动" in result.message
+                and "健康接口 PID 不匹配" in result.message
+            )
+        ), result.message
+        assert len(children) == 1
+        assert children[0].poll() is not None
+        assert running_process(config_path) is None
+        # 收尾只能结束本次子进程，原先占用端口的健康服务仍应可以访问。
+        assert _check_health("127.0.0.1", port) == (999999, None)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
-
-    assert result.exit_code == 1
-    assert "后台服务启动失败" in result.message
-    assert running_process(config_path) is None
+        try:
+            # 断言失败时也不遗留本用例创建的后台子进程，不接触其他配置的服务。
+            for child in children:
+                if child.poll() is None:
+                    try:
+                        terminate_process(child.pid, force=True, tree=True)
+                    except ProcessLookupError:
+                        pass
+                    child.wait(timeout=3)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
 
 def test_stop_discovers_process_after_pid_and_lock_are_moved(tmp_path) -> None:
