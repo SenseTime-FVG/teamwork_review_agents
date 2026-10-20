@@ -30,6 +30,7 @@ from .preflight_cache import (
 from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
+from .service_urls import preflight_details_url
 from .subprocess_utils import (
     ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -573,6 +574,7 @@ class PreflightExecutor:
         *,
         state: str,
         description: str,
+        run_id: str | None = None,
         ref: str | None = None,
         source_project: str | None = None,
         number: int | None = None,
@@ -593,6 +595,7 @@ class PreflightExecutor:
                 state=state,
                 context=repository.preflight.status_context,
                 description=description,
+                target_url=preflight_details_url(self.config.web, run_id) if run_id else None,
                 ref=ref,
                 source_project=source_project,
                 number=number,
@@ -727,6 +730,7 @@ class PreflightExecutor:
                 result.head_sha,
                 state=remote_state,
                 description=_status_description(result),
+                run_id=result.run_id,
                 ref=ref,
                 source_project=source_project,
                 number=result.number,
@@ -931,6 +935,7 @@ class PreflightExecutor:
                     snapshot.head_sha,
                     state="pending",
                     description="本地 CI 等待执行",
+                    run_id=reservation.run_id,
                     ref=snapshot.source_branch,
                     source_project=snapshot.source_project,
                     number=event.number,
@@ -966,6 +971,7 @@ class PreflightExecutor:
                 ) as home:
                     await self._set_remote_status(
                         repository, snapshot.head_sha, state="running", description="本地 CI 正在运行",
+                        run_id=reservation.run_id,
                         ref=snapshot.source_branch, source_project=snapshot.source_project,
                         number=event.number, target=remote_status_target,
                     )

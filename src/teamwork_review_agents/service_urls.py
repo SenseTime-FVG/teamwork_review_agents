@@ -1,11 +1,16 @@
-"""只用于启动提示的访问地址发现，不改变监听、路由或认证。"""
+"""启动提示与本地 CI 详情链接的地址发现，不改变监听或认证。"""
 
 from __future__ import annotations
 
 import ipaddress
 import socket
+from typing import TYPE_CHECKING
+from urllib.parse import urlencode
 
 import psutil
+
+if TYPE_CHECKING:
+    from .config import WebConfig
 
 
 def http_url(host: str, port: int) -> str:
@@ -49,6 +54,23 @@ def local_interface_addresses(family: int) -> list[tuple[str, str]]:
                 seen.add(normalized)
                 candidates.append(("".join(char for char in name if char.isprintable()), normalized))
     return sorted(candidates, key=lambda item: (item[0].casefold(), int(ipaddress.ip_address(item[1]))))
+
+
+def preflight_details_url(web: WebConfig, run_id: str) -> str | None:
+    """优先使用配置地址；通配监听仅在网卡地址唯一时自动生成，不猜测 VPN/多网卡。"""
+
+    base = web.public_url
+    if not base:
+        host = web.host
+        if host in {"0.0.0.0", "::"}:
+            family = socket.AF_INET if host == "0.0.0.0" else socket.AF_INET6
+            addresses = {address for _, address in local_interface_addresses(family)}
+            if len(addresses) != 1:
+                return None
+            host = addresses.pop()
+        base = http_url(host, web.port)
+    # 片段仅包含不透明的运行 ID，不把凭据或日志内容写入代码托管平台。
+    return f"{base.rstrip('/')}/#{urlencode({'preflight': run_id})}"
 
 
 def service_access_message(host: str, port: int, *, admin_token_required: bool | None = None) -> str:

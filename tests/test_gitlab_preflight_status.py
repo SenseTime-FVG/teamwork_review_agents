@@ -212,6 +212,29 @@ async def test_github_maps_lifecycle_to_supported_commit_statuses(state, expecte
         await provider.set_commit_status(repository(), SHA, state=state, context="ci", description="状态")
 
 
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+@pytest.mark.parametrize("state", ["pending", "running", "success", "failure", "error", "cancelled"])
+async def test_commit_status_details_link_is_kept_in_every_lifecycle_state(kind, state):
+    """两个平台在等待、执行和各类终态都使用同一运行详情入口。"""
+
+    url = "https://review.example.com/#preflight=run-123"
+
+    def handler(request):
+        """只检查 HTTP 请求体，不更新真实平台状态。"""
+
+        payload = json.loads(request.content)
+        assert request.method == "POST" and payload["target_url"] == url
+        if kind == "gitlab":
+            assert payload["pipeline_id"] == 71 and payload["ref"] == MR_REF
+        return httpx.Response(201, json={"pipeline_id": 71})
+
+    async with await status_provider(handler, kind=kind) as provider:
+        await provider.set_commit_status(
+            repository(), SHA, state=state, context="ci", description="状态", target_url=url,
+            target=CommitStatusTarget(project="23", sha=SHA, ref=MR_REF, pipeline_id=71),
+        )
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after_restart(
     tmp_path, monkeypatch, snapshot_factory, exit_code,
@@ -221,6 +244,7 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
     marker = tmp_path / "executions.txt"
     config = parse_config_data({
         "database": {"path": str(tmp_path / "state.db")},
+        "web": {"public_url": "https://review.example.com/teamwork"},
         "providers": {"platform": {"kind": "gitlab", "base_url": "https://platform.example/api/v4", "token_env": "TEST_TOKEN"}},
         "repositories": [{"id": "demo", "provider": "platform", "project": "group/demo", "workspace": str(tmp_path / "workspace"),
                           "preflight": {"enabled": True, "cache_enabled": False, "steps": [{"name": "count", "command": [
@@ -238,6 +262,7 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
         payload = json.loads(request.content)
         posts.append(payload)
         assert payload["pipeline_id"] == 71 and payload["ref"] == MR_REF
+        assert payload["target_url"].startswith("https://review.example.com/teamwork/#preflight=")
         if len(posts) == 3:
             return httpx.Response(503, json={"message": "retry later"})
         return httpx.Response(201, json={"pipeline_id": 71})
@@ -272,6 +297,7 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
     assert marker.read_text() == "run\n"
     assert len(reads) == 1
     assert [payload["state"] for payload in posts] == ["pending", "running", terminal_state, terminal_state]
+    assert {payload["target_url"] for payload in posts} == {f"https://review.example.com/teamwork/#preflight={first.run_id}"}
     assert restarted_store.load_preflight_result(preflight_idempotency_key(config, event)).status_published
 
 

@@ -28,6 +28,7 @@ import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOve
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import { createOverviewRefresher } from "./overviewRefresh";
 import type { OverviewRefreshState } from "./overviewRefresh";
+import { preflightRunIdFromHash, withoutPreflightHash } from "./preflightDeepLink";
 import { overviewSelectionRange, toggleOverviewRecords, refreshOverviewSelection, overviewSelectionScopeChanged } from "./overviewSelection";
 import type { OverviewSelectionAnchor } from "./overviewSelection";
 import { fitOverlayToViewport } from "./overlayPlacement";
@@ -2629,6 +2630,7 @@ function GlobalEnvironment(props: {
           <Field label="远端 CI 等待超时（分钟）" type="number" value={Number(props.document.runtime.remote_ci_wait_timeout_seconds ?? 1800) / 60} onChange={(value) => patchSection("runtime", "remote_ci_wait_timeout_seconds", Math.round(Number(value) * 60))} help="默认 30 分钟，含排队与执行；超时保留远端 PR，不自动重跑。临时工作区随任务树结束清理。与本地 CI 执行超时独立。" />
           <Field label="监听地址" value={String(props.document.web.host)} onChange={(value) => patchSection("web", "host", value)} />
           <Field label="端口" type="number" value={Number(props.document.web.port)} onChange={(value) => patchSection("web", "port", Number(value))} />
+          <Field label="对外访问地址（可选）" value={String(props.document.web.public_url ?? "")} onChange={(value) => patchSection("web", "public_url", value.trim() || null)} placeholder="https://review.example.com" help="用于 GitHub / GitLab 本地 CI 的详情链接，不含 Token。留空按监听配置推导；通配监听仅在局域网地址唯一时生成。反向代理、多网卡或命令行覆盖端口时请填写实际访问地址。" />
           <Field label="管理员 Token 环境变量" value={String(props.document.web.admin_token_env ?? "")} onChange={(value) => patchSection("web", "admin_token_env", value || undefined)} help="非本机监听时必填" />
         </div>
         <div className="toggle-grid">
@@ -10160,7 +10162,14 @@ function RunsView(props: {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(() => preflightRunIdFromHash(window.location.hash) ? "runs" : "overview");
+  const [linkedPreflightId, setLinkedPreflightId] = useState(() => preflightRunIdFromHash(window.location.hash));
+  useEffect(() => {
+    // 同页片段跳转只打开详情，不切换配置页或放弃正在编辑的草稿。
+    const openLinkedPreflight = () => setLinkedPreflightId(preflightRunIdFromHash(window.location.hash));
+    window.addEventListener("hashchange", openLinkedPreflight);
+    return () => window.removeEventListener("hashchange", openLinkedPreflight);
+  }, []);
   const [document, setDocument] = useState<ConfigDocument | null>(null);
   const [savedDocument, setSavedDocument] = useState<ConfigDocument | null>(null);
   const [status, setStatus] = useState<RuntimeStatus>(EMPTY_STATUS);
@@ -11114,6 +11123,17 @@ export default function App() {
           )}
         </div>
       </main>
+      {!loading && document && linkedPreflightId && (
+        <PreflightRunDetailDrawer
+          key={linkedPreflightId}
+          runId={linkedPreflightId}
+          depth={0}
+          onClose={() => {
+            setLinkedPreflightId(null);
+            window.history.replaceState(window.history.state, "", withoutPreflightHash(window.location.href));
+          }}
+        />
+      )}
       {setupDraft && <QuickSetupWizard {...setupDraft} onClose={() => setSetupDraft(null)} onSaved={(nextDocument, nextRevision) => {
         acceptItemConfig(normalizeDocument(nextDocument), nextRevision);
         setSetupDraft(null);

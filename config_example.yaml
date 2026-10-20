@@ -191,6 +191,10 @@ web:
   host: 127.0.0.1
   # 管理 UI 与 API 监听端口。
   port: 8080
+  # 可选：GitHub / GitLab 本地 CI 详情链接使用的对外访问地址，不要填写 Token。
+  # 留空按监听配置推导；通配监听仅在网卡地址唯一时生成。
+  # 反向代理、多网卡、容器或命令行覆盖监听地址/端口时，请显式填写实际访问地址。
+  # public_url: https://review.example.com
   # 检测 config.yaml 手工变化的周期秒数。
   config_poll_seconds: 2
   # 运行日志在 SQLite 中保留的天数。
