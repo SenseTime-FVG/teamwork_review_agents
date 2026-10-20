@@ -151,7 +151,9 @@ test("仓库选择区分整体与局部范围，清理跨仓库状态并隔离�
   assert.match(app, /overviewQuery\(changeRequestFilter, overviewRepositoryId\)/);
   assert.match(app, /overviewStatusPath\(overviewRepositoryId\)/);
   const change = app.slice(app.indexOf("const changeOverviewRepository ="), app.indexOf("const load = useCallback"));
-  assert.match(change, /overviewRequestSequence.current \+= 1/);
+  for (const refresher of ["statusRefresher", "changeRequestRefresher", "eventRefresher"]) {
+    assert.ok(change.includes(`${refresher}.invalidate()`));
+  }
   assert.match(change, /setOverviewStatus\(null\)/);
   assert.match(change, /setChangeRequestFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
   assert.match(change, /setEventFilter\(\(current\) => \(\{ \.\.\.current, repositoryId: "", page: 1 \}\)\)/);
@@ -159,7 +161,8 @@ test("仓库选择区分整体与局部范围，清理跨仓库状态并隔离�
   assert.match(change, /setSelectedEvents\(\[\]\)/);
   assert.match(change, /setOverviewConfirmation\(null\)/);
   assert.match(app, /key=\{overviewRepositoryId\}/);
-  assert.match(app, /requestSequence !== overviewRequestSequence.current\) return/);
+  const refresh = readFileSync(new URL("../src/overviewRefresh.ts", import.meta.url), "utf8");
+  assert.match(refresh, /generation !== request\) return/);
   assert.match(app, /后台调度器 · 全局/);
   assert.match(app, /最近成功扫描/);
 });

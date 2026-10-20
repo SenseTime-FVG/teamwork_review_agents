@@ -158,10 +158,10 @@ test("翻页、排序和条数不改变选择范围，仓库、编号及有效�
 
 test("翻页仅清起点和隔离迟到请求，按钮和提交按完整跨页集合接线", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  for (const [action, anchor] of [["changeOverviewChangeRequestPage", "changeRequestSelectionAnchor"], ["changeOverviewEventPage", "eventSelectionAnchor"]]) {
+  for (const [action, anchor, refresher] of [["changeOverviewChangeRequestPage", "changeRequestSelectionAnchor", "changeRequestRefresher"], ["changeOverviewEventPage", "eventSelectionAnchor", "eventRefresher"]]) {
     const handler = app.slice(app.indexOf(`function ${action}(`));
     const body = handler.slice(0, handler.indexOf("\n  }"));
-    assert.match(body, /overviewRequestSequence.current \+= 1/);
+    assert.ok(body.includes(`${refresher}.invalidate()`));
     assert.ok(body.includes(`${anchor}.current = null`));
     assert.doesNotMatch(body, /cancelChangeRequestSelection|cancelEventSelection|setSelected/);
   }
