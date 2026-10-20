@@ -26,6 +26,8 @@ import { EXTERNAL_REASONING_LEVELS, reasoningEffortOptions, modelSupportsReasoni
 import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } from "./eventStatusPresentation";
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
+import { createOverviewRefresher } from "./overviewRefresh";
+import type { OverviewRefreshState } from "./overviewRefresh";
 import { overviewSelectionRange, toggleOverviewRecords, refreshOverviewSelection, overviewSelectionScopeChanged } from "./overviewSelection";
 import type { OverviewSelectionAnchor } from "./overviewSelection";
 import { fitOverlayToViewport } from "./overlayPlacement";
@@ -1992,6 +1994,11 @@ function Overview(props: {
   eventFilter: OverviewFilter;
   changeRequestPage: OverviewPage;
   eventPage: OverviewPage;
+  statusRefreshError: string;
+  changeRequestRefresh: OverviewRefreshState;
+  eventRefresh: OverviewRefreshState;
+  onRefreshChangeRequests: () => void;
+  onRefreshEvents: () => void;
   emittingKey: string;
   triggeringKeys: string[];
   replayingEventIds: string[];
@@ -2057,22 +2064,32 @@ function Overview(props: {
       {(props.status.config_error || props.status.last_error || props.status.last_dispatch_error) && (
         <div className="alert error">{props.status.config_error ?? props.status.last_error ?? props.status.last_dispatch_error}</div>
       )}
-      {!overviewStatus ? <div className="empty" role="status">正在加载所选范围的统计与列表…</div> : <>
-      <div className="metric-grid">
-        <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
-        <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
-        <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{stats.runs.running ?? 0} 个执行中 · {stats.runs.preparing ?? 0} 个准备中 · {stats.runs.queued ?? 0} 个排队中</small></div>
-        {props.repositoryId ? (
-          <div className="metric-card"><span>最近成功扫描</span><strong>{overviewStatus.repository_last_scan_completed_at ? "已完成" : "暂无记录"}</strong><small>{dateTimeText(overviewStatus.repository_last_scan_completed_at)}</small></div>
-        ) : (
-          <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
-        )}
-      </div>
+      {props.statusRefreshError && <div className="alert error" role="alert">概览统计刷新失败：{props.statusRefreshError}</div>}
+      {!overviewStatus ? (!props.statusRefreshError && <div className="empty" role="status">正在加载所选范围的统计…</div>) : (
+        <div className="metric-grid">
+          <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
+          <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
+          <div className="metric-card"><span>Agent 运行</span><strong>{runTotal}</strong><small>{stats.runs.running ?? 0} 个执行中 · {stats.runs.preparing ?? 0} 个准备中 · {stats.runs.queued ?? 0} 个排队中</small></div>
+          {props.repositoryId ? (
+            <div className="metric-card"><span>最近成功扫描</span><strong>{overviewStatus.repository_last_scan_completed_at ? "已完成" : "暂无记录"}</strong><small>{dateTimeText(overviewStatus.repository_last_scan_completed_at)}</small></div>
+          ) : (
+            <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
+          )}
+        </div>
+      )}
       <section className="section-card">
         <div className="section-title-row overview-list-heading">
           <div><h2>已扫描 MR / PR</h2><p>扫描器在 SQLite 中保存的最新快照；最新平台事件来自 Provider Timeline，仅作为手动触发参考，不等同于已经入队的关联事件。</p></div>
           <div className="overview-section-tools">
             <div className="overview-selection-actions">
+              <button
+                type="button"
+                className="button secondary compact"
+                aria-label="刷新已扫描 MR / PR"
+                aria-busy={props.changeRequestRefresh.busy}
+                disabled={props.changeRequestRefresh.busy}
+                onClick={props.onRefreshChangeRequests}
+              >{props.changeRequestRefresh.busy ? "刷新中…" : "刷新"}</button>
               {props.selectionMode ? (
                 <>
                   <button className="button secondary compact" onClick={props.onCancelSelection}>取消</button>
@@ -2108,6 +2125,7 @@ function Overview(props: {
             />
           </div>
         </div>
+        {props.changeRequestRefresh.error && <div className="alert error" role="alert">已扫描 MR / PR 刷新失败：{props.changeRequestRefresh.error}；当前保留上次列表。</div>}
         <div className="table-wrap">
           <table>
             <thead>
@@ -2258,6 +2276,14 @@ function Overview(props: {
           <div><h2>最近变化事件</h2><p>新发现、提交、状态、标签等变化产生的语义事件，不代表 PR 总数。</p></div>
           <div className="overview-section-tools">
             <div className="overview-selection-actions">
+              <button
+                type="button"
+                className="button secondary compact"
+                aria-label="刷新最近变化事件"
+                aria-busy={props.eventRefresh.busy}
+                disabled={props.eventRefresh.busy}
+                onClick={props.onRefreshEvents}
+              >{props.eventRefresh.busy ? "刷新中…" : "刷新"}</button>
               {props.eventSelectionMode ? (
                 <>
                   <button
@@ -2301,6 +2327,7 @@ function Overview(props: {
             />
           </div>
         </div>
+        {props.eventRefresh.error && <div className="alert error" role="alert">最近变化事件刷新失败：{props.eventRefresh.error}；当前保留上次列表。</div>}
         <div className="table-wrap">
           <table>
             <thead>
@@ -2420,7 +2447,6 @@ function Overview(props: {
           onPageChange={props.onEventPageChange}
         />
       </section>
-      </>}
       <ChangeRequestDetailDrawer
         changeRequest={selectedChangeRequest}
         active={selectedEvent === null && selectedExecution === null && !props.confirmationOpen}
@@ -10154,12 +10180,38 @@ export default function App() {
   const [eventFilter, setEventFilter] = useState<OverviewFilter>(
     DEFAULT_EVENT_FILTER,
   );
+  const [changeRequestRefresh, setChangeRequestRefresh] = useState<OverviewRefreshState>({ busy: false, error: "" });
+  const [eventRefresh, setEventRefresh] = useState<OverviewRefreshState>({ busy: false, error: "" });
+  const [statusRefresh, setStatusRefresh] = useState<OverviewRefreshState>({ busy: false, error: "" });
+  // 三个数据源独立接收结果；只更新记录和分页，不重载配置或清空跨页选择。
+  const changeRequestRefresher = useMemo(() => createOverviewRefresher(
+    (path) => api<PaginatedOverviewResponse<ChangeRequestRecord>>(path, { cache: "no-store" }),
+    (result) => {
+      setChangeRequests(result.items);
+      setChangeRequestPage(result);
+      setChangeRequestFilter((current) => current.page === result.page ? current : { ...current, page: result.page });
+    },
+    setChangeRequestRefresh,
+  ), []);
+  const eventRefresher = useMemo(() => createOverviewRefresher(
+    (path) => api<PaginatedOverviewResponse<EventRecord>>(path, { cache: "no-store" }),
+    (result) => {
+      setEvents(result.items);
+      setEventPage(result);
+      setEventFilter((current) => current.page === result.page ? current : { ...current, page: result.page });
+    },
+    setEventRefresh,
+  ), []);
+  const statusRefresher = useMemo(() => createOverviewRefresher(
+    (path) => api<RuntimeStatus>(path, { cache: "no-store" }),
+    setOverviewStatus,
+    setStatusRefresh,
+  ), []);
   const [executionFilter, setExecutionFilter] = useState<ExecutionFilter>(
     DEFAULT_EXECUTION_FILTER,
   );
   const executionFilterRef = useRef<ExecutionFilter>(DEFAULT_EXECUTION_FILTER);
   const operationalRequestSequence = useRef(0);
-  const overviewRequestSequence = useRef(0);
   const mainRef = useRef<HTMLElement>(null);
   const [emittingKey, setEmittingKey] = useState("");
   const [triggeringKeys, setTriggeringKeys] = useState<string[]>([]);
@@ -10237,39 +10289,28 @@ export default function App() {
     setPreflightRuns(nextPreflightRuns);
   }, []);
 
+  const refreshChangeRequests = useCallback((manual = false) => changeRequestRefresher.refresh(
+    `/api/change-requests?${overviewQuery(changeRequestFilter, overviewRepositoryId)}`, manual,
+  ), [changeRequestRefresher, changeRequestFilter, overviewRepositoryId]);
+  const refreshEvents = useCallback((manual = false) => eventRefresher.refresh(
+    `/api/events?${overviewQuery(eventFilter, overviewRepositoryId, true)}`, manual,
+  ), [eventRefresher, eventFilter, overviewRepositoryId]);
+  const refreshOverviewStatus = useCallback(() => statusRefresher.refresh(
+    overviewStatusPath(overviewRepositoryId),
+  ), [statusRefresher, overviewRepositoryId]);
+  const refreshOverviewLists = useCallback(async () => {
+    // 顶部手动刷新仅刷新两张列表，不触发扫描或覆盖配置编辑草稿。
+    await Promise.all([refreshChangeRequests(true), refreshEvents(true)]);
+  }, [refreshChangeRequests, refreshEvents]);
   const refreshOverviewData = useCallback(async () => {
-    const requestSequence = overviewRequestSequence.current + 1;
-    overviewRequestSequence.current = requestSequence;
-    // 统计与列表同批替换，旧请求即使晚返回也不能覆盖当前仓库范围。
-    let response;
-    try {
-      response = await Promise.all([
-        api<RuntimeStatus>(overviewStatusPath(overviewRepositoryId)),
-        api<PaginatedOverviewResponse<EventRecord>>(`/api/events?${overviewQuery(eventFilter, overviewRepositoryId, true)}`),
-        api<PaginatedOverviewResponse<ChangeRequestRecord>>(`/api/change-requests?${overviewQuery(changeRequestFilter, overviewRepositoryId)}`),
-      ]);
-    } catch (reason) {
-      if (requestSequence === overviewRequestSequence.current) throw reason;
-      return;
-    }
-    if (requestSequence !== overviewRequestSequence.current) return;
-    const [nextOverviewStatus, nextEvents, nextChangeRequests] = response;
-    setOverviewStatus(nextOverviewStatus);
-    setEvents(nextEvents.items);
-    setChangeRequests(nextChangeRequests.items);
-    setEventPage(nextEvents);
-    setChangeRequestPage(nextChangeRequests);
-    if (nextEvents.page !== eventFilter.page) {
-      setEventFilter((current) => ({ ...current, page: nextEvents.page }));
-    }
-    if (nextChangeRequests.page !== changeRequestFilter.page) {
-      setChangeRequestFilter((current) => ({ ...current, page: nextChangeRequests.page }));
-    }
-  }, [changeRequestFilter, eventFilter, overviewRepositoryId]);
+    await Promise.all([refreshOverviewStatus(), refreshChangeRequests(), refreshEvents()]);
+  }, [refreshOverviewStatus, refreshChangeRequests, refreshEvents]);
 
   const changeOverviewRepository = useCallback((repositoryId: string) => {
     // 立即使旧请求失效，同时清理跨仓库的详情、分页、勾选及未提交确认。
-    overviewRequestSequence.current += 1;
+    statusRefresher.invalidate();
+    changeRequestRefresher.invalidate();
+    eventRefresher.invalidate();
     setOverviewRepositoryId(repositoryId);
     setOverviewStatus(null);
     setChangeRequests([]);
@@ -10285,7 +10326,7 @@ export default function App() {
     changeRequestSelectionAnchor.current = null;
     eventSelectionAnchor.current = null;
     setOverviewConfirmation(null);
-  }, []);
+  }, [statusRefresher, changeRequestRefresher, eventRefresher]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -10325,10 +10366,8 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refreshOperationalData]);
   useEffect(() => {
-    void refreshOverviewData().catch((reason) => {
-      setError(reason instanceof Error ? reason.message : "概览统计与列表加载失败");
-    });
-    const timer = window.setInterval(() => { void refreshOverviewData().catch(() => undefined); }, 3000);
+    void refreshOverviewData();
+    const timer = window.setInterval(() => { void refreshOverviewData(); }, 3000);
     return () => window.clearInterval(timer);
   }, [refreshOverviewData]);
   useEffect(() => {
@@ -10440,14 +10479,14 @@ export default function App() {
   }
 
   function changeOverviewChangeRequestFilter(filter: OverviewFilter) {
-    overviewRequestSequence.current += 1;
+    changeRequestRefresher.invalidate();
     changeRequestSelectionAnchor.current = null;
     if (overviewSelectionScopeChanged(changeRequestFilter, filter)) cancelChangeRequestSelection();
     setChangeRequestFilter({ ...filter, page: 1 });
   }
 
   function changeOverviewEventFilter(filter: OverviewFilter) {
-    overviewRequestSequence.current += 1;
+    eventRefresher.invalidate();
     eventSelectionAnchor.current = null;
     if (overviewSelectionScopeChanged(eventFilter, filter)) cancelEventSelection();
     setEventFilter({ ...filter, page: 1 });
@@ -10455,13 +10494,13 @@ export default function App() {
 
   function changeOverviewChangeRequestPage(page: number) {
     // 翻页只重置区间起点，立即隔离迟到响应，已选记录保持不变。
-    overviewRequestSequence.current += 1;
+    changeRequestRefresher.invalidate();
     changeRequestSelectionAnchor.current = null;
     setChangeRequestFilter((current) => ({ ...current, page }));
   }
 
   function changeOverviewEventPage(page: number) {
-    overviewRequestSequence.current += 1;
+    eventRefresher.invalidate();
     eventSelectionAnchor.current = null;
     setEventFilter((current) => ({ ...current, page }));
   }
@@ -10816,16 +10855,16 @@ export default function App() {
     // 配置删除或改名后，局部仓库条件也及时回到全部，避免隐形的失效筛选。
     const ids = new Set(overviewRepositories.map((item) => item.id));
     if (changeRequestFilter.repositoryId && !ids.has(changeRequestFilter.repositoryId)) {
-      overviewRequestSequence.current += 1;
+      changeRequestRefresher.invalidate();
       cancelChangeRequestSelection();
       setChangeRequestFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
     }
     if (eventFilter.repositoryId && !ids.has(eventFilter.repositoryId)) {
-      overviewRequestSequence.current += 1;
+      eventRefresher.invalidate();
       cancelEventSelection();
       setEventFilter((current) => ({ ...current, repositoryId: "", page: 1 }));
     }
-  }, [overviewRepositories, changeRequestFilter.repositoryId, eventFilter.repositoryId]);
+  }, [overviewRepositories, changeRequestFilter.repositoryId, eventFilter.repositoryId, changeRequestRefresher, eventRefresher]);
 
   useEffect(() => {
     const enabledIds = new Set(enabledRepositories.map((repository) => repository.id));
@@ -10889,6 +10928,16 @@ export default function App() {
           </div>
           <div className="top-actions">
             <label className="token-field"><span>管理 Token</span><input type="password" value={token} placeholder="本机模式可留空" onChange={(event) => setToken(event.target.value)} onBlur={() => { persistToken(token); if (!editing) void load(); }} /></label>
+            {tab === "overview" && (
+              <button
+                type="button"
+                className="button secondary"
+                aria-label="刷新概览列表"
+                aria-busy={changeRequestRefresh.busy || eventRefresh.busy}
+                disabled={loading || changeRequestRefresh.busy || eventRefresh.busy}
+                onClick={() => { void refreshOverviewLists(); }}
+              >{changeRequestRefresh.busy || eventRefresh.busy ? "刷新中…" : "刷新"}</button>
+            )}
             {tab !== "model-providers" && (configurableTab || editing) && (
               editing ? (
                 <div className="button-group edit-actions">
@@ -10926,6 +10975,11 @@ export default function App() {
                   eventFilter={eventFilter}
                   changeRequestPage={changeRequestPage}
                   eventPage={eventPage}
+                  statusRefreshError={statusRefresh.error}
+                  changeRequestRefresh={changeRequestRefresh}
+                  eventRefresh={eventRefresh}
+                  onRefreshChangeRequests={() => { void refreshChangeRequests(true); }}
+                  onRefreshEvents={() => { void refreshEvents(true); }}
                   emittingKey={emittingKey}
                   triggeringKeys={triggeringKeys}
                   replayingEventIds={replayingEventIds}
