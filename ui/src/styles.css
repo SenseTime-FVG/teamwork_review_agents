@@ -45,6 +45,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .service-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px rgba(96, 211, 148, .1); }
 .service-dot.busy { background: var(--blue); animation: pulse 1.4s infinite; }
 .service-dot.paused { background: var(--orange); box-shadow: 0 0 0 4px rgba(242, 166, 90, .1); }
+.service-dot.error { background: #ff8585; box-shadow: 0 0 0 4px rgba(255, 133, 133, .12); }
 
 .main { min-width: 0; }
 .topbar { height: 92px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 32px; border-bottom: 1px solid var(--line-soft); background: rgba(7, 11, 18, .65); backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 20; }
@@ -95,6 +96,7 @@ code, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
 .hero-card { padding: 28px 30px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border: 1px solid #264332; border-radius: 14px; background: linear-gradient(115deg, rgba(27, 61, 43, .62), rgba(13, 24, 28, .68) 55%, rgba(13, 20, 31, .75)); box-shadow: inset 0 1px rgba(255, 255, 255, .02); }
 .hero-card h1 { margin: 8px 0 6px; color: #edf9f2; font-size: 27px; letter-spacing: -.035em; }
 .hero-card p { margin: 0; color: #90a89b; font-size: 12px; }
+.hero-card.unhealthy { border-color: #7b3b44; background: linear-gradient(115deg, #321b22, #111923); }
 .button-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .button { border: 1px solid transparent; border-radius: 8px; padding: 9px 14px; font-size: 12px; font-weight: 700; cursor: pointer; transition: .15s ease; white-space: nowrap; }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
@@ -894,6 +896,8 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .alert { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; padding: 11px 14px; border: 1px solid; border-radius: 8px; font-size: 11px; }
 .alert.error { color: #ffaaaa; border-color: #603036; background: #211216; }
+/* 后台故障原因和重试时间分行，长数据库路径也不能撑出告警框。 */
+.alert.runtime-health-alert { display: block; line-height: 1.7; overflow-wrap: anywhere; }
 .alert.success { color: #91e6b7; border-color: #28563d; background: #10241a; }
 /* CI 等待有多行期限与保留说明，不能套用普通告警的左右分栏布局。 */
 .alert.ci-wait-note { display: block; line-height: 1.7; }

@@ -27,6 +27,7 @@ import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } f
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import { createOverviewRefresher } from "./overviewRefresh";
+import { runtimeHealth } from "./runtimeHealth";
 import type { OverviewRefreshState } from "./overviewRefresh";
 import { preflightRunIdFromHash, withoutPreflightHash } from "./preflightDeepLink";
 import { overviewSelectionRange, toggleOverviewRecords, refreshOverviewSelection, overviewSelectionScopeChanged } from "./overviewSelection";
@@ -2033,6 +2034,7 @@ function Overview(props: {
     id: string;
   } | null>(null);
   const overviewStatus = props.overviewStatus;
+  const health = runtimeHealth(props.status);
   const stats = overviewStatus?.stats ?? EMPTY_STATUS.stats;
   const runTotal = Object.values(stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(stats.events).reduce((sum, value) => sum + value, 0);
@@ -2045,10 +2047,10 @@ function Overview(props: {
   const selectedEventIds = new Set(selectedEventItems.map((event) => event.event_id));
   return (
     <div className="page-stack">
-      <section className="hero-card">
+      <section className={`hero-card${health.hasError ? " unhealthy" : ""}`}>
         <div>
           <span className="eyebrow">后台调度器 · 全局</span>
-          <h1>{props.status.paused ? "扫描已暂停" : props.status.running_cycle ? "正在扫描" : props.status.dispatching_events ? "Agent 调度进行中" : "服务运行正常"}</h1>
+          <h1>{health.title}</h1>
           <p>配置版本 {shortRevision(props.status.config_revision)} · 全局最近扫描完成 {timeText(props.status.last_finished_at)}</p>
         </div>
         <div className="button-group">
@@ -2062,11 +2064,16 @@ function Overview(props: {
           </DelayedTooltipButton>
         </div>
       </section>
-      {(props.status.config_error || props.status.last_error || props.status.last_dispatch_error) && (
-        <div className="alert error">{props.status.config_error ?? props.status.last_error ?? props.status.last_dispatch_error}</div>
-      )}
+      {health.alerts.map((alert) => (
+        <div className="alert error runtime-health-alert" role="alert" key={alert.key}>
+          <div>{alert.message}</div>
+          {alert.failedAt && <div>异常时间：{timeText(alert.failedAt)}{alert.retryAt ? ` · 计划自动重试：${timeText(alert.retryAt)}` : alert.recovering ? " · 正在尝试恢复，成功后解除告警" : ""}</div>}
+        </div>
+      ))}
       {props.statusRefreshError && <div className="alert error" role="alert">概览统计刷新失败：{props.statusRefreshError}</div>}
-      {!overviewStatus ? (!props.statusRefreshError && <div className="empty" role="status">正在加载所选范围的统计…</div>) : (
+      {!overviewStatus ? (!props.statusRefreshError && <div className="empty" role="status">正在加载所选范围的统计…</div>) : overviewStatus.stats_available === false ? (
+        <div className="alert error" role="alert">概览统计暂不可用：{overviewStatus.status_error}</div>
+      ) : (
         <div className="metric-grid">
           <div className="metric-card"><span>已扫描 MR / PR</span><strong>{changeRequestTotal}</strong><small>{stats.change_requests.opened ?? 0} 个处于打开状态</small></div>
           <div className="metric-card"><span>变化事件</span><strong>{eventTotal}</strong><small>{pendingEvents} 个待处理</small></div>
@@ -2074,7 +2081,7 @@ function Overview(props: {
           {props.repositoryId ? (
             <div className="metric-card"><span>最近成功扫描</span><strong>{overviewStatus.repository_last_scan_completed_at ? "已完成" : "暂无记录"}</strong><small>{dateTimeText(overviewStatus.repository_last_scan_completed_at)}</small></div>
           ) : (
-            <div className="metric-card"><span>最近扫描</span><strong>{props.status.running_cycle ? "进行中" : "已结束"}</strong><small>{timeText(props.status.last_started_at)}</small></div>
+            <div className="metric-card"><span>最近扫描</span><strong>{health.scanLabel}</strong><small>{timeText(props.status.last_started_at)}</small></div>
           )}
         </div>
       )}
@@ -10287,15 +10294,18 @@ export default function App() {
     const preflightRunsRequest = filter.type === "agent"
       ? Promise.resolve<PreflightRunSummary[]>([])
       : api<PreflightRunSummary[]>(`/api/preflight-runs?${query}`);
-    const [nextStatus, nextRuns, nextPreflightRuns] = await Promise.all([
-      api<RuntimeStatus>("/api/status"),
+    // 健康信息独立生效；执行列表读库失败或超时不能遮住后台故障告警。
+    const [statusResult, runsResult, preflightResult] = await Promise.allSettled([
+      api<RuntimeStatus>("/api/status").then((nextStatus) => {
+        if (requestSequence === operationalRequestSequence.current) setStatus(nextStatus);
+      }),
       runsRequest,
       preflightRunsRequest,
     ]);
     if (requestSequence !== operationalRequestSequence.current) return;
-    setStatus(nextStatus);
-    setRuns(nextRuns);
-    setPreflightRuns(nextPreflightRuns);
+    if (statusResult.status === "rejected") throw statusResult.reason;
+    if (runsResult.status === "fulfilled") setRuns(runsResult.value);
+    if (preflightResult.status === "fulfilled") setPreflightRuns(preflightResult.value);
   }, []);
 
   const refreshChangeRequests = useCallback((manual = false) => changeRequestRefresher.refresh(
@@ -10341,10 +10351,11 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
+      // 数据库请求可能长时间等待锁，首屏不能等待执行列表才展示健康告警。
+      void refreshOperationalData().catch(() => undefined);
       const [config, options] = await Promise.all([
         api<{ revision: string; document: ConfigDocument; error?: string }>("/api/config"),
         api<{ events: string[] }>("/api/options"),
-        refreshOperationalData(),
       ]);
       const normalized = normalizeDocument(config.document);
       setDocument(normalized);
@@ -10914,7 +10925,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">TR</div><div><strong>Teamwork</strong><span>Review Agents</span></div></div>
         <nav>{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}><span>{item.mark}</span>{item.label}</button>)}</nav>
-        <div className="sidebar-footer"><span className={`service-dot ${status.paused ? "paused" : status.running_cycle || status.dispatching_events ? "busy" : ""}`} /><div><strong>{status.paused ? "已暂停" : "后台在线"}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
+        <div className="sidebar-footer"><span className={`service-dot ${runtimeHealth(status).hasError ? "error" : status.paused ? "paused" : status.running_cycle || status.dispatching_events ? "busy" : ""}`} /><div><strong>{runtimeHealth(status).sidebarLabel}</strong><small>rev {shortRevision(revision || status.config_revision)}</small></div></div>
       </aside>
       <main className="main" ref={mainRef}>
         <header className="topbar">

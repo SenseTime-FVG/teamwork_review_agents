@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from typing import Any
 
@@ -14,6 +17,12 @@ from .config_manager import ConfigManager
 from .orchestrator import CycleSummary, Orchestrator
 from .scheduler import next_scheduled_at, schedule_signature, schedule_summary
 from .workspace_cleanup import WorkspaceCleanupManager
+
+
+LOGGER = logging.getLogger(__name__)
+WORKER_LABELS = {"scanner": "仓库扫描", "dispatcher": "Agent 调度", "scheduler": "定时调度"}
+RETRY_INITIAL_SECONDS = 5.0
+RETRY_MAX_SECONDS = 60.0
 
 
 class BackgroundRuntime:
@@ -33,6 +42,9 @@ class BackgroundRuntime:
         self._scan_task: asyncio.Task[None] | None = None
         self._dispatch_task: asyncio.Task[None] | None = None
         self._schedule_task: asyncio.Task[None] | None = None
+        self._worker_failures: dict[str, dict[str, Any]] = {}
+        self.status_error: str | None = None
+        self._status_read_error: str | None = None
         self._scheduled_occurrence_tasks: set[asyncio.Task[None]] = set()
         self._schedule_deadlines: dict[str, tuple[str, float]] = {}
         self._orchestrator = Orchestrator(
@@ -65,19 +77,19 @@ class BackgroundRuntime:
 
         self.curl_runtime.start()
         self.workspace_cleanup.start()
-        if self._scan_task is None:
+        if self._scan_task is None or self._scan_task.done():
             self._scan_task = asyncio.create_task(
-                self._scan_loop(),
+                self._supervise_loop("scanner", self._scan_loop),
                 name="teamwork-background-scanner",
             )
-        if self._dispatch_task is None:
+        if self._dispatch_task is None or self._dispatch_task.done():
             self._dispatch_task = asyncio.create_task(
-                self._dispatch_loop(),
+                self._supervise_loop("dispatcher", self._dispatch_loop),
                 name="teamwork-background-dispatcher",
             )
-        if self._schedule_task is None:
+        if self._schedule_task is None or self._schedule_task.done():
             self._schedule_task = asyncio.create_task(
-                self._schedule_loop(),
+                self._supervise_loop("scheduler", self._schedule_loop),
                 name="teamwork-background-scheduler",
             )
 
@@ -105,11 +117,108 @@ class BackgroundRuntime:
         )
         tasks = (*tasks, *tuple(self._scheduled_occurrence_tasks))
         if tasks:
-            await asyncio.gather(*tasks)
+            # 已异常退出的任务不能阻断其余任务与子进程的关闭。
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._scan_task = None
         self._dispatch_task = None
         self._schedule_task = None
         self._scheduled_occurrence_tasks.clear()
+
+    def _failure_message(self, exc: BaseException) -> str:
+        """保留异常类型及 SQLite 诊断，剩余空间仅代表记录异常时的状态。"""
+
+        message = f"{type(exc).__name__}: {exc}"
+        code = getattr(exc, "sqlite_errorcode", None)
+        if code is not None:
+            directory = self.store.path.parent
+            details = [
+                f"SQLite {getattr(exc, 'sqlite_errorname', 'UNKNOWN')}（{code}）",
+                f"数据库目录：{directory}",
+                f"目录存在：{directory.is_dir()}",
+            ]
+            try:
+                details.append(f"记录时剩余空间：{shutil.disk_usage(directory).free / 1024**3:.2f} GiB")
+            except OSError:
+                details.append("记录时无法读取剩余空间")
+            message += "；" + "；".join(details)
+        return message
+
+    def _record_worker_failure(self, worker: str, exc: BaseException, retry_at: float | None) -> None:
+        """先在内存记录故障，数据库不可用时页面和日志仍能看到错误。"""
+
+        previous = self._worker_failures.get(worker, {})
+        message = self._failure_message(exc)
+        self._worker_failures[worker] = {
+            "error": message,
+            "failed_at": time.time(),
+            "retry_at": retry_at,
+            "consecutive_failures": previous.get("consecutive_failures", 0) + 1,
+        }
+        if worker == "scanner":
+            self.running_cycle = False
+            self.last_error = message
+        elif worker == "dispatcher":
+            self.dispatching_events = False
+            self.last_dispatch_error = message
+        else:
+            self.last_schedule_error = message
+        LOGGER.error("%s后台任务异常：%s", WORKER_LABELS[worker], message, exc_info=exc)
+
+    async def _supervise_loop(self, worker: str, run: Callable[[], Awaitable[None]]) -> None:
+        """监督长期循环，以有上限的退避恢复异常退出，停止请求不触发重启。"""
+
+        while not self._stop_event.is_set():
+            if worker in self._worker_failures:
+                self._worker_failures[worker]["retry_at"] = None
+            try:
+                await run()
+                if self._stop_event.is_set():
+                    return
+                raise RuntimeError("后台循环意外退出")
+            except asyncio.CancelledError as exc:
+                if not self._stop_event.is_set():
+                    self._record_worker_failure(worker, exc, None)
+                raise
+            except Exception as exc:
+                failures = self._worker_failures.get(worker, {}).get("consecutive_failures", 0)
+                delay = min(RETRY_MAX_SECONDS, RETRY_INITIAL_SECONDS * 2 ** min(failures, 8))
+                self._record_worker_failure(worker, exc, time.time() + delay)
+                if worker == "dispatcher":
+                    # 已领取事件仍由持久化幂等与重试次数约束，恢复时重新检查队列。
+                    self._dispatch_event.set()
+                self._persist_status_safely()
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+
+    def _background_task_status(self) -> dict[str, dict[str, Any]]:
+        """将实际任务存活状态与最近故障一起交给 Dashboard。"""
+
+        result = {}
+        for worker, task in (
+            ("scanner", self._scan_task),
+            ("dispatcher", self._dispatch_task),
+            ("scheduler", self._schedule_task),
+        ):
+            failure = dict(self._worker_failures.get(worker, {}))
+            state = "not_started" if task is None else "running"
+            if task is not None and task.done():
+                state = "stopped"
+                if not failure.get("error"):
+                    exc = None if task.cancelled() else task.exception()
+                    failure["error"] = str(exc) if exc else "后台任务已停止"
+            elif failure:
+                state = "retrying" if failure.get("retry_at") is not None else "recovering"
+            result[worker] = {"state": state, **failure}
+        return result
+
+    def _clear_worker_failure(self, worker: str) -> None:
+        """只有实际工作恢复成功才清除故障，保留独立定时周期的执行错误。"""
+
+        failure = self._worker_failures.pop(worker, None)
+        if worker == "scheduler" and failure and self.last_schedule_error == failure["error"]:
+            self.last_schedule_error = None
 
     def notify_config_changed(self) -> None:
         """唤醒后台，让下一周期应用最新配置。"""
@@ -209,25 +318,50 @@ class BackgroundRuntime:
                 "last_schedule_finished_at": self.last_schedule_finished_at,
                 "last_schedule_summary": self.last_schedule_summary,
                 "last_schedule_error": self.last_schedule_error,
+                "status_error": self.status_error,
+                "background_tasks": self._background_task_status(),
             },
         )
+
+    def _persist_status_safely(self) -> None:
+        """收尾和监督路径不能因保存状态失败再次退出或覆盖原始异常。"""
+
+        try:
+            self._persist_status()
+        except Exception as exc:
+            message = self._failure_message(exc)
+            if message != self.status_error:
+                LOGGER.error("后台状态保存失败：%s", message, exc_info=exc)
+            self.status_error = message
+        else:
+            self.status_error = None
 
     async def snapshot(self, repository_id: str | None = None) -> dict[str, Any]:
         """组合全局服务状态与可选仓库范围的统计，筛选不改变调度范围。"""
 
-        stats = await asyncio.to_thread(self.store.dashboard_stats, repository_id)
+        stats = {"runs": {}, "events": {}, "change_requests": {}}
         repository_scan = None
-        if repository_id:
-            repository_scan = await asyncio.to_thread(
-                self.store.get_service_state,
-                Orchestrator._scan_state_key(repository_id),
-            )
+        read_error = None
+        try:
+            stats = await asyncio.to_thread(self.store.dashboard_stats, repository_id)
+            if repository_id:
+                repository_scan = await asyncio.to_thread(
+                    self.store.get_service_state,
+                    Orchestrator._scan_state_key(repository_id),
+                )
+        except Exception as exc:
+            # 健康信息来自内存；数据库损坏时也应返回告警，而非只返回 HTTP 500。
+            read_error = self._failure_message(exc)
+            if read_error != self._status_read_error:
+                LOGGER.error("概览统计读取失败：%s", read_error, exc_info=exc)
+        self._status_read_error = read_error
+        background_tasks = self._background_task_status()
         return {
             "repository_id": repository_id or None,
             "repository_last_scan_completed_at": (repository_scan or {}).get("completed_at"),
             "paused": self.paused,
-            "running_cycle": self.running_cycle,
-            "dispatching_events": self.dispatching_events,
+            "running_cycle": self.running_cycle and background_tasks["scanner"]["state"] != "stopped",
+            "dispatching_events": self.dispatching_events and background_tasks["dispatcher"]["state"] != "stopped",
             "config_revision": self._revision,
             "config_error": self.manager.last_error,
             "last_started_at": self.last_started_at,
@@ -242,6 +376,9 @@ class BackgroundRuntime:
             "last_schedule_finished_at": self.last_schedule_finished_at,
             "last_schedule_summary": self.last_schedule_summary,
             "last_schedule_error": self.last_schedule_error,
+            "status_error": self.status_error or read_error,
+            "stats_available": read_error is None,
+            "background_tasks": background_tasks,
             "scheduled_rules": [
                 {
                     "name": rule.name,
@@ -265,9 +402,8 @@ class BackgroundRuntime:
         await self._repository_ready.wait()
         self.running_cycle = True
         self.last_started_at = time.time()
-        self.last_error = None
-        self._persist_status()
         try:
+            self._persist_status()
             summary = CycleSummary()
             orchestrator = self._orchestrator
             self._active_orchestrators.add(orchestrator)
@@ -276,15 +412,17 @@ class BackgroundRuntime:
             finally:
                 self._active_orchestrators.discard(orchestrator)
             self.last_summary = summary.to_dict()
-            if summary.errors:
-                self.last_error = "; ".join(summary.errors)
+            self.last_error = "; ".join(summary.errors) if summary.errors else None
+            if not summary.errors:
+                self._clear_worker_failure("scanner")
         except Exception as exc:
-            self.last_error = str(exc)
+            self.last_error = self._failure_message(exc)
             self.last_summary = None
+            raise
         finally:
             self.running_cycle = False
             self.last_finished_at = time.time()
-            self._persist_status()
+            self._persist_status_safely()
             # 即使单个仓库失败，其他仓库本轮已产生的事件仍需及时调度。
             self._dispatch_event.set()
 
@@ -297,9 +435,8 @@ class BackgroundRuntime:
         await self._repository_ready.wait()
         self.dispatching_events = True
         self.last_dispatch_started_at = time.time()
-        self.last_dispatch_error = None
-        self._persist_status()
         try:
+            self._persist_status()
             summary = CycleSummary()
             orchestrator = self._orchestrator
             self._active_orchestrators.add(orchestrator)
@@ -308,15 +445,15 @@ class BackgroundRuntime:
             finally:
                 self._active_orchestrators.discard(orchestrator)
             self.last_dispatch_summary = summary.to_dict()
-            if summary.errors:
-                self.last_dispatch_error = "; ".join(summary.errors)
+            self.last_dispatch_error = "; ".join(summary.errors) if summary.errors else None
         except Exception as exc:
-            self.last_dispatch_error = str(exc)
+            self.last_dispatch_error = self._failure_message(exc)
             self.last_dispatch_summary = None
+            raise
         finally:
             self.dispatching_events = False
             self.last_dispatch_finished_at = time.time()
-            self._persist_status()
+            self._persist_status_safely()
         cutoff = time.time() - self.manager.config.web.log_retention_days * 86400
         await asyncio.to_thread(self.store.prune_run_logs, cutoff)
         await asyncio.to_thread(
@@ -324,6 +461,8 @@ class BackgroundRuntime:
             cutoff,
             max_attempts=self.manager.config.runtime.event_retry_count + 1,
         )
+        if not self.last_dispatch_error:
+            self._clear_worker_failure("dispatcher")
 
     async def _scan_loop(self) -> None:
         """按固定间隔扫描 Provider，不等待事件执行循环。"""
@@ -390,25 +529,24 @@ class BackgroundRuntime:
             await orchestrator.request_shutdown()
             return
         self.last_schedule_started_at = time.time()
-        self.last_schedule_error = None
         self._active_orchestrators.add(orchestrator)
-        self._persist_status()
         try:
+            self._persist_status()
             summary = await orchestrator.run_scheduled_rule(
                 rule,
                 scheduled_at=scheduled_at,
                 schedule_signature=signature,
             )
             self.last_schedule_summary = summary.to_dict()
-            if summary.errors:
-                self.last_schedule_error = "; ".join(summary.errors)
+            self.last_schedule_error = "; ".join(summary.errors) if summary.errors else None
         except Exception as exc:
-            self.last_schedule_error = str(exc)
+            self.last_schedule_error = self._failure_message(exc)
             self.last_schedule_summary = None
+            LOGGER.error("定时周期执行失败：%s", self.last_schedule_error, exc_info=exc)
         finally:
             self._active_orchestrators.discard(orchestrator)
             self.last_schedule_finished_at = time.time()
-            self._persist_status()
+            self._persist_status_safely()
 
     def _track_scheduled_occurrence(self, task: asyncio.Task[None]) -> None:
         """保存并自动清理仍在执行的定时周期任务引用。"""
@@ -477,6 +615,7 @@ class BackgroundRuntime:
                     self._schedule_deadlines[name] = (signature, deadline)
 
             deadlines = [item[1] for item in self._schedule_deadlines.values()]
+            self._clear_worker_failure("scheduler")
             timeout = self.manager.config.web.config_poll_seconds
             if deadlines:
                 timeout = min(timeout, max(0.05, min(deadlines) - time.time()))
