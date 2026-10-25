@@ -463,6 +463,15 @@ export type RuntimeStatus = {
   last_schedule_finished_at?: number | null;
   last_schedule_summary?: Record<string, unknown> | null;
   last_schedule_error?: string | null;
+  status_error?: string | null;
+  stats_available?: boolean;
+  background_tasks?: Record<string, {
+    state: "not_started" | "running" | "retrying" | "recovering" | "stopped";
+    error?: string;
+    failed_at?: number;
+    retry_at?: number | null;
+    consecutive_failures?: number;
+  }>;
   scheduled_rules?: Array<{
     name: string;
     enabled: boolean;
