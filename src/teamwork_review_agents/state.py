@@ -19,6 +19,7 @@ from .models import (
     CommitStatusTarget,
     PreflightResult,
 )
+from .sqlite_diagnostics import log_sqlite_failure
 
 
 CANCEL_SOURCE_ADMINISTRATOR = "administrator"
@@ -54,18 +55,47 @@ class StateStore:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        """创建启用 WAL 的连接，并在事务结束后确定关闭。"""
+        """创建 WAL 连接，按阶段记录故障并保留最初的操作异常。"""
 
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection: sqlite3.Connection | None = None
+        failure: BaseException | None = None
+        operation_error: BaseException | None = None
+        phase = "open"
         try:
+            connection = sqlite3.connect(self.path, timeout=30)
+            phase = "row_factory"
             connection.row_factory = sqlite3.Row
+            phase = "enable_wal"
             connection.execute("PRAGMA journal_mode=WAL")
+            phase = "enable_foreign_keys"
             connection.execute("PRAGMA foreign_keys=ON")
+            phase = "set_busy_timeout"
             connection.execute("PRAGMA busy_timeout=30000")
+            phase = "enter_transaction"
             with connection:
-                yield connection
+                try:
+                    yield connection
+                except BaseException as exc:
+                    operation_error = exc
+                    phase = "rollback"
+                    raise
+                phase = "commit"
+        except BaseException as exc:
+            failure = operation_error if operation_error is not None else exc
+            log_sqlite_failure(self.path, "operation" if operation_error is not None else phase, failure)
+            if exc is not failure:
+                log_sqlite_failure(self.path, phase, exc, secondary=True)
+                # 回滚失败只能作为附加原因，不能遮住最初的业务操作异常。
+                raise failure from exc
+            raise
         finally:
-            connection.close()
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException as exc:
+                    log_sqlite_failure(self.path, "close", exc, secondary=failure is not None)
+                    if failure is None:
+                        raise
 
     def initialize(self) -> None:
         """创建数据库目录和全部基础表。"""
