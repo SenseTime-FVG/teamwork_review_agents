@@ -31,7 +31,7 @@
 
 ## 自动失败诊断
 
-仓库详情的本地 CI 配置支持 `failure_diagnosis_enabled`（默认关闭）和 `failure_diagnosis_agent`（默认 `ci-failure-diagnoser`）。开启后，自动 MR/PR CI 的 `failure`、`timed_out` 以及重试耗尽的 `error` 会启动独立诊断 Agent。要求 CI 的正常审核仍然终止，不因诊断报告完成而放行。取消、被新提交取代以及手动默认分支 CI 不触发诊断。
+仓库详情的本地 CI 配置支持 `failure_diagnosis_enabled`（默认开启）和 `failure_diagnosis_agent`（默认 `ci-failure-diagnoser`）。新启用本地 CI 时默认启用失败诊断；已启用 CI 但未配置诊断开关的旧仓库，也按开启处理。明确配置 `false` 时保持关闭，切换 CI 开关不会覆盖这一选择。本地 CI 未启用时不会单独启动诊断。自动 MR/PR CI 的 `failure`、`timed_out` 以及重试耗尽的 `error` 会启动独立诊断 Agent。要求 CI 的正常审核仍然终止，不因诊断报告完成而放行。取消、被新提交取代以及手动默认分支 CI 不触发诊断。
 
 首次加载提供内置 `ci-failure-diagnoser`，在 Agent 页可修改模型、effort、提示词、轮次和超时，也可以删除。默认最多 32 轮、总时限 600 秒，另外沿用空闲超时和取消控制。配置中的 `builtin_agents_version` 记录模板已初始化，删除后重启不会恢复。重命名会同步仓库引用；删除则保留引用，后续 CI 详情显示“诊断已跳过”及指定 Agent 不存在的原因，不回退到其他 Agent。
 

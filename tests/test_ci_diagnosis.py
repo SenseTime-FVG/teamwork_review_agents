@@ -31,7 +31,7 @@ def diagnosis_case(configured_app_factory, snapshot_factory, monkeypatch):
     config = configured_app_factory()
     config.runtime.codex.model = "gpt-5.6-terra"
     settings = config.repositories[0].preflight
-    settings.failure_diagnosis_enabled = True
+    # 不显式开启诊断，覆盖配置缺省时的实际运行行为。
     settings.publish_failure_comment = False
     monkeypatch.setenv("GITHUB_TOKEN", "diagnosis-test-secret")
     snapshot = snapshot_factory(provider="github-main")
@@ -68,6 +68,28 @@ async def diagnose(case):
     """通过生产调度入口执行诊断。"""
 
     return await diagnose_ci_failure(case.config, case.store, case.executor, case.event, case.result)
+
+
+@pytest.mark.parametrize("configured", [None, False, True])
+def test_ci_diagnosis_default_and_explicit_choice_survive_reload(configured_app_factory, configured):
+    """旧仓库缺省诊断开启，明确关闭可跨 CI 开关切换、保存和重启保留。"""
+
+    config = configured_app_factory()
+    manager = ConfigManager(config.config_path)
+    document = manager.document()
+    preflight = {"enabled": True, "steps": [{"name": "test", "command": ["pytest"]}]}
+    if configured is not None:
+        preflight["failure_diagnosis_enabled"] = configured
+    document["repositories"][0]["preflight"] = preflight
+    expected = configured is not False
+    for enabled in [True, False, True]:
+        preflight["enabled"] = enabled
+        manager.save(document)
+        manager = ConfigManager(config.config_path)
+        settings = manager.config.repositories[0].preflight
+        assert settings.enabled is enabled
+        assert settings.failure_diagnosis_enabled is expected
+        assert settings.failure_diagnosis_agent == CI_DIAGNOSIS_AGENT
 
 
 @pytest.mark.parametrize("explicit_reference", [False, True])

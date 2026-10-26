@@ -40,6 +40,8 @@ def preflight_config(tmp_path):
                     "workspace": str(tmp_path / "workspace"),
                     "preflight": {
                         "enabled": True,
+                        # 此组仅验证审核门禁；默认开启诊断的集成场景由专门测试覆盖。
+                        "failure_diagnosis_enabled": False,
                         "steps": [{"name": "test", "command": ["pytest"]}],
                     },
                 }

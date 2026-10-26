@@ -5023,7 +5023,8 @@ function RepositoryDetailEditor(props: {
     enabled: repository.preflight?.enabled ?? false,
     cache_enabled: repository.preflight?.cache_enabled ?? true,
     publish_failure_comment: repository.preflight?.publish_failure_comment ?? false,
-    failure_diagnosis_enabled: repository.preflight?.failure_diagnosis_enabled ?? false,
+    // 默认开启诊断，保留明确关闭的配置，切换 CI 开关时不覆盖该选择。
+    failure_diagnosis_enabled: repository.preflight?.failure_diagnosis_enabled ?? true,
     failure_diagnosis_agent: repository.preflight?.failure_diagnosis_agent ?? "ci-failure-diagnoser",
     status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
     timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
