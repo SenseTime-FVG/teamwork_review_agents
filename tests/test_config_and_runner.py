@@ -150,6 +150,7 @@ def test_example_config_is_valid() -> None:
     assert config.providers == {}
     assert config.repositories == []
     assert set(config.agents) == {
+        "ci-failure-diagnoser",
         "general-reviewer",
         "dependency&incremental-doc-update-runner",
         "dependency-reviewer",
@@ -158,7 +159,10 @@ def test_example_config_is_valid() -> None:
     assert all(
         agent.prompt_file is not None and agent.prompt_file.is_file()
         for agent in config.agents.values()
+        if agent.builtin_kind is None
     )
+    assert config.agents["ci-failure-diagnoser"].prompt
+    assert config.agents["ci-failure-diagnoser"].builtin_kind == "ci_failure_diagnosis"
     assert config.agents[
         "dependency&incremental-doc-update-runner"
     ].allowed_sub_agents == ["dependency-reviewer", "incremental-doc-updater"]

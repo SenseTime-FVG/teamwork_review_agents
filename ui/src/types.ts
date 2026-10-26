@@ -18,6 +18,8 @@ export type RepositoryPreflight = {
   enabled?: boolean;
   cache_enabled?: boolean;
   publish_failure_comment?: boolean;
+  failure_diagnosis_enabled?: boolean;
+  failure_diagnosis_agent?: string;
   status_context?: string;
   timeout_seconds?: number;
   max_output_bytes?: number;
@@ -142,6 +144,7 @@ export type RepositoryGitDetail = {
 };
 
 export type Agent = {
+  builtin_kind?: "ci_failure_diagnosis" | null;
   context_window_tokens?: number | null;
   prompt_file?: string;
   prompt?: string;
@@ -429,6 +432,7 @@ export type ScheduledRule = {
 };
 
 export type ConfigDocument = {
+  builtin_agents_version?: number;
   database: { path: string };
   scanner: Record<string, unknown>;
   runtime: RuntimeConfig;
@@ -804,6 +808,7 @@ export type PreflightStepRunDetail = {
 };
 
 export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
+  diagnosis?: PreflightDiagnosis | null;
   output: string;
   steps: PreflightStepRunDetail[];
   linked_events: Array<{
@@ -814,4 +819,16 @@ export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" 
     reused: number | boolean;
     linked_at: number;
   }>;
+};
+
+export type PreflightDiagnosis = {
+  preflight_run_id: string;
+  agent_name: string;
+  status: "queued" | "running" | "completed" | "failed" | "timed_out" | "cancelled" | "skipped";
+  agent_run_id?: string | null;
+  report: string;
+  error?: string | null;
+  comment_error?: string | null;
+  created_at: number;
+  finished_at?: number | null;
 };

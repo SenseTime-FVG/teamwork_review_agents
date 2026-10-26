@@ -297,6 +297,8 @@ class ManagedCommentService:
         source_head_sha: str,
         body: str,
         replace_existing: bool,
+        update_existing: bool = False,
+        preflight_run_id: str | None = None,
     ) -> dict[str, Any]:
         """在槽位内发布最新评论，可选择先删除全部历史评论。"""
 
@@ -321,6 +323,13 @@ class ManagedCommentService:
             ttl_seconds=self.config.runtime.lock_ttl_seconds,
             timeout_seconds=self.config.runtime.lock_timeout_seconds,
         ):
+            if preflight_run_id is not None:
+                # 在同一评论锁内核对，避免成功清理后迟到的诊断重建旧失败评论。
+                latest = await asyncio.to_thread(self.store.latest_preflight_run_id, repository_id, number)
+                generation = await asyncio.to_thread(self.store.source_generation, repository_id, number)
+                current_run = await asyncio.to_thread(self.store.get_preflight_run, preflight_run_id)
+                if latest != preflight_run_id or (generation is not None and generation != source_generation) or current_run is None or current_run["status"] not in {"failure", "timed_out", "error"}:
+                    return {"action": "obsolete", "comment_id": None, "source_generation": source_generation}
             records = await asyncio.to_thread(
                 self.store.list_managed_comments,
                 repository_id=repository_id,
@@ -328,7 +337,7 @@ class ManagedCommentService:
                 namespace=namespace,
                 slot=slot,
             )
-            if records and not replace_existing:
+            if records and not replace_existing and not update_existing:
                 current = records[-1]
                 return {
                     "action": "preserved",
@@ -344,6 +353,18 @@ class ManagedCommentService:
                 self.config.scanner,
                 token=token,
             ) as remote:
+                if records and update_existing:
+                    current = records[-1]
+                    comment_id = str(current["remote_comment_id"])
+                    updated = await remote.update_change_request_comment(repository, comment_id, normalized_body, number=number)
+                    if updated:
+                        await asyncio.to_thread(
+                            self.store.save_managed_comment,
+                            repository_id=repository_id, number=number, namespace=namespace, slot=slot,
+                            source_generation=source_generation, remote_comment_id=comment_id,
+                            source_head_sha=source_head_sha, content_hash=stable_hash(normalized_body),
+                        )
+                        return {"action": "updated", "comment_id": comment_id, "source_generation": source_generation}
                 for record in records:
                     await remote.delete_change_request_comment(
                         repository,

@@ -25,9 +25,21 @@
 - `success`：写入平台 `success`，继续启动要求 CI 的 Review Agent。
 - `failure`：GitHub 写入 `failure`、GitLab 写入 `failed`，正常结束要求 CI 的规则路径；不影响同批次未要求 CI 的 Agent。
 - `timed_out`：按代码失败处理并写入平台失败状态，只阻断要求 CI 的规则。
-- `error`：不写入终态 Commit Status，也不发布或改写失败评论；只让要求 CI 的事件路径失败并按 `event_retry_count` 重试。
+- `error`：不写入终态 Commit Status，也不发布普通失败摘要；只让要求 CI 的事件路径失败并按 `event_retry_count` 重试。开启失败诊断后，重试耗尽可单独生成并按失败评论设置同步诊断报告。
 
 启用门禁的仓库会自动产生首次 `change_request.discovered` 事件，不受全局 `scanner.emit_initial_events` 开关影响。GitHub 可在 Ruleset 中把 `status_context`（默认 `teamwork/local-ci`）设为 required status check。GitLab 状态以同名外部作业参与源提交的流水线；若需在平台阻止失败合并，可启用项目的“Pipelines must succeed”。GitLab 若同时产生分支与 MR 流水线，应检查状态是否关联到目标 MR 显示的流水线，避免平台选择其他流水线导致门禁未生效。
+
+## 自动失败诊断
+
+仓库详情的本地 CI 配置支持 `failure_diagnosis_enabled`（默认关闭）和 `failure_diagnosis_agent`（默认 `ci-failure-diagnoser`）。开启后，自动 MR/PR CI 的 `failure`、`timed_out` 以及重试耗尽的 `error` 会启动独立诊断 Agent。要求 CI 的正常审核仍然终止，不因诊断报告完成而放行。取消、被新提交取代以及手动默认分支 CI 不触发诊断。
+
+首次加载提供内置 `ci-failure-diagnoser`，在 Agent 页可修改模型、effort、提示词、轮次和超时，也可以删除。默认最多 32 轮、总时限 600 秒，另外沿用空闲超时和取消控制。配置中的 `builtin_agents_version` 记录模板已初始化，删除后重启不会恢复。重命名会同步仓库引用；删除则保留引用，后续 CI 详情显示“诊断已跳过”及指定 Agent 不存在的原因，不回退到其他 Agent。
+
+诊断使用模型工具循环，只提供完整保留日志的分页搜索、固定失败 SHA 的 Git 对象读取，以及本轮长工具结果的补读。不会执行仓库准备脚本、安装依赖、重跑测试或修改源码。源码对象已清理或不可读取时，报告必须说明证据限制。日志与报告使用现有凭据脱敏机制。
+
+报告和诊断状态单独持久化在 CI 详情，支持复制 Markdown、查看正常 Agent 运行记录和取消诊断。每个 CI 运行原子占位一次；复用同一失败结果不重复调用模型。诊断失败、超时或服务中断可见，但不改变 CI 原始结论。
+
+同时开启 `publish_failure_comment` 时，服务端把诊断报告更新到当前失败评论；过长内容保留在本地详情，评论展示截取部分和详情链接。评论写回在槽位锁内核对最新 CI 及源版本，避免迟到报告覆盖新结果，或在成功清理后重建旧失败评论。评论同步失败会在诊断报告区单独显示，完整报告仍保留。
 
 ## 凭据与安全边界
 

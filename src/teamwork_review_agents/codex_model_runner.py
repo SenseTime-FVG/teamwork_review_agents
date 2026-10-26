@@ -187,7 +187,7 @@ class CodexModelRunner:
             tool_runtime_home = TemporaryAgentHome.create(f"{run_id}-model-tools")
             tool_codex_home = tool_runtime_home.path / "codex-home"
             tool_codex_home.mkdir(mode=0o700)
-            projection = SkillProjection(
+            projection = None if context is not None and context.preflight_run_id is not None else SkillProjection(
                 repository.workspace,
                 {
                     skill_id: skill.path
@@ -210,7 +210,7 @@ class CodexModelRunner:
                         "bridges": list(temporary_home.bridges),
                     },
                 )
-            if projection.marker.is_file():
+            if projection is not None and projection.marker.is_file():
                 _add_git_excludes_file(environment, projection.marker)
 
             if any(
@@ -235,7 +235,12 @@ class CodexModelRunner:
                     )
 
             managed_sandbox = False
-            if agent.sandbox != "danger-full-access":
+            if context is not None and context.preflight_run_id is not None:
+                await emit("system", "run.sandbox_prepared", {
+                    "mode": "read-only", "backend": "ci-readonly-tools",
+                    "message": "诊断只提供服务端日志及固定 SHA 源码读取，不提供命令执行能力",
+                })
+            elif agent.sandbox != "danger-full-access":
                 if not self.config.runtime.managed_sandbox.enabled:
                     error = (
                         "模型 Provider 驱动下，受限 Agent 必须启用 Teamwork 外层沙盒"
@@ -317,7 +322,7 @@ class CodexModelRunner:
                 prompt=prompt,
                 environment=environment,
                 codex_runtime_directory=tool_codex_home,
-                skill_files=projection.skill_files,
+                skill_files=projection.skill_files if projection is not None else {},
                 managed_sandbox=managed_sandbox,
                 redactor=active_redactor,
                 emit=emit,
@@ -472,7 +477,7 @@ class CodexModelRunner:
                             control.stop = await requested_cancellation()
                     except Exception:
                         pass
-                if control.stop is None and parent_run_id is not None and now - started_at >= agent.timeout_seconds:
+                if control.stop is None and (parent_run_id is not None or (context is not None and context.preflight_run_id is not None)) and now - started_at >= agent.timeout_seconds:
                     control.stop = RunStop(
                         "timed_out", "agent_total_timeout", "Agent 超过总运行时限", "run.timed_out",
                     )
@@ -875,6 +880,10 @@ class CodexModelRunner:
             allow_sub_agents=bool(agent.allowed_sub_agents),
             allow_publish_comment=agent.managed_comment,
         )
+        if context is not None and context.preflight_run_id is not None:
+            from .ci_diagnosis_tools import ci_diagnosis_tools
+
+            tools = ci_diagnosis_tools()
         tool_executor = ModelToolExecutor(
             config=self.config,
             agent=agent,

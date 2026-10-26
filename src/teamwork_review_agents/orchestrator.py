@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,7 @@ from .state import (
 
 
 EVENT_RETRY_BACKOFF_SECONDS = 1.0
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -569,6 +571,24 @@ class Orchestrator:
             idempotency_key=invocation.idempotency_key,
         )
 
+    async def _diagnose_preflight(self, event: ChangeEvent, result: Any, summary: CycleSummary) -> None:
+        """诊断错误单独记录，不使已失败的 CI 重新执行或放行审核。"""
+
+        if self._shutdown_requested:
+            return
+        from .ci_diagnosis import diagnose_ci_failure
+
+        try:
+            if await diagnose_ci_failure(self.config, self.store, self.executor, event, result):
+                summary.agent_runs += 1
+        except Exception:
+            LOGGER.exception("CI 失败诊断调度异常，CI 运行 %s", result.run_id)
+            # 持久化不可用时保留底层日志；告警不能反过来改变 CI 的真实结果。
+            try:
+                await asyncio.to_thread(self.store.finish_preflight_diagnosis, result.run_id, status="failed", error="CI 诊断调度异常，请查看后台错误日志")
+            except Exception:
+                LOGGER.exception("无法保存 CI 诊断异常，CI 运行 %s", result.run_id)
+
     async def run_scheduled_rule(
         self,
         rule: ScheduledRuleConfig,
@@ -944,6 +964,7 @@ class Orchestrator:
                             preflight_result.run_id,
                             reused=preflight_result.reused,
                         )
+                        await self._diagnose_preflight(representative, preflight_result, summary)
                         if preflight_result.status in {"failure", "timed_out"}:
                             summary.preflight_failures += 1
                             ready_preflight_invocations = []

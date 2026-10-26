@@ -458,6 +458,9 @@ class PreflightConfig(BaseModel):
     enabled: bool = False
     cache_enabled: bool = True
     publish_failure_comment: bool = False
+    failure_diagnosis_enabled: bool = False
+    # 保留失效引用供 UI 提示；Agent 被删除时运行期跳过诊断。
+    failure_diagnosis_agent: str = "ci-failure-diagnoser"
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
     timeout_seconds: PositiveInt = 1800
     max_output_bytes: PositiveInt = 1_000_000
@@ -603,6 +606,7 @@ class AgentConfig(BaseModel):
     """一个可由模型 Provider 执行的 Agent 配置。"""
 
     prompt_file: Path | None = None
+    builtin_kind: Literal["ci_failure_diagnosis"] | None = None
     prompt: str | None = None
     model_provider: str | None = None
     model: str | None = None
@@ -831,6 +835,7 @@ class AppConfig(BaseModel):
     repositories: list[RepositoryConfig] = Field(default_factory=list)
     skills: dict[str, SkillConfig] = Field(default_factory=dict)
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
+    builtin_agents_version: int = Field(default=0, ge=0)
     rules: list[RuleConfig] = Field(default_factory=list)
     scheduled_rules: list[ScheduledRuleConfig] = Field(default_factory=list)
     config_path: Path = Field(exclude=True)
@@ -1122,6 +1127,9 @@ def normalize_model_provider_document(raw: dict[str, Any]) -> dict[str, Any]:
     """补齐唯一内置 Provider，并折叠历史 OAuth Provider 引用。"""
 
     data = copy.deepcopy(raw)
+    from .builtin_agents import install_builtin_agents
+
+    install_builtin_agents(data)
     runtime = data.setdefault("runtime", {})
     if not isinstance(runtime, dict):
         return data

@@ -13,7 +13,7 @@ test("全局默认 256，Agent 可覆盖或留空继承具体轮数，保留原�
   assert.ok(app.includes("继承全局 ${String(props.document.runtime.max_tool_rounds ?? 256)} 轮"));
   assert.ok(app.includes("当前有效：${agent.max_tool_rounds ?? props.document.runtime.max_tool_rounds ?? 256} 轮"));
   assert.ok(app.includes("max_tool_rounds: value ? Number(value) : undefined"));
-  assert.ok(app.includes("作为主 Agent 运行时无固定总时限"));
+  assert.ok(app.includes("作为普通主 Agent 运行时无固定总时限"));
 });
 
 test("预算提醒和耗尽区分告警与错误，明确未完成及不自动重试", () => {

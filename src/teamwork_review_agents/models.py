@@ -194,6 +194,8 @@ class InvocationContext(BaseModel):
     call_chain: tuple[str, ...] = ()
     inherit_workspace: bool = False
     active_workspace: str = ""
+    # 服务端绑定的 CI 运行，仅允许诊断工具读取该次日志及其提交。
+    preflight_run_id: str | None = None
     event: ChangeEvent | None = None
     schedule: ScheduledRunContext | None = None
 
