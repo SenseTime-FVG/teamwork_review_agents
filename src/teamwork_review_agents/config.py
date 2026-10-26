@@ -458,7 +458,8 @@ class PreflightConfig(BaseModel):
     enabled: bool = False
     cache_enabled: bool = True
     publish_failure_comment: bool = False
-    failure_diagnosis_enabled: bool = False
+    # 未配置时随本地 CI 默认启用诊断，明确配置 false 时保留用户选择。
+    failure_diagnosis_enabled: bool = True
     # 保留失效引用供 UI 提示；Agent 被删除时运行期跳过诊断。
     failure_diagnosis_agent: str = "ci-failure-diagnoser"
     status_context: str = Field(default="teamwork/local-ci", min_length=1)
