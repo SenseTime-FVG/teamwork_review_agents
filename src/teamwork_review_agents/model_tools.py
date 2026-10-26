@@ -205,6 +205,13 @@ class ModelToolExecutor:
     ) -> dict[str, Any]:
         """按工具名分派调用并返回可序列化结果。"""
 
+        if self.context is not None and self.context.preflight_run_id is not None:
+            from .ci_diagnosis_tools import execute_ci_diagnosis_tool
+
+            return await asyncio.to_thread(
+                execute_ci_diagnosis_tool, self.config, self.context, name, arguments,
+                self.codex_runtime_directory,
+            )
         if name == "execute_command":
             return await self._execute_command(arguments)
         if name == "apply_patch":

@@ -377,6 +377,20 @@ class StateStore:
                 """
             )
             self._migrate_preflight_runs_for_manual(connection)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS preflight_diagnoses (
+                    preflight_run_id TEXT PRIMARY KEY,
+                    agent_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    agent_run_id TEXT,
+                    report TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    comment_error TEXT,
+                    created_at REAL NOT NULL,
+                    finished_at REAL,
+                    FOREIGN KEY(preflight_run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                )
+            """)
             self._ensure_column(
                 connection,
                 "agent_runs",
@@ -750,6 +764,11 @@ class StateStore:
                 (now,),
             )
             connection.execute("DELETE FROM resource_locks")
+            connection.execute(
+                """UPDATE preflight_diagnoses SET status = 'failed',
+                       error = '服务异常退出，CI 诊断未完成', finished_at = ?
+                   WHERE status IN ('queued', 'running')""", (now,),
+            )
             connection.commit()
 
     def load_snapshot(self, snapshot_key: str) -> ChangeRequestSnapshot | None:
@@ -1721,6 +1740,78 @@ class StateStore:
             )
             connection.commit()
         return True
+
+    def begin_preflight_diagnosis(self, run_id: str, agent_name: str, *, skip_reason: str | None = None) -> bool:
+        """按 CI 运行原子占位，复用事件和并发调度都只生成一份报告。"""
+
+        now = time.time()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO preflight_diagnoses
+                   (preflight_run_id, agent_name, status, error, created_at, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (run_id, agent_name, "skipped" if skip_reason else "queued", skip_reason, now, now if skip_reason else None),
+            )
+            return cursor.rowcount == 1
+
+    def link_preflight_diagnosis_run(self, run_id: str, agent_run_id: str) -> None:
+        """关联正常 Agent 审计记录，UI 复用运行日志与取消入口。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE preflight_diagnoses SET status = 'running', agent_run_id = ? WHERE preflight_run_id = ? AND status = 'queued'",
+                (agent_run_id, run_id),
+            )
+
+    def finish_preflight_diagnosis(self, run_id: str, *, status: str, report: str = "", error: str | None = None) -> None:
+        """诊断终态与 CI 结果分开保存，中断恢复后的迟到结果不再覆盖。"""
+
+        if status not in {"completed", "failed", "timed_out", "cancelled"}:
+            raise ValueError("无效的 CI 诊断终态")
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE preflight_diagnoses SET status = ?, report = ?, error = ?, finished_at = ?
+                   WHERE preflight_run_id = ? AND status IN ('queued', 'running')""",
+                (status, report, error, time.time(), run_id),
+            )
+
+    def get_preflight_diagnosis(self, run_id: str) -> dict[str, Any] | None:
+        """读取报告或跳过、失败原因，不触发新的诊断。"""
+
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM preflight_diagnoses WHERE preflight_run_id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def set_preflight_diagnosis_comment_error(self, run_id: str, error: str | None) -> None:
+        """评论同步失败仍保留本地完整报告。"""
+
+        with self.connect() as connection:
+            connection.execute("UPDATE preflight_diagnoses SET comment_error = ? WHERE preflight_run_id = ?", (error, run_id))
+
+    def latest_preflight_run_id(self, repository_id: str, number: int) -> str | None:
+        """报告写回只针对同一 MR/PR 最新的真实 CI，兼容同 SHA 重跑。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT run_id FROM preflight_runs WHERE repository_id = ? AND number = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (repository_id, number),
+            ).fetchone()
+        return str(row["run_id"]) if row else None
+
+    def iter_preflight_output(self, run_id: str) -> Iterator[str]:
+        """流式读取保留的完整输出；旧记录没有逐块日志时回退终态输出。"""
+
+        with self.connect() as connection:
+            found = False
+            for row in connection.execute(
+                "SELECT payload FROM preflight_logs WHERE run_id = ? AND event_type = 'output' ORDER BY id", (run_id,),
+            ):
+                found = True
+                yield str(row["payload"])
+            if not found:
+                row = connection.execute("SELECT output FROM preflight_runs WHERE run_id = ?", (run_id,)).fetchone()
+                if row:
+                    yield str(row["output"])
 
     def begin_preflight_run(
         self,
@@ -3910,6 +4001,7 @@ class StateStore:
             **dict(row),
             "linked_events": [dict(event_row) for event_row in event_rows],
             "steps": steps,
+            "diagnosis": self.get_preflight_diagnosis(run_id),
         }
 
     def save_config_version(

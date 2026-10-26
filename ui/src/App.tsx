@@ -30,6 +30,7 @@ import { createOverviewRefresher } from "./overviewRefresh";
 import { runtimeHealth } from "./runtimeHealth";
 import type { OverviewRefreshState } from "./overviewRefresh";
 import { preflightRunIdFromHash, withoutPreflightHash } from "./preflightDeepLink";
+import { copyDiagnosisMarkdown, diagnosisStatusLabel, shouldRefreshPreflight } from "./ciDiagnosisPresentation";
 import { overviewSelectionRange, toggleOverviewRecords, refreshOverviewSelection, overviewSelectionScopeChanged } from "./overviewSelection";
 import type { OverviewSelectionAnchor } from "./overviewSelection";
 import { fitOverlayToViewport } from "./overlayPlacement";
@@ -354,6 +355,7 @@ function normalizeDocument(value: Partial<ConfigDocument>): ConfigDocument {
     repositories: value.repositories ?? [],
     skills: value.skills ?? {},
     agents: value.agents ?? {},
+    builtin_agents_version: value.builtin_agents_version ?? 0,
     rules: value.rules ?? [],
     scheduled_rules: value.scheduled_rules ?? [],
   };
@@ -5021,6 +5023,8 @@ function RepositoryDetailEditor(props: {
     enabled: repository.preflight?.enabled ?? false,
     cache_enabled: repository.preflight?.cache_enabled ?? true,
     publish_failure_comment: repository.preflight?.publish_failure_comment ?? false,
+    failure_diagnosis_enabled: repository.preflight?.failure_diagnosis_enabled ?? false,
+    failure_diagnosis_agent: repository.preflight?.failure_diagnosis_agent ?? "ci-failure-diagnoser",
     status_context: repository.preflight?.status_context ?? "teamwork/local-ci",
     timeout_seconds: repository.preflight?.timeout_seconds ?? 1800,
     max_output_bytes: repository.preflight?.max_output_bytes ?? 1_000_000,
@@ -5426,6 +5430,21 @@ function RepositoryDetailEditor(props: {
                     onChange={(publish_failure_comment) => updatePreflight({ publish_failure_comment })}
                   />
                   <p>仅自动 MR / PR CI 失败、超时或异常时创建或更新同一条评论；后续通过后删除。成功结果和手动仓库 CI 不发布评论。</p>
+                </div>
+                <div className="repository-preflight-cache-option">
+                  <Toggle label="CI 失败时生成诊断报告" checked={preflight.failure_diagnosis_enabled}
+                    onChange={(failure_diagnosis_enabled) => updatePreflight({ failure_diagnosis_enabled })} />
+                  <p>自动 CI 失败、超时或最终异常后分析日志与对应提交，生成可复制的 Markdown 报告。开启失败评论时，会同步补充报告。</p>
+                  {preflight.failure_diagnosis_enabled && <>
+                    <SelectField label="诊断 Agent" value={preflight.failure_diagnosis_agent}
+                      onChange={(failure_diagnosis_agent) => updatePreflight({ failure_diagnosis_agent })}
+                      options={[
+                        ...(!props.document.agents[preflight.failure_diagnosis_agent] ? [{ value: preflight.failure_diagnosis_agent, label: `${preflight.failure_diagnosis_agent || "未指定"}（不存在，将跳过）` }] : []),
+                        ...Object.entries(props.document.agents).map(([name, agent]) => ({ value: name, label: agent.builtin_kind === "ci_failure_diagnosis" ? `${name}（内置 CI 诊断）` : name })),
+                      ]}
+                      help="模型、effort 和提示词在 Agent 页配置。诊断只读日志和源码；指定 Agent 被删除后自动跳过。" />
+                    {!props.document.agents[preflight.failure_diagnosis_agent] && <p className="error-text">指定的 Agent 不存在或已删除，当前仓库将跳过失败诊断。</p>}
+                  </>}
                 </div>
                 <div className="repository-preflight-steps-head">
                   <div><strong>CI 命令步骤</strong><p>按顺序直接执行参数数组，不隐式经过 shell；复杂流程建议调用仓库内脚本。</p></div>
@@ -6885,7 +6904,7 @@ function AgentsEditor(props: {
                       ? "缓存与用户级配置写入本次运行目录，结束后清理"
                       : "命令继续直接使用启动服务用户的 HOME"}
                 />
-                <Field label="作为子 Agent 的总超时（秒）" type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} help="作为主 Agent 运行时无固定总时限，仍受无进展超时约束；等待子 Agent 或受控 CI 时单独计时。" />
+                <Field label={agent.builtin_kind === "ci_failure_diagnosis" ? "诊断总超时（秒）" : "作为子 Agent 的总超时（秒）"} type="number" value={agent.timeout_seconds ?? 1200} onChange={(value) => update(name, { timeout_seconds: Number(value) })} help="用于 CI 失败诊断或作为子 Agent 时，此值是总时限；作为普通主 Agent 运行时无固定总时限，仍受无进展超时约束；等待子 Agent 或受控 CI 时单独计时。" />
                 <Field label="无进展超时（秒，可选）" type="number" value={agent.idle_timeout_seconds ?? ""} placeholder={`继承运行时默认 ${String(props.document.runtime.agent_idle_timeout_seconds ?? 300)}`} onChange={(value) => update(name, { idle_timeout_seconds: value ? Number(value) : undefined })} />
                 <Field label="模型与工具交互轮数上限（可选）" type="number" value={agent.max_tool_rounds ?? ""} placeholder={`继承全局 ${String(props.document.runtime.max_tool_rounds ?? 256)} 轮`} onChange={(value) => update(name, { max_tool_rounds: value ? Number(value) : undefined })} help={`当前有效：${agent.max_tool_rounds ?? props.document.runtime.max_tool_rounds ?? 256} 轮 · ${agent.max_tool_rounds == null ? "继承全局" : "此 Agent 显式配置"}；根 Agent 和子 Agent 独立计数。仅用于自研模型模式，留空继承。`} />
                 <Field label="此 Agent 并发数（可选）" type="number" value={agent.max_concurrent_runs ?? ""} placeholder="留空表示不额外限制" onChange={(value) => update(name, { max_concurrent_runs: value ? Number(value) : undefined })} help="根 Agent 与同名 sub-agent 共同计数，仍受全局和运行时总额度限制" />
@@ -7360,7 +7379,7 @@ function AgentsView(props: {
         { label: "sub-agent 引用", value: `${callerCount} 个` },
       ],
       impactTitle: "同步清理名称引用",
-      impact: "引用该 Agent 的触发规则和其他 Agent 白名单会同时移除对应名称；历史运行记录不会删除。",
+      impact: "触发规则和其他 Agent 白名单会移除对应名称；仓库中的失败诊断引用会保留，并自动跳过诊断。内置 Agent 删除后不会自动恢复；历史运行记录保留。",
       confirmLabel: "确认删除",
       dangerous: true,
     };
@@ -7413,7 +7432,7 @@ function AgentsView(props: {
               const agent = props.document.agents[name];
               return (
                 <button type="button" className="agent-config-row" key={name} onClick={() => requestDetail(name)}>
-                  <span className="agent-config-identity"><span className="agent-config-avatar" aria-hidden="true">A</span><span><strong>{name}</strong><small>Codex Agent</small></span></span>
+                  <span className="agent-config-identity"><span className="agent-config-avatar" aria-hidden="true">A</span><span><strong>{name}</strong><small>{agent.builtin_kind === "ci_failure_diagnosis" ? "内置 · CI 失败诊断" : "Codex Agent"}</small></span></span>
                   <span className="agent-config-summary"><strong>{agent.prompt_file ? "文件 Prompt" : "内联 Prompt"}</strong><small>{agentModelDisplay(props.document, props.codexOptions, agent)}</small></span>
                   <span><strong>{agentSandboxLabel(agent.sandbox)}</strong><small>{agentHomeLabel(agent)}</small></span>
                   <span><strong className={agent.network_access || agent.sandbox === "danger-full-access" ? "success-text" : ""}>{agentNetworkLabel(agent)}</strong></span>
@@ -7438,9 +7457,10 @@ function AgentsView(props: {
         <button type="button" className="agent-detail-back" onClick={() => requestDetail(null)}><span aria-hidden="true">←</span>返回 Agent 列表</button>
         <div className="agent-detail-heading">
           <div>
-            <span className="eyebrow">CODEX AGENT</span>
+            <span className="eyebrow">{activeDocument.agents[activeName]?.builtin_kind === "ci_failure_diagnosis" ? "内置 · CI 失败诊断" : "CODEX AGENT"}</span>
             <h2>{activeName}</h2>
             <p>配置版本 {shortRevision(props.revision)} · {creating ? "尚未保存的新 Agent" : editing ? "当前修改仅保存在页面草稿" : "当前已保存配置"}</p>
+            {activeDocument.agents[activeName]?.builtin_kind === "ci_failure_diagnosis" && <p>用于 CI 失败诊断时只读取日志和对应提交的源码，输出 Markdown 报告；不会运行命令、修改代码或调用其他 Agent。</p>}
           </div>
           <span className={`agent-detail-mode ${editing ? "editing" : ""}`}>{creating ? "新建" : editing ? "编辑中" : "只读"}</span>
         </div>
@@ -8749,8 +8769,8 @@ function eventStatusExplanation(event: EventRecord): string {
   }
   if (["failure", "timed_out", "error"].includes(event.preflight_status ?? "")) {
     return event.preflight_reused
-      ? "本事件复用了相同提交与配置的历史 Preflight / CI 结果，因此没有重复运行 Agent。"
-      : "本地 Preflight / CI 未通过，因此没有继续启动 Agent。";
+      ? "本事件复用了相同提交与配置的历史 Preflight / CI 结果，受门禁约束的审核未启动；失败诊断报告见 CI 详情。"
+      : "本地 Preflight / CI 未通过，受门禁约束的审核未启动；如已开启失败诊断，可在 CI 详情查看报告或诊断状态。";
   }
   if (event.status === "pending") {
     return queueReasonLabel(event.queue_reason) ?? "事件正在等待调度。";
@@ -9277,6 +9297,8 @@ function PreflightRunDetailDrawer(props: {
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [streamError, setStreamError] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [diagnosisRunId, setDiagnosisRunId] = useState<string | null>(null);
+  const [copyNotice, setCopyNotice] = useState("");
   const liveOutputRef = useRef<HTMLPreElement | null>(null);
 
   useBodyScrollLock(Boolean(runId));
@@ -9291,7 +9313,7 @@ function PreflightRunDetailDrawer(props: {
         if (!disposed) {
           setDetail(next);
           setError("");
-          refreshAgain = next.status === "running";
+          refreshAgain = shouldRefreshPreflight(next);
         }
       } catch (reason) {
         if (!disposed) setError(reason instanceof Error ? reason.message : "本地 CI 详情加载失败");
@@ -9302,6 +9324,8 @@ function PreflightRunDetailDrawer(props: {
     };
     setDetail(null);
     setError("");
+    setDiagnosisRunId(null);
+    setCopyNotice("");
     void load();
     return () => {
       disposed = true;
@@ -9339,11 +9363,11 @@ function PreflightRunDetailDrawer(props: {
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && !diagnosisRunId) onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
+  }, [onClose, diagnosisRunId]);
 
   async function cancelManualPreflight() {
     if (!detail || detail.trigger_source !== "manual" || detail.status !== "running") return;
@@ -9433,6 +9457,24 @@ function PreflightRunDetailDrawer(props: {
                 {streamError && <div className="alert error">{streamError}；步骤状态仍会继续刷新。</div>}
                 <pre ref={liveOutputRef} className="detail-pre preflight-live-output">{liveOutput || (detail.status === "running" ? "正在等待 CI 输出…" : detail.output || "该历史记录没有实时日志")}</pre>
               </section>
+              {detail.diagnosis && <section className="event-detail-section">
+                <div className="event-detail-section-title">
+                  <div><span className="eyebrow">DIAGNOSIS</span><h3>失败诊断报告</h3></div>
+                  <span className="event-detail-count">{diagnosisStatusLabel(detail.diagnosis.status)}</span>
+                </div>
+                <p>诊断 Agent：{detail.diagnosis.agent_name || "未指定"}</p>
+                <div className="button-group">
+                  {detail.diagnosis.report && <button type="button" className="button secondary compact" onClick={() => {
+                    void copyDiagnosisMarkdown(detail.diagnosis!.report).then(() => setCopyNotice("Markdown 已复制"))
+                      .catch(reason => setCopyNotice(reason instanceof Error ? reason.message : "复制失败"));
+                  }}>复制 Markdown</button>}
+                  {detail.diagnosis.agent_run_id && <button type="button" className="button secondary compact" onClick={() => setDiagnosisRunId(detail.diagnosis!.agent_run_id!)}>查看诊断运行</button>}
+                </div>
+                {copyNotice && <p role="status">{copyNotice}</p>}
+                {detail.diagnosis.error && <pre className="detail-pre detail-error">{detail.diagnosis.error}</pre>}
+                {detail.diagnosis.comment_error && <div className="alert error">报告已保存在本地，评论同步失败：{detail.diagnosis.comment_error}</div>}
+                {detail.diagnosis.report && <div className="run-result-message"><MarkdownMessage>{detail.diagnosis.report}</MarkdownMessage></div>}
+              </section>}
               <section className="event-detail-section">
                 <div className="event-detail-section-title"><div><span className="eyebrow">RESULT</span><h3>执行结论</h3></div></div>
                 <dl className="run-metadata">
@@ -9499,6 +9541,8 @@ function PreflightRunDetailDrawer(props: {
           )}
         </div>
       </aside>
+      {diagnosisRunId && <AgentRunDetailDrawer initialRunId={diagnosisRunId} depth={depth + 1}
+        onClose={() => setDiagnosisRunId(null)} onRefresh={() => {}} />}
     </div>
   );
 }

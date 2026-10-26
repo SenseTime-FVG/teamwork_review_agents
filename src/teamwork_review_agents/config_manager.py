@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from .builtin_agents import CI_DIAGNOSIS_AGENT
 from .config import (
     AppConfig,
     BUILTIN_CODEX_CLI_PROVIDER_ID,
@@ -177,6 +178,8 @@ class ConfigManager:
         current = protect_provider_credentials(self._read_raw())
         incoming = protect_provider_credentials(document)
         merged = protect_provider_credentials(self._merge_masked(incoming, current))
+        # 旧客户端可能不认识内置模板版本，不能因此重新补回已删除的 Agent。
+        merged["builtin_agents_version"] = current.get("builtin_agents_version", 1)
         return parse_config_data(merged, self.path)
 
     def save(self, document: dict[str, Any], *, source: str = "ui") -> AppConfig:
@@ -188,6 +191,7 @@ class ConfigManager:
             merged = protect_provider_credentials(
                 self._merge_masked(incoming, current_raw)
             )
+            merged["builtin_agents_version"] = current_raw.get("builtin_agents_version", 1)
             # 全量保存没有原仓库身份和维护窗口，目录变更必须走单仓库迁移入口。
             previous = parse_config_data(current_raw, self.path).repository_map()
             following = parse_config_data(merged, self.path).repository_map()
@@ -250,6 +254,9 @@ class ConfigManager:
                     assignments = repository.get("agent_skills", {})
                     if current_name in assignments:
                         assignments[next_name] = assignments.pop(current_name)
+                    preflight = repository.setdefault("preflight", {})
+                    if preflight.get("failure_diagnosis_agent", CI_DIAGNOSIS_AGENT) == current_name:
+                        preflight["failure_diagnosis_agent"] = next_name
                 for value in next_agents.values():
                     if not isinstance(value, dict):
                         continue
