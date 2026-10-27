@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -17,10 +19,12 @@ from teamwork_review_agents.ci_diagnosis_tools import execute_ci_diagnosis_tool
 from teamwork_review_agents.config_manager import ConfigManager
 from teamwork_review_agents.config import RuleConfig
 from teamwork_review_agents.events import detect_events
+from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.executor import AgentExecutor
 from teamwork_review_agents.managed_comments import ManagedCommentService
 from teamwork_review_agents.models import AgentResult, InvocationContext, PreflightResult
 from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
+from teamwork_review_agents.preflight import PreflightExecutor, build_failure_comment_body
 from teamwork_review_agents.state import StateStore
 
 
@@ -248,6 +252,51 @@ async def test_comment_failure_keeps_complete_redacted_report(diagnosis_case, mo
     assert len(publish.call_args.kwargs["body"].encode()) < 60000
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~~"])
+def test_long_report_preserves_original_output_and_fold_structure(diagnosis_case, fence):
+    """中文、HTML 转义和超长代码摘录共存时保留原日志、完整标签及截断提示。"""
+
+    case = diagnosis_case
+    result = case.result.model_copy(update={
+        "output": "旧日志" * 10000 + "<&中文😀>" * 2000 + "最后一条失败信息 diagnosis-test-secret",
+        "error": '错误 <&"' * 2000,
+    })
+    redactor = SecretRedactor(("diagnosis-test-secret",))
+    original = build_failure_comment_body(case.config.repositories[0], result, redactor=redactor)
+    report = f"## 失败原因\n\n{fence}text\n" + "堆栈日志😀\n" * 10000 + f"{fence}\n最终修复建议"
+    body = build_failure_comment_body(
+        case.config.repositories[0], result, redactor=redactor, diagnosis_report=report,
+    )
+    pattern = r"<details(?: open)?>.*?</details>"
+    before = re.findall(pattern, original, flags=re.DOTALL)
+    after = re.findall(pattern, body, flags=re.DOTALL)
+    assert after[:-1] == before
+    assert "最后一条失败信息" in body
+    assert "diagnosis-test-secret" not in body
+    assert "&lt;" in body
+    assert len(body.encode("utf-8")) <= 54 * 1024
+    assert body.count("<details>") == 2
+    assert body.count("</details>") == 3
+    assert after[-1].startswith("<details>\n<summary>CI 失败诊断报告</summary>\n\n## 失败原因")
+    assert f"\n{fence}\n\n> 诊断报告超过评论长度限制" in after[-1]
+    assert "最终修复建议" not in body
+    assert body.endswith("本地 CI 通过后会自动删除活动失败评论。")
+
+
+def test_report_fold_tags_cannot_close_outer_fold(diagnosis_case):
+    """报告自带折叠标签和未闭合代码块时，外层诊断区仍默认折叠且可正常结束。"""
+
+    report = "## 报告\n\n</details><DETAILS open><summary>内部</summary>\n\n```text\n错误"
+    body = build_failure_comment_body(
+        diagnosis_case.config.repositories[0], diagnosis_case.result,
+        redactor=SecretRedactor(()), diagnosis_report=report,
+    )
+    assert body.count("<details>") == body.count("</details>") == 2
+    assert "<details open>" not in body
+    assert html.escape("</details><DETAILS open><summary>内部</summary>") in body
+    assert "错误\n```\n\n</details>" in body
+
+
 async def test_cancelled_diagnosis_keeps_ci_result(diagnosis_case):
     """服务取消需要保留诊断终态并继续传播取消。"""
 
@@ -276,10 +325,14 @@ def test_atomic_claim_and_restart_recovery(diagnosis_case):
 
 @pytest.mark.parametrize("provider", ["github-main", "gitlab-main"])
 async def test_report_updates_existing_comment_and_never_revives_stale_failure(diagnosis_case, monkeypatch, provider):
-    """两个平台共用评论槽，成功新 CI、源版本变化均阻止迟到报告写回。"""
+    """两个平台补充折叠报告并保留原始信息，无后台链接，成功后拒绝迟到写回。"""
 
     case = diagnosis_case
     case.config.repositories[0].provider = provider
+    case.config.repositories[0].preflight.publish_failure_comment = True
+    case.config.web.public_url = "http://10.151.92.100:8080"
+    case.result = case.result.model_copy(update={"error": "测试断言失败"})
+    case.store.finish_preflight_run(case.result)
     monkeypatch.setenv("GITLAB_TOKEN", "test-gitlab-secret")
     remote = SimpleNamespace(
         create_change_request_comment=AsyncMock(return_value="comment-1"),
@@ -300,10 +353,27 @@ async def test_report_updates_existing_comment_and_never_revives_stale_failure(d
     service = ManagedCommentService(case.config, case.store)
     args = dict(repository_id="demo", number=7, namespace="preflight", slot="teamwork/local-ci",
                 source_generation=1, source_head_sha=case.result.head_sha, replace_existing=False)
-    assert (await service.publish_latest(**args, body="失败摘要"))["action"] == "created"
-    assert (await service.publish_latest(**args, body="完整报告", update_existing=True, preflight_run_id=case.result.run_id))["action"] == "updated"
+    await PreflightExecutor(case.config, case.store)._sync_failure_comment(case.config.repositories[0], case.result)
+    original = remote.create_change_request_comment.call_args.args[2]
+    # 模拟调度只持有精简结果，原始失败信息仍须从持久化记录取回。
+    case.result = case.result.model_copy(update={"output": "", "error": None})
+    assert await diagnose(case)
     remote.update_change_request_comment.assert_awaited_once()
     remote.create_change_request_comment.assert_awaited_once()
+    body = remote.update_change_request_comment.call_args.args[2]
+    report_fold = re.search(r"\n<details>\n<summary>CI 失败诊断报告</summary>.*?</details>", body, re.DOTALL)
+    assert report_fold is not None
+    assert body.replace(report_fold.group(0) + "\n", "", 1) == original
+    assert "## 错误报告\n测试断言失败。" in report_fold.group(0)
+    assert "<details>\n<summary>末尾输出</summary>" in body
+    assert "- 失败步骤：`test-all`" in body
+    assert "- 退出码：`1`" in body
+    assert "AssertionError: 预期拒绝，实际成功" in body
+    assert "测试断言失败" in body
+    assert "#preflight=" not in body
+    assert case.config.web.public_url not in body
+    assert "查看 CI 日志与完整报告" not in body
+    assert "诊断报告超过评论长度限制" not in body
     case.create_run("ci-new-success", "success")
     assert (await service.publish_latest(**args, body="迟到报告", update_existing=True, preflight_run_id=case.result.run_id))["action"] == "obsolete"
     new = case.create_run("ci-next-failure")
