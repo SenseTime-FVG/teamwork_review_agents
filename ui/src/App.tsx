@@ -9457,9 +9457,10 @@ function PreflightRunDetailDrawer(props: {
                 </div>
                 {streamError && <div className="alert error">{streamError}；步骤状态仍会继续刷新。</div>}
                 <pre ref={liveOutputRef} className="detail-pre preflight-live-output">{liveOutput || (detail.status === "running" ? "正在等待 CI 输出…" : detail.output || "该历史记录没有实时日志")}</pre>
-                {detail.log_upload?.status === "uploading" && <p className="muted">正在上传 GitLab 日志附件…</p>}
+                {["queued", "running"].includes(detail.log_delivery?.status ?? "") && <p className="muted">CI 状态已回写，正在后台上传日志附件并补充链接…</p>}
                 {detail.log_upload?.status === "completed" && detail.log_upload.url && <p><a href={detail.log_upload.url} target="_blank" rel="noreferrer">下载 GitLab 完整 CI 日志附件</a></p>}
                 {detail.log_upload?.status === "failed" && <div className="alert error">日志附件上传失败，不影响 CI 结果：{detail.log_upload.error}</div>}
+                {detail.log_delivery?.status === "failed" && detail.log_upload?.status !== "failed" && <div className="alert error">日志附件发布失败，不影响 CI 结果：{detail.log_delivery.error}</div>}
               </section>
               {detail.diagnosis && <section className="event-detail-section">
                 <div className="event-detail-section-title">

@@ -267,7 +267,7 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
         posts.append(payload)
         assert payload["pipeline_id"] == 71 and payload["ref"] == MR_REF
         assert payload["target_url"] == (
-            "" if payload["state"] in {"pending", "running"}
+            "" if not uploads
             else "https://platform.example/-/project/23/uploads/abc/ci.log"
         )
         if len(posts) == 3:
@@ -304,6 +304,13 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
     assert marker.read_text() == "run\n"
     assert len(reads) == 1
     assert [payload["state"] for payload in posts] == ["pending", "running", terminal_state, terminal_state]
+    assert not uploads
+    assert {payload["target_url"] for payload in posts} == {""}
+    # 独立消费者在终态回写之后上传，并保持原来的流水线与终态。
+    from teamwork_review_agents.preflight_log_worker import PreflightLogWorker
+
+    await PreflightLogWorker(lambda: config, restarted_store).drain()
+    assert posts[-1]["state"] == terminal_state
     assert {payload["target_url"] for payload in posts} == {"", "https://platform.example/-/project/23/uploads/abc/ci.log"}
     assert len(uploads) == 1
     assert restarted_store.load_preflight_result(preflight_idempotency_key(config, event)).status_published

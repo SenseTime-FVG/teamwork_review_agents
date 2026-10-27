@@ -7,9 +7,9 @@ import uuid
 from typing import Any, Literal
 
 from .config import AppConfig
-from .environment import resolve_provider_token
+from .environment import SecretRedactor, resolve_provider_token, resolve_repository_process_environment
 from .locks import ResourceLease
-from .models import InvocationContext, stable_hash
+from .models import InvocationContext, PreflightResult, stable_hash
 from .providers.base import create_provider
 from .state import StateStore
 
@@ -299,6 +299,7 @@ class ManagedCommentService:
         replace_existing: bool,
         update_existing: bool = False,
         preflight_run_id: str | None = None,
+        refresh_preflight_body: bool = False,
     ) -> dict[str, Any]:
         """在槽位内发布最新评论，可选择先删除全部历史评论。"""
 
@@ -330,6 +331,20 @@ class ManagedCommentService:
                 current_run = await asyncio.to_thread(self.store.get_preflight_run, preflight_run_id)
                 if latest != preflight_run_id or (generation is not None and generation != source_generation) or current_run is None or current_run["status"] not in {"failure", "timed_out", "error"}:
                     return {"action": "obsolete", "comment_id": None, "source_generation": source_generation}
+                if refresh_preflight_body:
+                    # 在评论锁内重新拼接，附件与诊断并发完成时不能用旧正文互相覆盖。
+                    from .preflight import build_failure_comment_body
+
+                    environment = resolve_repository_process_environment(self.config, repository, preflight_run_id)
+                    token = resolve_provider_token(self.config, self.config.providers[repository.provider], repository)
+                    diagnosis = current_run.get("diagnosis") or {}
+                    upload = current_run.get("log_upload") or {}
+                    normalized_body = build_failure_comment_body(
+                        repository, PreflightResult.model_validate(current_run),
+                        redactor=SecretRedactor((*environment.secret_values, token)),
+                        diagnosis_report=diagnosis.get("report", "") if diagnosis.get("status") == "completed" else "",
+                        log_url=upload.get("url") if upload.get("status") == "completed" else None,
+                    ).strip()
             records = await asyncio.to_thread(
                 self.store.list_managed_comments,
                 repository_id=repository_id,

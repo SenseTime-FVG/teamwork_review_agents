@@ -15,12 +15,13 @@ from .curl_runtime import CurlRuntimeManager
 from .repository_migration import has_pending_repository_migration
 from .config_manager import ConfigManager
 from .orchestrator import CycleSummary, Orchestrator
+from .preflight_log_worker import PreflightLogWorker
 from .scheduler import next_scheduled_at, schedule_signature, schedule_summary
 from .workspace_cleanup import WorkspaceCleanupManager
 
 
 LOGGER = logging.getLogger(__name__)
-WORKER_LABELS = {"scanner": "仓库扫描", "dispatcher": "Agent 调度", "scheduler": "定时调度"}
+WORKER_LABELS = {"scanner": "仓库扫描", "dispatcher": "Agent 调度", "scheduler": "定时调度", "ci_logs": "CI 日志附件"}
 RETRY_INITIAL_SECONDS = 5.0
 RETRY_MAX_SECONDS = 60.0
 
@@ -34,6 +35,7 @@ class BackgroundRuntime:
         self.store = manager.store
         self.store.recover_interrupted_work()
         self.workspace_cleanup = WorkspaceCleanupManager(lambda: manager.config, self.store)
+        self.preflight_logs = PreflightLogWorker(lambda: manager.config, self.store)
         self.workspace_cleanup.maintenance_check = lambda: self.repository_migrating
         self._stop_event = asyncio.Event()
         self._scan_wake_event = asyncio.Event()
@@ -42,6 +44,7 @@ class BackgroundRuntime:
         self._scan_task: asyncio.Task[None] | None = None
         self._dispatch_task: asyncio.Task[None] | None = None
         self._schedule_task: asyncio.Task[None] | None = None
+        self._log_upload_task: asyncio.Task[None] | None = None
         self._worker_failures: dict[str, dict[str, Any]] = {}
         self.status_error: str | None = None
         self._status_read_error: str | None = None
@@ -92,6 +95,11 @@ class BackgroundRuntime:
                 self._supervise_loop("scheduler", self._schedule_loop),
                 name="teamwork-background-scheduler",
             )
+        if self._log_upload_task is None or self._log_upload_task.done():
+            self._log_upload_task = asyncio.create_task(
+                self._supervise_loop("ci_logs", self._log_upload_loop),
+                name="teamwork-ci-log-uploads",
+            )
 
     async def stop(self) -> None:
         """停止新工作、取消活动 Agent，并等待全部子进程安全收尾。"""
@@ -112,7 +120,7 @@ class BackgroundRuntime:
             )
         tasks = tuple(
             task
-            for task in (self._scan_task, self._dispatch_task, self._schedule_task)
+            for task in (self._scan_task, self._dispatch_task, self._schedule_task, self._log_upload_task)
             if task is not None
         )
         tasks = (*tasks, *tuple(self._scheduled_occurrence_tasks))
@@ -122,6 +130,7 @@ class BackgroundRuntime:
         self._scan_task = None
         self._dispatch_task = None
         self._schedule_task = None
+        self._log_upload_task = None
         self._scheduled_occurrence_tasks.clear()
 
     def _failure_message(self, exc: BaseException) -> str:
@@ -160,7 +169,7 @@ class BackgroundRuntime:
         elif worker == "dispatcher":
             self.dispatching_events = False
             self.last_dispatch_error = message
-        else:
+        elif worker == "scheduler":
             self.last_schedule_error = message
         LOGGER.error("%s后台任务异常：%s", WORKER_LABELS[worker], message, exc_info=exc)
 
@@ -200,6 +209,7 @@ class BackgroundRuntime:
             ("scanner", self._scan_task),
             ("dispatcher", self._dispatch_task),
             ("scheduler", self._schedule_task),
+            ("ci_logs", self._log_upload_task),
         ):
             failure = dict(self._worker_failures.get(worker, {}))
             state = "not_started" if task is None else "running"
@@ -239,6 +249,7 @@ class BackgroundRuntime:
         if (
             self.repository_migrating
             or self.workspace_cleanup.running
+            or self.preflight_logs.running
             or self.running_cycle
             or self.dispatching_events
             or self._active_orchestrators
@@ -463,6 +474,14 @@ class BackgroundRuntime:
         )
         if not self.last_dispatch_error:
             self._clear_worker_failure("dispatcher")
+
+    async def _log_upload_loop(self) -> None:
+        """附件在独立循环发布，故障由同一监督机制显示到 Dashboard。"""
+
+        await self.preflight_logs.run(
+            self._stop_event, lambda: self.repository_migrating,
+            lambda: self._clear_worker_failure("ci_logs"),
+        )
 
     async def _scan_loop(self) -> None:
         """按固定间隔扫描 Provider，不等待事件执行循环。"""

@@ -809,6 +809,12 @@ export type PreflightStepRunDetail = {
 
 export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
   diagnosis?: PreflightDiagnosis | null;
+  // 已发布 CI 终态后，附件仍可独立排队、上传或重试补链。
+  log_delivery?: {
+    status: "queued" | "running" | "completed" | "failed" | "obsolete";
+    attempts: number;
+    error?: string | null;
+  } | null;
   // 附件上传与 CI 结果独立，避免把上传失败展示成测试失败。
   log_upload?: {
     status: "uploading" | "completed" | "failed";
