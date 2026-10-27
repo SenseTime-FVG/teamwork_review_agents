@@ -9,8 +9,9 @@ export function diagnosisStatusLabel(status?: PreflightDiagnosis["status"]): str
 }
 
 export function shouldRefreshPreflight(detail: PreflightRunDetail): boolean {
-  // CI 结束与诊断占位之间也继续刷新，避免恰好读到空报告后永久停止轮询。
+  // CI 结束后的附件上传、状态回写与诊断占位期间也继续刷新。
   return detail.status === "running"
+    || (!detail.status_published && detail.linked_events.some(event => event.status === "processing"))
     || detail.diagnosis?.status === "queued"
     || detail.diagnosis?.status === "running"
     || (["failure", "timed_out", "error"].includes(detail.status)

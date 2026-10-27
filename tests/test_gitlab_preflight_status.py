@@ -252,17 +252,24 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
                           ]}]}}],
     }, tmp_path / "config.yaml")
     event = detect_events(None, snapshot_factory(provider="platform", repository_id="demo", head_sha=SHA), emit_initial=True)[0]
-    posts, reads = [], []
+    posts, reads, uploads = [], [], []
     terminal_state = "success" if exit_code == 0 else "failed"
 
     def handler(request):
+        if request.url.path.endswith("/uploads"):
+            uploads.append(request.content)
+            assert b'Teamwork' in request.content
+            return httpx.Response(201, json={"full_path": "/-/project/23/uploads/abc/ci.log"})
         if request.method == "GET":
             reads.append(request)
             return httpx.Response(200, json={"head_pipeline": mr_pipeline(id=71 if len(reads) == 1 else 99)})
         payload = json.loads(request.content)
         posts.append(payload)
         assert payload["pipeline_id"] == 71 and payload["ref"] == MR_REF
-        assert payload["target_url"].startswith("https://review.example.com/teamwork/#preflight=")
+        assert payload["target_url"] == (
+            "" if payload["state"] in {"pending", "running"}
+            else "https://platform.example/-/project/23/uploads/abc/ci.log"
+        )
         if len(posts) == 3:
             return httpx.Response(503, json={"message": "retry later"})
         return httpx.Response(201, json={"pipeline_id": 71})
@@ -297,7 +304,8 @@ async def test_preflight_persists_mr_binding_and_retries_terminal_delivery_after
     assert marker.read_text() == "run\n"
     assert len(reads) == 1
     assert [payload["state"] for payload in posts] == ["pending", "running", terminal_state, terminal_state]
-    assert {payload["target_url"] for payload in posts} == {f"https://review.example.com/teamwork/#preflight={first.run_id}"}
+    assert {payload["target_url"] for payload in posts} == {"", "https://platform.example/-/project/23/uploads/abc/ci.log"}
+    assert len(uploads) == 1
     assert restarted_store.load_preflight_result(preflight_idempotency_key(config, event)).status_published
 
 
