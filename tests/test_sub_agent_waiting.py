@@ -15,7 +15,7 @@ from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
 from teamwork_review_agents.model_provider_runtime import resolve_model_plan
 from teamwork_review_agents.model_tools import ModelToolExecutor
-from teamwork_review_agents.models import AgentResult, InvocationContext
+from teamwork_review_agents.models import AgentResult, InvocationContext, LocalPreflightContext
 from teamwork_review_agents.run_control import RunControl, RunStop, active_run_control
 from teamwork_review_agents.state import StateStore
 
@@ -318,14 +318,51 @@ def executor_harness(configured_app_factory, snapshot_factory, monkeypatch):
     executor = AgentExecutor(config, store)
     event = detect_events(None, snapshot_factory(provider="github-main"), emit_initial=True)[0]
 
-    async def execute():
+    async def execute(**kwargs):
+        """保留真实执行链，并允许测试传入后台签发的可选上下文。"""
+
         return await executor.execute(
             agent_name="code-reviewer", event=event, task="本地测试任务",
             inherit_workspace=True, parent_workspace=config.repositories[0].workspace,
             idempotency_key="waiting-test",
+            **kwargs,
         )
 
     return executor, store, execute
+
+
+@pytest.mark.parametrize("status", ["passed", "skipped"])
+async def test_full_executor_preserves_local_gate_in_prompt_and_context(
+    executor_harness, monkeypatch, status,
+):
+    """真实执行器把门禁摘要同时写入持久化 Prompt 和运行器调用上下文。"""
+
+    executor, store, execute = executor_harness
+    gate = LocalPreflightContext(
+        repository_id="demo", number=7, head_sha="a" * 40,
+        status=status, reason="测试后台门禁摘要",
+        run_id="ci-run" if status == "passed" else None,
+    )
+    captured = {}
+
+    async def run(self, **kwargs):
+        """仅替代真实模型请求，保留准备、输入持久化与正常收尾。"""
+
+        captured.update(kwargs)
+        return AgentResult(
+            run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
+            agent_name=kwargs["agent_name"], status="completed",
+        )
+
+    monkeypatch.setattr(CodexModelRunner, "run", run)
+    result = await execute(local_preflight=gate)
+    assert result.status == "completed"
+    assert captured["context"].local_preflight == gate
+    assert captured["context"].preflight_run_id is None
+    prompt = store.get_run(result.run_id)["prompt"]
+    assert prompt == captured["prompt"]
+    payload = prompt.split("# 本次运行上下文\n\n```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(payload)["local_preflight"] == gate.model_dump(exclude_none=True)
 
 
 @pytest.mark.asyncio

@@ -171,6 +171,28 @@ class PreflightResult(BaseModel):
     reused: bool = False
 
 
+class LocalPreflightContext(BaseModel):
+    """后台已完成的本地门禁摘要，不包含日志或诊断工具授权。"""
+
+    repository_id: str
+    number: int
+    head_sha: str
+    status: Literal["passed", "skipped"]
+    reason: str
+    run_id: str | None = None
+    reused: bool = False
+
+    @model_validator(mode="after")
+    def validate_gate_evidence(self) -> "LocalPreflightContext":
+        """通过必须绑定实际运行，跳过不能携带成功或复用证据。"""
+
+        if self.status == "passed" and not self.run_id:
+            raise ValueError("本地 CI 已通过状态必须包含运行 ID")
+        if self.status == "skipped" and (self.run_id is not None or self.reused):
+            raise ValueError("本地 CI 已跳过状态不能包含运行 ID 或复用标记")
+        return self
+
+
 class ScheduledRunContext(BaseModel):
     """一次定时周期传递给根 Agent 与 sub-agent 的可信上下文。"""
 
@@ -196,6 +218,8 @@ class InvocationContext(BaseModel):
     active_workspace: str = ""
     # 服务端绑定的 CI 运行，仅允许诊断工具读取该次日志及其提交。
     preflight_run_id: str | None = None
+    # 普通审核仅继承后台门禁摘要，不因此获得 CI 诊断权限。
+    local_preflight: LocalPreflightContext | None = None
     event: ChangeEvent | None = None
     schedule: ScheduledRunContext | None = None
 

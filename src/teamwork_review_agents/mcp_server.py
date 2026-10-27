@@ -91,6 +91,8 @@ async def invoke_agent(
         "schedule": context.schedule,
         "task": task,
         "extra_context": extra_context,
+        # 只继承服务端签发的门禁摘要，不接受模型通过委托材料改写。
+        "local_preflight": context.local_preflight,
         "root_run_id": context.root_run_id,
         "parent_run_id": context.run_id,
         "depth": child_depth,
