@@ -70,6 +70,7 @@ SAFE_HOST_ENVIRONMENT = {
 } | WINDOWS_REQUIRED_ENVIRONMENT_NAMES
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PREFLIGHT_COMMENT_OUTPUT_CHARS = 12_000
+PREFLIGHT_COMMENT_BODY_BYTES = 54 * 1024
 
 
 @dataclass(frozen=True)
@@ -468,40 +469,96 @@ def _status_description(result: PreflightResult) -> str:
     raise ValueError("基础设施异常没有可发布的 Commit Status")
 
 
-def _bounded_comment_text(value: str, *, limit: int) -> str:
-    """移除终端控制字符，并只保留适合评论展示的尾部内容。"""
+def _bounded_comment_text(value: str, *, limit: int, byte_limit: int | None = None) -> str:
+    """保留日志尾部，并按 HTML 转义后的字节数预留其他评论内容的空间。"""
 
     normalized = ANSI_ESCAPE_PATTERN.sub("", value).strip()
+    if byte_limit is not None:
+        lower, upper = 0, min(limit, len(normalized))
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+            candidate = _bounded_comment_text(normalized, limit=middle)
+            if len(html.escape(candidate).encode("utf-8")) <= byte_limit:
+                lower = middle
+            else:
+                upper = middle - 1
+        limit = lower
     if len(normalized) <= limit:
         return normalized
-    return f"…（仅显示末尾 {limit} 个字符）\n{normalized[-limit:]}"
+    return f"…（仅显示末尾 {limit} 个字符）\n{normalized[-limit:] if limit else ''}"
 
 
-def _failure_comment_body(
+def _close_report_code_fence(value: str) -> str:
+    """补齐被截断或模型遗漏的 Markdown 代码围栏，避免吞掉折叠区结束标签。"""
+
+    opened = ""
+    for line in value.splitlines():
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if match is None:
+            continue
+        fence, suffix = match.groups()
+        if not opened:
+            if fence[0] != "`" or "`" not in suffix:
+                opened = fence
+        elif fence[0] == opened[0] and len(fence) >= len(opened) and not suffix.strip():
+            opened = ""
+    return value + (f"\n{opened}" if opened else "")
+
+
+def _bounded_diagnosis_markdown(value: str, *, byte_limit: int) -> str:
+    """只截取报告内容，保留 Markdown 排版并隔离报告自身的折叠标签。"""
+
+    normalized = re.sub(
+        r"</?(?:details|summary)\b[^>]*>",
+        lambda match: html.escape(match.group()),
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
+    complete = _close_report_code_fence(normalized)
+    if len(complete.encode("utf-8")) <= byte_limit:
+        return complete
+    notice = "\n\n> 诊断报告超过评论长度限制，后续内容已截断。"
+    # 预留提示和围栏空间，不能在完整评论拼接后直接截断 HTML。
+    remaining = max(0, byte_limit - len(notice.encode("utf-8")))
+    while remaining > 0:
+        excerpt = normalized.encode("utf-8")[:remaining].decode("utf-8", errors="ignore").rstrip()
+        excerpt = _close_report_code_fence(excerpt)
+        overflow = len(excerpt.encode("utf-8")) - remaining
+        if len((excerpt + notice).encode("utf-8")) <= byte_limit:
+            return excerpt + notice
+        remaining = max(0, remaining - max(1, overflow))
+    return notice.encode("utf-8")[:max(0, byte_limit)].decode("utf-8", errors="ignore")
+
+
+def build_failure_comment_body(
     repository,
     result: PreflightResult,
     *,
     redactor: SecretRedactor,
+    diagnosis_report: str = "",
 ) -> str:
-    """构造有界且脱敏的 MR / PR 本地 CI 失败评论。"""
+    """共用失败摘要和日志格式，诊断只追加独立折叠区，不覆盖原始失败证据。"""
 
     status_label = {
         "failure": "未通过",
         "timed_out": "超时",
+        "error": "基础设施异常",
     }.get(result.status, result.status)
     marker = stable_hash(
         "preflight-failure-comment",
         repository.id,
         result.number,
     )[:16]
-    failed_step = redactor.text(result.failed_step or "unknown")
+    failed_step = _bounded_comment_text(redactor.text(result.failed_step or "unknown"), limit=200)
     error = _bounded_comment_text(
         redactor.text(result.error or ""),
         limit=2_000,
+        byte_limit=8 * 1024,
     )
     output = _bounded_comment_text(
         redactor.text(result.output),
         limit=PREFLIGHT_COMMENT_OUTPUT_CHARS,
+        byte_limit=36 * 1024,
     )
     sections = [
         f"<!-- teamwork-preflight-failure:{marker} -->",
@@ -531,11 +588,20 @@ def _failure_comment_body(
             f"<pre>{html.escape(output)}</pre>",
             "</details>",
         ])
-    sections.extend([
+    footer = [
         "",
         "> 后续真实 CI 再次失败时会删除本评论并在时间线底部发布最新结果；本地 CI 通过后会自动删除活动失败评论。",
-    ])
-    return "\n".join(sections)
+    ]
+    if diagnosis_report:
+        opening = "\n<details>\n<summary>CI 失败诊断报告</summary>\n\n"
+        closing = "\n\n</details>"
+        fixed = "\n".join([*sections, opening + closing, *footer])
+        report = _bounded_diagnosis_markdown(
+            redactor.text(diagnosis_report),
+            byte_limit=PREFLIGHT_COMMENT_BODY_BYTES - len(fixed.encode("utf-8")),
+        )
+        sections.append(opening + report + closing)
+    return "\n".join([*sections, *footer])
 
 
 class PreflightExecutor:
@@ -647,7 +713,7 @@ class PreflightExecutor:
 
         provider_config = self.config.providers[repository.provider]
         token = resolve_provider_token(self.config, provider_config, repository)
-        body = _failure_comment_body(
+        body = build_failure_comment_body(
             repository,
             result,
             redactor=SecretRedactor((token,)),

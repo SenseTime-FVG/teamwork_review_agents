@@ -11,7 +11,7 @@ from .environment import SecretRedactor, resolve_environment, resolve_provider_t
 from .executor import AgentExecutor
 from .managed_comments import ManagedCommentService
 from .models import ChangeEvent, PreflightResult, stable_hash
-from .service_urls import preflight_details_url
+from .preflight import build_failure_comment_body
 from .state import RunReservation, StateStore
 
 
@@ -92,18 +92,12 @@ async def diagnose_ci_failure(
         return True
 
     if settings.publish_failure_comment and run["number"] is not None:
-        body = (
-            f"## Teamwork 本地 CI 失败诊断\n\n"
-            f"- Head SHA：`{run['head_sha']}`\n"
-            f"- CI 运行：`{result.run_id}`\n\n{report}"
-        )
-        limit = 54 * 1024
-        if len(body.encode("utf-8")) > limit:
-            body = body.encode("utf-8")[:limit].decode("utf-8", errors="ignore") + "\n\n报告过长，完整内容见 Teamwork CI 详情。"
-        details_url = preflight_details_url(config.web, result.run_id)
-        if details_url:
-            body += f"\n\n[查看 CI 日志与完整报告]({details_url})"
         try:
+            # 从持久化的同次 CI 重建原始摘要和日志，复用结果也不能丢失失败证据。
+            body = build_failure_comment_body(
+                repository, PreflightResult.model_validate(run),
+                redactor=redactor, diagnosis_report=report,
+            )
             await ManagedCommentService(config, store).publish_latest(
                 repository_id=repository.id, number=run["number"], namespace="preflight",
                 slot=settings.status_context, source_generation=selected_event.source_generation,
