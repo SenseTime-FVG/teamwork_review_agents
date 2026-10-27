@@ -8,6 +8,8 @@
 
 仓库启用 `preflight` 只代表具备本地 CI 能力。编排器仅在匹配规则配置 `run_preflight: true`、仓库启用 CI 且变更请求仍处于打开状态时执行门禁。规则要求 CI 但仓库未启用或未配置时直接启动 Agent，不报错；MR / PR 已关闭或合并时也跳过门禁。规则选择全部仓库时，不要求所有启用仓库都配置 CI。
 
+编排器向事件 Agent 提供独立的 `local_preflight` 摘要。`passed` 绑定本次成功结果的仓库、编号及源 SHA，附带运行 ID 和复用标记；`skipped` 按实际规则说明跳过原因，不伪装为通过。摘要不含原始日志，随可信调用上下文传给子 Agent，与 CI 失败诊断的 `preflight_run_id` 授权分离。审核模型只按摘要报告后台执行事实，不查询、补跑或重新判断本地门禁；缺少摘要也不增加阻断条件。模型额外专项测试单独报告，环境限制不覆盖后台成功结果，真实可复现的代码问题仍按审核标准处理。远端 CI 检查和平台实际门禁不变，详见 [本地门禁上下文设计](design-review-local-ci-context.md)。
+
 同一批次中未要求 CI 的 Agent 会立即启动，不等待 Preflight。要求 CI 的规则共享以仓库 ID、PR 编号、Head SHA 和完整配置 revision 生成的幂等结果。`success`、`failure` 与 `timed_out` 是可复用的本地终态；Git、进程启动或清理故障产生的 `error` 只影响要求 CI 的事件路径，并按事件重试额度再次执行。基础设施异常耗尽自动重试后，扫描事件继续复用该终态以避免无限运行；管理员新建的手动事件会把旧运行保留为历史记录，并为同一幂等键原子换入一条全新运行和完整重试额度。新运行随后成为同一 Head 与配置的当前可复用结果。
 
 执行器先更新 MR / PR 引用并创建独立 detached worktree，校验实际 Head SHA、初始化 submodule；精确工作区准备成功后才写入 `pending` Commit Status，并按参数数组顺序执行步骤。GitLab 状态写入 MR 的源项目与源分支，避免把外部作业放到错误的流水线；同一 SHA/ref 写入发生临时 409 冲突时最多重试两次。命令不经过 shell；单步超时同时受总超时约束，首个非零退出码停止后续步骤。日志按 `max_output_bytes` 保留最新内容。Preflight worktree 与 Agent 运行 clone/worktree 相互独立，均不修改基础仓库。

@@ -15,7 +15,7 @@ from teamwork_review_agents.models import (
     ChangeRequestActivityBatch,
     PreflightResult,
 )
-from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator
+from teamwork_review_agents.orchestrator import CycleSummary, Orchestrator, RuleInvocation
 from teamwork_review_agents.preflight import PreflightStepUpdate, StepExecutionOutcome, preflight_idempotency_key
 
 
@@ -75,11 +75,17 @@ def enqueue_discovered(orchestrator, snapshot_factory, *, state="opened"):
 
 
 class FakeAgentExecutor:
+    """记录真实编排传递的 Agent 名称和可信门禁摘要。"""
+
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.arguments: list[dict] = []
 
-    async def execute(self, *, agent_name, **_kwargs):
+    async def execute(self, *, agent_name, **kwargs):
+        """只记录调度参数，不调用模型或真实命令。"""
+
         self.calls.append(agent_name)
+        self.arguments.append(kwargs)
         return AgentResult(
             run_id=f"run-{agent_name}",
             root_run_id=f"run-{agent_name}",
@@ -379,17 +385,26 @@ async def test_reused_preflight_result_is_linked_to_current_event(
     assert preflight_detail["output"] == "断言失败"
 
 
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+@pytest.mark.parametrize("reused", [False, True])
 async def test_successful_preflight_allows_matching_review_agents(
     tmp_path,
     snapshot_factory,
+    kind,
+    reused,
 ) -> None:
-    """只有 CI 成功时，现有规则匹配到的 Review Agent 才能运行。"""
+    """两平台成功或复用结果均传递精确源版本摘要，不泄漏 CI 原始输出。"""
 
-    orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
-    enqueue_discovered(orchestrator, snapshot_factory)
+    config = preflight_config(tmp_path)
+    config.providers["github-main"].kind = kind
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    event = enqueue_discovered(orchestrator, snapshot_factory)
     agents = FakeAgentExecutor()
     orchestrator.executor = agents
-    orchestrator.preflight = FakePreflightExecutor(result("success"))
+    success = result("success").model_copy(update={
+        "reused": reused, "output": "不应进入审核摘要的原始日志",
+    })
+    orchestrator.preflight = FakePreflightExecutor(success)
     summary = CycleSummary()
 
     await orchestrator.process_events(summary)
@@ -398,6 +413,43 @@ async def test_successful_preflight_allows_matching_review_agents(
     assert orchestrator.store.pending_events() == []
     assert summary.preflight_failures == 0
     assert summary.agent_runs == 1
+    gate = agents.arguments[0]["local_preflight"]
+    assert gate.model_dump() == {
+        "repository_id": event.repository_id,
+        "number": event.number,
+        "head_sha": event.current_snapshot.head_sha,
+        "status": "passed",
+        "reason": "后台本地 CI 门禁已通过",
+        "run_id": success.run_id,
+        "reused": reused,
+    }
+    assert "不应进入审核摘要的原始日志" not in gate.model_dump_json()
+
+
+@pytest.mark.parametrize("mismatch", [None, "status", "repository_id", "number", "head_sha"])
+async def test_preflight_context_requires_matching_success_before_dispatch(
+    tmp_path, snapshot_factory, mismatch,
+) -> None:
+    """缺失、失败或绑定其他审核对象的结果不能标为本轮门禁通过。"""
+
+    config = preflight_config(tmp_path)
+    orchestrator = Orchestrator(config, recover_interrupted=False)
+    event = enqueue_discovered(orchestrator, snapshot_factory)
+    agents = FakeAgentExecutor()
+    orchestrator.executor = agents
+    evidence = None
+    if mismatch is not None:
+        replacements = {
+            "status": "failure", "repository_id": "other", "number": 8,
+            "head_sha": "c" * 40,
+        }
+        evidence = result("success").model_copy(update={mismatch: replacements[mismatch]})
+    invocation = RuleInvocation(config.rules[0], "reviewer", (event,))
+
+    with pytest.raises(RuntimeError, match="缺少匹配当前源提交的成功结果"):
+        await orchestrator._run_agent(invocation, preflight_result=evidence)
+
+    assert agents.calls == []
 
 
 async def test_matching_event_stays_processing_while_preflight_is_running(
@@ -504,6 +556,10 @@ async def test_rule_without_preflight_does_not_wait_for_enabled_repository_ci(
     assert preflight.calls == 0
     assert summary.preflight_runs == 0
     assert summary.agent_runs == 1
+    gate = agents.arguments[0]["local_preflight"]
+    assert gate.status == "skipped"
+    assert gate.reason == "本轮触发规则未要求本地 CI"
+    assert gate.run_id is None and not gate.reused
 
 
 async def test_rule_preflight_is_bypassed_when_repository_ci_is_disabled(
@@ -528,16 +584,22 @@ async def test_rule_preflight_is_bypassed_when_repository_ci_is_disabled(
     assert preflight.calls == 0
     assert summary.preflight_runs == 0
     assert summary.errors == []
+    gate = agents.arguments[0]["local_preflight"]
+    assert gate.status == "skipped"
+    assert gate.reason == "仓库未启用本地 CI"
+    assert gate.run_id is None and not gate.reused
 
 
+@pytest.mark.parametrize("state", ["closed", "merged"])
 async def test_rule_preflight_is_bypassed_for_non_open_change_request(
     tmp_path,
     snapshot_factory,
+    state,
 ) -> None:
     """已关闭或合并的变更请求不执行 Head CI，但仍运行匹配 Agent。"""
 
     orchestrator = Orchestrator(preflight_config(tmp_path), recover_interrupted=False)
-    enqueue_discovered(orchestrator, snapshot_factory, state="merged")
+    enqueue_discovered(orchestrator, snapshot_factory, state=state)
     agents = FakeAgentExecutor()
     preflight = FakePreflightExecutor(result("failure"))
     orchestrator.executor = agents
@@ -549,6 +611,10 @@ async def test_rule_preflight_is_bypassed_for_non_open_change_request(
     assert agents.calls == ["reviewer"]
     assert preflight.calls == 0
     assert summary.preflight_runs == 0
+    gate = agents.arguments[0]["local_preflight"]
+    assert gate.status == "skipped"
+    assert gate.reason == "变更请求已关闭或合并，不执行本地 CI"
+    assert gate.run_id is None and not gate.reused
 
 
 async def test_failed_preflight_only_blocks_rules_that_requested_ci(

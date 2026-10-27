@@ -109,16 +109,27 @@ def test_general_review_renders_exclusive_final_policy() -> None:
 def test_general_review_ci_only_binds_current_source_commit(
     auto_merge: str | None,
 ) -> None:
-    """两种审核模式均终止真实 CI 失败，但不要求成功 CI 绑定当前目标版本。"""
+    """两种审核模式均保留远端失败阻断，本地门禁仅报告后台摘要。"""
 
     template = (PROJECT_ROOT / "prompts/general-review.md").read_text(encoding="utf-8")
     values = {} if auto_merge is None else {"REVIEW_AUTO_MERGE": auto_merge}
     rendered = render_prompt(template, values)
     ci_policy = rendered.split("# 四、CI 门禁及等待策略", 1)[1].split("# 五、", 1)[0]
 
-    assert "本轮有效的本地或远端 CI 明确失败就立即终止审核" in rendered
-    assert "本地或远端任一有效结果明确失败，立即结束" in ci_policy
-    assert "本地 CI 失败不能被远端成功抵消，远端 CI 失败也不能被本地成功抵消" in ci_policy
+    assert "本轮有效的远端 CI 明确失败就立即终止审核" in rendered
+    assert "远端任一有效结果明确失败，立即结束" in ci_policy
+    assert "后台本地门禁成功不能抵消远端 CI 失败" in ci_policy
+    assert "审核 Agent 不再查询、补跑或重新判定本地门禁" in ci_policy
+    assert "`status=passed`" in ci_policy
+    assert "`status=skipped`" in ci_policy
+    assert "跳过不等于通过" in ci_policy
+    assert "不得仅凭 Agent 已启动推测本地 CI 通过" in ci_policy
+    assert "也不因摘要缺失而要求查询、补跑或终止审核" in ci_policy
+    assert "不自动终止其余代码、设计和一致性审核" in ci_policy
+    assert "不能因为后台 CI 成功而忽略真实缺陷" in ci_policy
+    assert "远端成功也不能被补充验证的环境限制改写为 CI 失败" in ci_policy
+    assert "先检查已提供的本地 Preflight 结果" not in rendered
+    assert "本地或远端 CI 明确失败" not in rendered
     assert "非必要检查的明确失败也必须终止审核" in ci_policy
     assert "merged-results、test merge commit、merge queue" in ci_policy
     assert "合并结果 CI 的执行提交 SHA 可以不同于源 SHA" in ci_policy

@@ -201,5 +201,5 @@ def test_review_prompt_receives_safe_gitlab_approval_context(
     assert "不能把 403、404、空响应或缺失的审批数量当成“无需审批”" in prompt
     assert "`mergeable: true` 本身不能覆盖这些阻断" in prompt
     assert "不为消除该状态主动提交正式 Approval" in prompt
-    assert "本轮有效的本地或远端 CI 明确失败就立即终止审核" in prompt
+    assert "本轮有效的远端 CI 明确失败就立即终止审核" in prompt
     assert "当前目标 SHA 仍等于 `REVIEW_TARGET_SHA`" in prompt

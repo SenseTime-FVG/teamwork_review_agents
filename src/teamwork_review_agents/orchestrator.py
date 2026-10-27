@@ -24,6 +24,8 @@ from .models import (
     ChangeEvent,
     ChangeRequestActivityBatch,
     ChangeRequestSnapshot,
+    LocalPreflightContext,
+    PreflightResult,
     ScheduledRunContext,
     stable_hash,
 )
@@ -558,10 +560,50 @@ class Orchestrator:
     async def _run_agent(
         self,
         invocation: RuleInvocation,
+        *,
+        preflight_result: PreflightResult | None = None,
     ) -> AgentResult | None:
         """执行一条规则产生的 Agent 任务，额度由执行器持久化申请。"""
 
         event = invocation.events[0]
+        repository = self.config.repository_map()[event.repository_id]
+        snapshot = event.current_snapshot
+        # 跳过原因按本条规则判定，不能借用同批次其他规则的成功门禁。
+        if not invocation.rule.run_preflight:
+            reason = "本轮触发规则未要求本地 CI"
+        elif not repository.preflight.enabled:
+            reason = "仓库未启用本地 CI"
+        elif snapshot.state != "opened":
+            reason = "变更请求已关闭或合并，不执行本地 CI"
+        else:
+            reason = None
+        if reason is not None:
+            local_preflight = LocalPreflightContext(
+                repository_id=event.repository_id,
+                number=event.number,
+                head_sha=snapshot.head_sha,
+                status="skipped",
+                reason=reason,
+            )
+        else:
+            # 成功证据只认本次编排取得的同仓库、同编号及同源版本结果。
+            if (
+                preflight_result is None
+                or preflight_result.status != "success"
+                or preflight_result.repository_id != event.repository_id
+                or preflight_result.number != event.number
+                or preflight_result.head_sha != snapshot.head_sha
+            ):
+                raise RuntimeError("本地 CI 门禁缺少匹配当前源提交的成功结果")
+            local_preflight = LocalPreflightContext(
+                repository_id=event.repository_id,
+                number=event.number,
+                head_sha=snapshot.head_sha,
+                status="passed",
+                reason="后台本地 CI 门禁已通过",
+                run_id=preflight_result.run_id,
+                reused=preflight_result.reused,
+            )
         return await self.executor.execute(
             agent_name=invocation.agent_name,
             event=event,
@@ -569,6 +611,7 @@ class Orchestrator:
             rule_name=invocation.rule.name,
             inherit_workspace=invocation.rule.inherit_workspace,
             idempotency_key=invocation.idempotency_key,
+            local_preflight=local_preflight,
         )
 
     async def _diagnose_preflight(self, event: ChangeEvent, result: Any, summary: CycleSummary) -> None:
@@ -939,6 +982,8 @@ class Orchestrator:
                 )
 
                 ready_preflight_invocations = preflight_invocations
+                # 每批清空结果，不能把上一批的成功摘要带入当前源版本。
+                preflight_result = None
                 if (
                     preflight_invocations
                     and repository.preflight.enabled
@@ -1020,7 +1065,9 @@ class Orchestrator:
                     else:
                         matched_event_ids.update(item[0] for item in preflight_dispatches)
                         task_items.extend(
-                            (invocation, asyncio.create_task(self._run_agent(invocation)))
+                            (invocation, asyncio.create_task(self._run_agent(
+                                invocation, preflight_result=preflight_result,
+                            )))
                             for invocation in ready_preflight_invocations
                         )
             except Exception as exc:

@@ -41,6 +41,7 @@ from .models import (
     AgentResult,
     ChangeEvent,
     InvocationContext,
+    LocalPreflightContext,
     ScheduledRunContext,
     stable_hash,
 )
@@ -269,6 +270,7 @@ class AgentExecutor:
             "schedule": context.schedule,
             "task": task,
             "extra_context": extra_context,
+            "local_preflight": context.local_preflight,
             "root_run_id": context.root_run_id,
             "parent_run_id": context.run_id,
             "depth": child_depth,
@@ -405,6 +407,7 @@ class AgentExecutor:
         target_head_sha: str | None = None,
         schedule: ScheduledRunContext | None = None,
         preflight_run_id: str | None = None,
+        local_preflight: LocalPreflightContext | None = None,
     ) -> str:
         """组合 Agent 固定角色、触发上下文和临时委托任务。"""
 
@@ -459,6 +462,18 @@ class AgentExecutor:
                     repository,
                     provider,
                 )
+        if local_preflight is not None:
+            # 摘要由后台调用上下文单独传递，委托补充材料不能覆盖它。
+            if (
+                event is None
+                or local_preflight.repository_id != event.repository_id
+                or local_preflight.number != event.number
+                or local_preflight.head_sha != event.current_snapshot.head_sha
+            ):
+                raise AgentExecutionError("本地 CI 门禁摘要与当前审核对象不一致")
+            context["local_preflight"] = local_preflight.model_dump(
+                mode="json", exclude_none=True,
+            )
         managed_comment_instruction = ""
         if agent.managed_comment and event is not None:
             managed_comment_instruction = (
@@ -528,6 +543,7 @@ class AgentExecutor:
         parent_workspace: Path | None = None,
         run_started_callback: Callable[[RunReservation], Awaitable[None]] | None = None,
         preflight_run_id: str | None = None,
+        local_preflight: LocalPreflightContext | None = None,
     ) -> AgentResult | None:
         """申请审计记录与写锁，然后运行所选 Codex 执行模式。"""
 
@@ -1076,6 +1092,7 @@ class AgentExecutor:
                     actions=effective_actions,
                     target_head_sha=target_head_sha,
                     preflight_run_id=preflight_run_id,
+                    local_preflight=local_preflight,
                 )
                 await asyncio.to_thread(
                     self.store.update_agent_run_inputs,
@@ -1202,6 +1219,7 @@ class AgentExecutor:
                         event=event,
                         schedule=resolved_schedule,
                         preflight_run_id=preflight_run_id,
+                        local_preflight=local_preflight,
                     )
                     result = await runner.run(
                         run_id=reservation.run_id,
