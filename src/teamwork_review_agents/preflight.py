@@ -27,6 +27,7 @@ from .preflight_cache import (
     build_repository_cache_environment,
     repository_cache_root,
 )
+from .preflight_log_uploads import ensure_gitlab_log_upload
 from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
@@ -536,6 +537,7 @@ def build_failure_comment_body(
     *,
     redactor: SecretRedactor,
     diagnosis_report: str = "",
+    log_url: str | None = None,
 ) -> str:
     """共用失败摘要和日志格式，诊断只追加独立折叠区，不覆盖原始失败证据。"""
 
@@ -592,6 +594,8 @@ def build_failure_comment_body(
         "",
         "> 后续真实 CI 再次失败时会删除本评论并在时间线底部发布最新结果；本地 CI 通过后会自动删除活动失败评论。",
     ]
+    if log_url:
+        sections.extend(["", f"[下载完整 CI 运行日志]({log_url})"])
     if diagnosis_report:
         opening = "\n<details>\n<summary>CI 失败诊断报告</summary>\n\n"
         closing = "\n\n</details>"
@@ -655,13 +659,27 @@ class PreflightExecutor:
             self.config.scanner,
             token=resolve_provider_token(self.config, provider_config, repository),
         ) as remote:
+            target_url = preflight_details_url(self.config.web, run_id) if run_id else None
+            if provider_config.kind == "gitlab":
+                # 运行中尚无最终附件；上传失败也不回退到仓库用户无法访问的后台。
+                target_url = ""
+                if run_id and state not in {"pending", "running"}:
+                    try:
+                        target_url = await ensure_gitlab_log_upload(
+                            self.config, self.store, repository, run_id, remote,
+                        ) or ""
+                    except Exception as exc:
+                        await self._append_log(
+                            run_id, f"CI 日志附件发布异常：{type(exc).__name__}",
+                            stream="stderr", event_type="log_upload_error",
+                        )
             return await remote.set_commit_status(
                 repository,
                 sha,
                 state=state,
                 context=repository.preflight.status_context,
                 description=description,
-                target_url=preflight_details_url(self.config.web, run_id) if run_id else None,
+                target_url=target_url,
                 ref=ref,
                 source_project=source_project,
                 number=number,
@@ -713,10 +731,12 @@ class PreflightExecutor:
 
         provider_config = self.config.providers[repository.provider]
         token = resolve_provider_token(self.config, provider_config, repository)
+        upload = await asyncio.to_thread(self.store.get_preflight_log_upload, result.run_id)
         body = build_failure_comment_body(
             repository,
             result,
             redactor=SecretRedactor((token,)),
+            log_url=upload["url"] if upload and upload["status"] == "completed" else None,
         )
         synced = await service.publish_latest(
             repository_id=repository.id,

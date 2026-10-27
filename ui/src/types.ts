@@ -809,6 +809,13 @@ export type PreflightStepRunDetail = {
 
 export type PreflightRunDetail = Omit<PreflightRunSummary, "linked_event_count" | "reused_event_count"> & {
   diagnosis?: PreflightDiagnosis | null;
+  // 附件上传与 CI 结果独立，避免把上传失败展示成测试失败。
+  log_upload?: {
+    status: "uploading" | "completed" | "failed";
+    attempts: number;
+    url?: string | null;
+    error?: string | null;
+  } | null;
   output: string;
   steps: PreflightStepRunDetail[];
   linked_events: Array<{

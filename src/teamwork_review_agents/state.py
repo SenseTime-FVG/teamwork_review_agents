@@ -378,6 +378,19 @@ class StateStore:
             )
             self._migrate_preflight_runs_for_manual(connection)
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS preflight_log_uploads (
+                    run_id TEXT NOT NULL,
+                    ci_attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    url TEXT,
+                    error TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(run_id, ci_attempt),
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                )
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_diagnoses (
                     preflight_run_id TEXT PRIMARY KEY,
                     agent_name TEXT NOT NULL,
@@ -1797,6 +1810,45 @@ class StateStore:
                 (repository_id, number),
             ).fetchone()
         return str(row["run_id"]) if row else None
+
+    def get_preflight_log_upload(self, run_id: str) -> dict[str, Any] | None:
+        """只读取本次执行尝试的附件，避免基础设施重试复用旧日志。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT upload.* FROM preflight_log_uploads AS upload
+                JOIN preflight_runs AS run ON run.run_id = upload.run_id
+                    AND run.attempts = upload.ci_attempt WHERE upload.run_id = ?""",
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_preflight_log_upload(
+        self, run_id: str, ci_attempt: int, *, status: str,
+        attempts: int, url: str | None = None, error: str | None = None,
+    ) -> None:
+        """附件的传输状态独立于 CI 终态，失败不能改写测试结论。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO preflight_log_uploads
+                (run_id, ci_attempt, status, attempts, url, error, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, ci_attempt) DO UPDATE SET
+                status=excluded.status, attempts=excluded.attempts, url=excluded.url,
+                error=excluded.error, updated_at=excluded.updated_at""",
+                (run_id, ci_attempt, status, attempts, url, error, time.time()),
+            )
+
+    def iter_preflight_logs(self, run_id: str) -> Iterator[dict[str, Any]]:
+        """按写入顺序流式导出准备过程和输出，不使用详情页分页上限。"""
+
+        with self.connect() as connection:
+            for row in connection.execute(
+                "SELECT id, created_at, stream, event_type, payload FROM preflight_logs WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ):
+                yield dict(row)
 
     def iter_preflight_output(self, run_id: str) -> Iterator[str]:
         """流式读取保留的完整输出；旧记录没有逐块日志时回退终态输出。"""
@@ -4002,6 +4054,7 @@ class StateStore:
             "linked_events": [dict(event_row) for event_row in event_rows],
             "steps": steps,
             "diagnosis": self.get_preflight_diagnosis(run_id),
+            "log_upload": self.get_preflight_log_upload(run_id),
         }
 
     def save_config_version(

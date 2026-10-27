@@ -97,6 +97,8 @@ async def diagnose_ci_failure(
             body = build_failure_comment_body(
                 repository, PreflightResult.model_validate(run),
                 redactor=redactor, diagnosis_report=report,
+                log_url=(run["log_upload"]["url"] if run.get("log_upload")
+                         and run["log_upload"]["status"] == "completed" else None),
             )
             await ManagedCommentService(config, store).publish_latest(
                 repository_id=repository.id, number=run["number"], namespace="preflight",

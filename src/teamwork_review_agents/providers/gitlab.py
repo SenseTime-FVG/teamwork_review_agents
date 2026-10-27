@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any, Literal
-from urllib.parse import quote
+from typing import Any, BinaryIO, Literal
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -309,8 +309,8 @@ class GitLabProvider(BaseProvider):
             "name": context,
             "description": description[:255],
         }
-        if target_url:
-            # 外部阶段中的作业可直接跳转到对应本地 CI 的实时日志。
+        if target_url is not None:
+            # 空字符串显式清除旧后台链接，终态可改为 GitLab 项目日志附件。
             payload["target_url"] = target_url
         if target.ref:
             payload["ref"] = target.ref
@@ -337,6 +337,45 @@ class GitLabProvider(BaseProvider):
                 ):
                     raise
                 await asyncio.sleep(0.2 * (attempt + 1))
+
+    async def upload_ci_log(self, repository: RepositoryConfig, file: BinaryIO, filename: str) -> str:
+        """上传到 MR 所属项目，并将新旧 GitLab 返回路径规范为同源附件地址。"""
+
+        path = f"projects/{quote(repository.project, safe='')}/uploads"
+        try:
+            file.seek(0)
+            response = await self.client.post(path, files={"file": (filename, file, "text/plain")})
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(f"GitLab CI 日志上传失败：HTTP {exc.response.status_code}") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderError(f"GitLab CI 日志上传失败：{type(exc).__name__}") from exc
+        if not isinstance(payload, dict):
+            raise ProviderError("GitLab CI 日志附件响应格式错误")
+        base = urlsplit(self.config.base_url)
+        upload_path = payload.get("full_path")
+        if not upload_path:
+            relative = payload.get("url")
+            if not isinstance(relative, str) or not relative.startswith("/uploads/"):
+                raise ProviderError("GitLab CI 日志附件响应缺少有效路径")
+            prefix = base.path.rstrip("/").removesuffix("/api/v4")
+            upload_path = f"{prefix}/{quote(repository.project, safe='/')}{relative}"
+        if not isinstance(upload_path, str):
+            raise ProviderError("GitLab CI 日志附件路径类型错误")
+        parsed = urlsplit(upload_path)
+        if (
+            parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+            or not upload_path.startswith("/") or upload_path.startswith("//")
+            or "/uploads/" not in parsed.path or "\\" in upload_path
+            or any(char.isspace() or ord(char) < 32 for char in upload_path)
+            or any(part in {".", ".."} for part in parsed.path.split("/"))
+        ):
+            raise ProviderError("GitLab CI 日志附件路径无效")
+        url = urlunsplit((base.scheme, base.netloc, parsed.path, "", ""))
+        if len(url) > 255:
+            raise ProviderError("GitLab CI 日志附件地址超过状态链接长度限制")
+        return url
 
     async def create_change_request_comment(
         self,

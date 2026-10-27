@@ -33,3 +33,10 @@ test("诊断已完成只表示生成报告，不表示 CI 通过", () => {
   assert.equal(diagnosisStatusLabel("skipped"), "诊断已跳过");
   assert.equal(diagnosisStatusLabel("failed"), "诊断失败");
 });
+
+test("成功 CI 仍在上传附件和回写状态时刷新，回写结束后停止", () => {
+  const uploading = { ...detail("success", undefined, true), status_published: false };
+  assert.equal(shouldRefreshPreflight(uploading), true);
+  assert.equal(shouldRefreshPreflight({ ...uploading, status_published: true }), false);
+  assert.equal(shouldRefreshPreflight({ ...uploading, linked_events: [] }), false);
+});

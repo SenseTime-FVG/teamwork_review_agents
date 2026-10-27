@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import httpx
 
@@ -119,6 +119,11 @@ class BaseProvider(ABC):
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Provider {self.name} 请求失败：{path}：{exc}") from exc
+
+    async def upload_ci_log(self, repository: RepositoryConfig, file: BinaryIO, filename: str) -> str:
+        """只有支持项目附件的平台实现此接口，其余平台不改变原有行为。"""
+
+        raise ProviderError("当前平台不支持上传 CI 日志附件")
 
     async def patch_optional_json(
         self,
