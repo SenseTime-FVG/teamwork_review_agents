@@ -378,6 +378,18 @@ class StateStore:
             )
             self._migrate_preflight_runs_for_manual(connection)
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS preflight_log_deliveries (
+                    run_id TEXT NOT NULL,
+                    ci_attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(run_id, ci_attempt),
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                )
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_log_uploads (
                     run_id TEXT NOT NULL,
                     ci_attempt INTEGER NOT NULL,
@@ -1810,6 +1822,55 @@ class StateStore:
                 (repository_id, number),
             ).fetchone()
         return str(row["run_id"]) if row else None
+
+    def enqueue_preflight_log_delivery(self, run_id: str) -> None:
+        """只把已发布终态的自动 CI 放入附件队列，重复事件不能重置已完成任务。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO preflight_log_deliveries (run_id, ci_attempt)
+                SELECT run_id, attempts FROM preflight_runs WHERE run_id=?
+                AND trigger_source='event' AND status_published=1
+                AND status IN ('success', 'failure', 'timed_out', 'error', 'cancelled')""",
+                (run_id,),
+            )
+
+    def pending_preflight_log_deliveries(self) -> list[dict[str, Any]]:
+        """读取当前执行尝试的待办；running 项可在进程中断后由租约保护恢复。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT job.*, run.repository_id FROM preflight_log_deliveries AS job
+                JOIN preflight_runs AS run ON run.run_id=job.run_id AND run.attempts=job.ci_attempt
+                WHERE job.status IN ('queued', 'running') AND job.next_attempt_at<=?
+                AND run.status_published=1 AND run.status!='running'
+                ORDER BY run.started_at LIMIT 32""", (time.time(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_preflight_log_delivery(self, run_id: str) -> dict[str, Any] | None:
+        """附件发布状态单独展示，不与测试终态混淆。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT job.* FROM preflight_log_deliveries AS job JOIN preflight_runs AS run
+                ON run.run_id=job.run_id AND run.attempts=job.ci_attempt WHERE job.run_id=?""",
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_preflight_log_delivery(
+        self, run_id: str, ci_attempt: int, *, status: str, attempts: int,
+        error: str | None = None, next_attempt_at: float = 0,
+    ) -> None:
+        """持久化独立任务的有限重试状态，任何结果均不改动 CI 记录。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE preflight_log_deliveries SET status=?, attempts=?, error=?, next_attempt_at=?
+                WHERE run_id=? AND ci_attempt=?""",
+                (status, attempts, error, next_attempt_at, run_id, ci_attempt),
+            )
 
     def get_preflight_log_upload(self, run_id: str) -> dict[str, Any] | None:
         """只读取本次执行尝试的附件，避免基础设施重试复用旧日志。"""
@@ -3997,6 +4058,7 @@ class StateStore:
                        preflight.status, preflight.attempts,
                        preflight.failed_step, preflight.exit_code,
                        preflight.output, preflight.error,
+                       preflight.source_generation, preflight.remote_status_target,
                        preflight.status_published, preflight.started_at,
                        preflight.finished_at,
                        event.event_type,
@@ -4055,6 +4117,8 @@ class StateStore:
             "steps": steps,
             "diagnosis": self.get_preflight_diagnosis(run_id),
             "log_upload": self.get_preflight_log_upload(run_id),
+            "log_delivery": self.get_preflight_log_delivery(run_id),
+            "remote_status_target": json.loads(row["remote_status_target"]) if row["remote_status_target"] else None,
         }
 
     def save_config_version(

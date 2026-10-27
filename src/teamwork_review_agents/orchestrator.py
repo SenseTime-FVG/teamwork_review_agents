@@ -1328,6 +1328,10 @@ class Orchestrator:
         await self.scan(summary)
         if not dry_run:
             await self.process_events(summary)
+            # CLI 单次运行没有常驻上传循环，门禁完成后再消费附件队列。
+            from .preflight_log_worker import PreflightLogWorker
+
+            await PreflightLogWorker(lambda: self.config, self.store).drain()
         return summary
 
     async def serve(self, stop_event: asyncio.Event) -> None:

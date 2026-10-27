@@ -105,6 +105,7 @@ async def diagnose_ci_failure(
                 slot=settings.status_context, source_generation=selected_event.source_generation,
                 source_head_sha=run["head_sha"], body=body,
                 replace_existing=False, update_existing=True, preflight_run_id=result.run_id,
+                refresh_preflight_body=True,
             )
         except Exception as exc:
             await asyncio.to_thread(store.set_preflight_diagnosis_comment_error, result.run_id, redactor.text(str(exc)))

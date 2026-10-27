@@ -40,3 +40,11 @@ test("成功 CI 仍在上传附件和回写状态时刷新，回写结束后停�
   assert.equal(shouldRefreshPreflight({ ...uploading, status_published: true }), false);
   assert.equal(shouldRefreshPreflight({ ...uploading, linked_events: [] }), false);
 });
+
+test("事件已结束且 CI 终态已回写时，独立附件队列仍触发刷新", () => {
+  const published = { ...detail("success"), status_published: true };
+  for (const status of ["queued", "running", "completed", "failed", "obsolete"] as const) {
+    assert.equal(shouldRefreshPreflight({ ...published, log_delivery: { status, attempts: 1 } }),
+      status === "queued" || status === "running");
+  }
+});

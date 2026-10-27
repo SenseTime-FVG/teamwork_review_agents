@@ -12,7 +12,7 @@ export type RuntimeAlert = {
 export function runtimeHealth(status: RuntimeStatus) {
   const alerts: RuntimeAlert[] = [];
   const messages = new Set<string>();
-  const labels: Record<string, string> = { scanner: "仓库扫描", dispatcher: "Agent 调度", scheduler: "定时调度" };
+  const labels: Record<string, string> = { scanner: "仓库扫描", dispatcher: "Agent 调度", scheduler: "定时调度", ci_logs: "CI 日志附件" };
   for (const [worker, task] of Object.entries(status.background_tasks ?? {})) {
     if (!task.error && !["retrying", "recovering", "stopped"].includes(task.state)) continue;
     const message = task.error || "后台任务已停止";

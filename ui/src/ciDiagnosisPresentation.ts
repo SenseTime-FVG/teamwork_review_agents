@@ -11,6 +11,8 @@ export function diagnosisStatusLabel(status?: PreflightDiagnosis["status"]): str
 export function shouldRefreshPreflight(detail: PreflightRunDetail): boolean {
   // CI 结束后的附件上传、状态回写与诊断占位期间也继续刷新。
   return detail.status === "running"
+    || detail.log_delivery?.status === "queued"
+    || detail.log_delivery?.status === "running"
     || (!detail.status_published && detail.linked_events.some(event => event.status === "processing"))
     || detail.diagnosis?.status === "queued"
     || detail.diagnosis?.status === "running"

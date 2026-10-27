@@ -13,8 +13,10 @@ import pytest
 from teamwork_review_agents.config import EnvironmentVariable
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.models import PreflightResult
+from teamwork_review_agents.managed_comments import ManagedCommentService
+from teamwork_review_agents.models import CommitStatusTarget, PreflightResult
 from teamwork_review_agents.preflight import PreflightExecutor, build_failure_comment_body
+from teamwork_review_agents.preflight_log_worker import PreflightLogWorker
 from teamwork_review_agents.preflight_log_uploads import ensure_gitlab_log_upload, export_ci_log
 from teamwork_review_agents.providers.base import ProviderError
 from teamwork_review_agents.providers.gitlab import GitLabProvider
@@ -222,6 +224,198 @@ async def test_status_failure_still_publishes_real_result_without_internal_url(u
     assert result.status == "failure" and result.status_published
     assert case.remote.set_commit_status.call_args.kwargs["state"] == "failure"
     assert case.remote.set_commit_status.call_args.kwargs["target_url"] == ""
+    case.remote.upload_ci_log.assert_not_awaited()
+    assert case.store.get_preflight_log_delivery(result.run_id)["status"] == "queued"
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert case.store.get_preflight_log_delivery(result.run_id)["status"] == "failed"
+    assert case.store.get_preflight_run(result.run_id)["status_published"]
+    assert case.store.get_preflight_run(result.run_id)["status"] == "failure"
+
+
+@pytest.fixture
+def delivery_case(upload_case, monkeypatch):
+    """使用真实队列和发布逻辑，模拟远端流水线、评论与文件传输。"""
+
+    case = upload_case
+    target = CommitStatusTarget(project="23", sha=case.result.head_sha, ref="refs/merge-requests/7/head", pipeline_id=71)
+    case.remote.set_commit_status = AsyncMock(return_value=target)
+    case.remote.create_change_request_comment = AsyncMock(return_value="comment-1")
+    case.remote.update_change_request_comment = AsyncMock(return_value=True)
+    case.remote.delete_change_request_comment = AsyncMock()
+    case.repository.preflight.publish_failure_comment = True
+
+    class RemoteContext:
+        """跨任务共享调用记录，不访问真实 GitLab。"""
+
+        async def __aenter__(self):
+            return case.remote
+
+        async def __aexit__(self, *_args):
+            return None
+
+    for module in ("preflight", "managed_comments"):
+        monkeypatch.setattr(f"teamwork_review_agents.{module}.create_provider", lambda *_a, **_kw: RemoteContext())
+    return case
+
+
+@pytest.mark.parametrize("status", ["success", "failure"])
+async def test_ci_terminal_is_visible_while_upload_is_blocked(delivery_case, status):
+    """即使附件网络永久等待，门禁已经返回且平台已收到终态。"""
+
+    case = delivery_case
+    case.result = case.result.model_copy(update={"status": status})
+    case.store.finish_preflight_run(case.result)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(*_args):
+        """用同步屏障观察状态顺序，不依靠上传速度推断。"""
+
+        entered.set()
+        await release.wait()
+        return case.url
+
+    case.remote.upload_ci_log.side_effect = hold
+    result = await asyncio.wait_for(PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result), 3)
+    assert result.status == status and result.status_published
+    case.remote.upload_ci_log.assert_not_awaited()
+    task = asyncio.create_task(PreflightLogWorker(lambda: case.config, case.store).drain())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        assert not task.done()
+        assert case.remote.set_commit_status.await_count == 1
+        assert case.remote.set_commit_status.call_args.kwargs["state"] == status
+        assert case.remote.set_commit_status.call_args.kwargs["target_url"] == ""
+        assert case.store.get_preflight_run(result.run_id)["status_published"]
+    finally:
+        release.set()
+        await task
+    assert [call.kwargs["state"] for call in case.remote.set_commit_status.call_args_list] == [status, status]
+    assert case.remote.set_commit_status.call_args.kwargs["target_url"] == case.url
+    assert case.store.get_preflight_log_delivery(result.run_id)["status"] == "completed"
+    if status == "failure":
+        assert case.url in case.remote.update_change_request_comment.call_args.args[2]
+
+
+async def test_restart_retries_link_only_and_stops_after_limit(delivery_case):
+    """链接发布错误跨重启重试，但已成功的附件不重传，重试有上限。"""
+
+    case = delivery_case
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    case.remote.set_commit_status.side_effect = ProviderError("临时错误 provider-secret")
+    for attempt in range(1, 4):
+        case.store = StateStore(case.config.database.path)
+        case.store.initialize()
+        await PreflightLogWorker(lambda: case.config, case.store).drain()
+        job = case.store.get_preflight_log_delivery(case.result.run_id)
+        assert job["attempts"] == attempt
+        assert job["status"] == ("failed" if attempt == 3 else "queued")
+        assert "provider-secret" not in job["error"]
+        assert case.store.get_preflight_run(case.result.run_id)["status_published"]
+        with case.store.connect() as connection:
+            connection.execute("UPDATE preflight_log_deliveries SET next_attempt_at=0")
+    case.remote.upload_ci_log.assert_awaited_once()
+    assert not case.store.pending_preflight_log_deliveries()
+
+
+async def test_old_upload_cannot_overwrite_new_ci_result(delivery_case):
+    """同一源提交的新 CI 已经通过时，迟到的旧失败附件不得复活失败状态或评论。"""
+
+    case = delivery_case
+    executor = PreflightExecutor(case.config, case.store)
+    await executor._publish_terminal_result(case.repository, case.result)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(*_args):
+        """延迟旧上传，让新 CI 在相同 MR 与 SHA 上先发布。"""
+
+        entered.set()
+        await release.wait()
+        return case.url
+
+    case.remote.upload_ci_log.side_effect = hold
+    task = asyncio.create_task(PreflightLogWorker(lambda: case.config, case.store).drain())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        case.store.begin_preflight_run(
+            proposed_run_id="new-ci", idempotency_key="new-ci", event_id=case.event.id,
+            repository_id=case.repository.id, number=7, head_sha=case.result.head_sha,
+            config_revision=case.config.revision, max_attempts=3,
+        )
+        newer = case.result.model_copy(update={"run_id": "new-ci", "status": "success"})
+        case.store.finish_preflight_run(newer)
+        await executor._publish_terminal_result(case.repository, newer)
+    finally:
+        release.set()
+        await task
+    assert [call.kwargs["state"] for call in case.remote.set_commit_status.call_args_list] == ["failure", "success"]
+    case.remote.update_change_request_comment.assert_not_awaited()
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "obsolete"
+
+
+async def test_background_stop_cancels_upload_and_restart_resumes(delivery_case):
+    """关闭后台立即取消上传等待，重启消费剩余额度且不重跑 CI。"""
+
+    case = delivery_case
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    entered = asyncio.Event()
+
+    async def hold(*_args):
+        """只等待取消，不主动结束网络阶段。"""
+
+        entered.set()
+        await asyncio.Event().wait()
+
+    case.remote.upload_ci_log.side_effect = hold
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    stop = asyncio.Event()
+    task = asyncio.create_task(worker.run(stop, lambda: False, lambda: None))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 2)
+    assert not worker.running
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "running"
+    case.store = StateStore(case.config.database.path)
+    case.store.initialize()
+    case.remote.upload_ci_log.side_effect = None
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "completed"
+    assert case.store.get_preflight_run(case.result.run_id)["status"] == "failure"
+    assert case.remote.set_commit_status.await_count == 2
+
+
+@pytest.mark.parametrize("report_first", [True, False])
+async def test_report_and_attachment_updates_preserve_each_other(delivery_case, report_first):
+    """无论报告或附件先完成，后到的旧正文都必须在评论锁内重建。"""
+
+    case = delivery_case
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    stale_body = case.remote.create_change_request_comment.call_args.args[2]
+
+    async def publish_report():
+        """模拟诊断早已构造正文，实际发布时需重新读取当前附件。"""
+
+        case.store.begin_preflight_diagnosis(case.result.run_id, "diagnoser")
+        case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report="诊断结论：测试断言错误")
+        await ManagedCommentService(case.config, case.store).publish_latest(
+            repository_id=case.repository.id, number=7, namespace="preflight",
+            slot=case.repository.preflight.status_context, source_generation=1,
+            source_head_sha=case.result.head_sha, body=stale_body,
+            replace_existing=False, update_existing=True, preflight_run_id=case.result.run_id,
+            refresh_preflight_body=True,
+        )
+
+    if report_first:
+        await publish_report()
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    if not report_first:
+        await publish_report()
+    body = case.remote.update_change_request_comment.call_args.args[2]
+    assert case.url in body
+    assert "诊断结论：测试断言错误" in body
+    assert "仅有界末尾摘要" in body
+    assert "<summary>CI 失败诊断报告</summary>" in body
 
 
 def test_legacy_log_fallback_is_explicit_and_attachment_survives_diagnosis(upload_case):
