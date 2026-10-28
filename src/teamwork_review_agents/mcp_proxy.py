@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp.server import FastMCP, Settings
+from mcp.types import Tool
 
 from .mcp_bridge import (
     call_bridge,
     channel_from_environment,
+    list_tools_bridge,
     publish_comment_bridge,
     wait_for_ci_bridge,
 )
@@ -18,7 +20,17 @@ from .mcp_bridge import (
 Settings.model_rebuild(_types_namespace={"FastMCP": FastMCP})
 
 
-mcp = FastMCP(
+class AgentGatewayProxy(FastMCP):
+    """沙盒只透传本次宿主目录，不能自行生成无约束的调用参数。"""
+
+    async def list_tools(self) -> list[Tool]:
+        """目录查询经鉴权通道完成，查询失败直接向客户端报告。"""
+
+        result = await list_tools_bridge(channel_from_environment())
+        return [Tool.model_validate(tool) for tool in result["tools"]]
+
+
+mcp = AgentGatewayProxy(
     "teamwork-agent-gateway-proxy",
     instructions=(
         "invoke_agent 请求只会经本次运行的临时通道交给 Teamwork 服务校验；"

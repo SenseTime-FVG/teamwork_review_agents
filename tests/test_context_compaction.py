@@ -304,7 +304,7 @@ async def test_builtin_prompts_fit_default_fixed_budget(configured_app_factory):
     agent = config.agents["code-reviewer"]
     fields = {
         "instructions": _instructions(repository=config.repositories[0], agent=agent, personality=None, skill_files={}),
-        "tools": teamwork_function_tools(allow_sub_agents=True, allow_publish_comment=True),
+        "tools": teamwork_function_tools(allowed_sub_agents=agent.allowed_sub_agents, allow_publish_comment=True),
     }
 
     async def summarize(payload):
@@ -325,7 +325,7 @@ async def test_builtin_prompts_remain_complete_summary_reference(configured_app_
     config = configured_app_factory()
     fields = {
         "instructions": _instructions(repository=config.repositories[0], agent=config.agents["code-reviewer"], personality=None, skill_files={}),
-        "tools": teamwork_function_tools(allow_sub_agents=True, allow_publish_comment=True),
+        "tools": teamwork_function_tools(allowed_sub_agents=config.agents["code-reviewer"].allowed_sub_agents, allow_publish_comment=True),
     }
     prompt = (Path(__file__).resolve().parents[1] / "prompts" / name).read_text(encoding="utf-8")
     fixed = [{"role": "user", "content": prompt}]

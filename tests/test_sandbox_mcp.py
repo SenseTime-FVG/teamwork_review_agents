@@ -8,6 +8,7 @@ import sys
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
 
 from teamwork_review_agents.mcp_bridge import McpBridgeChannel, _atomic_write_json
 from teamwork_review_agents.sandbox_mcp import standalone_mcp_command
@@ -16,7 +17,8 @@ from teamwork_review_agents.sandbox_mcp import standalone_mcp_command
 pytestmark = pytest.mark.usefixtures("verified_test_sandbox_python")
 
 
-async def test_standalone_proxy_preserves_real_broker_authority(configured_app_factory, snapshot_factory):
+@pytest.mark.parametrize("parent", ["code-reviewer", "security-reviewer"])
+async def test_standalone_proxy_preserves_real_broker_authority(configured_app_factory, snapshot_factory, parent):
     """新解释器代理不能绕过宿主 Broker 的 sub-agent 白名单。"""
 
     from teamwork_review_agents.codex_runner import encode_invocation_context
@@ -27,9 +29,9 @@ async def test_standalone_proxy_preserves_real_broker_authority(configured_app_f
     config = configured_app_factory()
     repository = config.repositories[0]
     event = detect_events(None, snapshot_factory(repository_id=repository.id, provider=repository.provider), emit_initial=True)[0]
-    context = InvocationContext(config_path=str(config.config_path), current_agent="security-reviewer",
+    context = InvocationContext(config_path=str(config.config_path), current_agent=parent,
                                 run_id="standalone-authority", root_run_id="standalone-authority",
-                                call_chain=("security-reviewer",), event=event)
+                                call_chain=(parent,), event=event)
     broker = await ManagedMcpBroker.start(run_id=context.run_id, config_path=config.config_path,
                                         encoded_context=encode_invocation_context(context),
                                         base_environment=os.environ, response_timeout_seconds=5)
@@ -38,6 +40,12 @@ async def test_standalone_proxy_preserves_real_broker_authority(configured_app_f
         async with stdio_client(StdioServerParameters(command=command[0], args=command[1:], env=broker.channel.environment_overrides())) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
+                tools = (await session.list_tools()).tools
+                invocations = [tool for tool in tools if tool.name == "invoke_agent"]
+                if parent == "code-reviewer":
+                    assert invocations[0].inputSchema["properties"]["agent_name"]["enum"] == ["security-reviewer"]
+                else:
+                    assert not invocations
                 result = await session.call_tool("invoke_agent", {"agent_name": "code-reviewer", "task": "不应执行"})
                 assert result.isError
                 assert "不允许调用" in result.content[0].text
@@ -70,7 +78,19 @@ async def test_standalone_proxy_has_no_site_dependency_and_keeps_protocol():
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
-                assert [item.name for item in (await session.list_tools()).tools] == ["invoke_agent", "publish_comment", "wait_for_ci"]
+                # 使用受控宿主响应，确认独立代理透传枚举而非使用本地静态目录。
+                listing = asyncio.create_task(session.list_tools())
+                request = await _request(channel)
+                assert request["method"] == "list_tools" and request["params"] == {}
+                catalog = [{"name": name, "inputSchema": {"type": "object", "properties": {
+                    "agent_name": {"type": "string", "enum": ["child"]},
+                }}} for name in ("invoke_agent", "publish_comment", "wait_for_ci")]
+                _atomic_write_json(channel.responses_directory / f"{request['request_id']}.response.json", {
+                    **request, "ok": True, "result": {"tools": catalog},
+                })
+                tools = (await listing).tools
+                assert [item.name for item in tools] == ["invoke_agent", "publish_comment", "wait_for_ci"]
+                assert tools[0].inputSchema["properties"]["agent_name"]["enum"] == ["child"]
                 await session.send_ping()
                 for name, arguments in [("invoke_agent", {"agent_name": "child", "task": "检查中文"}), ("publish_comment", {"body": "评论"}), ("wait_for_ci", {"number": 12, "expected_head_sha": "a" * 40})]:
                     pending = asyncio.create_task(session.call_tool(name, arguments))
@@ -84,6 +104,15 @@ async def test_standalone_proxy_has_no_site_dependency_and_keeps_protocol():
                     assert not response.isError
                     assert response.structuredContent == {"status": "completed", "text": "成功"}
                     assert json.loads(response.content[0].text) == response.structuredContent
+                # 宿主目录读取失败不能退回静态无约束工具，也不能泄露通道令牌。
+                listing = asyncio.create_task(session.list_tools())
+                request = await _request(channel)
+                _atomic_write_json(channel.responses_directory / f"{request['request_id']}.response.json", {
+                    **request, "ok": False, "error": {"message": "目录读取失败 " + channel.token},
+                })
+                with pytest.raises(McpError, match="无法读取 Teamwork 工具目录") as error:
+                    await listing
+                assert channel.token not in str(error.value)
                 invalid = await session.call_tool("publish_comment", {"body": "x", "other": "forbidden"})
                 assert invalid.isError
                 assert not list(channel.requests_directory.iterdir())

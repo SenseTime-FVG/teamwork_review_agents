@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp.server import FastMCP, Settings
+from mcp.types import Tool
 
 from .codex_runner import decode_invocation_context
 from .config import load_config
@@ -17,13 +18,38 @@ from .managed_comments import ManagedCommentService
 from .state import StateStore
 from .remote_ci import CI_TOOL_DESCRIPTION, RemoteCIWaiter
 from .run_waits import RunWaits, mcp_wait_timeout
+from .sub_agent_tools import INVOKE_AGENT_DESCRIPTION, configured_sub_agent_names, sub_agent_name_parameter
 
 
 # Python 3.14 不会自动解析该泛型前向引用，显式重建可避免设置字段不完整。
 Settings.model_rebuild(_types_namespace={"FastMCP": FastMCP})
 
 
-mcp = FastMCP(
+class AgentGateway(FastMCP):
+    """按当前父 Agent 生成工具目录，不将其他 Agent 的名单混入请求。"""
+
+    async def list_tools(self) -> list[Tool]:
+        """每次查询都读取可信调用身份，配置不可读时不返回无约束工具。"""
+
+        config, context = _load_invocation()
+        if context.current_agent not in config.agents:
+            raise RuntimeError(f"父 Agent 不存在：{context.current_agent}")
+        names = configured_sub_agent_names(config, config.agents[context.current_agent])
+        tools = await super().list_tools()
+        result = []
+        for tool in tools:
+            if tool.name == "invoke_agent":
+                if not names:
+                    continue
+                # 深复制目录项，避免修改 SDK 缓存的注册定义。
+                tool = tool.model_copy(deep=True)
+                tool.description = INVOKE_AGENT_DESCRIPTION
+                tool.inputSchema["properties"]["agent_name"] = sub_agent_name_parameter(names)
+            result.append(tool)
+        return result
+
+
+mcp = AgentGateway(
     "teamwork-agent-gateway",
     instructions=(
         "invoke_agent 只能调用当前 Agent 配置白名单中的 sub-agent。"
@@ -54,7 +80,7 @@ def _load_invocation():
 
 @mcp.tool(
     name="invoke_agent",
-    description="调用一个配置允许的 Codex CLI sub-agent，并等待其结构化结果。",
+    description=INVOKE_AGENT_DESCRIPTION,
 )
 async def invoke_agent(
     agent_name: str,

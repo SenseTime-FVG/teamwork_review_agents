@@ -15,31 +15,6 @@ from pathlib import Path
 
 
 _VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
-_TOOLS = [
-    {
-        "name": "invoke_agent",
-        "description": "调用一个配置允许的 Codex CLI sub-agent，并等待其结构化结果。",
-        "inputSchema": {
-            "type": "object", "required": ["agent_name", "task"],
-            "properties": {"agent_name": {"type": "string"}, "task": {"type": "string"},
-                           "extra_context": {"anyOf": [{"type": "object"}, {"type": "null"}], "default": None}},
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "publish_comment",
-        "description": "发布或更新当前 Agent 在当前源版本代次的 PR/MR 顶层评论。",
-        "inputSchema": {"type": "object", "required": ["body"],
-                        "properties": {"body": {"type": "string"}}, "additionalProperties": False},
-    },
-    {
-        "name": "wait_for_ci",
-        "description": "等待当前仓库 PR/MR 的远端 CI；超时保留成果，不自动重跑或合并。",
-        "inputSchema": {"type": "object", "required": ["number", "expected_head_sha"],
-                        "properties": {"number": {"type": "integer", "minimum": 1},
-                                       "expected_head_sha": {"type": "string"}}, "additionalProperties": False},
-    },
-]
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -145,7 +120,12 @@ async def _respond(message: dict) -> None:
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": _TOOLS}
+        try:
+            # 与普通代理读取同一宿主目录，独立解释器无需接触业务配置。
+            result = await _call_bridge("list_tools", {})
+        except Exception:
+            _send({**response, "error": {"code": -32603, "message": "无法读取 Teamwork 工具目录，请检查宿主 Broker"}})
+            return
     elif method == "tools/call":
         try:
             name, arguments = _tool_arguments(params)

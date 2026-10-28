@@ -109,6 +109,8 @@ Agent 可声明以下写作用域：
 - 与父任务一致的仓库和变更请求上下文。
 - 写 Agent 必须申请对应资源锁。
 
+`invoke_agent` 工具的 `agent_name` 参数枚举由后台提供：按父 Agent 配置顺序去重，并排除已不存在的 Agent；没有候选时隐藏该工具。工具说明明确无需另行查询允许名单，调用时仍执行全部后端校验。内嵌模型与 MCP 网关遵循相同规则，沙盒代理通过鉴权通道读取宿主目录，不在 Prompt 中重复添加名单或当前 Agent 名称。详见 [子 Agent 工具参数枚举](design-sub-agent-tool-enum.md)。
+
 sub-agent 不是模型内部的逻辑角色，而是由编排器启动的另一个真实 `codex exec` 进程，因此具有独立日志、运行 ID 和超时。
 
 父 Agent 调用 `invoke_agent(agent_name, task, extra_context)` 时负责指定目标 sub-agent 和具体委托任务。sub-agent 自动继承仓库标识与远端项目，但不自动继承根 Agent 的 MR / PR 数据或动作列表。父 Agent 判断任务确有需要时，可在 `task` 或 `extra_context` 中明确传递所需信息。sub-agent 是否与父 Agent 共用本地工作目录由触发规则的 `inherit_workspace` 决定。
