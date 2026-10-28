@@ -195,6 +195,12 @@ async def wait_for_ci_bridge(channel: McpBridgeChannel, *, number: int, expected
     })
 
 
+async def list_tools_bridge(channel: McpBridgeChannel) -> dict[str, Any]:
+    """只读取宿主生成的工具目录，不允许代理指定父 Agent 或配置路径。"""
+
+    return await _call_bridge_method(channel, method="list_tools", params={})
+
+
 async def _call_bridge_method(
     channel: McpBridgeChannel,
     *,
@@ -417,14 +423,20 @@ async def _handle_request(
         if request.get("token") != channel.token:
             raise PermissionError("MCP Bridge 通道令牌无效")
         method = request.get("method")
-        if method not in {"invoke_agent", "publish_comment", "wait_for_ci"}:
+        if method not in {"invoke_agent", "publish_comment", "wait_for_ci", "list_tools"}:
             raise PermissionError("MCP Bridge 请求的方法不在白名单中")
         params = request.get("params")
         if not isinstance(params, dict):
             raise ValueError("MCP Bridge 参数格式无效")
 
         # 延迟导入可避免 CodexRunner 与桥接模块在主服务进程中形成循环依赖。
-        if method == "invoke_agent":
+        if method == "list_tools":
+            if params:
+                raise ValueError("list_tools 不接受参数")
+            from .mcp_server import mcp
+
+            result = {"tools": [tool.model_dump(mode="json", exclude_none=True) for tool in await mcp.list_tools()]}
+        elif method == "invoke_agent":
             agent_name = params.get("agent_name")
             task = params.get("task")
             extra_context = params.get("extra_context")

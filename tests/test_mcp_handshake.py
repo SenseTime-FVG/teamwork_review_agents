@@ -16,20 +16,28 @@ from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.state import StateStore
 
 
-async def test_mcp_server_lists_invoke_agent() -> None:
+@pytest.mark.parametrize("parent", ["code-reviewer", "security-reviewer"])
+async def test_mcp_server_lists_invoke_agent(configured_app_factory, snapshot_factory, parent) -> None:
+    """实际 STDIO 目录按父 Agent 隔离，空名单不暴露调用工具。"""
+
+    config = configured_app_factory()
+    event = detect_events(None, snapshot_factory(provider="github-main"), emit_initial=True)[0]
+    context = InvocationContext(config_path=str(config.config_path), current_agent=parent,
+                                run_id="catalog", root_run_id="catalog", call_chain=(parent,), event=event)
     parameters = StdioServerParameters(
         command=sys.executable,
         args=["-m", "teamwork_review_agents.mcp_server"],
+        env={"TEAMWORK_CONFIG_PATH": str(config.config_path), "TEAMWORK_INVOCATION_CONTEXT": encode_invocation_context(context)},
     )
     async with stdio_client(parameters) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
             tools = await session.list_tools()
-    assert [tool.name for tool in tools.tools] == [
-        "invoke_agent",
-        "publish_comment",
-        "wait_for_ci",
-    ]
+    expected = ["invoke_agent"] if parent == "code-reviewer" else []
+    assert [tool.name for tool in tools.tools] == [*expected, "publish_comment", "wait_for_ci"]
+    if expected:
+        assert tools.tools[0].inputSchema["properties"]["agent_name"]["enum"] == ["security-reviewer"]
+        assert "无需另外查询允许名单" in tools.tools[0].description
 
 
 async def test_mcp_rejects_agent_outside_allowlist(

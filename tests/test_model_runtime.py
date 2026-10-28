@@ -181,6 +181,10 @@ async def test_model_runner_emits_live_sub_agent_link(
 
     async def fake_create_response(self, payload, *, event_callback=None):
         nonlocal response_count
+        # 在实际模型请求上核对名单，不能只验证独立构造函数。
+        invocation = next(tool for tool in payload["tools"] if tool["name"] == "invoke_agent")
+        assert invocation["parameters"]["properties"]["agent_name"]["enum"] == ["security-reviewer"]
+        assert "无需另外查询允许名单" in invocation["description"]
         response_count += 1
         if response_count == 1:
             return {

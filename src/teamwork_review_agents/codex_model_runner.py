@@ -52,6 +52,7 @@ from .model_tools import (
     teamwork_function_tools,
 )
 from .models import AgentResult, InvocationContext
+from .sub_agent_tools import configured_sub_agent_names
 from .reasoning_effort import next_reasoning_effort
 from .run_control import RunControl, RunStop, active_run_control, cancellation_stop
 from .tool_results import ToolResultError, ToolResultStore
@@ -877,7 +878,7 @@ class CodexModelRunner:
         if not await activate(0):
             raise RuntimeError("模型主链与回退链没有可用的 Provider/模型")
         tools = teamwork_function_tools(
-            allow_sub_agents=bool(agent.allowed_sub_agents),
+            allowed_sub_agents=configured_sub_agent_names(self.config, agent),
             allow_publish_comment=agent.managed_comment,
         )
         if context is not None and context.preflight_run_id is not None:

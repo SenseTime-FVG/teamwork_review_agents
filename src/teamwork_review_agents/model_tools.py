@@ -8,7 +8,7 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -29,6 +29,7 @@ from .run_control import RunStop, active_run_control
 from .remote_ci import CI_TOOL_DESCRIPTION, CI_TOOL_PARAMETERS, RemoteCIWaiter
 from .run_waits import CI_TIMEOUT_MESSAGE
 from .tool_results import TOOL_CAPTURE_LIMIT_BYTES, ToolResultError
+from .sub_agent_tools import INVOKE_AGENT_DESCRIPTION, sub_agent_name_parameter
 
 
 CancelCheck = Callable[[], Awaitable[bool]]
@@ -53,7 +54,7 @@ _PROCESS_KILL_GRACE_SECONDS = 1.0
 
 def teamwork_function_tools(
     *,
-    allow_sub_agents: bool,
+    allowed_sub_agents: Sequence[str],
     allow_publish_comment: bool = False,
 ) -> list[dict[str, Any]]:
     """生成 Codex Responses 接受的 Teamwork 函数工具定义。"""
@@ -112,22 +113,16 @@ def teamwork_function_tools(
             },
         },
     ]
-    if allow_sub_agents:
+    if allowed_sub_agents:
         tools.append(
             {
                 "type": "function",
                 "name": "invoke_agent",
-                "description": (
-                    "调用当前 Agent 白名单中的 sub-agent，并等待结构化结果。"
-                    "只在任务确实需要委托时使用。"
-                ),
+                "description": INVOKE_AGENT_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent_name": {
-                            "type": "string",
-                            "description": "配置中允许调用的 sub-agent 名称。",
-                        },
+                        "agent_name": sub_agent_name_parameter(allowed_sub_agents),
                         "task": {
                             "type": "string",
                             "description": "边界清晰、可独立完成的委托任务。",
