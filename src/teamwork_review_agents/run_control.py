@@ -42,6 +42,8 @@ class RunControl:
     waiting_ci: int = 0
     stop: RunStop | None = None
     runtime_wait_deadline: float | None = None
+    model_request_deadline: float | None = None
+    total_deadline: float | None = None
 
     def progress(self) -> None:
         """只更新当前运行的进展，不传播到父运行。"""
@@ -65,10 +67,14 @@ class RunControl:
 
         if self.stop is not None:
             return self.stop
+        if self.total_deadline is not None and time.monotonic() >= self.total_deadline:
+            self.stop = RunStop("timed_out", "agent_total_timeout", "Agent 超过总运行时限", "run.timed_out")
+            return self.stop
         parent = self.parent
         while parent is not None:
-            if parent.stop is not None:
-                self.stop = child_stop(parent.stop, parent.run_id)
+            parent_stop = parent.effective_stop()
+            if parent_stop is not None:
+                self.stop = child_stop(parent_stop, parent.run_id)
                 return self.stop
             parent = parent.parent
         return None
@@ -106,6 +112,26 @@ class RunControl:
         """期限不被心跳续期，异常未退出的等待最终仍受看门狗约束。"""
 
         return self.runtime_wait_deadline is not None and now < self.runtime_wait_deadline
+
+    @contextmanager
+    def waiting_for_model(self, timeout_seconds: float) -> Iterator[None]:
+        """模型请求自行监督 idle；保留固定期限，结束后恢复工具阶段计时。"""
+
+        self.raise_if_stopped()
+        previous = self.model_request_deadline
+        deadline = time.monotonic() + timeout_seconds
+        self.model_request_deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self.model_request_deadline = previous
+            # 流式事件可能已经更新进展，不能再把整段请求耗时加到未来。
+            self.progress()
+
+    def model_request_active(self, now: float) -> bool:
+        """故障客户端不退出时，看门狗仍会在有界保护结束后接管。"""
+
+        return self.model_request_deadline is not None and now < self.model_request_deadline
 
 
 def child_stop(stop: RunStop, parent_run_id: str) -> RunStop:

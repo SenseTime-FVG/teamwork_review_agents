@@ -348,7 +348,7 @@ async def test_builtin_prompts_remain_complete_summary_reference(configured_app_
 def run_context(configured_app_factory, monkeypatch):
     """通过真实 HTTP 协议适配器验证运行器，禁止网络和真实工具执行。"""
 
-    async def run(handler, *, settings=None, output_size=2400, fallback=False, window=None, windows=None):
+    async def run(handler, *, settings=None, output_size=2400, fallback=False, window=None, windows=None, idle=None):
         config = configured_app_factory()
         config.runtime.context_compaction = settings or _settings()
         # 窗口归属 Provider，与压缩算法参数独立；默认测试使用小窗口。
@@ -378,6 +378,8 @@ def run_context(configured_app_factory, monkeypatch):
 
         monkeypatch.setattr(ModelToolExecutor, "execute", execute)
         agent = config.agents["code-reviewer"].model_copy(update={"sandbox": "danger-full-access"})
+        if idle is not None:
+            agent = agent.model_copy(update={"idle_timeout_seconds": idle})
         result = await CodexModelRunner(config, provider_id="a").run(
             run_id="context-run", root_run_id="context-run", parent_run_id=None,
             agent_name="code-reviewer", agent=agent, repository=config.repositories[0], context=None,
@@ -445,6 +447,36 @@ async def test_runner_compacts_without_changing_system_or_replaying_tools(run_co
     assert all(body["input"][0] == normal[0]["input"][0] for body in normal)
     assert any(SUMMARY_PREFIX.splitlines()[0] in json.dumps(body, ensure_ascii=False) for body in normal[1:])
     assert outcome.result.usage["input_tokens"] == 2 * (len(normal) + len(summaries))
+    assert outcome.snapshots[-1]["context_compactions"][-1]["fixed_content_preserved"] is True
+
+
+async def test_summary_timeout_falls_back_with_original_history(run_context):
+    """摘要静默时向备用模型发送相同历史，已完成工具保持一次执行。"""
+
+    import asyncio
+
+    normal, summaries = [], []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if _is_summary(body):
+            summaries.append(body)
+            if body["model"] == "gpt-a":
+                await asyncio.Event().wait()
+            return _response("已完成首轮工具。后续完成验证并返回结果。")
+        normal.append(body)
+        if len(normal) == 1:
+            return _tool(0)
+        if len(normal) == 2:
+            return _overflow()
+        return _response("完成")
+
+    outcome = await run_context(handler, output_size=30000, settings=ContextCompactionConfig(), fallback=True, idle=0.1)
+    assert outcome.result.status == "completed"
+    assert outcome.calls == [0]
+    assert [body["model"] for body in summaries] == ["gpt-a", "gpt-b"]
+    assert summaries[0]["input"] == summaries[1]["input"]
+    assert any(kind == "model.request_timed_out" and payload["phase"] == "compaction" for kind, payload in outcome.logs)
     assert outcome.snapshots[-1]["context_compactions"][-1]["fixed_content_preserved"] is True
 
 

@@ -37,6 +37,7 @@ from .context_compaction import (
     summary_payload,
 )
 from .model_provider_client import ExternalModelClient, ModelProviderRequestError
+from .model_request import ModelRequestTimeout, run_model_request
 from .model_provider_credentials import ModelProviderCredentialStore
 from .model_provider_runtime import (
     ResolvedModelSelection,
@@ -415,6 +416,9 @@ class CodexModelRunner:
 
         started_at = time.monotonic()
         control = RunControl(run_id, parent=active_run_control.get())
+        if parent_run_id is not None or (context is not None and context.preflight_run_id is not None):
+            # 在请求恢复前同步核对期限，避免看门狗下一次轮询前多发一次请求。
+            control.total_deadline = started_at + agent.timeout_seconds
         control_token = active_run_control.set(control)
         idle_timeout = (
             agent.idle_timeout_seconds
@@ -468,7 +472,8 @@ class CodexModelRunner:
             """轮询持久化取消、总时限与无进展时限。"""
 
             while not main_task.done():
-                await asyncio.sleep(0.25)
+                # 短预算也及时处理管理员取消，避免请求期限先到而掩盖取消来源。
+                await asyncio.sleep(min(0.25, agent.timeout_seconds / 4, idle_timeout / 4))
                 if main_task.done():
                     return
                 now = time.monotonic()
@@ -487,6 +492,7 @@ class CodexModelRunner:
                     and not control.waiting_children
                     and not control.waiting_ci
                     and not control.runtime_wait_active(now)
+                    and not control.model_request_active(now)
                     and now - control.last_progress_at >= idle_timeout
                 ):
                     control.stop = RunStop(
@@ -510,6 +516,18 @@ class CodexModelRunner:
             if control.effective_stop() is None:
                 control.stop = await requested_cancellation()
             return await stopped_result()
+        except ModelRequestTimeout as exc:
+            if control.effective_stop() is not None:
+                return await stopped_result()
+            error = f"{exc}；当前轮请求的有限恢复已耗尽，任务未完成"
+            await emit("system", "run.model_request_timed_out", {
+                **exc.details, "error": error, "error_code": exc.error_code, "retryable": False,
+            })
+            return AgentResult(
+                run_id=run_id, root_run_id=root_run_id, parent_run_id=parent_run_id,
+                agent_name=agent_name, status="timed_out", error=error,
+                error_code=exc.error_code, retryable=False,
+            )
         except ContextCompactionError as exc:
             if control.effective_stop() is not None:
                 return await stopped_result()
@@ -641,6 +659,8 @@ class CodexModelRunner:
         def fallbackable_error(error: Exception) -> bool:
             """只把 Provider 暂时不可用类错误交给回退链。"""
 
+            if isinstance(error, ModelRequestTimeout):
+                return True
             if isinstance(error, (ModelProviderRequestError, CodexUpstreamError)) and error.quota_exhausted:
                 return True
             if isinstance(error, ModelProviderRequestError):
@@ -974,17 +994,36 @@ class CodexModelRunner:
                 if len(events) < self.config.runtime.max_jsonl_events:
                     events.append(redactor.data(safe))
 
-        async def request_model(payload: dict[str, Any], callback: Any) -> dict[str, Any]:
-            """正常请求和摘要请求共享当前 Provider 的并发与超时边界。"""
+        request_attempt = 0
 
+        async def request_model(payload: dict[str, Any], callback: Any, *, phase: str = "inference") -> dict[str, Any]:
+            """请求超时先交回退链处理，避免被运行级 idle 看门狗抢先取消。"""
+
+            nonlocal request_attempt
+            request_attempt += 1
+            provider = current_selection.provider if current_selection else self.provider
             semaphore = self._semaphore_for(
                 current_selection.provider_id if current_selection else self.provider_id,
-                current_selection.provider if current_selection else self.provider,
+                provider,
             )
-            if semaphore is None:
-                return await client.create_response(payload, event_callback=callback)
-            async with semaphore:
-                return await client.create_response(payload, event_callback=callback)
+            idle_seconds = float(agent.idle_timeout_seconds or self.config.runtime.agent_idle_timeout_seconds)
+            total_seconds = float(agent.timeout_seconds if provider.driver == "codex_cli" else min(agent.timeout_seconds, provider.request_timeout_seconds))
+
+            async def diagnostic(kind: str, details: dict[str, Any]) -> None:
+                """请求阶段只记录安全元数据，不把日志写入算作模型进展。"""
+
+                await emit("system", kind, {
+                    **details, "request_round": request_round, "request_attempt": request_attempt,
+                    "provider_id": current_selection.provider_id if current_selection else self.provider_id,
+                    "model": model, "phase": phase,
+                    "idle_timeout_seconds": idle_seconds, "request_timeout_seconds": total_seconds,
+                })
+
+            return await run_model_request(
+                lambda receive: client.create_response(payload, event_callback=receive),
+                callback=callback, emit=diagnostic, idle_seconds=idle_seconds,
+                total_seconds=total_seconds, semaphore=semaphore,
+            )
 
         async def summarize(payload: dict[str, Any]) -> str:
             """摘要只产生交接文本，不能执行工具或冒充正常 Agent 回复。"""
@@ -1007,7 +1046,7 @@ class CodexModelRunner:
                 "message": "正在从原对话副本生成交接摘要；保留消息结构与系统指令，仅在副本末尾追加交接请求，不执行工具。",
             })
             try:
-                summary_response = await request_model(redactor.data(payload), summary_progress)
+                summary_response = await request_model(redactor.data(payload), summary_progress, phase="compaction")
             except Exception as exc:
                 if incomplete:
                     raise ContextCompactionError("摘要生成未完整结束；原历史保留") from exc
@@ -1037,6 +1076,8 @@ class CodexModelRunner:
         for round_index in range(max_tool_rounds):
             check_stop()
             request_round = round_index + 1
+            request_attempt = 0
+            timeout_retried = False
             context_retried: set[tuple[str, str | None]] = set()
             force_compaction = False
             # 新请求从主链起点选模；只跳过本次运行已明确额度耗尽的候选。
@@ -1160,6 +1201,8 @@ class CodexModelRunner:
                         "phase": request_phase,
                         "reason": redactor.text(str(exc)),
                     }
+                    if isinstance(exc, ModelRequestTimeout):
+                        failure_payload.update({**exc.details, "error_code": exc.error_code})
                     attempts.append(failure_payload)
                     await emit("system", "model.attempt_failed", failure_payload)
                     if quota_exhausted and failed_selection is not None:
@@ -1236,7 +1279,15 @@ class CodexModelRunner:
                             },
                         )
                         await save_snapshot()
-                        force_compaction = False
+                        # 摘要超时未提交新历史，备用模型仍须完成本轮压缩。
+                        force_compaction = isinstance(exc, ModelRequestTimeout) and request_phase == "compaction"
+                        continue
+                    if isinstance(exc, ModelRequestTimeout) and not timeout_retried:
+                        # 无可用备用时，同一轮只额外重试一次，不重新执行已完成工具。
+                        timeout_retried = True
+                        await emit("system", "model.request_retry", {
+                            **failure_payload, "message": "没有可用的后续候选，当前轮模型请求仅重试一次；保留已完成工具结果。",
+                        })
                         continue
                     raise
                 attempts.append(

@@ -724,8 +724,8 @@ class AgentExecutor:
         ) -> None:
             """将 Runner 流式事件写入当前运行日志。"""
 
-            # 取消终态在确认来源并完成收尾后统一持久化，避免同一取消出现两张卡片。
-            if event_type == "run.cancelled":
+            # 停止终态统一在收尾后持久化；具体原因由 error_code 保留，避免重复卡片。
+            if event_type in {"run.cancelled", "run.timed_out", "run.idle_timed_out", "run.model_request_timed_out"}:
                 return
             await asyncio.to_thread(
                 self.store.append_run_log,

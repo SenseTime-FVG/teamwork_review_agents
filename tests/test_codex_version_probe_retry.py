@@ -158,6 +158,32 @@ async def _cancel_after(entered):
     return entered.is_set()
 
 
+async def test_incomplete_stream_does_not_execute_tools_before_retry(retry_harness, monkeypatch):
+    """未完整响应的工具调用不执行，重试携带已完成工具的原始结果。"""
+
+    payloads = []
+
+    async def respond(self, payload, *, event_callback):
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return {"output": [{"type": "function_call", "call_id": "done", "name": "execute_command", "arguments": "{}"}]}
+        if len(payloads) == 2:
+            await event_callback({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "partial", "name": "execute_command", "arguments": "{}",
+            }})
+            await asyncio.Event().wait()
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "完成"}]}]}
+
+    h = retry_harness(idle=0.1)
+    monkeypatch.setattr(CodexResponsesClient, "create_response", respond)
+    result = await h.run()
+    assert result.status == "completed"
+    assert h.tools == ["execute_command"]
+    assert len(payloads) == 3
+    assert payloads[1]["input"] == payloads[2]["input"]
+    assert "partial" not in json.dumps(payloads[2]["input"])
+
+
 async def test_runtime_wait_preserves_idle_age_and_is_bounded(monkeypatch):
     """等待不续期父级或自身进展，只扣除期限内耗时，异常退出也清理。"""
 

@@ -474,7 +474,7 @@ async def test_full_executor_nested_wait_and_terminal_state(executor_harness, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["agent_idle_timeout", "remote_ci_timeout", "agent_total_timeout"])
+@pytest.mark.parametrize("code", ["agent_idle_timeout", "remote_ci_timeout", "agent_total_timeout", "model_request_timeout"])
 async def test_execution_timeout_does_not_restart_root(executor_harness, monkeypatch, code):
     """贯通运行器、数据库和幂等预留，超时后不能再创建新会话执行整套流程。"""
 
@@ -485,6 +485,8 @@ async def test_execution_timeout_does_not_restart_root(executor_harness, monkeyp
         """模拟已经进入运行阶段的超时，默认 retryable 由执行器收紧。"""
 
         calls.append(kwargs["run_id"])
+        event = {"agent_idle_timeout": "run.idle_timed_out", "model_request_timeout": "run.model_request_timed_out"}.get(code, "run.timed_out")
+        await kwargs["log_callback"]("system", event, "回归测试超时")
         return AgentResult(run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
                            agent_name=kwargs["agent_name"], status="timed_out", error="回归测试超时", error_code=code)
 
@@ -498,3 +500,7 @@ async def test_execution_timeout_does_not_restart_root(executor_harness, monkeyp
     assert detail["status"] == "timed_out"
     assert detail["retryable"] == 0
     assert detail["attempts"] == 1
+    logs = store.list_run_logs(calls[0])
+    terminal = [log for log in logs if log["event_type"].startswith("run.") and log["event_type"].endswith("timed_out")]
+    assert len(terminal) == 1
+    assert json.loads(terminal[0]["payload"])["error_code"] == code

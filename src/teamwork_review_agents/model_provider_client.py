@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .model_request import record_model_transport
+
 from .config import ModelProviderConfig
 from .model_quota import is_quota_exhausted
 from .context_compaction import is_context_length_exceeded
@@ -337,11 +339,15 @@ class ExternalModelClient:
         )
         try:
             async with httpx.AsyncClient(timeout=timeout, transport=self.transport) as client:
-                response = await client.post(
-                    url,
-                    headers={"Content-Type": "application/json", **headers},
-                    json=body,
-                )
+                await record_model_transport("awaiting_headers")
+                async with client.stream(
+                    "POST", url, headers={"Content-Type": "application/json", **headers}, json=body,
+                ) as response:
+                    await record_model_transport(
+                        "reading_response", http_status=response.status_code,
+                        upstream_request_id=response.headers.get("x-request-id"),
+                    )
+                    await response.aread()
         except httpx.HTTPError as exc:
             raise ModelProviderRequestError(
                 f"模型 Provider 连接失败：{type(exc).__name__}",
