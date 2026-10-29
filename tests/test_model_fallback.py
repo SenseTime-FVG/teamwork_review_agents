@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from functools import partial
 from types import SimpleNamespace
 
@@ -158,7 +159,7 @@ def _outputs(body):
 def fallback_harness(configured_app_factory, monkeypatch):
     """以真实外部协议客户端驱动循环，只替换网络与工具执行。"""
 
-    def create(handler, *, chain=(("a", "gpt-a"), ("b", "gpt-b"), ("c", "gpt-c")), effort=None):
+    def create(handler, *, chain=(("a", "gpt-a"), ("b", "gpt-b"), ("c", "gpt-c")), effort=None, idle=None):
         config = configured_app_factory()
         credentials = ModelProviderCredentialStore(config.database.path.parent / "model-provider-credentials")
         for provider_id, model in chain:
@@ -172,6 +173,8 @@ def fallback_harness(configured_app_factory, monkeypatch):
         config.runtime.default_model = selections[0]
         config.runtime.default_model_fallbacks = selections[1:]
         agent = config.agents["code-reviewer"].model_copy(update={"sandbox": "danger-full-access"})
+        if idle is not None:
+            agent = agent.model_copy(update={"idle_timeout_seconds": idle})
         plan = resolve_model_plan(config, agent).selections
         monkeypatch.setattr(
             "teamwork_review_agents.codex_model_runner.ExternalModelClient",
@@ -210,6 +213,68 @@ def fallback_harness(configured_app_factory, monkeypatch):
         return SimpleNamespace(run=run, config=config, tool_calls=tool_calls)
 
     return create
+
+
+async def test_silent_model_falls_back_with_completed_tool_history(fallback_harness):
+    """完成工具之后的请求沉默只切换该轮模型，不能重放工具。"""
+
+    calls = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if not _outputs(body):
+            return _tool_response(0)
+        if body["model"] == "gpt-a":
+            await asyncio.Event().wait()
+        return _completed()
+
+    h = fallback_harness(handler, idle=0.3)
+    outcome = await h.run()
+    assert outcome.result.status == "completed"
+    assert [body["model"] for body in calls] == ["gpt-a", "gpt-a", "gpt-b"]
+    assert calls[1]["input"] == calls[2]["input"]
+    assert h.tool_calls == [0]
+    assert any(kind == "model.request_timed_out" for kind, _ in outcome.logs)
+    assert not any(kind == "run.idle_timed_out" for kind, _ in outcome.logs)
+
+
+@pytest.mark.parametrize("chain,expected", [
+    ((("a", "gpt-a"),), ["gpt-a", "gpt-a"]),
+    ((("a", "gpt-a"), ("b", "gpt-b")), ["gpt-a", "gpt-b", "gpt-b"]),
+])
+async def test_silent_candidates_are_bounded_and_never_restart_run(fallback_harness, chain, expected):
+    """回退耗尽只额外重试一次，最终不可由调度器从头重跑。"""
+
+    calls = []
+
+    async def handler(request):
+        calls.append(json.loads(request.content)["model"])
+        await asyncio.Event().wait()
+
+    outcome = await fallback_harness(handler, chain=chain, idle=0.1).run()
+    assert calls == expected
+    assert outcome.result.status == "timed_out"
+    assert outcome.result.error_code == "model_request_timeout"
+    assert outcome.result.retryable is False
+    assert sum(kind == "model.request_retry" for kind, _ in outcome.logs) == 1
+
+
+async def test_single_model_retry_can_recover(fallback_harness):
+    """无备用时的一次额外请求可恢复，后续不再重复发送。"""
+
+    calls = []
+
+    async def handler(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            await asyncio.Event().wait()
+        return _completed()
+
+    outcome = await fallback_harness(handler, chain=(("a", "gpt-a"),), idle=0.1).run()
+    assert outcome.result.status == "completed"
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
 
 
 async def test_runtime_version_failure_preserves_no_retry_and_no_fallback(fallback_harness):

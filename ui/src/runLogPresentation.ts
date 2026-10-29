@@ -94,6 +94,11 @@ const SYSTEM_TITLES: Record<string, string> = {
   "model.attempt_failed": "模型请求失败",
   "model.fallback": "切换备用模型",
   "model.request_started": "新一轮请求选模",
+  "model.request_stage": "模型请求进度",
+  "model.request_first_event": "已收到模型响应",
+  "model.request_completed": "模型请求完成",
+  "model.request_timed_out": "本次模型请求超时",
+  "model.request_retry": "重试当前模型请求",
   "model.quota_exhausted": "额度耗尽，本次运行跳过该模型",
   "model.reasoning_downgraded": "推理强度自动降级",
   "run.tool_round_limit_warning": "交互轮数即将耗尽",
@@ -109,8 +114,9 @@ const SYSTEM_TITLES: Record<string, string> = {
   "run.tool_output_failed": "工具结果无法完整交付",
   "run.cancel_requested": "已请求取消运行",
   "run.cancelled": "运行已取消",
-  "run.timed_out": "运行超过总时限",
+  "run.timed_out": "运行超时",
   "run.idle_timed_out": "运行因无进展而超时",
+  "run.model_request_timed_out": "模型请求恢复耗尽，运行终止",
   "run.version_mismatch": "Codex CLI 版本不匹配",
   error: "Codex 返回错误",
 };
@@ -228,14 +234,21 @@ function itemMessage(log: RunLog, item: JsonObject): RunMessage {
 
 function systemMessage(log: RunLog, payload: unknown): RunMessage {
   const object = asObject(payload);
+  // 历史终态统一叫 timed_out，必须依实际错误码区分超时原因。
+  const timeoutTitle = log.event_type === "run.timed_out" ? ({
+    agent_idle_timeout: "运行因无进展而超时",
+    agent_total_timeout: "运行超过总时限",
+    remote_ci_timeout: "等待远端 CI 超时",
+    model_request_timeout: "模型请求恢复耗尽，运行终止",
+  } as Record<string, string>)[textValue(object?.error_code)] : undefined;
   const title = object?.error_code === "sandbox_git_ownership_mismatch"
     ? "工作区所有权校验失败，已阻断运行"
-    : SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
+    : timeoutTitle ?? SYSTEM_TITLES[log.event_type] ?? log.event_type.replaceAll(".", " · ");
   const isError = log.stream === "stderr"
     || log.event_type === "run.tool_round_limit_reached"
     || /(?:error|failed|timed_out|mismatch|cancelled|unavailable)/.test(log.event_type);
   // 能力告警及单个模型额度耗尽不等于整个任务已经终止。
-  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "context.retry_after_compaction", "context.tool_output_truncated", "run.tool_round_limit_warning", "runtime.codex_version_retry"].includes(log.event_type);
+  const isWarning = ["run.curl_unavailable", "run.curl_warning", "run.http_tls_unavailable", "model.quota_exhausted", "model.request_timed_out", "model.request_retry", "context.retry_after_compaction", "context.tool_output_truncated", "run.tool_round_limit_warning", "runtime.codex_version_retry"].includes(log.event_type);
   let body = "";
   let detail = "";
   if (log.event_type.startsWith("context.") && object) {
@@ -289,6 +302,24 @@ function systemMessage(log: RunLog, payload: unknown): RunMessage {
     detail = [
       `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}`,
       object.max_tool_rounds != null ? `交互轮数上限：${textValue(object.max_tool_rounds)} 轮；含当前请求剩余 ${textValue(object.remaining_rounds)} 轮` : "",
+      textValue(object.reason),
+    ].filter(Boolean).join("\n");
+  } else if (log.event_type.startsWith("model.request_") && object) {
+    const stage = ({
+      provider_queue: "等待 Provider 并发名额", client_preparation: "准备模型客户端",
+      version_probe: "检查 CLI 版本", authentication: "准备认证",
+      awaiting_headers: "等待 HTTP 响应头", reading_response: "读取响应内容",
+      receiving_response: "接收模型事件", transport_backoff: "连接重试退避",
+    } as Record<string, string>)[textValue(object.stage)] ?? textValue(object.stage);
+    body = textValue(object.message) || stage;
+    detail = [
+      `第 ${textValue(object.request_round)} 轮 · ${textValue(object.provider_id)} / ${textValue(object.model)}`,
+      object.request_attempt != null ? `请求序号：${textValue(object.request_attempt)} · ${object.phase === "compaction" ? "上下文压缩" : "模型推理"}` : "",
+      object.elapsed_seconds != null ? `已耗时 ${textValue(object.elapsed_seconds)} 秒；无响应 ${textValue(object.idle_seconds)} 秒` : "",
+      object.idle_timeout_seconds != null ? `无响应上限 ${textValue(object.idle_timeout_seconds)} 秒；请求最长 ${textValue(object.request_timeout_seconds)} 秒` : "",
+      object.timeout_kind ? `超时类型：${({ idle: "无响应", total: "请求最长耗时", transport: "HTTP 连接或读取" } as Record<string, string>)[textValue(object.timeout_kind)] ?? textValue(object.timeout_kind)}` : "",
+      object.http_status != null ? `HTTP 状态：${textValue(object.http_status)}` : "",
+      object.upstream_request_id ? `上游请求 ID：${textValue(object.upstream_request_id)}` : "",
       textValue(object.reason),
     ].filter(Boolean).join("\n");
   } else if ((log.event_type.startsWith("run.curl_") || log.event_type === "run.http_tls_unavailable") && object) {
@@ -428,10 +459,26 @@ function toRunMessage(log: RunLog): RunMessage {
 export function presentRunLogs(logs: RunLog[]): RunMessage[] {
   const messages: RunMessage[] = [];
   const invokeAgentMessageIndexes = new Map<string, number>();
+  const timeoutMessageIndexes = new Map<string, number>();
   for (const log of logs) {
     // Responses SSE 属于模型基座的底层协议，用户时间线只展示统一 Agent 语义事件。
     if (log.event_type.startsWith("response.")) continue;
     const message = toRunMessage(log);
+    // 兼容旧日志：底层停止与随后外层终态只显示一次，两条原始记录仍可查看。
+    const specificTimeout = ({ "run.idle_timed_out": "agent_idle_timeout", "run.model_request_timed_out": "model_request_timeout" } as Record<string, string>)[log.event_type];
+    if (log.event_type === "run.timed_out") {
+      const code = textValue(asObject(parsePayload(log.payload))?.error_code);
+      const index = timeoutMessageIndexes.get(`${log.run_id}:${code}`);
+      if (index !== undefined) {
+        const previous = messages[index];
+        if (previous.body === message.body && log.created_at - previous.lastCreatedAt <= 60) {
+          messages[index] = { ...message, id: previous.id, createdAt: previous.createdAt,
+            raw: JSON.stringify([parsePayload(previous.raw), parsePayload(message.raw)], null, 2) };
+          timeoutMessageIndexes.delete(`${log.run_id}:${code}`);
+          continue;
+        }
+      }
+    }
     if (message.toolCallId && message.linkedAgentName) {
       const existingIndex = invokeAgentMessageIndexes.get(message.toolCallId);
       if (existingIndex !== undefined) {
@@ -451,8 +498,10 @@ export function presentRunLogs(logs: RunLog[]): RunMessage[] {
     if (previous && previous.eventType === message.eventType && previous.raw === message.raw) {
       previous.repeatCount += 1;
       previous.lastCreatedAt = message.createdAt;
+      if (specificTimeout) timeoutMessageIndexes.set(`${log.run_id}:${specificTimeout}`, messages.length - 1);
       continue;
     }
+    if (specificTimeout) timeoutMessageIndexes.set(`${log.run_id}:${specificTimeout}`, messages.length);
     messages.push(message);
   }
   return messages;

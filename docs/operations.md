@@ -150,6 +150,10 @@ teamwork-review-agents run -c C:\path\to\config.yaml
 
 `timeout_seconds` 控制总时长，`agent_idle_timeout_seconds` 控制连续无 JSONL 进展时长。管理界面可以取消排队中或执行中的任务。
 
+模型基座和外部 Provider 的单次请求独立监督无响应时限，沿用 Agent 的 idle 配置；请求固定最长耗时对 Codex 使用 Agent 的 `timeout_seconds`，对外部 Provider 取 Agent 与 Provider `request_timeout_seconds` 的较小值。真实响应事件只刷新无响应计时，不延长固定期限。CLI 版本升级探测沿用自身有界等待，不按上游无响应处理。请求超时优先切换已有备用候选；后续候选不可用时，同一轮最多额外重试一次，耗尽后终止且不从头重跑工具。原有轮数、子 Agent/诊断总时限和取消约束继续生效。
+
+运行消息记录 Provider 排队、CLI/认证准备、等待 HTTP 响应头、读取响应、首个模型事件及请求完成/超时，并附实际耗时、HTTP 状态及可用的上游请求 ID。阶段诊断不包含请求正文或凭据，也不计作模型进展。界面按错误码区分运行无进展、模型请求、远端 CI 等待和总时限超时；单次请求超时提示不代表整轮已经终止，应结合后续回退或最终状态查看。
+
 ## 9. 文件权限与联网
 
 `sandbox` 控制本地文件权限，`network_access` 控制 `workspace-write` 命令联网，二者独立。

@@ -21,6 +21,8 @@ from typing import Any
 
 import httpx
 
+from .model_request import record_model_transport
+
 from .process_control import hidden_process_options
 from .codex_executable import resolve_codex_executable as resolve_executable
 from .codex_executable import CodexRuntimeError
@@ -290,6 +292,7 @@ class CodexResponsesClient:
         """发送一次请求并返回 completed response。"""
 
         # 只重试当前请求的版本探测，不重放模型回合或已经执行的工具。
+        await record_model_transport("version_probe")
         client_version = await self._version_with_retry()
         last_error: Exception | None = None
         for attempt in range(3):
@@ -352,6 +355,7 @@ class CodexResponsesClient:
                 )
                 if not retryable:
                     raise
+                await record_model_transport("transport_backoff")
                 await asyncio.sleep(2**attempt)
         assert last_error is not None
         raise last_error
@@ -421,6 +425,7 @@ class CodexResponsesClient:
 
         request_payload = dict(payload)
         request_payload["stream"] = True
+        await record_model_transport("authentication")
         credentials = await self.oauth.credentials()
         for auth_attempt in range(2):
             timeout = httpx.Timeout(
@@ -433,6 +438,7 @@ class CodexResponsesClient:
                     timeout=timeout,
                     transport=self.transport,
                 ) as client:
+                    await record_model_transport("awaiting_headers")
                     async with client.stream(
                         "POST",
                         CODEX_RESPONSES_URL,
@@ -442,9 +448,14 @@ class CodexResponsesClient:
                         ),
                         json=request_payload,
                     ) as response:
+                        await record_model_transport(
+                            "reading_response", http_status=response.status_code,
+                            upstream_request_id=response.headers.get("x-request-id"),
+                        )
                         if response.status_code >= 400:
                             body = await response.aread()
                             if response.status_code == 401 and auth_attempt == 0:
+                                await record_model_transport("authentication")
                                 latest = self.oauth.load()
                                 credentials = await self.oauth.credentials(
                                     force_refresh=(
