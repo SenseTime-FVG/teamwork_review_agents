@@ -244,6 +244,13 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_preflight_runs_started
                 ON preflight_runs(started_at DESC);
 
+                CREATE TABLE IF NOT EXISTS preflight_disk_waits (
+                    run_id TEXT PRIMARY KEY,
+                    next_check_at REAL NOT NULL,
+                    payload TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS preflight_step_runs (
                     run_id TEXT NOT NULL,
                     step_index INTEGER NOT NULL,
@@ -1843,7 +1850,7 @@ class StateStore:
                 """SELECT job.*, run.repository_id FROM preflight_log_deliveries AS job
                 JOIN preflight_runs AS run ON run.run_id=job.run_id AND run.attempts=job.ci_attempt
                 WHERE job.status IN ('queued', 'running') AND job.next_attempt_at<=?
-                AND run.status_published=1 AND run.status!='running'
+                AND run.status_published=1 AND run.status NOT IN ('running', 'waiting_for_space')
                 ORDER BY run.started_at LIMIT 32""", (time.time(),),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -2263,7 +2270,8 @@ class StateStore:
                 """
                 SELECT run_id, repository_id, number, head_sha, status,
                        source_generation, failed_step, exit_code, output, error,
-                       status_published, remote_status_target
+                       status_published, remote_status_target,
+                       (SELECT payload FROM preflight_disk_waits WHERE run_id = preflight_runs.run_id) AS disk_wait
                 FROM preflight_runs WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
@@ -2282,6 +2290,7 @@ class StateStore:
             output=str(row["output"] or ""),
             error=row["error"],
             status_published=bool(row["status_published"]),
+            disk_wait=json.loads(row["disk_wait"]) if row["disk_wait"] else None,
             remote_status_target=(
                 CommitStatusTarget.model_validate_json(row["remote_status_target"])
                 if row["remote_status_target"] else None
@@ -2323,6 +2332,8 @@ class StateStore:
                     result.run_id,
                 ),
             )
+            if result.status == "waiting_for_space" and result.disk_wait:
+                self._park_preflight_for_disk(connection, result.run_id, result.disk_wait)
             connection.execute(
                 """
                 UPDATE preflight_step_runs
@@ -2361,6 +2372,109 @@ class StateStore:
                     result.run_id,
                 ),
             )
+
+    @staticmethod
+    def _park_preflight_for_disk(
+        connection: sqlite3.Connection, run_id: str, wait: dict[str, Any],
+    ) -> None:
+        """原子保存资源等待并退回本次尝试；重复调用不会重复扣减。"""
+
+        existing = connection.execute(
+            "SELECT 1 FROM preflight_disk_waits WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO preflight_disk_waits (run_id, next_check_at, payload)
+               VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET
+               next_check_at = excluded.next_check_at, payload = excluded.payload""",
+            (run_id, wait["next_check_at"], json.dumps(wait, ensure_ascii=False)),
+        )
+        connection.execute(
+            """UPDATE preflight_runs SET status = 'waiting_for_space',
+               phase = 'waiting_for_space', finished_at = NULL, status_published = 0,
+               attempts = MAX(0, attempts - ?) WHERE run_id = ?""",
+            (int(existing is None), run_id),
+        )
+        connection.execute(
+            """UPDATE event_inbox SET status = 'waiting_for_space',
+               queue_reason = 'disk_space', error_code = 'disk_space',
+               error = '磁盘空间不足，等待恢复后自动重新执行本地 CI',
+               attempts = MAX(0, attempts - 1), updated_at = ?
+               WHERE event_id IN (SELECT event_id FROM event_preflight_links WHERE run_id = ?)
+               AND status IN ('processing', 'triggered', 'pending', 'failed')""",
+            (time.time(), run_id),
+        )
+
+    def park_preflight_for_disk(self, run_id: str, wait: dict[str, Any]) -> None:
+        """迁移旧空间不足记录，或把复用同一等待记录的新事件一起挂起。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._park_preflight_for_disk(connection, run_id, wait)
+
+    def disk_wait_delay(self) -> float | None:
+        """返回最近一次资源检查的剩余时间，供后台唤醒使用。"""
+
+        with self.connect() as connection:
+            row = connection.execute("SELECT MIN(next_check_at) AS due FROM preflight_disk_waits").fetchone()
+        return max(0.1, float(row["due"]) - time.time()) if row["due"] is not None else None
+
+    def due_disk_waits(self) -> list[dict[str, Any]]:
+        """只读取到期的等待，不占用执行槽或启动子进程。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT run.*, wait.payload AS disk_wait FROM preflight_disk_waits AS wait
+                   JOIN preflight_runs AS run ON run.run_id = wait.run_id
+                   WHERE wait.next_check_at <= ?""", (time.time(),),
+            ).fetchall()
+        return [{**dict(row), "disk_wait": json.loads(row["disk_wait"])} for row in rows]
+
+    def update_disk_wait(self, run_id: str, wait: dict[str, Any]) -> None:
+        """刷新剩余空间和检查时间，不创建新的 CI 尝试。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE preflight_disk_waits SET next_check_at = ?, payload = ? WHERE run_id = ?",
+                (wait["next_check_at"], json.dumps(wait, ensure_ascii=False), run_id),
+            )
+
+    def release_disk_wait(self, run_id: str, *, obsolete: bool = False) -> None:
+        """资源恢复时入队；已失效的源版本只收敛为跳过。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE event_inbox SET status = ?, queue_reason = NULL,
+                   error = NULL, error_code = NULL, unmatched_reason = ?, updated_at = ?
+                   WHERE status = 'waiting_for_space' AND event_id IN (
+                       SELECT event_id FROM event_preflight_links WHERE run_id = ?)""",
+                ("unmatched" if obsolete else "pending",
+                 "disk_wait_superseded" if obsolete else None, time.time(), run_id),
+            )
+            connection.execute(
+                """UPDATE preflight_runs SET status = ?, phase = 'finished', finished_at = ?
+                   WHERE run_id = ? AND status = 'waiting_for_space'""",
+                ("superseded" if obsolete else "error", time.time(), run_id),
+            )
+            connection.execute("DELETE FROM preflight_disk_waits WHERE run_id = ?", (run_id,))
+
+    def legacy_disk_error_candidates(self) -> list[dict[str, Any]]:
+        """仅迁移仍有失败事件关联的自动 CI，排除已被后续运行替代的记录。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT run.* FROM preflight_runs AS run
+                   JOIN event_preflight_links AS link ON link.run_id = run.run_id
+                   JOIN event_inbox AS event ON event.event_id = link.event_id
+                   WHERE run.status = 'error' AND run.trigger_source = 'event'
+                     AND event.status = 'failed' AND event.retryable = 1
+                     AND link.id = (SELECT MAX(latest.id) FROM event_preflight_links AS latest
+                                    WHERE latest.event_id = event.event_id)
+                     AND NOT EXISTS (SELECT 1 FROM preflight_runs AS newer
+                         WHERE newer.repository_id = run.repository_id AND newer.number = run.number
+                         AND newer.started_at > run.started_at)""",
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_preflight_status_published(self, run_id: str) -> None:
         """记录终态 Commit Status 已成功发布，重试时无需重新执行 CI。"""
@@ -3752,6 +3866,7 @@ class StateStore:
                        json_extract(event_inbox.payload, '$.source_event_occurred_at')
                            AS source_event_occurred_at,
                        preflight.status AS preflight_status,
+                       (SELECT payload FROM preflight_disk_waits WHERE run_id = preflight.run_id) AS disk_wait,
                        preflight.run_id AS preflight_run_id,
                        preflight.exit_code AS preflight_exit_code,
                        preflight.failed_step AS preflight_failed_step,
@@ -3834,7 +3949,7 @@ class StateStore:
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "disk_wait": json.loads(row["disk_wait"]) if row["disk_wait"] else None} for row in rows]
 
     def count_events(
         self,
@@ -4009,6 +4124,7 @@ class StateStore:
                        preflight.phase, preflight.cache_path,
                        preflight.cancel_requested,
                        preflight.status, preflight.attempts,
+                       (SELECT payload FROM preflight_disk_waits WHERE run_id = preflight.run_id) AS disk_wait,
                        preflight.failed_step, preflight.exit_code,
                        preflight.error, preflight.status_published,
                        preflight.started_at, preflight.finished_at,
@@ -4041,7 +4157,7 @@ class StateStore:
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "disk_wait": json.loads(row["disk_wait"]) if row["disk_wait"] else None} for row in rows]
 
     def get_preflight_run(self, run_id: str) -> dict[str, Any] | None:
         """按需返回单次本地 Preflight / CI 的完整结果与事件关联。"""
@@ -4056,6 +4172,7 @@ class StateStore:
                        preflight.phase, preflight.cache_path,
                        preflight.cancel_requested,
                        preflight.status, preflight.attempts,
+                       (SELECT payload FROM preflight_disk_waits WHERE run_id = preflight.run_id) AS disk_wait,
                        preflight.failed_step, preflight.exit_code,
                        preflight.output, preflight.error,
                        preflight.source_generation, preflight.remote_status_target,
@@ -4113,6 +4230,7 @@ class StateStore:
             steps.append(step)
         return {
             **dict(row),
+            "disk_wait": json.loads(row["disk_wait"]) if row["disk_wait"] else None,
             "linked_events": [dict(event_row) for event_row in event_rows],
             "steps": steps,
             "diagnosis": self.get_preflight_diagnosis(run_id),
@@ -4235,7 +4353,7 @@ class StateStore:
                             AND json_extract(member.payload, '$.batch_id') =
                                 json_extract(event_inbox.payload, '$.batch_id')
                             AND (
-                                member.status IN ('pending', 'processing', 'triggered')
+                                member.status IN ('pending', 'processing', 'triggered', 'waiting_for_space')
                                 OR (member.status = 'failed' AND member.attempts < ?
                                     AND member.retryable = 1)
                             )

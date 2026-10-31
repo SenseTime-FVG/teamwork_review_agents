@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from .events import (
     detect_target_branch_event,
 )
 from .executor import AgentExecutor
+from .disk_space import is_disk_full_error, preflight_disk_paths, probe_disk_space
 from .models import (
     AgentResult,
     ChangeEvent,
@@ -205,6 +207,8 @@ class Orchestrator:
         self.executor = AgentExecutor(config, self.store)
         self.preflight = PreflightExecutor(config, self.store)
         self._shutdown_requested = False
+        self._disk_errors_migrated = False
+        self._next_disk_check = 0.0
 
     async def request_shutdown(self) -> list[str]:
         """停止创建新 Agent，并持久化取消当前服务的全部活动运行。"""
@@ -890,6 +894,7 @@ class Orchestrator:
             administrator_cancelled_event_ids: set[str] = set()
             matched_event_ids: set[str] = set()
             settled_unmatched_event_ids: set[str] = set()
+            disk_wait_event_ids: set[str] = set()
             task_items: list[
                 tuple[RuleInvocation, asyncio.Task[AgentResult | None]]
             ] = []
@@ -1003,14 +1008,18 @@ class Orchestrator:
                                 errors_by_event[event.id].append(str(exc))
                                 retryable_by_event[event.id] = True
                     else:
-                        await asyncio.to_thread(
-                            self.store.link_events_to_preflight,
-                            preflight_matched_event_ids,
-                            preflight_result.run_id,
-                            reused=preflight_result.reused,
-                        )
-                        await self._diagnose_preflight(representative, preflight_result, summary)
-                        if preflight_result.status in {"failure", "timed_out"}:
+                        if preflight_result.status != "waiting_for_space":
+                            await asyncio.to_thread(
+                                self.store.link_events_to_preflight,
+                                preflight_matched_event_ids,
+                                preflight_result.run_id,
+                                reused=preflight_result.reused,
+                            )
+                            await self._diagnose_preflight(representative, preflight_result, summary)
+                        if preflight_result.status == "waiting_for_space":
+                            ready_preflight_invocations = []
+                            disk_wait_event_ids.update(preflight_matched_event_ids)
+                        elif preflight_result.status in {"failure", "timed_out"}:
                             summary.preflight_failures += 1
                             ready_preflight_invocations = []
                             for invocation in preflight_invocations:
@@ -1133,6 +1142,9 @@ class Orchestrator:
             for event in claimed_events:
                 if event.id in settled_unmatched_event_ids:
                     continue
+                if event.id in disk_wait_event_ids:
+                    # CI 执行器已原子挂起事件，不能再覆盖为成功或普通失败。
+                    continue
                 if event.id in service_interrupted_event_ids:
                     await asyncio.to_thread(
                         self.store.release_event_after_service_shutdown,
@@ -1198,6 +1210,47 @@ class Orchestrator:
                 return "retry"
         return None
 
+    async def _check_disk_waits(self) -> None:
+        """恢复到期的资源等待；旧版明确的空间错误仅按当前快照迁移一次。"""
+
+        if time.monotonic() < self._next_disk_check:
+            return
+        self._next_disk_check = time.monotonic() + 1
+        repositories = self.config.repository_map()
+        if not self._disk_errors_migrated:
+            candidates = await asyncio.to_thread(self.store.legacy_disk_error_candidates)
+            for run in candidates:
+                repository = repositories.get(run["repository_id"])
+                snapshot = await asyncio.to_thread(
+                    self.store.load_snapshot, f"{run['repository_id']}:{run['number']}",
+                )
+                if (repository and repository.enabled and repository.preflight.enabled
+                    and snapshot and snapshot.state == "opened" and snapshot.head_sha == run["head_sha"]
+                    and is_disk_full_error(run["error"] or "")):
+                    wait = await asyncio.to_thread(probe_disk_space, preflight_disk_paths(self.config, repository))
+                    await asyncio.to_thread(self.store.park_preflight_for_disk, run["run_id"], wait.model_dump())
+            self._disk_errors_migrated = True
+
+        for run in await asyncio.to_thread(self.store.due_disk_waits):
+            repository = repositories.get(run["repository_id"])
+            snapshot = await asyncio.to_thread(
+                self.store.load_snapshot, f"{run['repository_id']}:{run['number']}",
+            )
+            obsolete = (repository is None or not repository.enabled or not repository.preflight.enabled
+                        or (snapshot is not None and
+                            (snapshot.state != "opened" or snapshot.head_sha != run["head_sha"])))
+            if obsolete:
+                await asyncio.to_thread(self.store.release_disk_wait, run["run_id"], obsolete=True)
+                continue
+            # 缺少快照时继续等待；不能凭磁盘恢复重放无法确认的历史任务。
+            paths = preflight_disk_paths(self.config, repository)
+            paths.extend(volume["path"] for volume in run["disk_wait"]["volumes"])
+            wait = await asyncio.to_thread(probe_disk_space, paths)
+            if snapshot is not None and wait.recovered:
+                await asyncio.to_thread(self.store.release_disk_wait, run["run_id"])
+            else:
+                await asyncio.to_thread(self.store.update_disk_wait, run["run_id"], wait.model_dump())
+
     async def process_events(self, summary: CycleSummary) -> None:
         """并发处理不同 PR / MR，并在活动期间持续补充新事件。"""
 
@@ -1208,6 +1261,7 @@ class Orchestrator:
         retry_after: dict[tuple[str, int], float] = {}
         loop = asyncio.get_running_loop()
         while not self._shutdown_requested:
+            await self._check_disk_waits()
             resources = []
             if not stop_scheduling:
                 resources = await asyncio.to_thread(

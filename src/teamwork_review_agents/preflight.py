@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import os
 import re
 import uuid
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
 from .config import AgentWorkspaceConfig, AppConfig, PreflightConfig
+from .disk_space import is_disk_full_error, preflight_disk_paths, probe_disk_space
 from .environment import (
     SecretRedactor,
     resolve_provider_token,
@@ -72,6 +74,7 @@ SAFE_HOST_ENVIRONMENT = {
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PREFLIGHT_COMMENT_OUTPUT_CHARS = 12_000
 PREFLIGHT_COMMENT_BODY_BYTES = 54 * 1024
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -664,7 +667,7 @@ class PreflightExecutor:
                 latest = await asyncio.to_thread(self.store.latest_preflight_run_id, repository.id, number)
                 generation = await asyncio.to_thread(self.store.source_generation, repository.id, number)
                 if (current is None or latest != run_id or current["attempts"] != attachment_attempt
-                    or current["status"] == "running" or not current["status_published"]
+                    or current["status"] in {"running", "waiting_for_space"} or not current["status_published"]
                     or (generation is not None and generation != current["source_generation"])):
                     return None
             target_url = preflight_details_url(self.config.web, run_id) if run_id else None
@@ -695,7 +698,7 @@ class PreflightExecutor:
         """后台上传完成后只补充原终态的链接，旧执行不覆盖新状态或评论。"""
 
         run = await asyncio.to_thread(self.store.get_preflight_run, run_id)
-        if run is None or run["attempts"] != ci_attempt or run["status"] == "running":
+        if run is None or run["attempts"] != ci_attempt or run["status"] in {"running", "waiting_for_space"}:
             return "obsolete"
         repository = self.repositories.get(run["repository_id"])
         if repository is None or self.config.providers[repository.provider].kind != "gitlab":
@@ -912,6 +915,12 @@ class PreflightExecutor:
             cached = cached.model_copy(
                 update={"source_generation": event.source_generation}
             )
+            if cached.status == "waiting_for_space":
+                if cached.disk_wait:
+                    await asyncio.to_thread(
+                        self.store.park_preflight_for_disk, cached.run_id, cached.disk_wait,
+                    )
+                return cached.model_copy(update={"reused": True})
             if cached.status == "superseded":
                 return cached.model_copy(update={"reused": True})
             if cached.status_published:
@@ -970,6 +979,9 @@ class PreflightExecutor:
 
         result: PreflightResult
         remote_status_target: CommitStatusTarget | None = None
+        remote_status_started = False
+        disk_full_output = False
+        output_tail = ""
         try:
             await asyncio.to_thread(
                 self.store.set_preflight_phase,
@@ -1010,6 +1022,10 @@ class PreflightExecutor:
             async def record_output(chunk: str) -> None:
                 """持续保存合并后的 stdout / stderr 输出。"""
 
+                nonlocal disk_full_output, output_tail
+                # 跨输出块识别空间错误，不依赖可能已截断的末尾日志。
+                output_tail = (output_tail + chunk)[-131072:]
+                disk_full_output = disk_full_output or is_disk_full_error(output_tail)
                 await self._append_log(
                     reservation.run_id,
                     chunk,
@@ -1077,6 +1093,7 @@ class PreflightExecutor:
                     source_project=snapshot.source_project,
                     number=event.number,
                 )
+                remote_status_started = True
                 if remote_status_target is not None:
                     await asyncio.to_thread(
                         self.store.set_preflight_status_target, reservation.run_id, remote_status_target,
@@ -1182,17 +1199,49 @@ class PreflightExecutor:
             )
 
         result = result.model_copy(update={"remote_status_target": remote_status_target})
+        explicit_disk_error = is_disk_full_error(result.error or "")
+        if result.status in {"error", "failure"} and (
+            explicit_disk_error or disk_full_output or is_disk_full_error(result.output)
+        ):
+            wait = await asyncio.to_thread(probe_disk_space, preflight_disk_paths(self.config, repository))
+            # 命令输出可能包含测试预期文本，必须与真实低空间交叉确认。
+            if explicit_disk_error or any(
+                volume.free_bytes is not None and volume.free_bytes < wait.required_bytes
+                for volume in wait.volumes
+            ):
+                result = result.model_copy(update={
+                    "status": "waiting_for_space", "disk_wait": wait.model_dump(),
+                })
         await asyncio.to_thread(self.store.finish_preflight_run, result)
-        await self._append_log(
-            reservation.run_id,
-            {
-                "status": result.status,
-                "failed_step": result.failed_step,
-                "exit_code": result.exit_code,
-                "error": result.error,
-            },
-            event_type="completed",
-        )
+        try:
+            await self._append_log(
+                reservation.run_id,
+                {
+                    "status": result.status,
+                    "failed_step": result.failed_step,
+                    "exit_code": result.exit_code,
+                    "error": result.error,
+                },
+                event_type="disk_wait" if result.status == "waiting_for_space" else "completed",
+            )
+        except Exception:
+            if result.status != "waiting_for_space":
+                raise
+            # 空间不足可能连追加日志也失败，不能覆盖已持久化的等待状态。
+            LOGGER.exception("CI %s 已挂起，但写入磁盘等待日志失败", result.run_id)
+        if result.status == "waiting_for_space":
+            # 已发布的运行状态改为等待；通知失败不能使资源等待消耗普通重试。
+            if remote_status_started:
+                try:
+                    await self._set_remote_status(
+                        repository, snapshot.head_sha, state="pending",
+                        description="本地 CI 等待磁盘空间恢复", run_id=reservation.run_id,
+                        ref=snapshot.source_branch, source_project=snapshot.source_project,
+                        number=event.number, target=remote_status_target,
+                    )
+                except Exception:
+                    LOGGER.exception("CI %s 磁盘等待状态回写失败，保留本地等待", reservation.run_id)
+            return result
         if result.status == "superseded":
             return result
         return await self._publish_terminal_result(

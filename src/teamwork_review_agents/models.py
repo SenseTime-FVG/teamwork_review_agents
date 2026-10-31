@@ -161,6 +161,7 @@ class PreflightResult(BaseModel):
         "error",
         "cancelled",
         "superseded",
+        "waiting_for_space",
     ]
     failed_step: str | None = None
     exit_code: int | None = None
@@ -169,6 +170,7 @@ class PreflightResult(BaseModel):
     status_published: bool = False
     remote_status_target: CommitStatusTarget | None = None
     reused: bool = False
+    disk_wait: dict[str, Any] | None = None
 
 
 class LocalPreflightContext(BaseModel):

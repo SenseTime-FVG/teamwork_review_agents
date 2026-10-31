@@ -14,6 +14,7 @@ function detail(status: string, diagnosis?: string, processing = false): Preflig
 
 test("CI 结束后等待诊断占位、模型执行和评论写回时继续刷新", () => {
   assert.equal(shouldRefreshPreflight(detail("running")), true);
+  assert.equal(shouldRefreshPreflight(detail("waiting_for_space")), true);
   assert.equal(shouldRefreshPreflight(detail("failure", undefined, true)), true);
   assert.equal(shouldRefreshPreflight(detail("failure", "queued")), true);
   assert.equal(shouldRefreshPreflight(detail("failure", "running")), true);

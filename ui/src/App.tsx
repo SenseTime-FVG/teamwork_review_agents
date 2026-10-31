@@ -418,7 +418,7 @@ function executionStatusMatches(
         cancelled: ["cancelled"],
       }
     : {
-        waiting: [],
+        waiting: ["waiting_for_space"],
         running: ["running"],
         success: ["success"],
         failure: ["failure", "error"],
@@ -2041,7 +2041,7 @@ function Overview(props: {
   const runTotal = Object.values(stats.runs).reduce((sum, value) => sum + value, 0);
   const eventTotal = Object.values(stats.events).reduce((sum, value) => sum + value, 0);
   const changeRequestTotal = stats.change_requests.total ?? 0;
-  const pendingEvents = (stats.events.pending ?? 0) + (stats.events.processing ?? 0);
+  const pendingEvents = (stats.events.pending ?? 0) + (stats.events.processing ?? 0) + (stats.events.waiting_for_space ?? 0);
   // 按完整已选集合统计和提交，当前页仅决定展示，不裁剪其他页的选择。
   const selectedItems = props.selectedChangeRequests;
   const selectedEventItems = props.selectedEvents;
@@ -8537,6 +8537,7 @@ function queueReasonLabel(reason?: string | null): string | null {
     agent_concurrency: "等待此 Agent 并发槽",
     change_request_order: "等待同一 PR / MR 前序批次",
     event_retry_backoff: "等待前序事件重试",
+    disk_space: "等待磁盘空间恢复",
     resource_lock: "等待变更请求或分支资源锁",
     repository_lock: "等待基础仓库管理锁",
   };
@@ -8693,6 +8694,20 @@ function buildEventAgentTreeRows(
   return rows;
 }
 
+function DiskSpaceWaitNotice({ wait }: { wait: EventRecord["disk_wait"] }) {
+  // 独立展示资源原因，避免将基础设施等待误读为代码测试失败。
+  if (!wait) return null;
+  const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+  return <div className="alert">
+    <strong>等待磁盘空间恢复</strong>
+    <p>恢复条件：各相关磁盘至少剩余 {gib(wait.required_bytes)}；下次检查：{new Date(wait.next_check_at * 1000).toLocaleString()}</p>
+    {wait.volumes.map(volume => <p key={volume.path}>
+      {volume.path} · {volume.free_bytes == null ? "剩余空间未知" : `剩余 ${gib(volume.free_bytes)}`}
+      {volume.error ? ` · 查询失败：${volume.error}` : ""}
+    </p>)}
+  </div>;
+}
+
 function preflightStatusLabel(status?: string | null): string {
   const labels: Record<string, string> = {
     running: "执行中",
@@ -8702,6 +8717,7 @@ function preflightStatusLabel(status?: string | null): string {
     error: "执行异常",
     cancelled: "已取消",
     superseded: "Head 已更新，已跳过",
+    waiting_for_space: "等待磁盘空间恢复",
   };
   return status ? labels[status] ?? status : "未执行";
 }
@@ -8709,6 +8725,7 @@ function preflightStatusLabel(status?: string | null): string {
 function preflightStatusClass(status: string): string {
   if (status === "success") return "completed";
   if (status === "running") return "processing";
+  if (status === "waiting_for_space") return "queued";
   if (status === "superseded") return "unmatched";
   if (status === "cancelled") return "cancelled";
   return "failed";
@@ -8718,6 +8735,7 @@ function preflightPhaseLabel(phase?: string | null): string {
   const labels: Record<string, string> = {
     queued: "等待启动",
     waiting_lock: "等待仓库锁",
+    waiting_for_space: "等待磁盘空间恢复",
     preparing: "准备代码工作区",
     preparing_cache: "准备依赖缓存",
     running_steps: "执行 CI 步骤",
@@ -8744,6 +8762,7 @@ function preflightStepStatusLabel(status: string): string {
 function preflightStepStatusClass(status: string): string {
   if (status === "success") return "completed";
   if (status === "running") return "processing";
+  if (status === "waiting_for_space") return "queued";
   if (status === "pending") return "queued";
   if (status === "skipped") return "unmatched";
   if (status === "cancelled") return "cancelled";
@@ -8751,7 +8770,7 @@ function preflightStepStatusClass(status: string): string {
 }
 
 function eventDetailNeedsRefresh(detail: EventDetailRecord): boolean {
-  if (["pending", "processing"].includes(detail.status)) return true;
+  if (["pending", "processing", "waiting_for_space"].includes(detail.status)) return true;
   if (detail.preflights.some((preflight) => preflight.status === "running")) return true;
   if (detail.agent_queued_count + detail.agent_preparing_count + detail.agent_running_count > 0) return true;
   if (detail.dispatches.some((dispatch) => ["queued", "preparing", "running"].includes(dispatch.run_status ?? ""))) return true;
@@ -8759,6 +8778,9 @@ function eventDetailNeedsRefresh(detail: EventDetailRecord): boolean {
 }
 
 function eventStatusExplanation(event: EventRecord): string {
+  if (event.status === "waiting_for_space") {
+    return "本地 CI 因磁盘空间不足暂停，每分钟检查一次，空间恢复后自动重跑。等待不消耗重试次数，也不会启动审核或失败诊断。";
+  }
   if (event.error?.includes("状态回写失败")) {
     return "事件处理已结束，但向平台回写状态时失败。";
   }
@@ -9211,6 +9233,7 @@ function EventDetailDrawer(props: {
                   <EventStatusPill event={detail} />
                 </div>
                 <p className="event-detail-explanation">{eventStatusExplanation(detail)}</p>
+                <DiskSpaceWaitNotice wait={detail.disk_wait} />
                 <dl className="run-metadata">
                   <div><dt>来源</dt><dd>{detail.origin === "manual" ? "手动触发" : "扫描器"}</dd></div>
                   <div><dt>事件状态</dt><dd>{detail.status}</dd></div>
@@ -9389,6 +9412,7 @@ function PreflightRunDetailDrawer(props: {
   }
 
   const liveOutput = logs.map((log) => {
+    if (log.event_type === "disk_wait") return "\n[暂停] 磁盘空间不足，等待恢复后自动重跑\n";
     if (log.event_type === "git_progress") {
       try {
         const progress = JSON.parse(log.payload) as Partial<GitCommandDetail>;
@@ -9456,6 +9480,7 @@ function PreflightRunDetailDrawer(props: {
                   <span className="event-detail-count">{detail.status === "running" ? progressLabel : preflightStatusLabel(detail.status)}</span>
                 </div>
                 {streamError && <div className="alert error">{streamError}；步骤状态仍会继续刷新。</div>}
+                <DiskSpaceWaitNotice wait={detail.disk_wait} />
                 <pre ref={liveOutputRef} className="detail-pre preflight-live-output">{liveOutput || (detail.status === "running" ? "正在等待 CI 输出…" : detail.output || "该历史记录没有实时日志")}</pre>
                 {["queued", "running"].includes(detail.log_delivery?.status ?? "") && <p className="muted">CI 状态已回写，正在后台上传日志附件并补充链接…</p>}
                 {detail.log_upload?.status === "completed" && detail.log_upload.url && <p><a href={detail.log_upload.url} target="_blank" rel="noreferrer">下载 GitLab 完整 CI 日志附件</a></p>}
