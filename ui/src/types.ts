@@ -672,7 +672,14 @@ export type RunLog = {
   payload: string;
 };
 
+export type DiskSpaceWait = {
+  volumes: { path: string; free_bytes: number | null; error?: string | null }[];
+  required_bytes: number;
+  next_check_at: number;
+};
+
 export type EventRecord = {
+  disk_wait?: DiskSpaceWait | null;
   event_id: string;
   event_type: string;
   repository_id: string;
@@ -700,7 +707,7 @@ export type EventRecord = {
   source_occurred_at?: string | null;
   source_event_id?: string | null;
   source_event_occurred_at?: string | null;
-  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | "superseded" | null;
+  preflight_status?: "running" | "success" | "failure" | "timed_out" | "error" | "waiting_for_space" | "superseded" | null;
   preflight_run_id?: string | null;
   preflight_exit_code?: number | null;
   preflight_failed_step?: string | null;
@@ -748,7 +755,7 @@ export type EventPreflightSummary = {
   number: number;
   head_sha: string;
   config_revision: string;
-  status: "running" | "success" | "failure" | "timed_out" | "error" | "superseded";
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "waiting_for_space" | "superseded";
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;
@@ -769,6 +776,7 @@ export type EventDetailRecord = EventRecord & {
 };
 
 export type PreflightRunSummary = {
+  disk_wait?: DiskSpaceWait | null;
   run_id: string;
   event_id?: string | null;
   repository_id: string;
@@ -780,7 +788,7 @@ export type PreflightRunSummary = {
   phase: string;
   cache_path?: string | null;
   cancel_requested: number | boolean;
-  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "superseded";
+  status: "running" | "success" | "failure" | "timed_out" | "error" | "cancelled" | "waiting_for_space" | "superseded";
   attempts: number;
   failed_step?: string | null;
   exit_code?: number | null;

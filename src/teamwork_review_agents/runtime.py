@@ -528,7 +528,12 @@ class BackgroundRuntime:
         """收到持久化事件通知后串行执行调度批次。"""
 
         while not self._stop_event.is_set():
-            await self._dispatch_event.wait()
+            # 没有新平台事件时也按持久化时间唤醒磁盘等待，重启后无需重新触发。
+            disk_delay = await asyncio.to_thread(self.store.disk_wait_delay)
+            try:
+                await asyncio.wait_for(self._dispatch_event.wait(), timeout=disk_delay)
+            except TimeoutError:
+                pass
             self._dispatch_event.clear()
             if self._stop_event.is_set():
                 break

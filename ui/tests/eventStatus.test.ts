@@ -7,6 +7,14 @@ import type { EventRecord } from "../src/types.ts";
 // 只提供本展示函数读取的字段，不构造与状态无关的网络响应数据。
 const record = (values: Partial<EventRecord>): EventRecord => ({ status: "processing", trigger_count: 0, ...values } as EventRecord);
 
+test("磁盘不足显示等待而不是失败，并可单独筛选", () => {
+  const result = eventStatusPresentation(record({ status: "waiting_for_space", preflight_status: "waiting_for_space", error: "磁盘空间不足" }));
+  assert.equal(result.label, "等待磁盘空间恢复");
+  assert.equal(result.visualStatus, "queued");
+  assert.equal(result.details, "磁盘空间不足");
+  assert.ok(EVENT_STATUS_OPTIONS.some(option => option.value === "waiting_for_space"));
+});
+
 test("处理中与是否开始本地 CI 无关，筛选保持同名", () => {
   for (const preflight_status of [null, "running", "success", "failure"] as const) {
     const result = eventStatusPresentation(record({ preflight_status }));

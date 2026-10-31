@@ -86,7 +86,7 @@ AGENT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 PREFLIGHT_EXECUTION_STATUS_GROUPS: dict[str, tuple[str, ...]] = {
-    "waiting": (),
+    "waiting": ("waiting_for_space",),
     "running": ("running",),
     "success": ("success",),
     "failure": ("failure", "error"),
@@ -1598,6 +1598,7 @@ def create_app(
         all_records: bool = False,
         status: Literal[
             "running",
+            "waiting_for_space",
             "success",
             "failure",
             "timed_out",
@@ -1841,6 +1842,7 @@ def create_app(
         status: list[
             Literal[
                 "pending",
+                "waiting_for_space",
                 "processing",
                 "unmatched",
                 "triggered",

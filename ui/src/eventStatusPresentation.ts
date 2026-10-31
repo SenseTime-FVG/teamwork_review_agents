@@ -1,8 +1,9 @@
 import type { EventRecord } from "./types";
 
-// 筛选和列表共享进行中语义；内部状态不变，不新增 CI 阶段状态。
+// 筛选和列表共享状态语义，磁盘资源等待单独展示。
 export const EVENT_STATUS_OPTIONS = [
   { value: "pending", label: "待处理" },
+  { value: "waiting_for_space", label: "等待磁盘空间恢复" },
   { value: "processing", label: "处理中" },
   { value: "unmatched", label: "未触发" },
   { value: "triggered", label: "已触发" },
@@ -14,6 +15,7 @@ export const EVENT_STATUS_OPTIONS = [
 export function unmatchedReasonLabel(reason?: string | null): string | null {
   if (!reason) return null;
   const labels: Record<string, string> = {
+    disk_wait_superseded: "等待空间期间源提交已变化、请求已关闭或 CI 已停用，已跳过",
     scan_deduplicated: "本扫描周期内已被更新事件替代",
     manual_batch_deduplicated: "本次手动批次内已被更新事件替代，未触发运行",
   };
@@ -32,7 +34,10 @@ export function eventStatusPresentation(event: EventRecord): {
   };
   let label = labels[event.status] ?? event.status;
   let visualStatus = event.status;
-  if (event.error?.includes("状态回写失败")) {
+  if (event.status === "waiting_for_space") {
+    label = "等待磁盘空间恢复";
+    visualStatus = "queued";
+  } else if (event.error?.includes("状态回写失败")) {
     label = "状态回写失败";
     visualStatus = "failed";
   } else if (event.status === "completed" && event.preflight_status === "failure") {
