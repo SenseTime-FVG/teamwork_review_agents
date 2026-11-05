@@ -261,13 +261,13 @@ class Orchestrator:
         return completed_at
 
     def _updated_since(self, repository_id: str) -> datetime | None:
-        """读取上次成功扫描时间，并保留两个扫描周期的重叠窗口。"""
+        """从上次成功扫描的开始时间回看，覆盖长扫描和退避期间的变化。"""
 
-        completed_at = self._last_scan_completed_at(repository_id)
-        if completed_at is None:
+        started_at = self._last_successful_scan_started_at(repository_id)
+        if started_at is None:
             return None
         overlap_seconds = max(60, self.config.scanner.interval_seconds * 2)
-        return completed_at - timedelta(seconds=overlap_seconds)
+        return started_at - timedelta(seconds=overlap_seconds)
 
     def _last_successful_scan_started_at(self, repository_id: str) -> datetime | None:
         """读取上一次成功轮次的开始时间，旧数据回退到完成时间。"""
