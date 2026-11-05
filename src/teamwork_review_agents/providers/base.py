@@ -2,15 +2,50 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 from abc import ABC, abstractmethod
+from asyncio import sleep
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import BinaryIO, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
 from ..config import ProviderConfig, RepositoryConfig, ScannerConfig
 from ..models import ChangeRequestActivityBatch, ChangeRequestSnapshot, CommitStatusTarget
+
+
+logger = logging.getLogger(__name__)
+
+# 只为只读请求重试瞬态故障，写入请求保持单次执行，避免重复产生副作用。
+_GET_MAX_ATTEMPTS = 3
+_GET_RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_GET_RETRY_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+_GET_MAX_RETRY_DELAY_SECONDS = 30.0
+
+
+def _get_retry_delay(attempt: int, response: httpx.Response | None) -> float:
+    """使用一秒、两秒退避，并在有界等待内尊重平台 Retry-After。"""
+
+    delay = float(2 ** (attempt - 1))
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            requested_delay = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                requested_delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                requested_delay = 0.0
+        if math.isfinite(requested_delay):
+            delay = max(delay, requested_delay)
+    return min(delay, _GET_MAX_RETRY_DELAY_SECONDS)
 
 
 class ProviderError(RuntimeError):
@@ -61,6 +96,40 @@ class BaseProvider(ABC):
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
+    async def _get_with_retry(self, path: str, **kwargs: object) -> httpx.Response:
+        """完整读取响应后返回；短暂断流、超时和服务端繁忙时有限重试。"""
+
+        for attempt in range(1, _GET_MAX_ATTEMPTS + 1):
+            response = None
+            try:
+                response = await self.client.get(path, **kwargs)
+                if (
+                    response.status_code not in _GET_RETRY_STATUS_CODES
+                    or attempt == _GET_MAX_ATTEMPTS
+                ):
+                    return response
+                reason = f"HTTP {response.status_code}"
+            except _GET_RETRY_ERRORS as exc:
+                if attempt == _GET_MAX_ATTEMPTS:
+                    raise
+                reason = type(exc).__name__
+            delay = _get_retry_delay(attempt, response)
+            if response is not None:
+                await response.aclose()
+            # 仅记录路径与错误类别，不记录查询参数、认证头或响应正文。
+            logger.warning(
+                "Provider %s GET 短暂失败：%s，原因=%s，尝试=%s/%s，%.1f 秒后重试",
+                self.name,
+                urlsplit(path).path,
+                reason,
+                attempt,
+                _GET_MAX_ATTEMPTS,
+                delay,
+            )
+            # 取消和外层截止时间可直接打断等待，不能被重试逻辑吞掉。
+            await sleep(delay)
+        raise AssertionError("GET 重试次数异常")
+
     async def get_json_response(
         self,
         path: str,
@@ -69,7 +138,7 @@ class BaseProvider(ABC):
         """执行 GET，并同时返回分页所需的响应头。"""
 
         try:
-            response = await self.client.get(path, **kwargs)
+            response = await self._get_with_retry(path, **kwargs)
             response.raise_for_status()
             return response.json(), dict(response.headers)
         except httpx.HTTPStatusError as exc:
@@ -94,7 +163,7 @@ class BaseProvider(ABC):
         """读取非关键补充信息，权限不足或不存在时返回默认值。"""
 
         try:
-            response = await self.client.get(path, **kwargs)
+            response = await self._get_with_retry(path, **kwargs)
             if response.status_code in {403, 404}:
                 return default
             response.raise_for_status()
