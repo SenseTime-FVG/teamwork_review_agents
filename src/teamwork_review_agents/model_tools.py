@@ -144,8 +144,7 @@ def teamwork_function_tools(
                 "type": "function",
                 "name": "publish_comment",
                 "description": (
-                    "发布或更新当前 Agent 在本次 PR/MR 源版本代次的托管顶层评论。"
-                    "目标分支变化会更新当前评论，源分支变化会创建下一代评论。"
+                    "发布或更新本次运行对应的 PR/MR 托管顶层评论。"
                 ),
                 "parameters": {
                     "type": "object",

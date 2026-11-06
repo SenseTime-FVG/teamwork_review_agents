@@ -434,7 +434,7 @@ agents:
 
 sub-agent 和托管评论都不需要为此获得配置文件或数据库权限。Teamwork 会在外层沙盒内启动一个只暴露 `invoke_agent` 与 `publish_comment` 的最小 MCP 代理，并通过每次运行独有的临时文件通道把请求交给沙盒外 Broker；Broker 继续执行白名单、写作用域、源版本代次、幂等和并发校验。`publish_comment` 只接收完整正文，仓库、PR/MR、Agent 槽位和源版本代次全部来自服务签发的可信上下文。沙盒只获准访问该次通道，不能读取 `config.yaml`、SQLite、基础仓库或其他 Agent 工作区；Provider Token 默认作为脱敏环境变量进入 Agent 和 sub-agent 进程，但不会进入 Prompt，管理员可以关闭进程暴露。通道及其随机令牌会在本轮结束后删除。取消、超时、`stop` 和 `restart` 会同时收尾 Codex、Broker 及仍在运行的 sub-agent。
 
-Agent 详情页可以开启“按源版本托管顶层评论”。开启后必须同时声明 `change_request` 写作用域，并保存一个不会随 Agent 重命名变化的 `managed_comment_slot`。同一 Agent、同一 PR/MR、同一源版本代次只维护一条顶层评论：目标分支变化但源分支未变时更新原评论；源分支新增提交或 force-push 时创建下一代评论，保留时间线中的旧审核记录。人工删除评论不会被后台立即补回，只有该 Agent 下一次实际调用 `publish_comment` 时才会重新创建。关闭开关也不会删除历史评论。
+Agent 详情页可以开启“按源版本托管顶层评论”。开启后必须同时声明 `change_request` 写作用域，并保存一个不会随 Agent 重命名变化的 `managed_comment_slot`。通常，同一 Agent、同一 PR/MR、同一源版本代次维护一条顶层评论：目标分支变化但源分支未变时更新原评论；源分支新增提交或 force-push 时创建下一代评论。GitLab 的审批或撤销审批触发审核时，为该事件追加一条评论；重试或手动重放同一事件只更新它自己的评论。人工删除评论不会被后台立即补回，只有该 Agent 下一次实际调用 `publish_comment` 时才会重新创建。关闭开关也不会删除历史评论。
 
 可同时开启“附加模型签名”。Teamwork 会读取本轮 Agent 启动时固化的模型快照，在 `publish_comment` 正文末尾自动追加如 `gpt-5.6-sol (high)` 或 `deepseek-v4-pro` 的签名；无法解析具体模型时明确显示账号默认且未记录型号。签名不依赖 Prompt，也不会附加到没有模型运行的 Preflight / CI 评论。
 

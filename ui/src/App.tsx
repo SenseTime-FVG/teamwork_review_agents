@@ -7043,11 +7043,11 @@ function AgentsEditor(props: {
                 <div className="network-permission-head">
                   <div>
                     <strong>按源版本托管顶层评论</strong>
-                    <p>目标分支变化时更新当前评论；源分支出现新提交或 force-push 时，为新的时间线代次追加评论。</p>
+                    <p>目标分支变化时更新当前评论；源分支有新提交或 force-push 时追加评论。GitLab 的每次审批变化触发审核时也会追加评论。</p>
                   </div>
                   <div className="managed-comment-toggles">
                     <Toggle
-                      label="每个源版本代次只维护一条评论"
+                      label="启用托管顶层评论"
                       checked={agent.managed_comment ?? false}
                       onChange={(managed_comment) => update(name, {
                         managed_comment,

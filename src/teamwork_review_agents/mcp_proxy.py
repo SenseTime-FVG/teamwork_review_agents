@@ -61,7 +61,7 @@ async def invoke_agent(
 
 @mcp.tool(
     name="publish_comment",
-    description="发布或更新当前 Agent 在当前源版本代次的 PR/MR 顶层评论。",
+    description="发布或更新本次运行对应的 PR/MR 托管顶层评论。",
 )
 async def publish_comment(body: str) -> dict[str, Any]:
     """通过本次运行的临时通道请求服务侧维护顶层评论。"""
