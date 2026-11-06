@@ -38,7 +38,7 @@ from teamwork_review_agents.state import StateStore
 async def test_gitlab_instance_probe_is_shared_optional_and_read_only(
     version_response, expected, snapshot_factory,
 ) -> None:
-    """并发 MR 只探测一次版本，失败不丢快照且绝不通过响应形状猜测版本。"""
+    """并发 MR 共享一次版本探测，临时错误可重试且不会丢失快照。"""
 
     paths: list[str] = []
 
@@ -85,8 +85,10 @@ async def test_gitlab_instance_probe_is_shared_optional_and_read_only(
     finally:
         await provider.close()
 
-    assert paths.count("/api/v4/version") == 1
-    assert len(paths) == 19
+    # 500 和读取超时共享同一轮退避，不能按并发 MR 数量分别重试。
+    expected_attempts = 3 if version_response is None or version_response.status_code == 500 else 1
+    assert paths.count("/api/v4/version") == expected_attempts
+    assert len(paths) == 18 + expected_attempts
     for snapshot in [*snapshots, later]:
         assert snapshot.raw["gitlab_instance"] == expected
         assert snapshot.approvals == 0

@@ -172,6 +172,20 @@ class ConfigManager:
         content = yaml.safe_dump(masked, allow_unicode=True, sort_keys=False)
         self.store.save_config_version(config.revision, content, source)
 
+    @staticmethod
+    def recover_historical_config(
+        config_path: Path, content: str, revision: str,
+    ) -> AppConfig | None:
+        """仅在能校验原始版本时，使用当前字面凭据还原历史占位。"""
+
+        raw = yaml.safe_load(content)
+        if MASK not in content:
+            return parse_config_data(raw, config_path)
+        with config_path.open("r", encoding="utf-8") as file:
+            current = protect_provider_credentials(normalize_model_provider_document(yaml.safe_load(file) or {}))
+        historical = parse_config_data(ConfigManager._merge_masked(raw, current), config_path)
+        return historical if historical.revision == revision else None
+
     def validate(self, document: dict[str, Any]) -> AppConfig:
         """合并 Secret 占位并执行完整配置校验。"""
 
