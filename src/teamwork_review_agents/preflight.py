@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
+import yaml
+
 from .config import AgentWorkspaceConfig, AppConfig, PreflightConfig
+from .config_manager import ConfigManager
 from .disk_space import is_disk_full_error, preflight_disk_paths, probe_disk_space
 from .environment import (
     SecretRedactor,
@@ -442,16 +445,72 @@ async def execute_preflight_steps(
     return StepExecutionOutcome(status="success", output=output)
 
 
+def _preflight_execution_fingerprint(config: AppConfig, repository_id: str) -> str:
+    """仅计算影响检出、测试执行及结果回写位置的配置指纹。"""
+
+    repository = config.repository_map()[repository_id]
+    provider = config.providers[repository.provider]
+    token = repository.environment.get(provider.token_env)
+    if token is None:
+        token = config.environment.global_variables.get(provider.token_env)
+    # 比较凭据配置，不读取宿主机凭据，也不把凭据原文写入状态库。
+    token_source = (
+        (token.value, token.from_system, token.expose_to_process)
+        if token is not None else (None, provider.token_env, False)
+    )
+    return stable_hash(
+        repository.provider, provider.kind, provider.base_url, provider.token_env, token_source,
+        repository.project, repository.clone_url, repository.workspace,
+        config.runtime.git_timeout_seconds, config.runtime.repository_initialization_timeout_seconds,
+        (
+            repository_cache_root(config, repository), config.runtime.lock_timeout_seconds,
+        ) if repository.preflight.cache_enabled else None,
+        repository.preflight.model_dump(include={
+            "enabled", "steps", "timeout_seconds", "max_output_bytes", "status_context",
+        }),
+    )
+
+
 def preflight_idempotency_key(config: AppConfig, event: ChangeEvent) -> str:
-    """按批次最终 Head 与配置版本返回 CI 幂等键。"""
+    """按批次最终 Head 与有效 CI 配置返回幂等键。"""
 
     return stable_hash(
-        "preflight",
+        "preflight-execution-v1",
         event.repository_id,
         event.number,
         event.current_snapshot.head_sha,
-        config.revision,
+        _preflight_execution_fingerprint(config, event.repository_id),
     )
+
+
+def _load_reusable_preflight(
+    config: AppConfig, store: StateStore, event: ChangeEvent, key: str,
+) -> PreflightResult | None:
+    """首次命中等效的旧记录时迁移其幂等键，保留运行和事件关联。"""
+
+    cached = store.load_preflight_result(key)
+    if cached is not None:
+        return cached
+    head = event.current_snapshot.head_sha
+    latest = store.latest_event_preflight_key(event.repository_id, event.number, head)
+    if latest is None:
+        return None
+    old_key, revision = latest
+    if old_key != stable_hash("preflight", event.repository_id, event.number, head, revision):
+        return None
+    if revision != config.revision:
+        version = store.get_config_version(revision)
+        if version is None:
+            return None
+        try:
+            previous = ConfigManager.recover_historical_config(config.config_path, version["content"], revision)
+            if previous is None or preflight_idempotency_key(previous, event) != key:
+                return None
+        except (yaml.YAMLError, ValueError, KeyError, OSError):
+            # 历史配置缺失或无法验证时，重新执行比猜测结果安全。
+            return None
+    store.migrate_preflight_key(old_key, key)
+    return store.load_preflight_result(key)
 
 
 def _status_description(result: PreflightResult) -> str:
@@ -906,7 +965,7 @@ class PreflightExecutor:
         provider_config = self.config.providers[repository.provider]
         snapshot = event.current_snapshot
         key = preflight_idempotency_key(self.config, event)
-        cached = await asyncio.to_thread(self.store.load_preflight_result, key)
+        cached = await asyncio.to_thread(_load_reusable_preflight, self.config, self.store, event, key)
         if cached is not None and cached.status != "error":
             # 状态回写和评论同步也可能耗时，复用关系必须先对当前事件可见。
             await asyncio.to_thread(

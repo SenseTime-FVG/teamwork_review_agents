@@ -2038,7 +2038,7 @@ class StateStore:
                 """
                 UPDATE preflight_runs
                 SET status = 'running', attempts = ?, event_id = ?,
-                    source_generation = ?,
+                    source_generation = ?, config_revision = ?,
                     trigger_source = 'event', phase = 'preparing',
                     branch = NULL, cache_path = NULL, cancel_requested = 0,
                     remote_status_target = NULL, status_published = 0,
@@ -2046,7 +2046,7 @@ class StateStore:
                     started_at = ?, finished_at = NULL
                 WHERE run_id = ?
                 """,
-                (attempts, event_id, source_generation, now, row["run_id"]),
+                (attempts, event_id, source_generation, config_revision, now, row["run_id"]),
             )
             self._link_events_to_preflight(
                 connection, linked_event_ids, str(row["run_id"]), reused=False, linked_at=now,
@@ -2260,6 +2260,29 @@ class StateStore:
                     run_id,
                     step_index,
                 ),
+            )
+
+    def latest_event_preflight_key(
+        self, repository_id: str, number: int, head_sha: str,
+    ) -> tuple[str, str] | None:
+        """获取同一提交最近一次事件 CI 的键和审计版本。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT idempotency_key, config_revision FROM preflight_runs
+                   WHERE repository_id = ? AND number = ? AND head_sha = ? AND trigger_source = 'event'
+                   ORDER BY started_at DESC, run_id DESC LIMIT 1""",
+                (repository_id, number, head_sha),
+            ).fetchone()
+        return None if row is None else (row["idempotency_key"], row["config_revision"])
+
+    def migrate_preflight_key(self, old_key: str, new_key: str) -> None:
+        """仅在新键没有运行时接管旧记录，兼容并发调用。"""
+
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE OR IGNORE preflight_runs SET idempotency_key = ? WHERE idempotency_key = ?",
+                (new_key, old_key),
             )
 
     def load_preflight_result(self, idempotency_key: str) -> PreflightResult | None:

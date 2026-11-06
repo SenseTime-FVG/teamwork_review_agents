@@ -13,14 +13,16 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import yaml
 
 from teamwork_review_agents.config import PreflightConfig, parse_config_data
+from teamwork_review_agents.config_manager import ConfigManager
 from teamwork_review_agents.events import (
     create_manual_replay_event,
     detect_activity_events,
     detect_events,
 )
-from teamwork_review_agents.models import ChangeRequestActivity, PreflightResult
+from teamwork_review_agents.models import ChangeRequestActivity, PreflightResult, stable_hash
 from teamwork_review_agents.preflight import (
     PreflightExecutor,
     build_preflight_environment,
@@ -562,6 +564,80 @@ async def test_preflight_executor_reuses_success_for_same_head_and_revision(
         "repository-provider-token",
         "repository-provider-token",
     ]
+
+
+@pytest.mark.parametrize("previous_key", ["current", "legacy", "legacy-rotated-token"])
+async def test_approval_rule_changes_reuse_preflight_until_execution_config_changes(
+    tmp_path, monkeypatch, snapshot_factory, previous_key,
+) -> None:
+    """审批触发规则不重跑 CI，实际命令和凭据发生变化则重新执行。"""
+
+    document = {
+        "database": {"path": "state.db"},
+        "providers": {
+            "github-main": {"kind": "github", "base_url": "https://api.github.com", "token_env": "GITHUB_TOKEN"},
+        },
+        "repositories": [{
+            "id": "demo", "provider": "github-main", "project": "owner/demo", "workspace": "workspace",
+            "environment": {"GITHUB_TOKEN": "original-test-token"},
+            "preflight": {"enabled": True, "cache_enabled": False, "steps": [
+                {"name": "test", "command": [sys.executable, "-c", "print('original command')"]},
+            ]},
+        }],
+        "rules": [{
+            "name": "review", "events": ["change_request.opened"], "agents": [], "run_preflight": True,
+        }],
+    }
+    config_path = tmp_path / "config.yaml"
+
+    def load_version():
+        """用真实配置管理器记录脱敏版本。"""
+
+        config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+        return ConfigManager(config_path)
+
+    @contextmanager
+    def fake_worktree(*_args, **_kwargs):
+        yield tmp_path
+
+    async def fake_remote_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("teamwork_review_agents.preflight.temporary_change_request_worktree", fake_worktree)
+    monkeypatch.setattr(PreflightExecutor, "_set_remote_status", fake_remote_status)
+
+    original = load_version()
+    snapshot = snapshot_factory(provider="github-main", repository_id="demo", head_sha="b" * 40)
+    opened = detect_events(None, snapshot, emit_initial=True)[0]
+    first = await PreflightExecutor(original.config, original.store).ensure_passed(opened)
+    assert first.status == "success"
+    if previous_key.startswith("legacy"):
+        legacy_key = stable_hash("preflight", "demo", opened.number, snapshot.head_sha, original.config.revision)
+        original.store.migrate_preflight_key(preflight_idempotency_key(original.config, opened), legacy_key)
+
+    document["rules"][0]["events"].append("change_request.approvals_changed")
+    if previous_key == "legacy-rotated-token":
+        document["repositories"][0]["environment"]["GITHUB_TOKEN"] = "rotated-test-token"
+    updated = load_version()
+    approval = next(
+        event for event in detect_events(snapshot, snapshot.model_copy(update={"approvals": 1}))
+        if event.type == "change_request.approvals_changed"
+    )
+    assert updated.config.revision != original.config.revision
+    second = await PreflightExecutor(updated.config, updated.store).ensure_passed(approval)
+    assert second.status == "success"
+    assert second.reused == (previous_key != "legacy-rotated-token")
+    assert (second.run_id == first.run_id) == second.reused
+    assert original.store.get_preflight_run(first.run_id)["config_revision"] == original.config.revision
+    assert updated.store.load_preflight_result(preflight_idempotency_key(updated.config, approval)).run_id == second.run_id
+
+    document["repositories"][0]["preflight"]["steps"][0]["command"][-1] = "print('updated command')"
+    changed = load_version()
+    third = await PreflightExecutor(changed.config, changed.store).ensure_passed(approval)
+    assert third.status == "success"
+    assert not third.reused
+    assert third.run_id != second.run_id
+    assert "updated command" in third.output
 
 
 @pytest.mark.parametrize(
