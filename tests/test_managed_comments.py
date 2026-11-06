@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+from unittest.mock import AsyncMock
+
 import pytest
 
 from teamwork_review_agents.config import EnvironmentVariable
-from teamwork_review_agents.events import detect_events, detect_target_branch_event
+from teamwork_review_agents.events import (
+    create_manual_replay_event,
+    detect_events,
+    detect_target_branch_event,
+)
 from teamwork_review_agents.managed_comments import ManagedCommentService
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.state import StateStore
@@ -212,6 +219,83 @@ async def test_managed_comment_updates_appends_and_recreates_deleted_comment(
     assert created == ["1", "2", "3"]
     assert provider_tokens
     assert set(provider_tokens) == {"repository-provider-token"}
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_ids", "expected_updates"),
+    [
+        ("gitlab-main", ["1", "2", "2", "3", "2", "2", "1"], ["2", "2", "2", "1"]),
+        ("github-main", ["1"] * 7, ["1"] * 6),
+    ],
+)
+async def test_approval_comment_keeps_gitlab_activity_history(
+    provider, expected_ids, expected_updates,
+    configured_app_factory, snapshot_factory, monkeypatch,
+) -> None:
+    """GitLab 审批活动各发一条，同事件重试及多级重放只更新自己的评论。"""
+
+    config = configured_app_factory()
+    config.repositories[0].provider = provider
+    monkeypatch.setenv(config.providers[provider].token_env, "provider-token")
+    agent = config.agents["security-reviewer"]
+    agent.managed_comment = True
+    agent.managed_comment_slot = "stable-review-slot"
+    agent.write_scopes = ["change_request"]
+    store = StateStore(config.database.path)
+    store.initialize()
+    remote = AsyncMock()
+    remote.__aenter__.return_value = remote
+    remote.create_change_request_comment.side_effect = ["1", "2", "3"]
+    remote.update_change_request_comment.return_value = True
+    monkeypatch.setattr(
+        "teamwork_review_agents.managed_comments.create_provider", lambda *a, **kw: remote,
+    )
+
+    initial = snapshot_factory(provider=provider)
+    approved = initial.model_copy(
+        update={"approvals": 1, "updated_at": initial.updated_at + timedelta(minutes=1)},
+    )
+    revoked = initial.model_copy(
+        update={"updated_at": initial.updated_at + timedelta(minutes=2)},
+    )
+
+    def save_event(old, new, event_type):
+        """使用扫描器产生并持久化的事件，保留数据库固化的源代次。"""
+
+        events = detect_events(old, new, emit_initial=True)
+        store.save_snapshot_and_events(new, events)
+        event_id = next(event.id for event in events if event.type == event_type)
+        return store.load_event(event_id)
+
+    opened = save_event(None, initial, "change_request.discovered")
+    approval = save_event(initial, approved, "change_request.approvals_changed")
+    revocation = save_event(approved, revoked, "change_request.approvals_changed")
+    replay = create_manual_replay_event(approval)
+    replay_again = create_manual_replay_event(replay)
+    assert store.enqueue_events([replay, replay_again]) == 2
+    context = InvocationContext(
+        config_path=str(config.config_path),
+        current_agent="security-reviewer",
+        run_id="run-one",
+        root_run_id="run-one",
+        event=opened,
+    )
+    service = ManagedCommentService(config, store)
+    results = []
+    for index, event in enumerate(
+        [opened, approval, approval, revocation, replay, replay_again, opened],
+    ):
+        result = await service.publish_agent_comment(
+            context.model_copy(update={"event": event}), f"审核结果 {index}",
+        )
+        assert result["source_generation"] == 1
+        results.append(result["comment_id"])
+
+    assert results == expected_ids
+    assert remote.create_change_request_comment.await_count == len(set(expected_ids))
+    assert [
+        call.args[1] for call in remote.update_change_request_comment.await_args_list
+    ] == expected_updates
 
 
 @pytest.mark.parametrize(

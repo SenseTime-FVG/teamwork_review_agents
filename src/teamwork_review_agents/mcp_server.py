@@ -53,7 +53,7 @@ mcp = AgentGateway(
     "teamwork-agent-gateway",
     instructions=(
         "invoke_agent 只能调用当前 Agent 配置白名单中的 sub-agent。"
-        "publish_comment 只维护当前 Agent 在当前 PR/MR 源版本代次的顶层评论。"
+        "publish_comment 只维护本次运行对应的托管顶层评论。"
         "委托内容必须具体、最小化；sub-agent 只自动复用当前仓库上下文，"
         "是否传递 MR / PR 信息由父 Agent 决定。"
     ),
@@ -163,7 +163,7 @@ async def invoke_agent(
 
 @mcp.tool(
     name="publish_comment",
-    description="发布或更新当前 Agent 在当前源版本代次的 PR/MR 顶层评论。",
+    description="发布或更新本次运行对应的 PR/MR 托管顶层评论。",
 )
 async def publish_comment(body: str) -> dict[str, Any]:
     """只接受正文，其余目标信息全部来自服务签发的可信上下文。"""

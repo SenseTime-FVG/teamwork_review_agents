@@ -1,4 +1,4 @@
-"""按源版本代次维护 GitHub PR 与 GitLab MR 顶层评论。"""
+"""按源版本代次或 GitLab 审批事件维护顶层评论。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, Literal
 from .config import AppConfig
 from .environment import SecretRedactor, resolve_provider_token, resolve_repository_process_environment
 from .locks import ResourceLease
-from .models import InvocationContext, PreflightResult, stable_hash
+from .models import ChangeEvent, InvocationContext, PreflightResult, stable_hash
 from .providers.base import create_provider
 from .state import StateStore
 
@@ -71,16 +71,46 @@ class ManagedCommentService:
                 body,
                 language=agent.managed_comment_model_signature_language,
             )
-        snapshot = context.event.current_snapshot
+        event = context.event
+        namespace, slot = "agent", agent.managed_comment_slot
+        if event.type == "change_request.approvals_changed":
+            repository = self._repository(event.repository_id)
+            if self.config.providers[repository.provider].kind == "gitlab":
+                # 审批活动保留各自的评论，同一事件重放仍沿用原来的槽位。
+                event_id = event.id
+                if event.source_event_id:
+                    event_id = await asyncio.to_thread(self._approval_comment_event_id, event)
+                namespace = "agent-gitlab-approval"
+                slot = stable_hash(slot, event_id)
         return await self.publish(
-            repository_id=context.event.repository_id,
-            number=context.event.number,
-            namespace="agent",
-            slot=agent.managed_comment_slot,
-            source_generation=context.event.source_generation,
-            source_head_sha=snapshot.head_sha,
+            repository_id=event.repository_id,
+            number=event.number,
+            namespace=namespace,
+            slot=slot,
+            source_generation=event.source_generation,
+            source_head_sha=event.current_snapshot.head_sha,
             body=body,
         )
+
+    def _approval_comment_event_id(self, event: ChangeEvent) -> str:
+        """沿手动重放链定位最初的审批事件。"""
+
+        visited = {event.id}
+        while (source_id := event.source_event_id) and source_id not in visited:
+            source = self.store.load_event(source_id)
+            if source is None:
+                return source_id
+            if (
+                source.type != event.type
+                or source.provider != event.provider
+                or source.repository_id != event.repository_id
+                or source.number != event.number
+                or source.source_generation != event.source_generation
+            ):
+                break
+            visited.add(source_id)
+            event = source
+        return event.id
 
     async def _append_model_signature(
         self,
