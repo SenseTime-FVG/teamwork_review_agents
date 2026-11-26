@@ -403,12 +403,14 @@ class StateStore:
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     url TEXT,
+                    inline_body TEXT NOT NULL DEFAULT '',
                     error TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(run_id, ci_attempt),
                     FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
                 )
             """)
+            self._ensure_column(connection, "preflight_log_uploads", "inline_body", "TEXT NOT NULL DEFAULT ''")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_diagnoses (
                     preflight_run_id TEXT PRIMARY KEY,
@@ -1894,19 +1896,35 @@ class StateStore:
     def save_preflight_log_upload(
         self, run_id: str, ci_attempt: int, *, status: str,
         attempts: int, url: str | None = None, error: str | None = None,
+        inline_body: str = "",
     ) -> None:
         """附件的传输状态独立于 CI 终态，失败不能改写测试结论。"""
 
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO preflight_log_uploads
-                (run_id, ci_attempt, status, attempts, url, error, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (run_id, ci_attempt, status, attempts, url, error, updated_at, inline_body)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, ci_attempt) DO UPDATE SET
                 status=excluded.status, attempts=excluded.attempts, url=excluded.url,
-                error=excluded.error, updated_at=excluded.updated_at""",
-                (run_id, ci_attempt, status, attempts, url, error, time.time()),
+                error=excluded.error, updated_at=excluded.updated_at, inline_body=excluded.inline_body""",
+                (run_id, ci_attempt, status, attempts, url, error, time.time(), inline_body),
             )
+
+    def list_preflight_log_comments(self, run_id: str, ci_attempt: int) -> list[dict[str, Any]]:
+        """只查当前执行尝试受管的日志评论，合并时不能删除其他评论。"""
+
+        prefix = f"{run_id}:{ci_attempt}:"
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT comment.* FROM managed_comments AS comment
+                JOIN preflight_runs AS run ON run.repository_id=comment.repository_id
+                    AND run.number=comment.number
+                WHERE run.run_id=? AND comment.namespace='preflight-log'
+                    AND substr(comment.slot, 1, ?)=?""",
+                (run_id, len(prefix), prefix),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def iter_preflight_logs(self, run_id: str) -> Iterator[dict[str, Any]]:
         """按写入顺序流式导出准备过程和输出，不使用详情页分页上限。"""

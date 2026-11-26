@@ -70,10 +70,16 @@ def github_logs(configured_app_factory, snapshot_factory, monkeypatch):
         comments[comment_id] = body
         return True
 
+    async def delete(_repository, comment_id, **_kwargs):
+        """删除远端受管日志评论，用于验证旧版目录收敛。"""
+
+        comments.pop(comment_id, None)
+
     remote = AsyncMock()
     remote.__aenter__.return_value = remote
     remote.create_change_request_comment.side_effect = create
     remote.update_change_request_comment.side_effect = update
+    remote.delete_change_request_comment.side_effect = delete
     remote.change_request_comment_url.side_effect = lambda _r, _n, cid: f"{web_url}#issuecomment-{cid}" if cid in comments else None
     remote.set_commit_status.return_value = CommitStatusTarget(project=repository.project, sha=result.head_sha)
     for module in ("preflight", "managed_comments"):
@@ -121,7 +127,7 @@ async def test_github_terminal_precedes_complete_collapsible_log_publication(git
     assert run["status"] == status and run["log_delivery"]["status"] == "completed"
     index_url = run["log_upload"]["url"]
     index_body = case.comments[index_url.rsplit("-", 1)[-1]]
-    assert "完整运行日志" in index_body and "[第 1 段]" in index_body
+    assert "完整 CI 运行日志" in index_body and "[第 1 段]" in index_body
     parts = [body for body in case.comments.values() if body.startswith("### Teamwork CI 完整日志")]
     assert len(parts) > 1
     exported = "".join(html.unescape(re.search(r"<pre>(.*)</pre>", part, re.S).group(1)) for part in parts)
@@ -136,9 +142,9 @@ async def test_github_terminal_precedes_complete_collapsible_log_publication(git
         assert final_url == index_url
     else:
         report = case.comments[final_url.rsplit("-", 1)[-1]]
-        assert "失败末尾输出" in report and index_url in report
+        assert "失败末尾输出" in report and final_url == index_url
         assert "<summary>末尾输出</summary>" in report
-        assert final_url in index_body
+        assert "查看失败输出与诊断报告" not in index_body
 
 
 async def test_github_partial_failure_resumes_without_duplicate_parts(github_logs):
@@ -169,7 +175,7 @@ async def test_github_partial_failure_resumes_without_duplicate_parts(github_log
     assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "completed"
     assert sum("展开第 1 段日志" in body for body in case.comments.values()) == 1
     assert not any("展开第 1 段日志" in call.args[2] for call in case.remote.update_change_request_comment.await_args_list)
-    assert sum("完整运行日志" in body for body in case.comments.values()) == 1
+    assert sum("<summary>完整 CI 运行日志</summary>" in body for body in case.comments.values()) == 1
     count = len(case.created)
     await worker.drain()
     assert len(case.created) == count
@@ -215,8 +221,126 @@ async def test_github_without_failure_comment_links_log_directory(github_logs):
     await PreflightLogWorker(lambda: case.config, case.store).drain()
     url = case.store.get_preflight_log_upload(case.result.run_id)["url"]
     assert case.remote.set_commit_status.call_args.kwargs["target_url"] == url
-    assert "完整运行日志" in case.comments[url.rsplit("-", 1)[-1]]
+    assert "完整 CI 运行日志" in case.comments[url.rsplit("-", 1)[-1]]
     assert not any("Teamwork 本地 CI 未通过" in body for body in case.comments.values())
+
+
+def _use_short_log(case):
+    """替换为能连同失败摘要和诊断放进单条评论的完整日志。"""
+
+    with case.store.connect() as connection:
+        connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
+    case.store.append_preflight_log(
+        case.result.run_id, stream="stdout", event_type="output",
+        payload="完整日志首行😀\n失败末尾输出\n完整日志末行\n",
+    )
+
+
+@pytest.mark.parametrize("status", ["success", "failure", "timed_out"])
+async def test_github_short_log_has_only_one_ci_comment(github_logs, status):
+    """普通日志直接并入主评论，失败摘要、完整输出和晚到诊断不各发一条。"""
+
+    case = github_logs
+    _use_short_log(case)
+    case.result = case.result.model_copy(update={"status": status})
+    case.store.finish_preflight_run(case.result)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    original = case.created[0] if case.created else None
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert len(case.comments) == 1 and len(case.created) == 1
+    url = case.store.get_preflight_log_upload(case.result.run_id)["url"]
+    comment_id = url.rsplit("-", 1)[-1]
+    assert original is None or comment_id == original
+    body = case.comments[comment_id]
+    assert "<summary>完整 CI 运行日志</summary>" in body
+    assert "完整日志首行😀" in body and "完整日志末行" in body
+    assert "[第 1 段]" not in body
+    assert len(body.encode()) < 60 * 1024
+    if status != "success":
+        case.store.begin_preflight_diagnosis(case.result.run_id, "diagnosis")
+        case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report="晚到诊断：断言错误")
+        await ManagedCommentService(case.config, case.store).publish_latest(
+            repository_id=case.repository.id, number=7, namespace="preflight",
+            slot=case.repository.preflight.status_context, source_generation=1,
+            source_head_sha=case.result.head_sha, body="更新诊断",
+            replace_existing=False, update_existing=True, preflight_run_id=case.result.run_id,
+            refresh_preflight_body=True,
+        )
+        assert len(case.comments) == 1 and len(case.created) == 1
+        assert "晚到诊断：断言错误" in case.comments[comment_id]
+        assert "完整日志末行" in case.comments[comment_id]
+
+
+async def test_github_legacy_three_comments_merge_before_cleanup(github_logs):
+    """原主评论更新成功后才删本次旧目录和日志，不触碰人工或其他运行的评论。"""
+
+    case = github_logs
+    _use_short_log(case)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    service = ManagedCommentService(case.config, case.store)
+    for slot in ("ci-github:1:part:1", "ci-github:1:index", "other-run:1:index"):
+        await service.publish(
+            repository_id=case.repository.id, number=7, namespace="preflight-log", slot=slot,
+            source_generation=1, source_head_sha=case.result.head_sha, body="旧版独立日志评论",
+        )
+    case.comments["user-comment"] = "人工评论"
+    case.store.save_preflight_log_upload(
+        case.result.run_id, 1, status="completed", attempts=1, url=case.web_url + "#issuecomment-3",
+    )
+    update = case.remote.update_change_request_comment.side_effect
+    case.remote.update_change_request_comment.side_effect = ProviderError("模拟合并失败")
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    await worker.drain()
+    assert all(cid in case.comments for cid in ("1", "2", "3", "4", "user-comment"))
+    case.remote.delete_change_request_comment.assert_not_awaited()
+
+    case.remote.update_change_request_comment.side_effect = update
+    case.store.update_preflight_log_delivery(case.result.run_id, 1, status="queued", attempts=1)
+    await worker.drain()
+    assert set(case.comments) == {"1", "4", "user-comment"}
+    assert "完整日志首行😀" in case.comments["1"]
+    assert case.store.get_preflight_log_upload(case.result.run_id)["url"] == case.web_url + "#issuecomment-1"
+    assert case.store.list_preflight_log_comments(case.result.run_id, 1) == []
+    assert len(case.created) == 4
+
+
+async def test_github_full_log_and_diagnosis_share_existing_report(github_logs):
+    """完整日志与诊断能放下时缩短重复尾部，不能因此多发目录或日志评论。"""
+
+    case = github_logs
+    _use_short_log(case)
+    text = "完整输出首行😀\n" + "x" * 41000 + "\n末尾错误"
+    with case.store.connect() as connection:
+        connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
+    case.store.append_preflight_log(case.result.run_id, stream="stdout", event_type="output", payload=text)
+    case.result = case.result.model_copy(update={"output": text[-26000:]})
+    case.store.finish_preflight_run(case.result)
+    case.store.begin_preflight_diagnosis(case.result.run_id, "diagnosis")
+    report = "已确认的诊断\n" * 300
+    case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report=report)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert len(case.comments) == 1 and len(case.created) == 1
+    body = next(iter(case.comments.values()))
+    assert "完整输出首行😀" in body and "末尾错误" in body
+    assert report.strip() in body
+    assert len(body.encode()) < 60 * 1024
+
+
+def test_github_legacy_upload_table_adds_inline_material_without_losing_url(github_logs):
+    """老数据库升级时保留已有远端地址和发布状态，为按需合并提供空材料。"""
+
+    case = github_logs
+    with case.store.connect() as connection:
+        connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN inline_body")
+        connection.execute(
+            "INSERT INTO preflight_log_uploads (run_id, ci_attempt, status, attempts, url, updated_at) VALUES (?, 1, 'completed', 1, ?, 0)",
+            (case.result.run_id, case.web_url + "#issuecomment-3"),
+        )
+    case.store.initialize()
+    record = case.store.get_preflight_log_upload(case.result.run_id)
+    assert record["status"] == "completed" and record["url"] == case.web_url + "#issuecomment-3"
+    assert record["inline_body"] == ""
 
 
 async def test_github_large_directory_is_grouped(github_logs, monkeypatch):
@@ -292,7 +416,8 @@ async def test_github_diagnosis_and_log_keep_each_others_content(github_logs, di
     assert "诊断结论：业务断言失败" in report
     assert "<summary>CI 失败诊断报告</summary>" in report
     assert "失败末尾输出" in report
-    assert case.store.get_preflight_log_upload(case.result.run_id)["url"] in report
+    assert "<summary>完整 CI 运行日志</summary>" in report
+    assert "[第 1 段]" in report
 
 
 @pytest.mark.parametrize("url,valid", [

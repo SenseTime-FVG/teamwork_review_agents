@@ -374,6 +374,7 @@ class ManagedCommentService:
                         redactor=SecretRedactor((*environment.secret_values, token)),
                         diagnosis_report=diagnosis.get("report", "") if diagnosis.get("status") == "completed" else "",
                         log_url=upload.get("url") if upload.get("status") == "completed" else None,
+                        log_details=upload.get("inline_body", ""),
                     ).strip()
             records = await asyncio.to_thread(
                 self.store.list_managed_comments,

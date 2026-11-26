@@ -600,6 +600,7 @@ def build_failure_comment_body(
     redactor: SecretRedactor,
     diagnosis_report: str = "",
     log_url: str | None = None,
+    log_details: str = "",
 ) -> str:
     """共用失败摘要和日志格式，诊断只追加独立折叠区，不覆盖原始失败证据。"""
 
@@ -622,7 +623,7 @@ def build_failure_comment_body(
     output = _bounded_comment_text(
         redactor.text(result.output),
         limit=PREFLIGHT_COMMENT_OUTPUT_CHARS,
-        byte_limit=36 * 1024,
+        byte_limit=4 * 1024 if log_details else 36 * 1024,
     )
     sections = [
         f"<!-- teamwork-preflight-failure:{marker} -->",
@@ -656,7 +657,10 @@ def build_failure_comment_body(
         "",
         "> 后续真实 CI 再次失败时会删除本评论并在时间线底部发布最新结果；本地 CI 通过后会自动删除活动失败评论。",
     ]
-    if log_url:
+    if log_details:
+        # 完整日志已在同条评论中，摘要只保留短尾部，避免重复占用平台限额。
+        sections.extend(["", log_details])
+    elif log_url:
         sections.extend(["", f"[查看完整 CI 运行日志]({log_url})"])
     if diagnosis_report:
         opening = "\n<details>\n<summary>CI 失败诊断报告</summary>\n\n"
