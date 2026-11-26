@@ -430,7 +430,7 @@ def test_legacy_log_fallback_is_explicit_and_attachment_survives_diagnosis(uploa
     assert "仅有界末尾摘要" in file.getvalue().decode()
     body = build_failure_comment_body(case.repository, case.result, redactor=SecretRedactor(()),
                                      diagnosis_report="## 原因\n断言错误", log_url=case.url)
-    assert f"[下载完整 CI 运行日志]({case.url})" in body
+    assert f"[查看完整 CI 运行日志]({case.url})" in body
     assert "<summary>CI 失败诊断报告</summary>" in body
 
 

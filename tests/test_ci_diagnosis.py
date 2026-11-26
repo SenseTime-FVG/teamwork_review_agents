@@ -377,7 +377,7 @@ async def test_report_updates_existing_comment_and_never_revives_stale_failure(d
     assert case.config.web.public_url not in body
     assert "查看 CI 日志与完整报告" not in body
     if attachment:
-        assert f"[下载完整 CI 运行日志]({attachment})" in body
+        assert f"[查看完整 CI 运行日志]({attachment})" in body
     assert "诊断报告超过评论长度限制" not in body
     case.create_run("ci-new-success", "success")
     assert (await service.publish_latest(**args, body="迟到报告", update_existing=True, preflight_run_id=case.result.run_id))["action"] == "obsolete"
