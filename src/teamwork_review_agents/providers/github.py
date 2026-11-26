@@ -6,7 +6,7 @@ import asyncio
 import re
 from datetime import datetime
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ..config import RepositoryConfig
 from ..models import (
@@ -107,6 +107,32 @@ class GitHubProvider(BaseProvider):
             {"body": body},
         )
         return payload is not None
+
+    async def change_request_comment_url(
+        self, repository: RepositoryConfig, number: int, comment_id: str,
+    ) -> str | None:
+        """只接受当前 GitHub 实例、仓库与 PR 对应的原生评论地址。"""
+
+        payload = await self.get_optional_json(
+            f"repos/{repository.project}/issues/comments/{quote(comment_id, safe='')}", None,
+        )
+        if payload is None:
+            return None
+        value = payload.get("html_url") if isinstance(payload, dict) else None
+        parsed = urlsplit(value) if isinstance(value, str) else None
+        api_host = urlsplit(self.config.base_url).netloc
+        web_host = "github.com" if api_host == "api.github.com" else api_host
+        if (
+            parsed is None or any(character.isspace() for character in value)
+            or parsed.scheme not in {"http", "https"}
+            or parsed.netloc != web_host or parsed.username or parsed.password or parsed.query
+            or parsed.path not in {
+                f"/{repository.project}/pull/{number}", f"/{repository.project}/issues/{number}",
+            }
+            or parsed.fragment != f"issuecomment-{comment_id}"
+        ):
+            raise ProviderError("GitHub CI 评论未返回有效的平台永久链接")
+        return value
 
     async def delete_change_request_comment(
         self,

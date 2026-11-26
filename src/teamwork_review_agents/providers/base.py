@@ -194,6 +194,13 @@ class BaseProvider(ABC):
 
         raise ProviderError("当前平台不支持上传 CI 日志附件")
 
+    async def change_request_comment_url(
+        self, repository: RepositoryConfig, number: int, comment_id: str,
+    ) -> str | None:
+        """由平台提供评论永久链接，不能猜测管理后台地址。"""
+
+        raise ProviderError("当前平台不支持读取评论永久链接")
+
     async def patch_optional_json(
         self,
         path: str,

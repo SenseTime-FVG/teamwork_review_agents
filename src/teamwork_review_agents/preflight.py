@@ -23,6 +23,7 @@ from .environment import (
     resolve_repository_process_environment,
 )
 from .git_auth import GitCredentialContext
+from .github_ci_logs import ensure_github_log_report
 from .filesystem import temporary_directory
 from .dependency_cache import RepositoryCacheUsage
 from .locks import LockCancelledError, ResourceLease
@@ -36,7 +37,6 @@ from .preflight_log_uploads import ensure_gitlab_log_upload
 from .process_control import process_group_options, terminate_process
 from .providers import create_provider
 from .state import StateStore
-from .service_urls import preflight_details_url
 from .subprocess_utils import (
     ProcessLaunch,
     WINDOWS_REQUIRED_ENVIRONMENT_NAMES,
@@ -657,7 +657,7 @@ def build_failure_comment_body(
         "> 后续真实 CI 再次失败时会删除本评论并在时间线底部发布最新结果；本地 CI 通过后会自动删除活动失败评论。",
     ]
     if log_url:
-        sections.extend(["", f"[下载完整 CI 运行日志]({log_url})"])
+        sections.extend(["", f"[查看完整 CI 运行日志]({log_url})"])
     if diagnosis_report:
         opening = "\n<details>\n<summary>CI 失败诊断报告</summary>\n\n"
         closing = "\n\n</details>"
@@ -729,14 +729,27 @@ class PreflightExecutor:
                     or current["status"] in {"running", "waiting_for_space"} or not current["status_published"]
                     or (generation is not None and generation != current["source_generation"])):
                     return None
-            target_url = preflight_details_url(self.config.web, run_id) if run_id else None
-            if provider_config.kind == "gitlab":
-                upload = await asyncio.to_thread(self.store.get_preflight_log_upload, run_id) if run_id else None
-                target_url = upload["url"] if upload and upload["status"] == "completed" and state not in {"pending", "running"} else ""
+            upload = await asyncio.to_thread(self.store.get_preflight_log_upload, run_id) if run_id else None
+            target_url = upload["url"] if upload and upload["status"] == "completed" and state not in {"pending", "running"} else ""
+            if provider_config.kind == "github" and not target_url and run_id:
+                # 日志尚未发布时使用 PR 原生地址，不能暴露管理员后台入口。
+                run = await asyncio.to_thread(self.store.get_preflight_run, run_id)
+                target_url = (run.get("change_request_url") or "") if run else ""
             async with create_provider(
                 repository.provider, provider_config, self.config.scanner,
                 token=resolve_provider_token(self.config, provider_config, repository),
             ) as remote:
+                if (provider_config.kind == "github" and attachment_attempt is not None
+                    and state in {"failure", "error"} and repository.preflight.publish_failure_comment):
+                    records = await asyncio.to_thread(
+                        self.store.list_managed_comments, repository_id=repository.id, number=number,
+                        namespace="preflight", slot=repository.preflight.status_context,
+                    )
+                    if records and records[-1]["source_head_sha"] == sha:
+                        report_url = await remote.change_request_comment_url(
+                            repository, number, str(records[-1]["remote_comment_id"]),
+                        )
+                        target_url = report_url or target_url
                 return await remote.set_commit_status(
                     repository, sha, state=state, context=repository.preflight.status_context,
                     description=description, target_url=target_url, ref=ref,
@@ -746,7 +759,7 @@ class PreflightExecutor:
     async def _queue_log_delivery(self, repository, result: PreflightResult) -> None:
         """只做本地入队，附件传输由独立后台任务处理。"""
 
-        if self.config.providers[repository.provider].kind == "gitlab":
+        if self.config.providers[repository.provider].kind in {"gitlab", "github"}:
             try:
                 await asyncio.to_thread(self.store.enqueue_preflight_log_delivery, result.run_id)
             except Exception as exc:
@@ -760,7 +773,7 @@ class PreflightExecutor:
         if run is None or run["attempts"] != ci_attempt or run["status"] in {"running", "waiting_for_space"}:
             return "obsolete"
         repository = self.repositories.get(run["repository_id"])
-        if repository is None or self.config.providers[repository.provider].kind != "gitlab":
+        if repository is None:
             return "obsolete"
         latest = await asyncio.to_thread(self.store.latest_preflight_run_id, repository.id, run["number"])
         if latest != run_id:
@@ -770,12 +783,20 @@ class PreflightExecutor:
             repository.provider, provider_config, self.config.scanner,
             token=resolve_provider_token(self.config, provider_config, repository),
         ) as remote:
-            url = await ensure_gitlab_log_upload(self.config, self.store, repository, run_id, remote)
+            if provider_config.kind == "github":
+                url = await ensure_github_log_report(self.config, self.store, repository, run_id, remote)
+            else:
+                url = await ensure_gitlab_log_upload(self.config, self.store, repository, run_id, remote)
         if not url:
-            return "failed"
+            return "obsolete" if provider_config.kind == "github" else "failed"
         result = PreflightResult.model_validate(run)
         if result.remote_status_target is None:
             raise RuntimeError("缺少本次 CI 的固定状态位置，不能猜测流水线补发附件链接")
+        if result.status in {"failure", "timed_out", "error"}:
+            diagnosis = await asyncio.to_thread(self.store.get_preflight_diagnosis, run_id)
+            if result.status != "error" or (diagnosis and diagnosis["status"] == "completed"):
+                # 评论先补日志入口或重建已删除的活动报告，再把状态指向最终评论。
+                await self._sync_failure_comment(repository, result, replace_existing=False, update_existing=True)
         target = await self._set_remote_status(
             repository, result.head_sha, state={"timed_out": "failure"}.get(result.status, result.status),
             description=_status_description(result), run_id=run_id, number=result.number,
@@ -783,13 +804,6 @@ class PreflightExecutor:
         )
         if target is None:
             return "obsolete"
-        if result.status in {"failure", "timed_out", "error"}:
-            if result.status == "error":
-                # 基础设施错误只给已完成的诊断补链接，不额外创建测试失败评论。
-                diagnosis = await asyncio.to_thread(self.store.get_preflight_diagnosis, run_id)
-                if not diagnosis or diagnosis["status"] != "completed":
-                    return "completed"
-            await self._sync_failure_comment(repository, result, replace_existing=False, update_existing=True)
         return "completed"
 
     async def _sync_failure_comment(
