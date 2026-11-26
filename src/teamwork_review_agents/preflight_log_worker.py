@@ -43,16 +43,19 @@ class PreflightLogWorker:
                 current = await asyncio.to_thread(self.store.get_preflight_log_delivery, run_id)
                 if not current or current["ci_attempt"] != ci_attempt or current["status"] not in {"queued", "running"}:
                     return
+                revision = current["revision"]
                 if current["attempts"] >= MAX_DELIVERY_ATTEMPTS:
                     await asyncio.to_thread(
                         self.store.update_preflight_log_delivery, run_id, ci_attempt,
                         status="failed", attempts=current["attempts"], error="附件发布已达到重试上限",
+                        expected_revision=revision,
                     )
                     return
                 attempts = current["attempts"] + 1
                 await asyncio.to_thread(
                     self.store.update_preflight_log_delivery, run_id, ci_attempt,
                     status="running", attempts=attempts,
+                    expected_revision=revision,
                 )
                 config = self.config_getter()
                 try:
@@ -61,6 +64,7 @@ class PreflightLogWorker:
                         self.store.update_preflight_log_delivery, run_id, ci_attempt,
                         status=status, attempts=attempts,
                         error="日志附件上传失败，详情见上传记录" if status == "failed" else None,
+                        expected_revision=revision,
                     )
                 except Exception as exc:
                     repository = next(repo for repo in config.repositories if repo.id == job["repository_id"])
@@ -71,6 +75,7 @@ class PreflightLogWorker:
                         self.store.update_preflight_log_delivery, run_id, ci_attempt,
                         status="queued" if attempts < MAX_DELIVERY_ATTEMPTS else "failed",
                         attempts=attempts, error=error, next_attempt_at=time.time() + 5 * attempts,
+                        expected_revision=revision,
                     )
                     await asyncio.to_thread(
                         self.store.append_preflight_log, run_id, stream="stderr",

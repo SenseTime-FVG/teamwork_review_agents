@@ -12,7 +12,7 @@ from typing import BinaryIO, Iterator
 from .config import AppConfig, RepositoryConfig
 from .environment import SecretRedactor, resolve_provider_token, resolve_repository_process_environment
 from .locks import ResourceLease
-from .managed_comments import ManagedCommentService
+from .managed_comments import MANAGED_COMMENT_BODY_BYTES, ManagedCommentService
 from .models import PreflightResult, stable_hash
 from .preflight_log_uploads import export_ci_log
 from .providers.base import BaseProvider, ProviderError
@@ -78,12 +78,20 @@ async def ensure_github_log_report(
         if not await asyncio.to_thread(_is_current, store, repository, run):
             return None
         record = await asyncio.to_thread(store.get_preflight_log_upload, run_id)
-        if record and record["status"] == "completed" and record.get("inline_body"):
+        diagnosis = await asyncio.to_thread(store.get_preflight_diagnosis, run_id)
+        layout_key = stable_hash(
+            "github-inline-log-v2", MANAGED_COMMENT_BODY_BYTES,
+            diagnosis.get("status") if diagnosis else None,
+            diagnosis.get("report", "") if diagnosis else "",
+        )
+        if (record and record["status"] == "completed" and record.get("inline_body")
+            and record.get("layout_key") == layout_key):
             return record["url"]
         tries = (record["attempts"] if record else 0) + 1
         await asyncio.to_thread(
             store.save_preflight_log_upload, run_id, attempt, status="uploading", attempts=tries,
             inline_body=(record or {}).get("inline_body", ""),
+            layout_key=layout_key,
         )
         token = resolve_provider_token(config, config.providers[repository.provider], repository)
         environment = resolve_repository_process_environment(config, repository, run_id)
@@ -102,11 +110,13 @@ async def ensure_github_log_report(
                 store.save_preflight_log_upload, run_id, attempt, status="failed", attempts=tries,
                 error=redactor.text(str(exc) or type(exc).__name__),
                 inline_body=(prepared or {}).get("inline_body", ""),
+                layout_key=layout_key,
             )
             raise
         await asyncio.to_thread(
             store.save_preflight_log_upload, run_id, attempt, status="completed", attempts=tries, url=url,
             inline_body=details,
+            layout_key=layout_key,
         )
         return url
 
@@ -117,7 +127,7 @@ async def _publish_report(
 ) -> tuple[str, str]:
     """优先把整份日志补入主评论，只有实际放不下时才创建续页。"""
 
-    from .preflight import PREFLIGHT_COMMENT_BODY_BYTES, build_failure_comment_body
+    from .preflight import build_failure_comment_body
 
     service = ManagedCommentService(config, store)
     prefix = f"{run['run_id']}:{run['attempts']}"
@@ -174,9 +184,9 @@ async def _publish_report(
 
     with tempfile.TemporaryFile(mode="w+b") as file:
         await asyncio.to_thread(export_ci_log, store, run, file, redactor)
-        raw = file.read(PREFLIGHT_COMMENT_BODY_BYTES + 1)
+        raw = file.read(MANAGED_COMMENT_BODY_BYTES + 1)
         details = ""
-        if len(raw) <= PREFLIGHT_COMMENT_BODY_BYTES:
+        if len(raw) <= MANAGED_COMMENT_BODY_BYTES:
             candidate = log_section(f"<pre>{html.escape(raw.decode('utf-8'), quote=False)}</pre>")
             baseline = summary + candidate
             reserve = 0
@@ -192,7 +202,7 @@ async def _publish_report(
                     not diagnosis or diagnosis["status"] in {"queued", "running"}
                 ):
                     reserve = 12 * 1024
-            if len(baseline.encode("utf-8")) + reserve < PREFLIGHT_COMMENT_BODY_BYTES:
+            if len(baseline.encode("utf-8")) + reserve <= MANAGED_COMMENT_BODY_BYTES:
                 details = candidate
 
         file.seek(0)

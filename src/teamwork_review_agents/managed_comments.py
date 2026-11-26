@@ -14,7 +14,7 @@ from .providers.base import create_provider
 from .state import StateStore
 
 
-_COMMENT_LIMIT_BYTES = 60 * 1024
+MANAGED_COMMENT_BODY_BYTES = 60 * 1024
 _SignatureLanguage = Literal["zh", "en", "bilingual"]
 _MODEL_SIGNATURE_PREFIXES = {
     "zh": "模型：",
@@ -174,7 +174,7 @@ class ManagedCommentService:
         normalized_body = body.strip()
         if not normalized_body:
             raise ValueError("publish_comment.body 必须是非空字符串")
-        if len(normalized_body.encode("utf-8")) > _COMMENT_LIMIT_BYTES:
+        if len(normalized_body.encode("utf-8")) > MANAGED_COMMENT_BODY_BYTES:
             raise ValueError("publish_comment.body 不能超过 60 KiB")
         if source_generation < 1:
             raise ValueError("托管评论的源版本代次必须大于零")
@@ -336,7 +336,7 @@ class ManagedCommentService:
         normalized_body = body.strip()
         if not normalized_body:
             raise ValueError("publish_comment.body 必须是非空字符串")
-        if len(normalized_body.encode("utf-8")) > _COMMENT_LIMIT_BYTES:
+        if len(normalized_body.encode("utf-8")) > MANAGED_COMMENT_BODY_BYTES:
             raise ValueError("publish_comment.body 不能超过 60 KiB")
         if source_generation < 1:
             raise ValueError("托管评论的源版本代次必须大于零")

@@ -12,9 +12,10 @@ import httpx
 import pytest
 
 from teamwork_review_agents.config import EnvironmentVariable
+from teamwork_review_agents.ci_diagnosis import diagnose_ci_failure
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.managed_comments import ManagedCommentService
-from teamwork_review_agents.models import CommitStatusTarget, PreflightResult
+from teamwork_review_agents.models import AgentResult, CommitStatusTarget, PreflightResult
 from teamwork_review_agents.preflight import PreflightExecutor
 from teamwork_review_agents.preflight_log_worker import PreflightLogWorker
 from teamwork_review_agents.providers.base import ProviderError
@@ -333,6 +334,8 @@ def test_github_legacy_upload_table_adds_inline_material_without_losing_url(gith
     case = github_logs
     with case.store.connect() as connection:
         connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN inline_body")
+        connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN layout_key")
+        connection.execute("ALTER TABLE preflight_log_deliveries DROP COLUMN revision")
         connection.execute(
             "INSERT INTO preflight_log_uploads (run_id, ci_attempt, status, attempts, url, updated_at) VALUES (?, 1, 'completed', 1, ?, 0)",
             (case.result.run_id, case.web_url + "#issuecomment-3"),
@@ -341,6 +344,119 @@ def test_github_legacy_upload_table_adds_inline_material_without_losing_url(gith
     record = case.store.get_preflight_log_upload(case.result.run_id)
     assert record["status"] == "completed" and record["url"] == case.web_url + "#issuecomment-3"
     assert record["inline_body"] == ""
+    assert record["layout_key"] == ""
+    case.store.mark_preflight_status_published(case.result.run_id)
+    case.store.enqueue_preflight_log_delivery(case.result.run_id)
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["revision"] == 0
+
+
+async def test_github_combined_body_between_54_and_60_kib_stays_single(github_logs):
+    """覆盖截图边界：约五十五 KiB 的完整正文能放入实际六十 KiB 上限。"""
+
+    case = github_logs
+    _use_short_log(case)
+    text = "日志首行😀\n" + "x" * 43000 + "\n日志末行"
+    with case.store.connect() as connection:
+        connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
+    case.store.append_preflight_log(case.result.run_id, stream="stdout", event_type="output", payload=text)
+    case.result = case.result.model_copy(update={"output": text[-26000:]})
+    case.store.finish_preflight_run(case.result)
+    case.store.begin_preflight_diagnosis(case.result.run_id, "diagnosis")
+    report = "诊断证据\n" + "e" * 8000
+    case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report=report)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert len(case.comments) == 1
+    body = next(iter(case.comments.values()))
+    assert 54 * 1024 < len(body.encode()) <= 60 * 1024
+    assert report in body and "日志首行😀" in body and "日志末行" in body
+
+
+async def test_github_late_diagnosis_requeues_and_merges_temporary_part(github_logs):
+    """先预留未知诊断而产生续页，实际报告较短时必须自动回收续页并更新原评论。"""
+
+    case = github_logs
+    _use_short_log(case)
+    with case.store.connect() as connection:
+        connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
+    case.store.append_preflight_log(
+        case.result.run_id, stream="stdout", event_type="output", payload="日志首行\n" + "x" * 50000 + "\n日志末行",
+    )
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    await worker.drain()
+    assert len(case.comments) > 1
+    first_revision = case.store.get_preflight_log_delivery(case.result.run_id)["revision"]
+    executor = SimpleNamespace(execute=AsyncMock(return_value=AgentResult(
+        run_id="diagnostic-run", root_run_id="diagnostic-run", agent_name="ci-failure-diagnoser",
+        status="completed", final_message="诊断证据：业务断言失败",
+    )))
+    assert await diagnose_ci_failure(case.config, case.store, executor, case.event, case.result)
+    job = case.store.get_preflight_log_delivery(case.result.run_id)
+    assert job["status"] == "queued" and job["revision"] > first_revision
+    await worker.drain()
+    assert len(case.comments) == 1 and "1" in case.comments
+    assert "日志首行" in case.comments["1"] and "日志末行" in case.comments["1"]
+    assert "诊断证据：业务断言失败" in case.comments["1"]
+    assert case.store.list_preflight_log_comments(case.result.run_id, 1) == []
+
+
+async def test_github_refresh_during_delivery_survives_old_completion(github_logs, monkeypatch):
+    """诊断在旧任务执行中完成时，旧任务的完成回写不得吞掉新的合并请求。"""
+
+    case = github_logs
+    _use_short_log(case)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(_executor, _run_id, _attempt):
+        """固定旧任务已取得版本号，但尚未写入完成状态的竞态窗口。"""
+
+        entered.set()
+        await release.wait()
+        return "completed"
+
+    monkeypatch.setattr(PreflightExecutor, "deliver_log_attachment", hold)
+    task = asyncio.create_task(PreflightLogWorker(lambda: case.config, case.store).drain())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        case.store.enqueue_preflight_log_delivery(case.result.run_id, refresh=True)
+        requested = case.store.get_preflight_log_delivery(case.result.run_id)
+    finally:
+        release.set()
+        await task
+    job = case.store.get_preflight_log_delivery(case.result.run_id)
+    assert job["status"] == "queued" and job["revision"] == requested["revision"]
+    assert job["attempts"] == 0
+
+
+@pytest.mark.parametrize("outcome", ["failed", "skipped", "cancelled"])
+async def test_github_diagnosis_without_report_releases_reserved_space(github_logs, outcome):
+    """诊断失败、取消或缺失 Agent 时，也要释放预留空间并自动收回临时续页。"""
+
+    case = github_logs
+    _use_short_log(case)
+    with case.store.connect() as connection:
+        connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
+    case.store.append_preflight_log(case.result.run_id, stream="stdout", event_type="output", payload="x" * 50000)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    await worker.drain()
+    assert len(case.comments) > 1
+    if outcome == "skipped":
+        case.config.agents.pop(case.repository.preflight.failure_diagnosis_agent)
+    error = asyncio.CancelledError() if outcome == "cancelled" else RuntimeError("模拟诊断失败")
+    executor = SimpleNamespace(execute=AsyncMock(side_effect=error))
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await diagnose_ci_failure(case.config, case.store, executor, case.event, case.result)
+    else:
+        await diagnose_ci_failure(case.config, case.store, executor, case.event, case.result)
+    assert case.store.get_preflight_diagnosis(case.result.run_id)["status"] == outcome
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "queued"
+    await worker.drain()
+    assert len(case.comments) == 1 and "1" in case.comments
+    assert "<summary>完整 CI 运行日志</summary>" in case.comments["1"]
 
 
 async def test_github_large_directory_is_grouped(github_logs, monkeypatch):

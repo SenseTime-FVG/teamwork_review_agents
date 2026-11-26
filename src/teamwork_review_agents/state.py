@@ -392,10 +392,12 @@ class StateStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     next_attempt_at REAL NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(run_id, ci_attempt),
                     FOREIGN KEY(run_id) REFERENCES preflight_runs(run_id) ON DELETE CASCADE
                 )
             """)
+            self._ensure_column(connection, "preflight_log_deliveries", "revision", "INTEGER NOT NULL DEFAULT 0")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_log_uploads (
                     run_id TEXT NOT NULL,
@@ -404,6 +406,7 @@ class StateStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     url TEXT,
                     inline_body TEXT NOT NULL DEFAULT '',
+                    layout_key TEXT NOT NULL DEFAULT '',
                     error TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(run_id, ci_attempt),
@@ -411,6 +414,7 @@ class StateStore:
                 )
             """)
             self._ensure_column(connection, "preflight_log_uploads", "inline_body", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(connection, "preflight_log_uploads", "layout_key", "TEXT NOT NULL DEFAULT ''")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_diagnoses (
                     preflight_run_id TEXT PRIMARY KEY,
@@ -1832,7 +1836,7 @@ class StateStore:
             ).fetchone()
         return str(row["run_id"]) if row else None
 
-    def enqueue_preflight_log_delivery(self, run_id: str) -> None:
+    def enqueue_preflight_log_delivery(self, run_id: str, *, refresh: bool = False) -> None:
         """只把已发布终态的自动 CI 放入附件队列，重复事件不能重置已完成任务。"""
 
         with self.connect() as connection:
@@ -1843,6 +1847,14 @@ class StateStore:
                 AND status IN ('success', 'failure', 'timed_out', 'error', 'cancelled')""",
                 (run_id,),
             )
+            if refresh:
+                # 新诊断是新材料；运行中的旧发布不能用其终态覆盖这次刷新请求。
+                connection.execute(
+                    """UPDATE preflight_log_deliveries SET revision=revision+1,
+                    status='queued', attempts=0, error=NULL, next_attempt_at=0
+                    WHERE run_id=? AND ci_attempt=(SELECT attempts FROM preflight_runs WHERE run_id=?)""",
+                    (run_id, run_id),
+                )
 
     def pending_preflight_log_deliveries(self) -> list[dict[str, Any]]:
         """读取当前执行尝试的待办；running 项可在进程中断后由租约保护恢复。"""
@@ -1871,14 +1883,15 @@ class StateStore:
     def update_preflight_log_delivery(
         self, run_id: str, ci_attempt: int, *, status: str, attempts: int,
         error: str | None = None, next_attempt_at: float = 0,
+        expected_revision: int | None = None,
     ) -> None:
         """持久化独立任务的有限重试状态，任何结果均不改动 CI 记录。"""
 
         with self.connect() as connection:
             connection.execute(
                 """UPDATE preflight_log_deliveries SET status=?, attempts=?, error=?, next_attempt_at=?
-                WHERE run_id=? AND ci_attempt=?""",
-                (status, attempts, error, next_attempt_at, run_id, ci_attempt),
+                WHERE run_id=? AND ci_attempt=? AND (? IS NULL OR revision=?)""",
+                (status, attempts, error, next_attempt_at, run_id, ci_attempt, expected_revision, expected_revision),
             )
 
     def get_preflight_log_upload(self, run_id: str) -> dict[str, Any] | None:
@@ -1897,18 +1910,20 @@ class StateStore:
         self, run_id: str, ci_attempt: int, *, status: str,
         attempts: int, url: str | None = None, error: str | None = None,
         inline_body: str = "",
+        layout_key: str = "",
     ) -> None:
         """附件的传输状态独立于 CI 终态，失败不能改写测试结论。"""
 
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO preflight_log_uploads
-                (run_id, ci_attempt, status, attempts, url, error, updated_at, inline_body)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (run_id, ci_attempt, status, attempts, url, error, updated_at, inline_body, layout_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, ci_attempt) DO UPDATE SET
                 status=excluded.status, attempts=excluded.attempts, url=excluded.url,
-                error=excluded.error, updated_at=excluded.updated_at, inline_body=excluded.inline_body""",
-                (run_id, ci_attempt, status, attempts, url, error, time.time(), inline_body),
+                error=excluded.error, updated_at=excluded.updated_at, inline_body=excluded.inline_body,
+                layout_key=excluded.layout_key""",
+                (run_id, ci_attempt, status, attempts, url, error, time.time(), inline_body, layout_key),
             )
 
     def list_preflight_log_comments(self, run_id: str, ci_attempt: int) -> list[dict[str, Any]]:

@@ -15,6 +15,20 @@ from .preflight import build_failure_comment_body
 from .state import RunReservation, StateStore
 
 
+async def _refresh_github_report(config: AppConfig, store: StateStore, repository, run_id: str) -> None:
+    """诊断进入任一终态后，按实际材料重新安排一次日志合并。"""
+
+    if not repository.preflight.publish_failure_comment or config.providers[repository.provider].kind != "github":
+        return
+    try:
+        await asyncio.to_thread(store.enqueue_preflight_log_delivery, run_id, refresh=True)
+    except Exception as exc:
+        await asyncio.to_thread(
+            store.set_preflight_diagnosis_comment_error, run_id,
+            f"日志合并任务入队失败：{type(exc).__name__}",
+        )
+
+
 async def diagnose_ci_failure(
     config: AppConfig, store: StateStore, executor: AgentExecutor,
     event: ChangeEvent, result: PreflightResult,
@@ -37,6 +51,8 @@ async def diagnose_ci_failure(
     reason = f"指定的诊断 Agent 不存在或已删除：{agent_name or '未指定'}；已跳过失败诊断" if missing else None
     claimed = await asyncio.to_thread(store.begin_preflight_diagnosis, result.run_id, agent_name, skip_reason=reason)
     if not claimed or missing:
+        if claimed:
+            await _refresh_github_report(config, store, repository, result.run_id)
         return False
 
     # 复用 CI 时仍按原始记录绑定源码，不受后续 MR 分支移动影响。
@@ -80,6 +96,7 @@ async def diagnose_ci_failure(
         await asyncio.to_thread(store.finish_preflight_diagnosis, result.run_id, status="completed", report=report)
     except asyncio.CancelledError:
         await asyncio.to_thread(store.finish_preflight_diagnosis, result.run_id, status="cancelled", error="CI 诊断已中断")
+        await _refresh_github_report(config, store, repository, result.run_id)
         raise
     except Exception as exc:
         agent_run = await asyncio.to_thread(store.get_run, agent_run_id) if agent_run_id else None
@@ -89,6 +106,7 @@ async def diagnose_ci_failure(
             status=status if status in {"cancelled", "timed_out"} else "failed",
             error=redactor.text(str(exc)),
         )
+        await _refresh_github_report(config, store, repository, result.run_id)
         return True
 
     if settings.publish_failure_comment and run["number"] is not None:
@@ -109,4 +127,5 @@ async def diagnose_ci_failure(
             )
         except Exception as exc:
             await asyncio.to_thread(store.set_preflight_diagnosis_comment_error, result.run_id, redactor.text(str(exc)))
+    await _refresh_github_report(config, store, repository, result.run_id)
     return True
