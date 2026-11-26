@@ -13,7 +13,7 @@ from teamwork_review_agents.events import (
     detect_events,
     detect_target_branch_event,
 )
-from teamwork_review_agents.managed_comments import ManagedCommentService
+from teamwork_review_agents.managed_comments import ManagedCommentService, comment_body_byte_limit
 from teamwork_review_agents.models import InvocationContext
 from teamwork_review_agents.state import StateStore
 
@@ -400,15 +400,18 @@ def test_model_signature_normalizes_untrusted_snapshot_text(language) -> None:
 
 
 @pytest.mark.parametrize("language", ["zh", "en", "bilingual"])
+@pytest.mark.parametrize("provider_kind", ["github", "gitlab"])
 async def test_model_signature_counts_toward_comment_size_limit(
     snapshot_factory,
     configured_app_factory,
     monkeypatch,
     language,
+    provider_kind,
 ) -> None:
-    """签名必须计入远端评论的最终 60 KiB 限制。"""
+    """签名计入各平台最终预算，GitHub 的 240 KiB 不能扩大 GitLab 限制。"""
 
     config = configured_app_factory()
+    config.providers["github-main"].kind = provider_kind
     agent = config.agents["security-reviewer"]
     agent.managed_comment = True
     agent.managed_comment_model_signature = True
@@ -440,5 +443,6 @@ async def test_model_signature_counts_toward_comment_size_limit(
         event=event,
     )
 
-    with pytest.raises(ValueError, match="不能超过 60 KiB"):
-        await service.publish_agent_comment(context, "x" * (60 * 1024))
+    budget = comment_body_byte_limit(provider_kind)
+    with pytest.raises(ValueError, match=f"不能超过 {budget // 1024} KiB"):
+        await service.publish_agent_comment(context, "x" * budget)

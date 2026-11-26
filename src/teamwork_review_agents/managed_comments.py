@@ -15,6 +15,16 @@ from .state import StateStore
 
 
 MANAGED_COMMENT_BODY_BYTES = 60 * 1024
+GITHUB_COMMENT_BODY_BYTES = 240 * 1024
+
+
+def comment_body_byte_limit(provider_kind: str, *, saved_limit: int = 0) -> int:
+    """按平台选择最终正文预算，并复用同次发布已确认的较小预算。"""
+
+    limit = GITHUB_COMMENT_BODY_BYTES if provider_kind == "github" else MANAGED_COMMENT_BODY_BYTES
+    return min(limit, saved_limit) if saved_limit > 0 else limit
+
+
 _SignatureLanguage = Literal["zh", "en", "bilingual"]
 _MODEL_SIGNATURE_PREFIXES = {
     "zh": "模型：",
@@ -174,11 +184,10 @@ class ManagedCommentService:
         normalized_body = body.strip()
         if not normalized_body:
             raise ValueError("publish_comment.body 必须是非空字符串")
-        if len(normalized_body.encode("utf-8")) > MANAGED_COMMENT_BODY_BYTES:
-            raise ValueError("publish_comment.body 不能超过 60 KiB")
+        repository = self._repository(repository_id)
+        self._validate_body(repository, normalized_body)
         if source_generation < 1:
             raise ValueError("托管评论的源版本代次必须大于零")
-        repository = self._repository(repository_id)
         resource_key = self._resource_key(
             repository_id=repository_id,
             number=number,
@@ -336,11 +345,10 @@ class ManagedCommentService:
         normalized_body = body.strip()
         if not normalized_body:
             raise ValueError("publish_comment.body 必须是非空字符串")
-        if len(normalized_body.encode("utf-8")) > MANAGED_COMMENT_BODY_BYTES:
-            raise ValueError("publish_comment.body 不能超过 60 KiB")
+        repository = self._repository(repository_id)
+        self._validate_body(repository, normalized_body)
         if source_generation < 1:
             raise ValueError("托管评论的源版本代次必须大于零")
-        repository = self._repository(repository_id)
         resource_key = self._slot_resource_key(
             repository_id=repository_id,
             number=number,
@@ -369,13 +377,18 @@ class ManagedCommentService:
                     token = resolve_provider_token(self.config, self.config.providers[repository.provider], repository)
                     diagnosis = current_run.get("diagnosis") or {}
                     upload = current_run.get("log_upload") or {}
+                    provider_kind = self.config.providers[repository.provider].kind
+                    body_limit = comment_body_byte_limit(provider_kind, saved_limit=upload.get("comment_body_bytes", 0))
                     normalized_body = build_failure_comment_body(
                         repository, PreflightResult.model_validate(current_run),
                         redactor=SecretRedactor((*environment.secret_values, token)),
                         diagnosis_report=diagnosis.get("report", "") if diagnosis.get("status") == "completed" else "",
                         log_url=upload.get("url") if upload.get("status") == "completed" else None,
                         log_details=upload.get("inline_body", ""),
+                        comment_body_bytes=body_limit if provider_kind == "github" else None,
                     ).strip()
+                    # 锁内重建后再次核对完整正文，不能绕过发布层的最终大小保护。
+                    self._validate_body(repository, normalized_body, saved_limit=body_limit)
             records = await asyncio.to_thread(
                 self.store.list_managed_comments,
                 repository_id=repository_id,
@@ -503,6 +516,14 @@ class ManagedCommentService:
                         source_generation=int(record["source_generation"]),
                     )
         return len(records)
+
+    def _validate_body(self, repository, body: str, *, saved_limit: int = 0) -> None:
+        """校验含服务端附加内容的最终 UTF-8 正文，不混用字符和字节。"""
+
+        kind = self.config.providers[repository.provider].kind
+        limit = comment_body_byte_limit(kind, saved_limit=saved_limit)
+        if len(body.encode("utf-8")) > limit:
+            raise ValueError(f"publish_comment.body 不能超过 {limit // 1024} KiB")
 
     def _repository(self, repository_id: str):
         """按 ID 解析仓库并返回清晰错误。"""

@@ -12,10 +12,13 @@ from typing import BinaryIO, Iterator
 from .config import AppConfig, RepositoryConfig
 from .environment import SecretRedactor, resolve_provider_token, resolve_repository_process_environment
 from .locks import ResourceLease
-from .managed_comments import MANAGED_COMMENT_BODY_BYTES, ManagedCommentService
+from .managed_comments import (
+    GITHUB_COMMENT_BODY_BYTES, MANAGED_COMMENT_BODY_BYTES,
+    ManagedCommentService, comment_body_byte_limit,
+)
 from .models import PreflightResult, stable_hash
 from .preflight_log_uploads import export_ci_log
-from .providers.base import BaseProvider, ProviderError
+from .providers.base import BaseProvider, ProviderCommentTooLong, ProviderError
 from .state import StateStore
 
 
@@ -29,7 +32,7 @@ class _ObsoleteReport(Exception):
     """旧运行停止发布日志，但不作为传输失败重试。"""
 
 
-def _escaped_log_parts(file: BinaryIO) -> Iterator[str]:
+def _escaped_log_parts(file: BinaryIO, *, byte_limit: int = LOG_PART_BYTES) -> Iterator[str]:
     """按转义后的字节数切段，不拆 Unicode 字符或 HTML 实体，不截断日志。"""
 
     reader = codecs.getreader("utf-8")(file)
@@ -39,13 +42,23 @@ def _escaped_log_parts(file: BinaryIO) -> Iterator[str]:
         for character in text:
             escaped = html.escape(character, quote=False)
             length = len(escaped.encode("utf-8"))
-            if size + length > LOG_PART_BYTES:
+            if size + length > byte_limit:
                 yield "".join(part)
                 part, size = [], 0
             part.append(escaped)
             size += length
     if part:
         yield "".join(part)
+
+
+def _layout_key(diagnosis: dict | None, budget: int) -> str:
+    """排版指纹覆盖平台默认值和实际预算，旧分段与降级结果都能正确复用。"""
+
+    return stable_hash(
+        "github-inline-log-v3", GITHUB_COMMENT_BODY_BYTES, budget,
+        diagnosis.get("status") if diagnosis else None,
+        diagnosis.get("report", "") if diagnosis else "",
+    )
 
 
 def _is_current(store: StateStore, repository: RepositoryConfig, run: dict) -> bool:
@@ -79,11 +92,8 @@ async def ensure_github_log_report(
             return None
         record = await asyncio.to_thread(store.get_preflight_log_upload, run_id)
         diagnosis = await asyncio.to_thread(store.get_preflight_diagnosis, run_id)
-        layout_key = stable_hash(
-            "github-inline-log-v2", MANAGED_COMMENT_BODY_BYTES,
-            diagnosis.get("status") if diagnosis else None,
-            diagnosis.get("report", "") if diagnosis else "",
-        )
+        budget = comment_body_byte_limit("github", saved_limit=(record or {}).get("comment_body_bytes", 0))
+        layout_key = _layout_key(diagnosis, budget)
         if (record and record["status"] == "completed" and record.get("inline_body")
             and record.get("layout_key") == layout_key):
             return record["url"]
@@ -92,13 +102,27 @@ async def ensure_github_log_report(
             store.save_preflight_log_upload, run_id, attempt, status="uploading", attempts=tries,
             inline_body=(record or {}).get("inline_body", ""),
             layout_key=layout_key,
+            comment_body_bytes=budget,
         )
         token = resolve_provider_token(config, config.providers[repository.provider], repository)
         environment = resolve_repository_process_environment(config, repository, run_id)
         redactor = SecretRedactor((*environment.secret_values, token))
         try:
             async with asyncio.timeout(REPORT_TIMEOUT_SECONDS):
-                url, details = await _publish_report(config, store, repository, run, remote, redactor, tries)
+                try:
+                    url, details = await _publish_report(config, store, repository, run, remote, redactor, tries, budget)
+                except ProviderCommentTooLong:
+                    if budget <= MANAGED_COMMENT_BODY_BYTES:
+                        raise
+                    # 平台已明确拒绝大正文，同次任务只降级一次，并供诊断和后台重试复用。
+                    budget = MANAGED_COMMENT_BODY_BYTES
+                    layout_key = _layout_key(diagnosis, budget)
+                    await asyncio.to_thread(
+                        store.save_preflight_log_upload, run_id, attempt,
+                        status="uploading", attempts=tries, layout_key=layout_key,
+                        comment_body_bytes=budget,
+                    )
+                    url, details = await _publish_report(config, store, repository, run, remote, redactor, tries, budget)
         except _ObsoleteReport:
             await asyncio.to_thread(
                 store.save_preflight_log_upload, run_id, attempt, status="obsolete", attempts=tries,
@@ -111,12 +135,14 @@ async def ensure_github_log_report(
                 error=redactor.text(str(exc) or type(exc).__name__),
                 inline_body=(prepared or {}).get("inline_body", ""),
                 layout_key=layout_key,
+                comment_body_bytes=budget,
             )
             raise
         await asyncio.to_thread(
             store.save_preflight_log_upload, run_id, attempt, status="completed", attempts=tries, url=url,
             inline_body=details,
             layout_key=layout_key,
+            comment_body_bytes=budget,
         )
         return url
 
@@ -124,6 +150,7 @@ async def ensure_github_log_report(
 async def _publish_report(
     config: AppConfig, store: StateStore, repository: RepositoryConfig,
     run: dict, remote: BaseProvider, redactor: SecretRedactor, tries: int,
+    budget: int,
 ) -> tuple[str, str]:
     """优先把整份日志补入主评论，只有实际放不下时才创建续页。"""
 
@@ -184,15 +211,16 @@ async def _publish_report(
 
     with tempfile.TemporaryFile(mode="w+b") as file:
         await asyncio.to_thread(export_ci_log, store, run, file, redactor)
-        raw = file.read(MANAGED_COMMENT_BODY_BYTES + 1)
+        raw = file.read(budget + 1)
         details = ""
-        if len(raw) <= MANAGED_COMMENT_BODY_BYTES:
+        if len(raw) <= budget:
             candidate = log_section(f"<pre>{html.escape(raw.decode('utf-8'), quote=False)}</pre>")
             baseline = summary + candidate
             reserve = 0
             if use_failure_comment:
                 baseline = build_failure_comment_body(
                     repository, PreflightResult.model_validate(run), redactor=redactor, log_details=candidate,
+                    comment_body_bytes=budget,
                 )
                 diagnosis = await asyncio.to_thread(store.get_preflight_diagnosis, run["run_id"])
                 # 诊断稍后完成时仍保留空间；已完成报告按其实际大小判断是否需要日志续页。
@@ -202,13 +230,14 @@ async def _publish_report(
                     not diagnosis or diagnosis["status"] in {"queued", "running"}
                 ):
                     reserve = 12 * 1024
-            if len(baseline.encode("utf-8")) + reserve <= MANAGED_COMMENT_BODY_BYTES:
+            if len(baseline.encode("utf-8")) + reserve <= budget:
                 details = candidate
 
         file.seek(0)
         links: list[str] = []
         if not details:
-            for index, text in enumerate(_escaped_log_parts(file), 1):
+            # 标题、执行标识和折叠标签计入同条预算，切段仍按转义后的真实字节数计算。
+            for index, text in enumerate(_escaped_log_parts(file, byte_limit=budget - 12 * 1024), 1):
                 body = (
                     f"### Teamwork CI 完整日志 · 第 {index} 段\n\n"
                     f"Head SHA：`{html.escape(run['head_sha'])}` · CI：`{html.escape(prefix)}`\n\n"
@@ -236,6 +265,7 @@ async def _publish_report(
     await asyncio.to_thread(
         store.save_preflight_log_upload, run["run_id"], run["attempts"], status="uploading", attempts=tries,
         inline_body=details,
+        comment_body_bytes=budget,
     )
     if use_failure_comment:
         result = await service.publish_latest(

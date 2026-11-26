@@ -52,6 +52,10 @@ class ProviderError(RuntimeError):
     """表示代码托管平台请求或数据解析失败。"""
 
 
+class ProviderCommentTooLong(ProviderError):
+    """仅表示平台明确拒绝超长评论，可由报告发布方重新分段。"""
+
+
 class BaseProvider(ABC):
     """统一 Provider 异步接口。"""
 

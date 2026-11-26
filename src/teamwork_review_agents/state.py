@@ -407,6 +407,7 @@ class StateStore:
                     url TEXT,
                     inline_body TEXT NOT NULL DEFAULT '',
                     layout_key TEXT NOT NULL DEFAULT '',
+                    comment_body_bytes INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(run_id, ci_attempt),
@@ -415,6 +416,7 @@ class StateStore:
             """)
             self._ensure_column(connection, "preflight_log_uploads", "inline_body", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "preflight_log_uploads", "layout_key", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(connection, "preflight_log_uploads", "comment_body_bytes", "INTEGER NOT NULL DEFAULT 0")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS preflight_diagnoses (
                     preflight_run_id TEXT PRIMARY KEY,
@@ -1911,19 +1913,22 @@ class StateStore:
         attempts: int, url: str | None = None, error: str | None = None,
         inline_body: str = "",
         layout_key: str = "",
+        comment_body_bytes: int = 0,
     ) -> None:
         """附件的传输状态独立于 CI 终态，失败不能改写测试结论。"""
 
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO preflight_log_uploads
-                (run_id, ci_attempt, status, attempts, url, error, updated_at, inline_body, layout_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (run_id, ci_attempt, status, attempts, url, error, updated_at, inline_body, layout_key, comment_body_bytes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, ci_attempt) DO UPDATE SET
                 status=excluded.status, attempts=excluded.attempts, url=excluded.url,
                 error=excluded.error, updated_at=excluded.updated_at, inline_body=excluded.inline_body,
-                layout_key=excluded.layout_key""",
-                (run_id, ci_attempt, status, attempts, url, error, time.time(), inline_body, layout_key),
+                layout_key=excluded.layout_key,
+                comment_body_bytes=CASE WHEN excluded.comment_body_bytes>0 THEN excluded.comment_body_bytes
+                    ELSE preflight_log_uploads.comment_body_bytes END""",
+                (run_id, ci_attempt, status, attempts, url, error, time.time(), inline_body, layout_key, comment_body_bytes),
             )
 
     def list_preflight_log_comments(self, run_id: str, ci_attempt: int) -> list[dict[str, Any]]:

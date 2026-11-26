@@ -601,6 +601,7 @@ def build_failure_comment_body(
     diagnosis_report: str = "",
     log_url: str | None = None,
     log_details: str = "",
+    comment_body_bytes: int | None = None,
 ) -> str:
     """共用失败摘要和日志格式，诊断只追加独立折叠区，不覆盖原始失败证据。"""
 
@@ -666,10 +667,10 @@ def build_failure_comment_body(
         opening = "\n<details>\n<summary>CI 失败诊断报告</summary>\n\n"
         closing = "\n\n</details>"
         fixed = "\n".join([*sections, opening + closing, *footer])
+        body_budget = comment_body_bytes or (MANAGED_COMMENT_BODY_BYTES if log_details else PREFLIGHT_COMMENT_BODY_BYTES)
         report = _bounded_diagnosis_markdown(
             redactor.text(diagnosis_report),
-            byte_limit=(MANAGED_COMMENT_BODY_BYTES if log_details else PREFLIGHT_COMMENT_BODY_BYTES)
-            - len(fixed.encode("utf-8")),
+            byte_limit=body_budget - len(fixed.encode("utf-8")),
         )
         sections.append(opening + report + closing)
     return "\n".join([*sections, *footer])

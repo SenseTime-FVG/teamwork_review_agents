@@ -14,11 +14,13 @@ import pytest
 from teamwork_review_agents.config import EnvironmentVariable
 from teamwork_review_agents.ci_diagnosis import diagnose_ci_failure
 from teamwork_review_agents.events import detect_events
-from teamwork_review_agents.managed_comments import ManagedCommentService
+from teamwork_review_agents.managed_comments import (
+    GITHUB_COMMENT_BODY_BYTES, ManagedCommentService, comment_body_byte_limit,
+)
 from teamwork_review_agents.models import AgentResult, CommitStatusTarget, PreflightResult
 from teamwork_review_agents.preflight import PreflightExecutor
 from teamwork_review_agents.preflight_log_worker import PreflightLogWorker
-from teamwork_review_agents.providers.base import ProviderError
+from teamwork_review_agents.providers.base import ProviderCommentTooLong, ProviderError
 from teamwork_review_agents.providers.github import GitHubProvider
 from teamwork_review_agents.state import StateStore
 
@@ -135,7 +137,7 @@ async def test_github_terminal_precedes_complete_collapsible_log_publication(git
     assert case.full_output in exported
     assert "日志开头" in exported and "日志结束" in exported
     assert "split-private-secret" not in exported and "provider-secret" not in exported
-    assert all(len(body.encode("utf-8")) < 60 * 1024 for body in case.comments.values())
+    assert all(len(body.encode("utf-8")) <= GITHUB_COMMENT_BODY_BYTES for body in case.comments.values())
     assert all(body.count("</pre>") == 1 and body.count("</details>") == 1 for body in parts)
     assert all("#preflight=" not in call.kwargs["target_url"] for call in case.remote.set_commit_status.call_args_list)
     final_url = case.remote.set_commit_status.call_args.kwargs["target_url"]
@@ -169,6 +171,7 @@ async def test_github_partial_failure_resumes_without_duplicate_parts(github_log
     await worker.drain()
     job = case.store.get_preflight_log_delivery(case.result.run_id)
     assert job["status"] == "queued" and job["attempts"] == 1
+    assert case.store.get_preflight_log_upload(case.result.run_id)["comment_body_bytes"] == GITHUB_COMMENT_BODY_BYTES
     assert "provider-secret" not in job["error"]
     assert case.store.get_preflight_run(case.result.run_id)["status"] == "failure"
     case.store.update_preflight_log_delivery(case.result.run_id, 1, status="queued", attempts=1)
@@ -226,14 +229,14 @@ async def test_github_without_failure_comment_links_log_directory(github_logs):
     assert not any("Teamwork 本地 CI 未通过" in body for body in case.comments.values())
 
 
-def _use_short_log(case):
-    """替换为能连同失败摘要和诊断放进单条评论的完整日志。"""
+def _use_short_log(case, text="完整日志首行😀\n失败末尾输出\n完整日志末行\n"):
+    """替换完整日志，用于验证内嵌及不同平台预算下的拆分边界。"""
 
     with case.store.connect() as connection:
         connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
     case.store.append_preflight_log(
         case.result.run_id, stream="stdout", event_type="output",
-        payload="完整日志首行😀\n失败末尾输出\n完整日志末行\n",
+        payload=text,
     )
 
 
@@ -328,6 +331,193 @@ async def test_github_full_log_and_diagnosis_share_existing_report(github_logs):
     assert len(body.encode()) < 60 * 1024
 
 
+@pytest.mark.parametrize("status", ["success", "failure"])
+@pytest.mark.parametrize("text", ["x" * 180000, "中文😀<>&\n" * 5000])
+async def test_github_large_single_comment_preserves_complete_log_and_report(github_logs, status, text):
+    """六十至二百四十 KiB 的最终正文保持单条，中文转义与长诊断均不能提前截断。"""
+
+    case = github_logs
+    _use_short_log(case, text)
+    case.result = case.result.model_copy(update={"status": status})
+    case.store.finish_preflight_run(case.result)
+    report = "诊断证据😀\n" * 3000
+    if status == "failure":
+        case.store.begin_preflight_diagnosis(case.result.run_id, "diagnosis")
+        case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report=report)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    await PreflightLogWorker(lambda: case.config, case.store).drain()
+    assert len(case.comments) == 1
+    body = next(iter(case.comments.values()))
+    assert 60 * 1024 < len(body.encode()) <= GITHUB_COMMENT_BODY_BYTES
+    assert text in html.unescape(body)
+    if status == "failure":
+        assert report.strip() in body and "后续内容已截断" not in body
+    upload = case.store.get_preflight_log_upload(case.result.run_id)
+    assert upload["status"] == "completed" and upload["comment_body_bytes"] == GITHUB_COMMENT_BODY_BYTES
+    assert case.store.get_preflight_run(case.result.run_id)["attempts"] == 1
+
+
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+@pytest.mark.parametrize("latest", [True, False])
+async def test_managed_comment_provider_budget_counts_final_utf8_body(github_logs, kind, latest):
+    """两种发布入口都按最终字节校验，边界中文可发布，多一个字节立即拒绝。"""
+
+    case = github_logs
+    case.config.providers[case.repository.provider].kind = kind
+    budget = comment_body_byte_limit(kind)
+    body = "界" * (budget // 3)
+    assert len(body.encode()) == budget
+    service = ManagedCommentService(case.config, case.store)
+    publish = service.publish_latest if latest else service.publish
+    arguments = {
+        "repository_id": case.repository.id, "number": 7, "namespace": "boundary",
+        "slot": "report", "source_generation": 1, "source_head_sha": case.result.head_sha,
+        **({"replace_existing": False} if latest else {}),
+    }
+    await publish(body=body, **arguments)
+    assert list(case.comments.values()) == [body]
+    with pytest.raises(ValueError, match=f"不能超过 {budget // 1024} KiB"):
+        await publish(body=body + "x", **arguments)
+    assert len(case.created) == 1
+
+
+@pytest.mark.parametrize("status", ["success", "failure"])
+@pytest.mark.parametrize("log_size", [100000, 500000])
+async def test_github_explicit_size_rejection_reflows_and_keeps_smaller_budget(github_logs, status, log_size):
+    """创建与更新明确超长时仅降级一次，诊断补写和重复发布不能再次试大正文。"""
+
+    case = github_logs
+    text = "日志首行😀\n" + "x" * log_size + "\n日志末行"
+    _use_short_log(case, text)
+    case.result = case.result.model_copy(update={"status": status})
+    case.store.finish_preflight_run(case.result)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    original_create = case.remote.create_change_request_comment.side_effect
+    original_update = case.remote.update_change_request_comment.side_effect
+    rejected = []
+
+    async def create(repository, number, body):
+        """平台模拟更小的正文限制，不把网络或鉴权错误伪装成超长。"""
+
+        if len(body.encode()) > 60 * 1024:
+            rejected.append(body)
+            raise ProviderCommentTooLong("平台拒绝超长正文")
+        return await original_create(repository, number, body)
+
+    async def update(repository, comment_id, body, **kwargs):
+        """已有失败摘要的更新请求也会遇到相同的长度校验。"""
+
+        if len(body.encode()) > 60 * 1024:
+            rejected.append(body)
+            raise ProviderCommentTooLong("平台拒绝超长正文")
+        return await original_update(repository, comment_id, body, **kwargs)
+
+    case.remote.create_change_request_comment.side_effect = create
+    case.remote.update_change_request_comment.side_effect = update
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    await worker.drain()
+    upload = case.store.get_preflight_log_upload(case.result.run_id)
+    assert upload["status"] == "completed" and upload["comment_body_bytes"] == 60 * 1024
+    assert len(rejected) == 1
+    assert all(len(body.encode()) <= 60 * 1024 for body in case.comments.values())
+    parts = [body for body in case.comments.values() if body.startswith("### Teamwork CI 完整日志")]
+    exported = "".join(html.unescape(re.search(r"<pre>(.*)</pre>", body, re.S).group(1)) for body in parts)
+    assert text in exported
+    if status == "failure":
+        case.store.begin_preflight_diagnosis(case.result.run_id, "diagnosis")
+        case.store.finish_preflight_diagnosis(case.result.run_id, status="completed", report="迟到诊断证据")
+        await ManagedCommentService(case.config, case.store).publish_latest(
+            repository_id=case.repository.id, number=7, namespace="preflight",
+            slot=case.repository.preflight.status_context, source_generation=1,
+            source_head_sha=case.result.head_sha, body="更新诊断",
+            replace_existing=False, update_existing=True, preflight_run_id=case.result.run_id,
+            refresh_preflight_body=True,
+        )
+        assert any("迟到诊断证据" in body for body in case.comments.values())
+    count = len(case.created)
+    case.store.enqueue_preflight_log_delivery(case.result.run_id, refresh=True)
+    await worker.drain()
+    assert len(rejected) == 1 and len(case.created) == count
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "completed"
+    assert case.store.get_preflight_run(case.result.run_id)["attempts"] == 1
+
+
+async def test_github_fallback_partial_failure_resumes_without_large_retry(github_logs):
+    """降级后第二段网络失败时保存小预算和第一段映射，后台恢复不会重复大正文。"""
+
+    case = github_logs
+    _use_short_log(case, "x" * 100000)
+    await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
+    original_update = case.remote.update_change_request_comment.side_effect
+    rejected = []
+    failed = False
+
+    async def update(repository, comment_id, body, **kwargs):
+        """第一次合并被平台明确拒绝，之后的小正文正常更新。"""
+
+        if len(body.encode()) > 60 * 1024:
+            rejected.append(body)
+            raise ProviderCommentTooLong("平台正文过长")
+        return await original_update(repository, comment_id, body, **kwargs)
+
+    async def create(repository, number, body):
+        """只中断降级后的第二段首次创建，保留第一段的平台证据。"""
+
+        nonlocal failed
+        if "展开第 2 段日志" in body and not failed:
+            failed = True
+            raise ProviderError("临时网络错误")
+        return await case.create(repository, number, body)
+
+    case.remote.update_change_request_comment.side_effect = update
+    case.remote.create_change_request_comment.side_effect = create
+    worker = PreflightLogWorker(lambda: case.config, case.store)
+    await worker.drain()
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "queued"
+    assert case.store.get_preflight_log_upload(case.result.run_id)["comment_body_bytes"] == 60 * 1024
+    case.store.update_preflight_log_delivery(case.result.run_id, 1, status="queued", attempts=1)
+    await worker.drain()
+    assert len(rejected) == 1
+    assert case.store.get_preflight_log_delivery(case.result.run_id)["status"] == "completed"
+    assert sum("展开第 1 段日志" in body for body in case.comments.values()) == 1
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+@pytest.mark.parametrize("status,payload,reflow", [
+    (422, {"message": "Validation Failed", "errors": [
+        {"resource": "IssueComment", "field": "data", "message": "Body is too long (maximum is 65536 characters)"},
+    ]}, True),
+    (422, {"message": "body is too long"}, True),
+    (413, {"message": "Request Entity Too Large"}, True),
+    (422, {"message": "Validation Failed", "errors": [{"field": "body", "message": "body is invalid"}]}, False),
+    (422, {"errors": [{"field": "title", "message": "body is too long"}]}, False),
+    (422, ["无效错误格式"], False),
+    (403, {"message": "Body is too long"}, False),
+    (429, {"message": "rate limited"}, False),
+])
+async def test_github_only_comment_body_size_errors_allow_reflow(github_logs, method, status, payload, reflow):
+    """真实适配器区分长度拒绝与鉴权、限流、普通校验错误，不靠泛化异常文本猜测。"""
+
+    case = github_logs
+    provider = GitHubProvider("github-main", case.config.providers["github-main"], case.config.scanner, token="test")
+    await provider.client.aclose()
+
+    def handler(request):
+        """在本地模拟 HTTP 响应，不向真实 PR 发送探测评论。"""
+
+        assert request.method == method
+        return httpx.Response(status, json=payload)
+
+    provider.client = httpx.AsyncClient(base_url="https://api.github.com/", transport=httpx.MockTransport(handler))
+    async with provider:
+        with pytest.raises(ProviderError) as error:
+            if method == "POST":
+                await provider.create_change_request_comment(case.repository, 7, "评论正文")
+            else:
+                await provider.update_change_request_comment(case.repository, "123", "评论正文")
+        assert isinstance(error.value, ProviderCommentTooLong) == reflow
+
+
 def test_github_legacy_upload_table_adds_inline_material_without_losing_url(github_logs):
     """老数据库升级时保留已有远端地址和发布状态，为按需合并提供空材料。"""
 
@@ -335,6 +525,7 @@ def test_github_legacy_upload_table_adds_inline_material_without_losing_url(gith
     with case.store.connect() as connection:
         connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN inline_body")
         connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN layout_key")
+        connection.execute("ALTER TABLE preflight_log_uploads DROP COLUMN comment_body_bytes")
         connection.execute("ALTER TABLE preflight_log_deliveries DROP COLUMN revision")
         connection.execute(
             "INSERT INTO preflight_log_uploads (run_id, ci_attempt, status, attempts, url, updated_at) VALUES (?, 1, 'completed', 1, ?, 0)",
@@ -345,13 +536,14 @@ def test_github_legacy_upload_table_adds_inline_material_without_losing_url(gith
     assert record["status"] == "completed" and record["url"] == case.web_url + "#issuecomment-3"
     assert record["inline_body"] == ""
     assert record["layout_key"] == ""
+    assert record["comment_body_bytes"] == 0
     case.store.mark_preflight_status_published(case.result.run_id)
     case.store.enqueue_preflight_log_delivery(case.result.run_id)
     assert case.store.get_preflight_log_delivery(case.result.run_id)["revision"] == 0
 
 
 async def test_github_combined_body_between_54_and_60_kib_stays_single(github_logs):
-    """覆盖截图边界：约五十五 KiB 的完整正文能放入实际六十 KiB 上限。"""
+    """保留旧截图边界回归：约五十五 KiB 正文不能再被摘要预算误拆。"""
 
     case = github_logs
     _use_short_log(case)
@@ -380,7 +572,8 @@ async def test_github_late_diagnosis_requeues_and_merges_temporary_part(github_l
     with case.store.connect() as connection:
         connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
     case.store.append_preflight_log(
-        case.result.run_id, stream="stdout", event_type="output", payload="日志首行\n" + "x" * 50000 + "\n日志末行",
+        case.result.run_id, stream="stdout", event_type="output",
+        payload="日志首行\n" + "x" * (GITHUB_COMMENT_BODY_BYTES - 10 * 1024) + "\n日志末行",
     )
     await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
     worker = PreflightLogWorker(lambda: case.config, case.store)
@@ -438,7 +631,10 @@ async def test_github_diagnosis_without_report_releases_reserved_space(github_lo
     _use_short_log(case)
     with case.store.connect() as connection:
         connection.execute("DELETE FROM preflight_logs WHERE run_id=?", (case.result.run_id,))
-    case.store.append_preflight_log(case.result.run_id, stream="stdout", event_type="output", payload="x" * 50000)
+    case.store.append_preflight_log(
+        case.result.run_id, stream="stdout", event_type="output",
+        payload="x" * (GITHUB_COMMENT_BODY_BYTES - 10 * 1024),
+    )
     await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
     worker = PreflightLogWorker(lambda: case.config, case.store)
     await worker.drain()
@@ -464,6 +660,7 @@ async def test_github_large_directory_is_grouped(github_logs, monkeypatch):
 
     case = github_logs
     monkeypatch.setattr("teamwork_review_agents.github_ci_logs.DIRECTORY_BYTES", 400)
+    case.store.append_preflight_log(case.result.run_id, stream="stdout", event_type="output", payload=case.full_output * 4)
     await PreflightExecutor(case.config, case.store)._publish_terminal_result(case.repository, case.result)
     await PreflightLogWorker(lambda: case.config, case.store).drain()
     url = case.store.get_preflight_log_upload(case.result.run_id)["url"]

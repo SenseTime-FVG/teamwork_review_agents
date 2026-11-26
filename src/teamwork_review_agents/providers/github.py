@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
+import httpx
+
 from ..config import RepositoryConfig
 from ..models import (
     ChangeRequestActivity,
@@ -16,7 +18,7 @@ from ..models import (
     CommitStatusTarget,
     stable_hash,
 )
-from .base import BaseProvider, ProviderError, parse_datetime
+from .base import BaseProvider, ProviderCommentTooLong, ProviderError, parse_datetime
 
 
 class GitHubProvider(BaseProvider):
@@ -83,9 +85,9 @@ class GitHubProvider(BaseProvider):
     ) -> str:
         """通过 GitHub Issue Comments API 创建 PR 评论。"""
 
-        payload = await self.post_json(
+        payload = await self._write_comment(
             f"repos/{repository.project}/issues/{number}/comments",
-            {"body": body},
+            body,
         )
         if not isinstance(payload, dict) or payload.get("id") is None:
             raise ProviderError("GitHub PR 评论返回格式异常")
@@ -101,12 +103,44 @@ class GitHubProvider(BaseProvider):
     ) -> bool:
         """更新已有 GitHub PR 评论；已被删除时交由调用方重建。"""
 
-        payload = await self.patch_optional_json(
+        payload = await self._write_comment(
             "repos/"
             f"{repository.project}/issues/comments/{quote(comment_id, safe='')}",
-            {"body": body},
+            body, update=True,
         )
         return payload is not None
+
+    async def _write_comment(self, path: str, body: str, *, update: bool = False) -> object:
+        """只把正文超长响应转换为可分段错误，其余平台错误保留原有重试语义。"""
+
+        try:
+            request = self.patch_optional_json if update else self.post_json
+            return await request(path, {"body": body})
+        except ProviderError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPStatusError):
+                response = cause.response
+                too_long = response.status_code == 413
+                if response.status_code == 422:
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = {}
+                    if isinstance(payload, dict):
+                        messages = [payload.get("message", "")]
+                        errors = payload.get("errors", [])
+                        if isinstance(errors, list):
+                            messages.extend(
+                                error.get("message", "") for error in errors
+                                if isinstance(error, dict) and error.get("field") in ("body", "data")
+                            )
+                        too_long = any(
+                            isinstance(message, str) and "body is too long" in message.lower()
+                            for message in messages
+                        )
+                if too_long:
+                    raise ProviderCommentTooLong("GitHub 拒绝超长评论正文，需缩小预算后重新分段") from exc
+            raise
 
     async def change_request_comment_url(
         self, repository: RepositoryConfig, number: int, comment_id: str,
