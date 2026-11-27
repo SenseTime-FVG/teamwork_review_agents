@@ -174,3 +174,45 @@ def test_repository_workspace_warmup_creates_reusable_snapshot(
         event_types = [item["event_type"] for item in final["logs"]]
         assert "workspace.prepare.started" in event_types
         assert "workspace.snapshot.created" in event_types
+
+
+def test_warmup_status_uses_default_commit_and_preserves_dirty_base(tmp_path, monkeypatch):
+    """基础目录旧 HEAD 和未提交依赖不能让成功预热永久过期，重启后也应判断一致。"""
+
+    origin = _create_origin(tmp_path)
+    monkeypatch.setattr(
+        "teamwork_review_agents.agent_workspace.inspect_managed_sandbox",
+        lambda *_args, **_kwargs: SimpleNamespace(available=True, error=None),
+    )
+    monkeypatch.setattr(
+        "teamwork_review_agents.agent_workspace.wrap_managed_sandbox_command",
+        lambda *, inner_command, environment, **_kwargs: ProcessLaunch(inner_command, dict(environment)),
+    )
+    config_path = _write_config(tmp_path, origin)
+    app = create_app(config_path, start_scheduler=False)
+    with TestClient(app) as client:
+        assert client.post("/api/repositories/demo/workspace/warmup/start").status_code == 200
+        first = _wait_for_warmup(client)
+        assert first["status"] == "ready"
+        base = app.state.config_manager.config.repositories[0].workspace
+        old_head = _run_git("rev-parse", "HEAD", cwd=base)
+        (base / "package-lock.json").write_text('未提交的管理员修改\n')
+        (base / "requirements-extra.txt").write_text('untracked==1\n')
+        assert client.get("/api/repositories/demo/workspace/warmup").json()["status"] == "ready"
+        source = tmp_path / "source"
+        (source / "package-lock.json").write_text('{"lockfileVersion":3,"new":true}\n')
+        _run_git("add", "package-lock.json", cwd=source)
+        _run_git("commit", "-m", "更新默认分支依赖", cwd=source)
+        _run_git("push", "origin", "main", cwd=source)
+        assert client.post("/api/repositories/demo/workspace/warmup/start").status_code == 200
+        second = _wait_for_warmup(client)
+        assert second["status"] == "ready" and second["head_sha"] != old_head
+        assert second["current_fingerprint"] == second["latest"]["fingerprint"]
+        assert second["snapshot_count"] == 2
+        assert _run_git("rev-parse", "HEAD", cwd=base) == old_head
+        assert (base / "package-lock.json").read_text() == '未提交的管理员修改\n'
+        assert (base / "requirements-extra.txt").read_text() == 'untracked==1\n'
+        expected = second["current_fingerprint"]
+    with TestClient(create_app(config_path, start_scheduler=False)) as client:
+        result = client.get("/api/repositories/demo/workspace/warmup").json()
+        assert result["status"] == "ready" and result["current_fingerprint"] == expected

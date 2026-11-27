@@ -150,6 +150,7 @@ class AgentWorkspaceWarmupManager:
             self.config_manager.config,
             repository,
             fingerprint_environment,
+            default_branch=True,
         )
         if operation is None:
             return {

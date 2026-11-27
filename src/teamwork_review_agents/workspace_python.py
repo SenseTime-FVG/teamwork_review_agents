@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Mapping
 
@@ -73,6 +74,52 @@ def check_python_script_paths(scripts: Path) -> None:
             and path.parent.resolve() != scripts.resolve()
         ):
             raise ValueError(f"虚拟环境入口 {entry.name} 仍指向旧目录的 Python")
+
+
+def relocate_python_script_paths(workspace: Path, relative_venv: str) -> None:
+    """重定位 POSIX 控制台入口；只修改明确引用同类虚拟环境 Python 的脚本。"""
+
+    if os.name == "nt":
+        return
+    _venv, scripts, python = workspace_python_paths(workspace, relative_venv)
+    expected_tail = (*Path(relative_venv).parts, "bin")
+    for entry in scripts.iterdir():
+        if entry.is_symlink() or not entry.is_file() or entry.name.startswith("python"):
+            continue
+        with entry.open("rb") as handle:
+            first = handle.readline(4096)
+            if not first.startswith(b"#!"):
+                continue
+            header_lines = 1
+            interpreter = first[2:].decode("utf-8", errors="replace").strip()
+            if interpreter == "/bin/sh":
+                # pip 在包含空格或较长的路径下会生成三行 shell 包装入口。
+                second, third = handle.readline(4096), handle.readline(4096)
+                if not second.startswith(b"'''exec' ") or third.strip() != b"' '''":
+                    continue
+                suffix = b' "$0" "$@"'
+                if not second.rstrip().endswith(suffix):
+                    continue
+                interpreter = second[len(b"'''exec' "):].rstrip()[:-len(suffix)].decode("utf-8", errors="replace")
+                header_lines = 3
+            try:
+                arguments = shlex.split(interpreter)
+            except ValueError:
+                continue
+            if not arguments:
+                continue
+            path = Path(arguments[0])
+            if (
+                not path.is_absolute()
+                or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", path.name)
+                or path.parent.parts[-len(expected_tail):] != expected_tail
+            ):
+                continue
+        # 不替换源码正文或其他宿主路径；shell 包装兼容新目录的空格及 shebang 长度限制。
+        content = entry.read_bytes().splitlines(keepends=True)
+        command = " ".join(shlex.quote(value) for value in (str(python), *arguments[1:]))
+        header = f"#!/bin/sh\n'''exec' {command} \"$0\" \"$@\"\n' '''\n".encode("utf-8")
+        entry.write_bytes(header + b"".join(content[header_lines:]))
 
 
 def workspace_python_environment(

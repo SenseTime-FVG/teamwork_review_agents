@@ -238,6 +238,7 @@ async def _prepare_workspace_artifacts(
                     repository,
                     snapshot_fingerprint,
                     cancel_check=cancel_check,
+                    environment=fingerprint_environment,
                 )
                 if restore_snapshot
                 else None
@@ -433,6 +434,7 @@ async def _prepare_workspace_artifacts(
                 snapshot_fingerprint,
                 preparation_signature,
                 cancel_check=cancel_check,
+                environment=fingerprint_environment,
             )
             snapshot_status = "created" if snapshot_metadata is not None else "empty"
             await log_callback(

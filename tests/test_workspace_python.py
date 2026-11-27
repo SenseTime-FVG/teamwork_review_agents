@@ -312,6 +312,43 @@ async def test_valid_snapshot_is_verified_in_new_checkout_without_reinstall(
     assert not any(kind == "workspace.prepare.started" for kind, _ in events)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 虚拟环境的符号链接和控制台脚本")
+@pytest.mark.parametrize("shell_wrapper", [False, True])
+async def test_symlink_venv_and_console_entry_restore_without_reinstall(python_workspace, shell_wrapper):
+    """真实符号链接虚拟环境及控制台入口跨目录恢复，旧目录消失后仍可直接执行。"""
+
+    _, repository, events, prepare = python_workspace
+    repository.agent_workspace.cache_enabled = True
+    script = (
+        "import pathlib,shlex,venv; "
+        "venv.EnvBuilder(with_pip=False,symlinks=True).create('.venv'); "
+        "entry=pathlib.Path('.venv/bin/playwright'); "
+        "python=str(pathlib.Path('.venv/bin/python').absolute()); "
+        "header=('#!/bin/sh\\n' + \"'''exec' \" + shlex.quote(python) + ' \\\"$0\\\" \\\"$@\\\"\\n' + \"' '''\\n\") "
+        f"if {shell_wrapper!r} else '#!'+python+'\\n'; "
+        "entry.write_text(header+'import sys; print(sys.prefix)\\n'); entry.chmod(0o755)"
+    )
+    repository.agent_workspace.prepare_steps = [AgentWorkspacePrepareStepConfig(
+        name="创建含标准链接的环境", command=[sys.executable, "-c", script],
+    )]
+    first = await prepare()
+    assert first.outcome.status == "success" and first.snapshot_status == "created"
+    old = repository.workspace
+    old.rename(old.with_name("old-checkout-removed"))
+    repository.workspace = old.parent / "restored checkout with spaces"
+    repository.workspace.mkdir()
+    subprocess.run(["git", "init", str(repository.workspace)], check=True, capture_output=True)
+    events.clear()
+    restored = await prepare()
+    assert restored.outcome.status == "success", restored.outcome.error
+    assert restored.snapshot_status == "restored"
+    assert not any(kind == "workspace.prepare.started" for kind, _ in events)
+    entry = repository.workspace / ".venv/bin/playwright"
+    result = subprocess.run([str(entry)], check=True, capture_output=True, text=True)
+    assert Path(result.stdout.strip()) == repository.workspace / ".venv"
+    assert str(old) not in entry.read_text()
+
+
 @pytest.mark.parametrize("rebuild_install_fails", [False, True])
 @pytest.mark.asyncio
 async def test_failed_rebuild_stops_and_invalidates_bad_snapshot(

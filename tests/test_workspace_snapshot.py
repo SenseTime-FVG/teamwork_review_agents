@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tarfile
 import time
@@ -160,3 +161,94 @@ def test_snapshot_restore_rejects_parent_directory_escape(
             fingerprint,
         )
     assert not (tmp_path / "escaped.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 链接边界")
+@pytest.mark.parametrize("attack", [
+    "ordinary_absolute", "foreign_interpreter", "absolute_hardlink", "relative_escape",
+    "existing_link_overwrite", "deferred_duplicate", "deferred_child", "deferred_hardlink",
+])
+def test_python_link_exception_keeps_archive_boundaries(tmp_path, configured_app_factory, attack):
+    """标准解释器例外不能放行普通外链、宿主覆盖、重复成员或延后链接攻击。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    repository.workspace = tmp_path / "restore"
+    repository.workspace.mkdir()
+    trusted = tmp_path / "trusted" / "python"
+    trusted.parent.mkdir()
+    trusted.write_bytes(b"trusted-interpreter")
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"private-value")
+    repository.agent_workspace = AgentWorkspaceConfig(
+        cache_enabled=True, python_venv="ci/.venv",
+        prepare_steps=[AgentWorkspacePrepareStepConfig(name="可信解释器", command=[str(trusted), "-m", "venv", "ci/.venv"])],
+    )
+    fingerprint = "python-boundary"
+    directory = workspace_snapshot_root(config, repository) / fingerprint
+    directory.mkdir(parents=True)
+    member = tarfile.TarInfo("ci/.venv/bin/python")
+    member.type = tarfile.SYMTYPE
+    member.linkname = str(trusted)
+    extra = None
+    if attack == "ordinary_absolute":
+        member.name = "node_modules/ordinary"
+    elif attack == "foreign_interpreter":
+        member.linkname = str(secret)
+    elif attack == "absolute_hardlink":
+        member.type = tarfile.LNKTYPE
+    elif attack == "relative_escape":
+        member.linkname = "../../../../secret"
+    elif attack == "existing_link_overwrite":
+        target = repository.workspace / member.name
+        target.parent.mkdir(parents=True)
+        target.symlink_to(trusted)
+        member.type = tarfile.REGTYPE
+        member.size = 6
+    elif attack in {"deferred_duplicate", "deferred_child"}:
+        extra = tarfile.TarInfo(member.name + ("/payload" if attack == "deferred_child" else ""))
+        extra.size = 6
+    elif attack == "deferred_hardlink":
+        extra = tarfile.TarInfo("copy")
+        extra.type = tarfile.LNKTYPE
+        extra.linkname = member.name
+    archive = directory / ARCHIVE_FILE_NAME
+    with tarfile.open(archive, "w") as bundle:
+        bundle.addfile(member, io.BytesIO(b"unsafe") if member.isfile() else None)
+        if extra is not None:
+            bundle.addfile(extra, io.BytesIO(b"unsafe") if extra.isfile() else None)
+    (directory / METADATA_FILE_NAME).write_text(json.dumps({"fingerprint": fingerprint}))
+    with pytest.raises(WorkspaceSnapshotError):
+        restore_workspace_snapshot(config, repository, fingerprint)
+    assert trusted.read_bytes() == b"trusted-interpreter"
+    assert secret.read_bytes() == b"private-value"
+
+
+def test_snapshot_creation_does_not_publish_unrestorable_absolute_link(tmp_path, configured_app_factory):
+    """创建阶段就拒绝普通绝对外链，不能把明知不可恢复的归档标成已就绪。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    _initialize_git_workspace(repository.workspace)
+    outside = tmp_path / "outside"
+    outside.write_text("private")
+    try:
+        (repository.workspace / "ordinary-link").symlink_to(outside)
+    except OSError:
+        pytest.skip("当前账号不能创建符号链接")
+    with pytest.raises(WorkspaceSnapshotError, match="绝对链接"):
+        create_workspace_snapshot(config, repository, "unsafe-link", "signature")
+    assert not (workspace_snapshot_root(config, repository) / "unsafe-link").exists()
+
+
+def test_snapshot_missing_configured_venv_reports_recoverable_restore_error(configured_app_factory):
+    """旧快照缺少配置的虚拟环境时，返回可触发准备步骤重建的恢复异常。"""
+
+    config = configured_app_factory()
+    repository = config.repositories[0]
+    _initialize_git_workspace(repository.workspace)
+    repository.agent_workspace.python_venv = ".venv"
+    (repository.workspace / "artifact.txt").write_text("旧准备产物")
+    create_workspace_snapshot(config, repository, "missing-python", "signature")
+    with pytest.raises(WorkspaceSnapshotError, match="Python 环境不可恢复"):
+        restore_workspace_snapshot(config, repository, "missing-python")
