@@ -28,8 +28,10 @@ CI_TOOL_PARAMETERS = {
     "required": ["number", "expected_head_sha"],
     "additionalProperties": False,
 }
+# 共享说明约定等待方式，是否需要等待由本轮任务的角色 Prompt 决定。
 CI_RUNTIME_INSTRUCTIONS = (
-    "远端 CI 等待必须使用 wait_for_ci(number, expected_head_sha)，不要用 shell sleep 长轮询。"
+    "仅当本轮任务明确需要等待远端 CI 时，使用 wait_for_ci(number, expected_head_sha)，不要用 shell sleep 长轮询。"
+    "角色 Prompt 要求不等待 CI 直接发布审核结论时，遵守该发布策略，不调用等待工具或改用命令轮询。"
     "远端 CI 成功只要求可靠关联当前源提交，不校验 CI 执行时的目标 SHA，不因目标分支更新判定过期或要求重跑。"
     "该工具不授予合并权限；返回 success 后仍须核验最新源/目标 SHA、审批与全部平台门禁。"
     "CI 超时或运行超时是待处理终态：保留已发布的远端 PR、分支和提交，不删除远端成果或从头重跑。"

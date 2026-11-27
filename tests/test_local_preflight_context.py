@@ -1,6 +1,7 @@
 """本地 CI 门禁摘要的可信传递、审核对象关联和旧调用兼容测试。"""
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,7 @@ from teamwork_review_agents.codex_runner import decode_invocation_context, encod
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
 from teamwork_review_agents.models import AgentResult, InvocationContext, LocalPreflightContext
+from teamwork_review_agents.remote_ci import CI_RUNTIME_INSTRUCTIONS
 from teamwork_review_agents.state import StateStore
 
 
@@ -88,6 +90,47 @@ def test_legacy_call_does_not_invent_preflight_success(local_gate_harness):
     )
 
     assert "local_preflight" not in prompt_context(prompt)
+
+
+@pytest.mark.parametrize("auto_merge", [None, "false", "true"])
+def test_review_ci_publication_policy_reaches_actual_agent_prompt(local_gate_harness, auto_merge):
+    """真实输入及共享说明保持一致：默认与仅审核直接发布，自动合并仍等待 CI。"""
+
+    config, repository, event, gate, executor = local_gate_harness
+    config.agents["code-reviewer"] = config.agents["code-reviewer"].model_copy(update={
+        "prompt": None,
+        "prompt_file": Path(__file__).resolve().parents[1] / "prompts/general-review.md",
+    })
+    values = {} if auto_merge is None else {"REVIEW_AUTO_MERGE": auto_merge}
+    prompt = executor.build_prompt(
+        agent_name="code-reviewer", event=event, repository=repository,
+        task=None, extra_context=None, prompt_values=values,
+        change_ref="refs/teamwork/change-requests/7/head",
+        actions=(event.type,), target_head_sha="d" * 40, local_preflight=gate,
+    )
+    assert CI_RUNTIME_INSTRUCTIONS in prompt
+    assert "仅当本轮任务明确需要等待远端 CI 时" in prompt
+    assert "角色 Prompt 要求不等待 CI 直接发布审核结论时，遵守该发布策略" in prompt
+    assert "远端任一有效结果明确失败，立即结束" in prompt
+    assert "源或目标 SHA 变化：立即结束，不评论、不合并" in prompt
+    assert prompt_context(prompt)["local_preflight"]["status"] == "passed"
+    waiting_rule = "**代码无阻塞问题，但 CI 仍在运行**：不评论，继续等待"
+    if auto_merge == "true":
+        assert waiting_rule in prompt
+        assert "有效远端 CI 已成功，或者确认没有配置远端 CI" in prompt
+        assert "不得使用管理员覆盖、绕过分支保护、跳过 CI、强制合并" in prompt
+    else:
+        assert "代码审核完成后直接发布最终结论，无需等待远端 CI" in prompt
+        assert "仅因 CI 运行中而出现 `ci_still_running`、`checks_pending`" in prompt
+        assert "不把查询限制自动当作代码审核未完成或门禁已通过" in prompt
+        assert "CI 仍在运行不影响本项完成条件" in prompt
+        assert "或将已完成的审核范围降为“部分”" in prompt
+        assert "不再调用 `wait_for_ci` 或继续轮询 CI" in prompt
+        assert waiting_rule not in prompt
+        assert "没有阻塞问题但 CI 仍在运行：继续等待" not in prompt
+        assert "否则持续等待到最终状态" not in prompt
+        assert "有效远端 CI 已成功，或者确认没有配置远端 CI" not in prompt
+        assert "仅用于提前结束场景" not in prompt
 
 
 @pytest.mark.parametrize("field,value", [
