@@ -27,6 +27,11 @@ CANCEL_SOURCE_SERVICE_SHUTDOWN = "service_shutdown"
 LEGACY_CANCELLED_RETRY_ERROR = (
     "幂等任务已经达到重试上限，当前状态：cancelled"
 )
+_RUN_REPOSITORY_CONDITION = (
+    "(agent_runs.repository_id = ? OR event_inbox.repository_id = ? "
+    "OR (agent_runs.repository_id IS NULL AND event_inbox.repository_id IS NULL "
+    "AND agent_runs.resource_key LIKE ?))"
+)
 
 
 @dataclass(frozen=True)
@@ -486,6 +491,17 @@ class StateStore:
                 "TEXT NOT NULL DEFAULT 'event'",
             )
             self._ensure_column(connection, "agent_runs", "trigger_context", "TEXT")
+            # 覆盖排序、归属及轻量状态字段，避免轮询扫描包含大段审计内容的运行行。
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_recent_summary
+                ON agent_runs(started_at DESC, run_id DESC, repository_id,
+                              event_id, resource_key, status, finished_at)
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_preparing_repository
+                ON agent_runs(repository_id, event_id, resource_key)
+                WHERE status='preparing'
+            """)
             self._ensure_column(connection, "event_inbox", "queue_reason", "TEXT")
             self._ensure_column(connection, "event_inbox", "unmatched_reason", "TEXT")
             for table in ("agent_runs", "event_inbox"):
@@ -3714,6 +3730,34 @@ class StateStore:
             record["change_request_url"] = snapshot.get("web_url")
         return record
 
+    def latest_repository_run(self, repository_id: str) -> dict[str, Any] | None:
+        """只读取仓库状态需要的最近运行元数据，兼容旧事件与资源键归属。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""SELECT agent_runs.run_id, agent_runs.status,
+                           agent_runs.started_at, agent_runs.finished_at
+                    FROM agent_runs
+                    LEFT JOIN event_inbox ON event_inbox.event_id=agent_runs.event_id
+                    WHERE {_RUN_REPOSITORY_CONDITION}
+                    ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC LIMIT 1""",
+                (repository_id, repository_id, f"%:{repository_id}:%"),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def has_preparing_repository_run(self, repository_id: str) -> bool:
+        """仅检查仍准备工作区的运行，不能被较新的已完成记录掩盖。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""SELECT 1 FROM agent_runs
+                    LEFT JOIN event_inbox ON event_inbox.event_id=agent_runs.event_id
+                    WHERE agent_runs.status='preparing' AND {_RUN_REPOSITORY_CONDITION}
+                    LIMIT 1""",
+                (repository_id, repository_id, f"%:{repository_id}:%"),
+            ).fetchone()
+        return row is not None
+
     def list_runs(
         self,
         limit: int | None = 20,
@@ -3742,12 +3786,7 @@ class StateStore:
             conditions.append("agent_runs.agent_name = ?")
             parameters.append(agent_name)
         if repository_id:
-            conditions.append(
-                "(agent_runs.repository_id = ? OR event_inbox.repository_id = ? "
-                "OR (agent_runs.repository_id IS NULL "
-                "AND event_inbox.repository_id IS NULL "
-                "AND agent_runs.resource_key LIKE ?))"
-            )
+            conditions.append(_RUN_REPOSITORY_CONDITION)
             parameters.extend(
                 (repository_id, repository_id, f"%:{repository_id}:%")
             )

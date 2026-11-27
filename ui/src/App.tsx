@@ -27,6 +27,7 @@ import { EVENT_STATUS_OPTIONS, eventStatusPresentation, unmatchedReasonLabel } f
 import { overviewQuery, overviewRepositoryOptions, overviewStatusPath, toggleOverviewSort } from "./overviewScope";
 import type { OverviewFilter, OverviewSortField } from "./overviewScope";
 import { createOverviewRefresher } from "./overviewRefresh";
+import { createSingleFlight } from "./singleFlight";
 import { runtimeHealth } from "./runtimeHealth";
 import type { OverviewRefreshState } from "./overviewRefresh";
 import { preflightRunIdFromHash, withoutPreflightHash } from "./preflightDeepLink";
@@ -5552,7 +5553,7 @@ function RepositoriesView(props: {
     { kind: "discard" } | { kind: "delete" } | null
   >(null);
 
-  const refreshWorkspaceItems = useCallback(async () => {
+  const refreshWorkspaceItems = useMemo(() => createSingleFlight(async () => {
     try {
       setWorkspaceItems(await api<RepositoryWorkspaceStatus[]>("/api/repositories/workspaces"));
     } catch {
@@ -5560,21 +5561,22 @@ function RepositoriesView(props: {
     } finally {
       setWorkspaceLoading(false);
     }
-  }, []);
+  }), []);
 
   useEffect(() => {
+    if (saving) return;
     void refreshWorkspaceItems();
     const timer = window.setInterval(() => { void refreshWorkspaceItems(); }, 2000);
     return () => window.clearInterval(timer);
-  }, [refreshWorkspaceItems]);
+  }, [refreshWorkspaceItems, saving]);
 
   useEffect(() => {
-    if (!detailId || creating) {
-      setWorkspaceWarmup(null);
+    if (!detailId || creating || saving) {
+      if (!detailId || creating) setWorkspaceWarmup(null);
       return;
     }
     let disposed = false;
-    const refresh = async () => {
+    const refresh = createSingleFlight(async () => {
       try {
         const status = await api<RepositoryWorkspaceWarmupStatus>(
           `/api/repositories/${encodeURIComponent(detailId)}/workspace/warmup`,
@@ -5583,14 +5585,14 @@ function RepositoriesView(props: {
       } catch {
         // 轮询失败不覆盖用户正在编辑的配置，主动操作仍会显示明确错误。
       }
-    };
+    });
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 1500);
     return () => {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [creating, detailId]);
+  }, [creating, detailId, saving]);
 
   const findActiveManualPreflight = useCallback(async (repositoryId: string): Promise<string | null> => {
     const parameters = new URLSearchParams({
@@ -5603,14 +5605,14 @@ function RepositoriesView(props: {
   }, []);
 
   useEffect(() => {
-    if (!detailId || editing || creating) {
+    if (!detailId || editing || creating || saving) {
       if (!detailId) setActiveManualPreflightRunId(null);
       setCheckingManualPreflight(false);
       return;
     }
     let disposed = false;
     let firstLoad = true;
-    const refresh = async () => {
+    const refresh = createSingleFlight(async () => {
       if (firstLoad) setCheckingManualPreflight(true);
       try {
         const runId = await findActiveManualPreflight(detailId);
@@ -5621,14 +5623,14 @@ function RepositoriesView(props: {
         if (!disposed && firstLoad) setCheckingManualPreflight(false);
         firstLoad = false;
       }
-    };
+    });
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 2000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [creating, detailId, editing, findActiveManualPreflight]);
+  }, [creating, detailId, editing, findActiveManualPreflight, saving]);
 
   const repositories = useMemo(
     () => [...props.document.repositories].sort((left, right) => left.id.localeCompare(right.id)),
@@ -5786,7 +5788,8 @@ function RepositoriesView(props: {
       props.onSaved(normalized, result.revision);
       setDetailId(draftId.trim());
       clearDraft();
-      await refreshWorkspaceItems();
+      // 配置已保存即可反馈成功，状态列表随后独立更新，慢轮询不能继续锁住保存按钮。
+      void refreshWorkspaceItems();
       props.onNotice(creating ? `仓库 ${draftId} 已创建并热加载` : migratingRepository
         ? `仓库 ${draftId.trim()} 已迁移并热加载，旧目录不再保留`
         : `仓库 ${draftId} 已保存并热加载`);

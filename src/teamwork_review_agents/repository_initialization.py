@@ -107,6 +107,7 @@ class RepositoryInitializationManager:
         self.config_manager = config_manager
         self._operations: dict[str, RepositoryInitialization] = {}
         self._size_cache: dict[str, int] = {}
+        self._snapshot_tasks: dict[tuple[str, str], asyncio.Task[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
 
     def _repository(self, repository_id: str) -> RepositoryConfig | None:
@@ -118,12 +119,26 @@ class RepositoryInitializationManager:
     ) -> dict[str, Any] | None:
         """返回该仓库最近一次 Agent 运行摘要。"""
 
-        runs = await asyncio.to_thread(
-            self.config_manager.store.list_runs,
-            1,
-            repository_id=repository_id,
+        return await asyncio.to_thread(
+            self.config_manager.store.latest_repository_run,
+            repository_id,
         )
-        return runs[0] if runs else None
+
+    async def is_busy(self, repository_id: str) -> bool:
+        """保存前只检查手动 Git 与准备中的 Agent，不等待目录巡检和历史摘要。"""
+
+        repository = self._repository(repository_id)
+        if repository is None:
+            return False
+        operation = self._operations.get(repository_id)
+        if (
+            operation is not None and operation.status in ACTIVE_STATUSES
+            and operation.workspace == str(repository.workspace.expanduser().resolve())
+        ):
+            return True
+        return await asyncio.to_thread(
+            self.config_manager.store.has_preparing_repository_run, repository_id,
+        )
 
     async def _inspect(
         self,
@@ -156,6 +171,31 @@ class RepositoryInitializationManager:
         self,
         repository: RepositoryConfig,
     ) -> dict[str, Any]:
+        """同配置、同仓库的并发读取共享任务，结束后立即允许读取新状态。"""
+
+        key = (self.config_manager.config.revision, repository.id)
+        task = self._snapshot_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(self._build_snapshot(repository))
+            self._snapshot_tasks[key] = task
+
+            def release(completed: asyncio.Task[dict[str, Any]]) -> None:
+                """所有读取者取消后也回收任务并接收异常，不取消其他请求的共用查询。"""
+
+                if self._snapshot_tasks.get(key) is completed:
+                    self._snapshot_tasks.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(release)
+        return await asyncio.shield(task)
+
+    async def _build_snapshot(
+        self,
+        repository: RepositoryConfig,
+    ) -> dict[str, Any]:
+        """读取仓库的完整展示状态，保存前的轻量忙碌检查不经过此路径。"""
+
         path = str(repository.workspace.expanduser().resolve())
         operation = self._operations.get(repository.id)
         if operation is not None and operation.workspace != path:

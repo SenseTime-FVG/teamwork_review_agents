@@ -664,12 +664,7 @@ def create_app(
     async def ensure_repository_idle(repository_id: str) -> None:
         """禁止在基础仓库或 Agent 正在准备工作区时修改目标配置。"""
 
-        status = await repository_initialization_manager.get(repository_id)
-        if status is not None and status.get("status") in {
-            "waiting",
-            "initializing",
-            "updating",
-        }:
+        if await repository_initialization_manager.is_busy(repository_id):
             raise HTTPException(
                 status_code=409,
                 detail="仓库正在执行 Git 操作，请等待完成或先取消操作",
