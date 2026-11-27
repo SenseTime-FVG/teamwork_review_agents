@@ -900,6 +900,7 @@ class CodexModelRunner:
         tools = teamwork_function_tools(
             allowed_sub_agents=configured_sub_agent_names(self.config, agent),
             allow_publish_comment=agent.managed_comment,
+            allow_ci_wait=context.allow_ci_wait if context is not None else True,
         )
         if context is not None and context.preflight_run_id is not None:
             from .ci_diagnosis_tools import ci_diagnosis_tools

@@ -15,13 +15,14 @@ from teamwork_review_agents.mcp_bridge import ManagedMcpBroker, _call_bridge_met
 from teamwork_review_agents.models import InvocationContext
 
 
-async def test_mcp_proxy_only_exposes_teamwork_gateway_tools(configured_app_factory, snapshot_factory) -> None:
+@pytest.mark.parametrize("allow_ci_wait", [False, True])
+async def test_mcp_proxy_only_exposes_teamwork_gateway_tools(configured_app_factory, snapshot_factory, allow_ci_wait) -> None:
     """沙盒代理从宿主读取授权目录，代理环境没有业务配置路径和调用身份。"""
 
     config = configured_app_factory()
     event = detect_events(None, snapshot_factory(provider="github-main"), emit_initial=True)[0]
     context = InvocationContext(config_path=str(config.config_path), current_agent="code-reviewer",
-                                run_id="proxy-catalog", root_run_id="proxy-catalog", event=event)
+                                run_id="proxy-catalog", root_run_id="proxy-catalog", event=event, allow_ci_wait=allow_ci_wait)
     broker = await ManagedMcpBroker.start(
         run_id=context.run_id, config_path=config.config_path, encoded_context=encode_invocation_context(context),
         base_environment=os.environ, response_timeout_seconds=5,
@@ -38,7 +39,7 @@ async def test_mcp_proxy_only_exposes_teamwork_gateway_tools(configured_app_fact
     assert [tool.name for tool in tools.tools] == [
         "invoke_agent",
         "publish_comment",
-        "wait_for_ci",
+        *(["wait_for_ci"] if allow_ci_wait else []),
     ]
     assert tools.tools[0].inputSchema["properties"]["agent_name"]["enum"] == ["security-reviewer"]
 

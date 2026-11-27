@@ -25,6 +25,7 @@ from .config import AppConfig, ProviderConfig, RepositoryConfig
 from .environment import (
     PromptRenderError,
     SecretRedactor,
+    prompt_allows_ci_wait,
     render_prompt,
     resolve_provider_token,
     resolve_environment,
@@ -1080,6 +1081,11 @@ class AgentExecutor:
                         f"refs/remotes/origin/{event.current_snapshot.target_branch}",
                         timeout_seconds=self.config.runtime.git_timeout_seconds,
                     )
+                # 使用已解析且实际进入 Prompt 的变量，仓库覆盖和暴露开关均与审核模式一致。
+                allow_ci_wait = prompt_allows_ci_wait(
+                    agent.prompt_file.read_text(encoding="utf-8") if agent.prompt_file else agent.prompt or "",
+                    resolved_environment.prompt_values,
+                )
                 prompt = self.build_prompt(
                     agent_name=agent_name,
                     event=event,
@@ -1216,6 +1222,7 @@ class AgentExecutor:
                         call_chain=(*call_chain, agent_name),
                         inherit_workspace=inherit_workspace,
                         active_workspace=str(active_workspace),
+                        allow_ci_wait=allow_ci_wait,
                         event=event,
                         schedule=resolved_schedule,
                         preflight_run_id=preflight_run_id,

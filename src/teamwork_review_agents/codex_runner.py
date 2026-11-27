@@ -228,7 +228,9 @@ class CodexRunner:
         if use_mcp_bridge and windows_environment_separation():
             # 沙盒运行时不依赖服务 venv；Broker 仍由服务 Python 在沙盒外运行。
             mcp_python, *mcp_args = standalone_mcp_command()
-        enabled_tools = ["invoke_agent", "wait_for_ci"]
+        enabled_tools = ["invoke_agent"]
+        if context.allow_ci_wait:
+            enabled_tools.append("wait_for_ci")
         if agent.managed_comment:
             enabled_tools.append("publish_comment")
         overrides = [

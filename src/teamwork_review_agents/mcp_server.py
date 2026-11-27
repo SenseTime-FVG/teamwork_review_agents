@@ -38,6 +38,8 @@ class AgentGateway(FastMCP):
         tools = await super().list_tools()
         result = []
         for tool in tools:
+            if tool.name == "wait_for_ci" and not context.allow_ci_wait:
+                continue
             if tool.name == "invoke_agent":
                 if not names:
                     continue
@@ -186,6 +188,8 @@ async def wait_for_ci(number: int, expected_head_sha: str) -> dict[str, Any]:
     config, context = _load_invocation()
     if context.current_agent not in config.agents:
         raise PermissionError("当前 Agent 不存在")
+    if not context.allow_ci_wait:
+        raise PermissionError("当前仅审核任务未提供 wait_for_ci 工具；请继续完成审核，完成后直接发布最终结论")
     store = StateStore(config.database.path)
     await asyncio.to_thread(store.initialize)
 

@@ -56,14 +56,11 @@ def teamwork_function_tools(
     *,
     allowed_sub_agents: Sequence[str],
     allow_publish_comment: bool = False,
+    allow_ci_wait: bool = True,
 ) -> list[dict[str, Any]]:
     """生成 Codex Responses 接受的 Teamwork 函数工具定义。"""
 
     tools: list[dict[str, Any]] = [
-        {
-            "type": "function", "name": "wait_for_ci",
-            "description": CI_TOOL_DESCRIPTION, "parameters": CI_TOOL_PARAMETERS,
-        },
         {
             "type": "function",
             "name": "execute_command",
@@ -113,6 +110,11 @@ def teamwork_function_tools(
             },
         },
     ]
+    if allow_ci_wait:
+        tools.insert(0, {
+            "type": "function", "name": "wait_for_ci",
+            "description": CI_TOOL_DESCRIPTION, "parameters": CI_TOOL_PARAMETERS,
+        })
     if allowed_sub_agents:
         tools.append(
             {
@@ -224,6 +226,8 @@ class ModelToolExecutor:
     async def _wait_for_ci(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """CI 使用自己的固定期限，超时后不能让模型继续清理或重放。"""
 
+        if self.context is not None and not self.context.allow_ci_wait:
+            raise PermissionError("当前仅审核任务未提供 wait_for_ci 工具；请继续完成审核，完成后直接发布最终结论")
         if set(arguments) != {"number", "expected_head_sha"}:
             raise ValueError("wait_for_ci 只接受当前仓库 PR/MR 编号和源提交 SHA")
         control = active_run_control.get()

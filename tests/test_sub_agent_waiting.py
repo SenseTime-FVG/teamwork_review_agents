@@ -10,6 +10,7 @@ import pytest
 
 from teamwork_review_agents.codex_model_client import CodexResponsesClient
 from teamwork_review_agents.codex_model_runner import CodexModelRunner
+from teamwork_review_agents.config import EnvironmentVariable
 from teamwork_review_agents.environment import SecretRedactor
 from teamwork_review_agents.events import detect_events
 from teamwork_review_agents.executor import AgentExecutionError, AgentExecutor
@@ -363,6 +364,48 @@ async def test_full_executor_preserves_local_gate_in_prompt_and_context(
     assert prompt == captured["prompt"]
     payload = prompt.split("# 本次运行上下文\n\n```json\n", 1)[1].split("\n```", 1)[0]
     assert json.loads(payload)["local_preflight"] == gate.model_dump(exclude_none=True)
+
+
+@pytest.mark.parametrize("global_value,agent_value,repository_value,expose,expected", [
+    (None, None, None, True, False),
+    ("true", "false", None, True, False),
+    ("false", "true", None, True, True),
+    (None, "true", "false", True, False),
+    (None, "false", "true", True, True),
+    (None, "false", "true", False, False),
+])
+async def test_executor_freezes_ci_tool_policy_from_actual_prompt_values(
+    executor_harness, monkeypatch, global_value, agent_value, repository_value, expose, expected,
+):
+    """实际执行链沿用变量覆盖和暴露开关，运行器不受后续配置变化干扰。"""
+
+    executor, _store, execute = executor_harness
+    config = executor.config
+    agent = config.agents["code-reviewer"]
+    agent.prompt = "{% if REVIEW_AUTO_MERGE | as_bool %}自动合并{% else %}仅审核{% endif %}"
+    for mapping, value in (
+        (config.environment.global_variables, global_value),
+        (agent.environment, agent_value),
+        (config.repositories[0].environment, repository_value),
+    ):
+        if value is not None:
+            mapping["REVIEW_AUTO_MERGE"] = EnvironmentVariable(value=value, expose_to_prompt=expose)
+
+    async def run(self, **kwargs):
+        """保留真实输入构造，只替代模型执行并模拟运行中的设置变化。"""
+
+        assert kwargs["context"].allow_ci_wait is expected
+        assert ("自动合并" in kwargs["prompt"].split("# 运行时等待与超时边界", 1)[0]) is expected
+        agent.environment["REVIEW_AUTO_MERGE"] = EnvironmentVariable(value="false" if expected else "true")
+        assert kwargs["context"].allow_ci_wait is expected
+        return AgentResult(
+            run_id=kwargs["run_id"], root_run_id=kwargs["root_run_id"],
+            agent_name=kwargs["agent_name"], status="completed",
+        )
+
+    monkeypatch.setattr(CodexModelRunner, "run", run)
+    result = await execute()
+    assert result.status == "completed"
 
 
 @pytest.mark.asyncio

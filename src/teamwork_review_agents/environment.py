@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from jinja2 import Undefined
+from jinja2 import Undefined, nodes
 from jinja2.exceptions import TemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
@@ -286,6 +286,20 @@ def resolve_repository_process_environment(
         audit_values=audit_values,
         secret_values=tuple(sorted(set(secrets), key=len, reverse=True)),
     )
+
+
+def prompt_allows_ci_wait(template: str, values: dict[str, str]) -> bool:
+    """使用审核开关的模板按实际模式裁剪等待工具，普通 Agent 保持原有能力。"""
+
+    normalized = TEMPLATE_PATTERN.sub(lambda match: "{{ " + match.group(1) + " }}", template)
+    try:
+        syntax = PROMPT_TEMPLATE_ENVIRONMENT.parse(normalized)
+    except TemplateError as exc:
+        message = getattr(exc, "message", None) or str(exc)
+        raise PromptRenderError(f"Prompt 模板渲染失败：{message}") from exc
+    # 只识别可信模板中的真实变量引用，避免文字、注释或 Agent 改名影响工具目录。
+    uses_review_mode = any(node.name == "REVIEW_AUTO_MERGE" for node in syntax.find_all(nodes.Name))
+    return not uses_review_mode or _as_bool(values.get("REVIEW_AUTO_MERGE"))
 
 
 def render_prompt(template: str, values: dict[str, str]) -> str:

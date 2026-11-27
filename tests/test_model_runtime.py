@@ -708,10 +708,12 @@ def test_model_tool_resolves_managed_sandbox_binary_from_child_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allow_ci_wait", [False, True])
 async def test_model_runner_executes_tool_loop_and_merges_usage(
     configured_app_factory,
     snapshot_factory,
     monkeypatch,
+    allow_ci_wait,
 ) -> None:
     """模型函数调用应由 Teamwork 执行并作为 output 回传下一回合。"""
 
@@ -792,7 +794,7 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
         agent_name="code-reviewer",
         agent=config.agents["code-reviewer"],
         repository=repository,
-        context=_context(config, snapshot_factory),
+        context=_context(config, snapshot_factory).model_copy(update={"allow_ci_wait": allow_ci_wait}),
         prompt="请执行工具测试",
         process_environment={},
         redactor=SecretRedactor(()),
@@ -804,6 +806,8 @@ async def test_model_runner_executes_tool_loop_and_merges_usage(
     assert result.final_message == "工具验证完成"
     assert result.thread_id == "resp_2"
     assert result.usage == {"input_tokens": 8, "output_tokens": 6}
+    for payload in payloads:
+        assert ("wait_for_ci" in {tool["name"] for tool in payload["tools"]}) is allow_ci_wait
     outputs = [
         item
         for item in payloads[1]["input"]
